@@ -1,10 +1,11 @@
 //! Zstandard compression and decompression in safe Rust, ported from the
 //! official library, [libzstd](https://github.com/facebook/zstd).
 //!
-//! Work in progress: decompressing whole frames in one call works
-//! ([`decompress`], [`DCtx`], with dictionaries through [`DDict`]);
-//! streaming and compression come next. The plan, and the rules the port
-//! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
+//! Work in progress: decompression works, of whole frames in one call
+//! ([`decompress`], [`DCtx::decompress`]) or streaming
+//! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`];
+//! compression comes next. The plan, and the rules the port follows, are in
+//! the repository: `docs/porting.md` and `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -12,6 +13,34 @@
 //! let mut out = vec![0; 5];
 //! let size = hivepack_zstd::decompress(&mut out, &frame)?;
 //! assert_eq!(&out[..size], b"hello");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Streaming, when the output's size is not known or too large to hold:
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_zstd::Error> {
+//! # let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
+//! use hivepack_zstd::{DCtx, InBuffer, OutBuffer};
+//!
+//! let mut dctx = DCtx::new();
+//! let mut decoded = Vec::new();
+//! let mut piece = vec![0; hivepack_zstd::dstream_out_size()];
+//! // The input can come in pieces too: each call reads what it can.
+//! let mut input = InBuffer::new(&frame);
+//! loop {
+//!     let mut output = OutBuffer::new(&mut piece);
+//!     let hint = dctx.decompress_stream(&mut output, &mut input)?;
+//!     let written = output.pos;
+//!     decoded.extend_from_slice(&piece[..written]);
+//!     if hint == 0 && input.pos == input.src.len() {
+//!         // The last frame is done, and all of it written out. Input that
+//!         // stops inside a frame ends in an error instead.
+//!         break;
+//!     }
+//! }
+//! assert_eq!(decoded, b"hello");
 //! # Ok(())
 //! # }
 //! ```
@@ -32,10 +61,11 @@ pub use common::error_private::{Error, ErrorCode, Result};
 pub use decompress::zstd_ddict::{DDict, DictContentType};
 pub use decompress::zstd_decompress::{
     BLOCKSIZE_MAX_MIN, ContentSize, DParameter, DParameterKind, FRAMEHEADER_SIZE_MAX,
-    FrameHeaderState, ResetDirective, SKIPPABLE_HEADER_SIZE, WINDOWLOG_MAX, decompress,
-    decompress_bound, find_decompressed_size, find_frame_compressed_size, frame_header_size,
-    get_dict_id_from_dict, get_dict_id_from_frame, get_frame_content_size, get_frame_header,
-    get_frame_header_advanced, is_frame, is_skippable_frame, read_skippable_frame,
+    FrameHeaderState, InBuffer, OutBuffer, ResetDirective, SKIPPABLE_HEADER_SIZE, WINDOWLOG_MAX,
+    decoding_buffer_size_min, decompress, decompress_bound, dstream_in_size, dstream_out_size,
+    find_decompressed_size, find_frame_compressed_size, frame_header_size, get_dict_id_from_dict,
+    get_dict_id_from_frame, get_frame_content_size, get_frame_header, get_frame_header_advanced,
+    is_frame, is_skippable_frame, read_skippable_frame,
 };
 pub use decompress::zstd_decompress_internal::{
     CONTENTSIZE_UNKNOWN, DCtx, Format, FrameHeader, FrameType,

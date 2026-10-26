@@ -78,7 +78,7 @@ fn force_long_loop() -> bool {
 /// `ZSTD_blockSizeMax`
 fn block_size_max(dctx: &DCtx) -> usize {
     let block_size_max = if dctx.is_frame_decompression {
-        dctx.block_size_max
+        dctx.f_params.block_size_max as usize
     } else {
         ZSTD_BLOCKSIZE_MAX
     };
@@ -1121,11 +1121,13 @@ fn copy_match(out: &mut [u8], op: usize, offset: usize, length: usize) {
 }
 
 /// Copies `len` bytes from position `at` of the older segment of the window.
+/// Within the output, the copy behaves as `memmove`, as libzstd's does.
 #[inline(always)]
 fn copy_from_ext(out: &mut [u8], op: usize, ext: ExtDict<'_>, at: usize, len: usize) {
     match ext {
         ExtDict::None => debug_assert!(len == 0),
         ExtDict::Separate(content) => out[op..op + len].copy_from_slice(&content[at..at + len]),
+        ExtDict::InOut { start, .. } => out.copy_within(start + at..start + at + len, op),
     }
 }
 

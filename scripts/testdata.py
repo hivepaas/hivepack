@@ -118,7 +118,12 @@ def unpack(archive: Path, kind: str, into: Path) -> None:
 
 
 def stamp_of(entry: dict) -> str:
-    return json.dumps(entry.get("fetch") or entry.get("generate"), sort_keys=True)
+    """What a finished set was made from: its manifest entry, and the
+    repository sources a generated set is built from."""
+    stamp = {"spec": entry.get("fetch") or entry.get("generate")}
+    for source in entry.get("generate", {}).get("sources", []):
+        stamp[source] = sha256(ROOT / source)
+    return json.dumps(stamp, sort_keys=True)
 
 
 def is_current(folder: Path, stamp: str) -> bool:
@@ -163,6 +168,18 @@ def build_tool(source: Path, tool: str) -> Path:
     return binary
 
 
+def build_oracle(source: Path, sources: list, folder: Path) -> None:
+    """tools/zstd-oracle, compiled with libzstd's own sources (without the
+    assembly loop, which the port does not have either)."""
+    lib = next(source.glob("zstd-*/lib"))
+    files = [str(ROOT / s) for s in sources]
+    for part in ("common", "compress", "decompress"):
+        files += sorted(str(f) for f in (lib / part).glob("*.c"))
+    compiler = os.environ.get("CC", "cc")
+    subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", f"-I{lib}", f"-I{lib / 'common'}",
+                    *files, "-o", str(folder / "oracle")], check=True)
+
+
 def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     folder = cache / entry["name"]
     generate = entry["generate"]
@@ -172,13 +189,16 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
         return
     origin = sets[generate["from"]]
     fetch_set(origin, cache)
-    binary = build_tool(cache / origin["name"], generate["tool"])
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
-    # Each frame goes to z<number>.zst with its original at z<number>.
-    subprocess.run([str(binary), f"-p{folder}", f"-o{folder}", *generate["args"]], check=True,
-                   stdout=subprocess.DEVNULL)
+    if generate["tool"] == "oracle":
+        build_oracle(cache / origin["name"], generate["sources"], folder)
+    else:
+        binary = build_tool(cache / origin["name"], generate["tool"])
+        # Each frame goes to z<number>.zst with its original at z<number>.
+        subprocess.run([str(binary), f"-p{folder}", f"-o{folder}", *generate["args"]], check=True,
+                       stdout=subprocess.DEVNULL)
     mark_current(folder, stamp)
     print(f"  {entry['name']}: generated")
 

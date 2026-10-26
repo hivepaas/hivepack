@@ -33,6 +33,23 @@ At least 0.95× libzstd's speed, for compression at each level and for decompres
 
 libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes it on x86-64 outside Windows, as the official build does. On Windows and on other processors, libzstd runs the C loop instead, and the benchmark's column header shows "no asm".
 
+## Progress
+
+| libzstd | Port | Status | Checked against libzstd by |
+|---|---|---|---|
+| `zstd_errors.h`, `common/error_private.{h,c}` | `common/error_private.rs` | done | the error codes in every comparison |
+| `common/mem.h` (reads), `common/bits.h` | `common/mem.rs`, `common/bits.rs` | done | the functions that use them |
+| `common/bitstream.h` (reading) | `common/bitstream.rs` | done | `bits`: random streams read in random steps |
+| `common/entropy_common.c` | `common/entropy_common.rs` | done | `ncount` and `readstats`: tables made by libzstd's encoder, the same tables damaged, random bytes, and zstd's fuzzing corpora |
+| `common/fse.h` (decoding), `common/fse_decompress.c` | `common/fse.rs`, `common/fse_decompress.rs` | done | `fsedtable` and `fsedecompress` |
+| `common/xxhash.h` (XXH64) | `common/xxhash.rs` | done | `xxh64`, and streamed against one call |
+| `common/zstd_internal.h` (format constants) | `common/zstd_internal.rs` | done | used by the decoder |
+| `decompress/huf_decompress.c` (tables) | `decompress/huf_decompress.rs` | done | `hufx1` and `hufx2`: every cell of the table |
+| `decompress/huf_decompress.c` (decoding loops) and the rest of `lib/decompress` | | next | |
+| `lib/compress`, `lib/dictBuilder` | | later | |
+
+The comparisons go through `tools/zstd-oracle`, a small C program built with libzstd 1.5.7's sources that answers requests by calling the internal C function. `crates/zstd/src/oracle.rs` asks the port the same requests and compares the answers as text: thousands per run where the oracle is built (Linux and macOS in CI). `testdata/oracle/common.txt` replays 2,000 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
+
 ## The order of work
 
 1. **Common pieces:**

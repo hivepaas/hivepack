@@ -65,9 +65,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # One job also compares with zstd's fuzzing corpora.
           - os: ubuntu-latest
-            groups: core,generated
-            cache: core-generated
+            groups: core,generated,fuzz
+            cache: core-generated-fuzz
           - os: ubuntu-24.04-arm
             groups: core,generated
             cache: core-generated

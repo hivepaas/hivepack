@@ -1,2 +1,6 @@
 # Test files are compared byte for byte: never convert their line endings.
 testdata/** binary
+# The descriptions and recorded answers are text: keep their bytes, show diffs.
+testdata/*.md -text diff
+testdata/*.json -text diff
+testdata/oracle/* -text diff

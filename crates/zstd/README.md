@@ -2,7 +2,7 @@
 
 Zstandard (zstd) compression and decompression in safe Rust, ported from the official library, [libzstd](https://github.com/facebook/zstd) 1.5.7.
 
-> **Status:** nothing is implemented yet. This crate is not on crates.io.
+> **Status:** the pieces decoding builds on are ported (bit reading, FSE and Huffman tables, XXH64) and match libzstd; the decoder comes next. This crate is not on crates.io.
 
 The goals:
 

@@ -575,6 +575,7 @@ fn port_matches_libzstd() {
             ));
         }
     }
+    eprintln!("compared {} requests with libzstd", requests.len());
     assert!(
         problems.is_empty(),
         "{} requests checked, differences:\n{}",

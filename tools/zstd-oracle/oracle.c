@@ -19,11 +19,23 @@
  *   bits <fast> <hex> <nbBits list>   BIT_initDStream, then BIT_readBits (or
  *                                     BIT_readBitsFast) and BIT_reloadDStream
  *   xxh64 <seed> <hex>                XXH64
+ *   hufdec <table> <streams> <fast> <dstSize> <hex>
+ *                                     Huffman decoding, as the decoder calls it: the table
+ *                                     is "auto" (HUF_decompress1X_DCtx_wksp or
+ *                                     HUF_decompress4X_hufOnly_wksp) or "x1"/"x2" (that
+ *                                     table, then HUF_decompress{1,4}X_usingDTable);
+ *                                     streams is 1 or 4; fast 0 sets HUF_flags_disableFast.
+ *                                     HUF_flags_bmi2 is set when the processor has BMI2,
+ *                                     as the decoder sets it.
  *
  * And two that make valid inputs for the others, from symbol counts:
  *   mkncount <tableLog> <counts>      FSE_normalizeCount, FSE_writeNCount
  *   mkhuf <maxNbBits> <counts>        HUF_buildCTable_wksp, HUF_writeCTable_wksp; maxNbBits
  *                                     must be at least HUF_minTableLog, as in libzstd
+ *   mkhufstream <streams> <maxNbBits> <hex>
+ *                                     a Huffman table description followed by <hex>
+ *                                     compressed with it (HUF_compress{1,4}X_usingCTable),
+ *                                     or "none" when that is not possible
  *
  * Copyright (c) 2026 HivePaaS. MIT license.
  */
@@ -37,10 +49,12 @@
 #include <string.h>
 
 #include "common/bitstream.h"
+#include "common/cpu.h"
 #include "common/error_private.h"
 #include "common/fse.h"
 #include "common/huf.h"
 #include "common/xxhash.h"
+#include "compress/hist.h"
 
 /* Large enough for every request the tests send. */
 #define MAX_BYTES (1 << 20)
@@ -291,6 +305,69 @@ static void mkhuf(char** args, int nargs)
     puts("");
 }
 
+static void hufdec(char** args, int nargs)
+{
+    HUF_DTable dt[HUF_DTABLE_SIZE(12)] = { 12 * 0x1000001 };
+    static U32 wksp[HUF_DECOMPRESS_WORKSPACE_SIZE_U32];
+    int streams, flags;
+    size_t dstSize, r;
+    long n;
+    if (nargs != 5 || (n = parse_hex(args[4])) < 0) { puts("bad"); return; }
+    streams = atoi(args[1]);
+    dstSize = strtoul(args[3], NULL, 10);
+    if ((streams != 1 && streams != 4) || dstSize > MAX_BYTES) { puts("bad"); return; }
+    flags = (ZSTD_cpuid_bmi2(ZSTD_cpuid()) ? HUF_flags_bmi2 : 0) | (atoi(args[2]) ? 0 : HUF_flags_disableFast);
+    if (!strcmp(args[0], "auto")) {
+        r = streams == 1
+            ? HUF_decompress1X_DCtx_wksp(dt, output, dstSize, input, (size_t)n, wksp, sizeof(wksp), flags)
+            : HUF_decompress4X_hufOnly_wksp(dt, output, dstSize, input, (size_t)n, wksp, sizeof(wksp), flags);
+    } else {
+        size_t const h = !strcmp(args[0], "x2")
+            ? HUF_readDTableX2_wksp(dt, input, (size_t)n, wksp, sizeof(wksp), flags)
+            : HUF_readDTableX1_wksp(dt, input, (size_t)n, wksp, sizeof(wksp), flags);
+        if (HUF_isError(h)) { answer_error(h); return; }
+        if (h >= (size_t)n) { answer_error(ERROR(srcSize_wrong)); return; }
+        r = streams == 1
+            ? HUF_decompress1X_usingDTable(output, dstSize, input + h, (size_t)n - h, dt, flags)
+            : HUF_decompress4X_usingDTable(output, dstSize, input + h, (size_t)n - h, dt, flags);
+    }
+    if (HUF_isError(r)) { answer_error(r); return; }
+    printf("ok %u ", (unsigned)r);
+    print_hex(output, r);
+    puts("");
+}
+
+static void mkhufstream(char** args, int nargs)
+{
+    unsigned counts[HUF_SYMBOLVALUE_MAX + 1];
+    HUF_CElt table[HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+    static U64 wksp[HUF_WORKSPACE_SIZE_U64];
+    unsigned maxSV = HUF_SYMBOLVALUE_MAX, maxNbBits;
+    int streams;
+    size_t hSize, cSize, huffLog;
+    long n;
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    streams = atoi(args[0]);
+    maxNbBits = (unsigned)strtoul(args[1], NULL, 10);
+    if ((streams != 1 && streams != 4) || n == 0) { puts("bad"); return; }
+    HIST_count_simple(counts, &maxSV, input, (size_t)n);
+    if (HUF_cardinality(counts, maxSV) < 2) { puts("none"); return; }
+    if (maxNbBits < HUF_minTableLog(HUF_cardinality(counts, maxSV)) || maxNbBits > HUF_TABLELOG_MAX) { puts("bad"); return; }
+    memset(table, 0, sizeof(table));
+    huffLog = HUF_buildCTable_wksp(table, counts, maxSV, maxNbBits, wksp, sizeof(wksp));
+    if (HUF_isError(huffLog)) { answer_error(huffLog); return; }
+    hSize = HUF_writeCTable_wksp(output, MAX_BYTES, table, maxSV, (unsigned)huffLog, wksp, sizeof(wksp));
+    if (HUF_isError(hSize)) { answer_error(hSize); return; }
+    cSize = streams == 1
+        ? HUF_compress1X_usingCTable(output + hSize, MAX_BYTES - hSize, input, (size_t)n, table, 0)
+        : HUF_compress4X_usingCTable(output + hSize, MAX_BYTES - hSize, input, (size_t)n, table, 0);
+    if (HUF_isError(cSize)) { answer_error(cSize); return; }
+    if (cSize == 0) { puts("none"); return; }
+    printf("ok ");
+    print_hex(output, hSize + cSize);
+    puts("");
+}
+
 int main(void)
 {
     static char line[4 * MAX_BYTES];
@@ -311,6 +388,8 @@ int main(void)
         else if (!strcmp(command, "xxh64")) xxh64(args, nargs);
         else if (!strcmp(command, "mkncount")) mkncount(args, nargs);
         else if (!strcmp(command, "mkhuf")) mkhuf(args, nargs);
+        else if (!strcmp(command, "hufdec")) hufdec(args, nargs);
+        else if (!strcmp(command, "mkhufstream")) mkhufstream(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

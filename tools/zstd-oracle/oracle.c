@@ -27,6 +27,10 @@
  *                                     streams is 1 or 4; fast 0 sets HUF_flags_disableFast.
  *                                     HUF_flags_bmi2 is set when the processor has BMI2,
  *                                     as the decoder sets it.
+ *   frames <maxBlockSize> <dstCapacity> <hex>
+ *                                     ZSTD_decompressDCtx, on a new context with
+ *                                     ZSTD_d_maxBlockSize set (0 for none), answered
+ *                                     "ok <size> <FNV-1a of the output>"
  *
  * And two that make valid inputs for the others, from symbol counts:
  *   mkncount <tableLog> <counts>      FSE_normalizeCount, FSE_writeNCount
@@ -42,6 +46,9 @@
  *   mkblocks <level> <blockSize> <hex>
  *                                     <hex> compressed block by block with ZSTD_compressBegin
  *                                     and ZSTD_compressBlock, as the list "blocks" takes
+ *   mkframe <level> <maxBlockSize> <hex>
+ *                                     <hex> compressed with ZSTD_compress2, with a checksum
+ *                                     and ZSTD_c_maxBlockSize set
  *   mkhufstream <streams> <maxNbBits> <hex>
  *                                     a Huffman table description followed by <hex>
  *                                     compressed with it (HUF_compress{1,4}X_usingCTable),
@@ -474,6 +481,53 @@ static void blocks(char** args, int nargs)
     puts(line_out);
 }
 
+/* FNV-1a, 64 bits. */
+static unsigned long long fnv64(const unsigned char* bytes, size_t n)
+{
+    unsigned long long hash = 0xcbf29ce484222325ULL;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        hash ^= bytes[i];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+static void mkframe(char** args, int nargs)
+{
+    static ZSTD_CCtx* cctx;
+    size_t r;
+    long n;
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    if (!cctx) cctx = ZSTD_createCCtx();
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    r = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, atoi(args[0]));
+    if (!ZSTD_isError(r)) r = ZSTD_CCtx_setParameter(cctx, ZSTD_c_maxBlockSize, atoi(args[1]));
+    if (!ZSTD_isError(r)) r = ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
+    if (!ZSTD_isError(r)) r = ZSTD_compress2(cctx, output, MAX_BYTES, input, (size_t)n);
+    if (ZSTD_isError(r)) { answer_error(r); return; }
+    line_reset();
+    line_append("ok ", 3);
+    line_append_hex(output, r);
+    puts(line_out);
+}
+
+static void frames(char** args, int nargs)
+{
+    ZSTD_DCtx* dctx;
+    size_t cap, r;
+    long n;
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    cap = strtoul(args[1], NULL, 10);
+    if (cap > MAX_BYTES) { puts("bad"); return; }
+    dctx = ZSTD_createDCtx();
+    r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_maxBlockSize, atoi(args[0]));
+    if (!ZSTD_isError(r)) r = ZSTD_decompressDCtx(dctx, output, cap, input, (size_t)n);
+    ZSTD_freeDCtx(dctx);
+    if (ZSTD_isError(r)) { answer_error(r); return; }
+    printf("ok %u %016llx\n", (unsigned)r, fnv64(output, r));
+}
+
 int main(void)
 {
     static char line[4 * MAX_BYTES];
@@ -498,6 +552,8 @@ int main(void)
         else if (!strcmp(command, "mkhufstream")) mkhufstream(args, nargs);
         else if (!strcmp(command, "mkblocks")) mkblocks(args, nargs);
         else if (!strcmp(command, "blocks")) blocks(args, nargs);
+        else if (!strcmp(command, "mkframe")) mkframe(args, nargs);
+        else if (!strcmp(command, "frames")) frames(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

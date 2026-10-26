@@ -15,7 +15,7 @@ hivepack-zstd = { path = "crates/zstd" }
 # The official library, used only as the reference in tests and benchmarks.
 # zstd 0.14.3 builds libzstd 1.5.7, the release hivepack-zstd ports. The
 # legacy formats (v0.1 to v0.7) are left out, as the port does not read them.
-zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }
+zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "experimental"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

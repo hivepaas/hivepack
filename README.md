@@ -16,7 +16,7 @@ Read and write archives and compressed files in Rust: one library for many forma
 
 | Crate | What it is | Status |
 |---|---|---|
-| [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | The pieces decoding builds on (bit reading, FSE and Huffman tables, XXH64), each compared with libzstd |
+| [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | Decompresses whole frames, with the same output and errors as libzstd; not yet as fast. Streaming and compression come next |
 
 Every crate forbids `unsafe` code. The rules are in [docs/safety.md](docs/safety.md), and how the zstd port follows the official library is in [docs/porting.md](docs/porting.md).
 

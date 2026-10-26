@@ -10,7 +10,7 @@
 //! Speeds are the range over rounds in MB/s of uncompressed data (10^6 bytes
 //! per second), and the output is a Markdown table.
 //!
-//! Only libzstd is timed until hivepack-zstd can decode.
+//! hivepack-zstd only decompresses so far; its compression column is empty.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,6 +22,10 @@ type Result<T> = std::result::Result<T, String>;
 
 trait Codec {
     fn name(&self) -> String;
+    /// Whether [`Codec::compress`] works yet.
+    fn compresses(&self) -> bool {
+        true
+    }
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
     /// Decompresses `input`, whose content is `size` bytes long.
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
@@ -66,6 +70,35 @@ impl Codec for Libzstd {
             .decompress(output, input)
             .map(drop)
             .map_err(error_name)
+    }
+}
+
+/// The port: decompression only, for now.
+struct Hivepack {
+    dctx: hivepack_zstd::DCtx,
+}
+
+impl Codec for Hivepack {
+    fn name(&self) -> String {
+        "hivepack-zstd".into()
+    }
+
+    fn compresses(&self) -> bool {
+        false
+    }
+
+    fn compress(&mut self, _level: i32, _input: &[u8], _output: &mut Vec<u8>) -> Result<()> {
+        Err("hivepack-zstd does not compress yet".into())
+    }
+
+    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
+        output.resize(size, 0);
+        let decoded = self
+            .dctx
+            .decompress(output, input)
+            .map_err(|e| e.to_string())?;
+        output.truncate(decoded);
+        Ok(())
     }
 }
 
@@ -123,6 +156,11 @@ fn inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .map_err(|e| format!("{}: {e}", path.display()))?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
                 .filter(|p| p.is_file())
+                // Hidden files, such as the `.complete` mark of a fetched set.
+                .filter(|p| {
+                    !p.file_name()
+                        .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."))
+                })
                 .collect();
             files.sort();
             found.extend(files);
@@ -185,10 +223,12 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
         let mut decompress: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
         for _ in 0..options.rounds {
             for (i, codec) in codecs.iter_mut().enumerate() {
-                let seconds = time(options.budget, || {
-                    codec.compress(level, &data, &mut scratch)
-                })?;
-                compress[i] = Range::add(compress[i].take(), megabytes / seconds);
+                if codec.compresses() {
+                    let seconds = time(options.budget, || {
+                        codec.compress(level, &data, &mut scratch)
+                    })?;
+                    compress[i] = Range::add(compress[i].take(), megabytes / seconds);
+                }
                 let seconds = time(options.budget, || {
                     codec.decompress(&compressed, data.len(), &mut scratch)
                 })?;
@@ -204,9 +244,12 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
         let cells: Vec<String> = compress
             .iter()
             .zip(&decompress)
-            .map(|(c, d)| match (c, d) {
-                (Some(c), Some(d)) => format!("{c} | {d}"),
-                _ => "– | –".into(),
+            .map(|(c, d)| {
+                let show = |r: &Option<Range>| {
+                    r.as_ref()
+                        .map_or_else(|| "–".to_string(), |r| r.to_string())
+                };
+                format!("{} | {}", show(c), show(d))
             })
             .collect();
         println!(
@@ -220,10 +263,15 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
 
 fn run() -> Result<()> {
     let options = parse(std::env::args().skip(1))?;
-    let mut codecs: Vec<Box<dyn Codec>> = vec![Box::new(Libzstd {
-        compressor: CCtx::create(),
-        decompressor: DCtx::create(),
-    })];
+    let mut codecs: Vec<Box<dyn Codec>> = vec![
+        Box::new(Libzstd {
+            compressor: CCtx::create(),
+            decompressor: DCtx::create(),
+        }),
+        Box::new(Hivepack {
+            dctx: hivepack_zstd::DCtx::new(),
+        }),
+    ];
     let header: Vec<String> = codecs
         .iter()
         .map(|c| format!("{0} compress | {0} decompress", c.name()))

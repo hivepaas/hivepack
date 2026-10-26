@@ -2,7 +2,18 @@
 
 Zstandard (zstd) compression and decompression in safe Rust, ported from the official library, [libzstd](https://github.com/facebook/zstd) 1.5.7.
 
-> **Status:** the pieces decoding builds on are ported (bit reading, FSE and Huffman tables, XXH64) and match libzstd; the decoder comes next. This crate is not on crates.io.
+> **Status:** decompression of whole frames in one call works, with dictionaries, and gives the same output and errors as libzstd on all the test data. It does not go as fast as libzstd yet. Streaming decompression comes next, then the encoder. This crate is not on crates.io.
+
+```rust
+let frame = [
+    0x28, 0xb5, 0x2f, 0xfd, // magic number
+    0x20, 0x05, // header: single segment, content size 5
+    0x29, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o', // one raw block, the last
+];
+let mut out = [0u8; 5];
+let size = hivepack_zstd::decompress(&mut out, &frame)?;
+assert_eq!(&out[..size], b"hello");
+```
 
 The goals:
 

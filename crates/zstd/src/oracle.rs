@@ -40,6 +40,7 @@ use crate::decompress::huf_decompress::{
     huf_decompress1x_dctx_wksp, huf_decompress1x_using_dtable, huf_decompress4x_huf_only_wksp,
     huf_decompress4x_using_dtable, huf_read_dtable_x1_wksp, huf_read_dtable_x2_wksp,
 };
+use crate::decompress::zstd_decompress::DParameter;
 use crate::decompress::zstd_decompress_block::{BlockOut, decompress_block};
 use crate::decompress::zstd_decompress_internal::{DCtx, ExtDict};
 
@@ -348,6 +349,7 @@ pub(crate) fn answer(request: &str) -> String {
                         dst_capacity: capacity - pos,
                         prefix_start: 0,
                         ext: ExtDict::None,
+                        dict: None,
                     };
                     match decompress_block(&mut dctx, &mut bo, &data) {
                         Ok(size) => pos += size,
@@ -363,6 +365,19 @@ pub(crate) fn answer(request: &str) -> String {
                 }
             }
             format!("ok {pos} {}", hex(&out[..pos]))
+        }
+        ["frames", max_block_size, capacity, src] => {
+            let capacity: usize = capacity.parse().expect("capacity");
+            let mut out = vec![0u8; capacity];
+            let mut dctx = DCtx::new();
+            let max_block_size = max_block_size.parse().expect("block size");
+            match dctx
+                .set_parameter(DParameter::MaxBlockSize(max_block_size))
+                .and_then(|()| dctx.decompress(&mut out, &unhex(src)))
+            {
+                Ok(size) => format!("ok {size} {:016x}", fnv64(&out[..size])),
+                Err(error) => failed(error),
+            }
         }
         ["xxh64", seed, src] => format!(
             "ok {:016x}",
@@ -689,6 +704,48 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         requests.push(format!("blocks {capacity} {}", blocks.join(",")));
     }
 
+    // Whole frames with blocks up to some size, decoded with a block size
+    // limit below, at or above it, or none (ZSTD_d_maxBlockSize, which the
+    // tests against libzstd's public API cannot set); some damaged.
+    for i in 0..per_command / 10 {
+        let level = [-5i64, 1, 3, 9, 19][rng.range(0, 4) as usize];
+        let len = rng.range(0, if level == 19 { 50_000 } else { 300_000 }) as usize;
+        let data = if i % 3 == 0 {
+            rng.huffman_data(len)
+        } else {
+            rng.lz_data(len)
+        };
+        let block_size = [
+            1024u64,
+            1500,
+            4096,
+            65_536,
+            128 * 1024,
+            rng.range(1024, 128 * 1024),
+        ][rng.range(0, 5) as usize];
+        let Some(frame) = made(
+            oracle,
+            &format!("mkframe {level} {block_size} {}", hex(&data)),
+        ) else {
+            continue;
+        };
+        let limit = match rng.range(0, 7) {
+            0 => 0,
+            1 => block_size,
+            2..=4 => rng.range(1024, block_size),
+            5 => rng.range(block_size, 128 * 1024),
+            // Out of bounds.
+            6 => [1, 1023, 128 * 1024 + 1][rng.range(0, 2) as usize],
+            _ => 1024,
+        };
+        let frame = if i % 5 == 0 {
+            mutate(rng, &frame)
+        } else {
+            frame
+        };
+        requests.push(format!("frames {limit} {len} {}", hex(&frame)));
+    }
+
     // Bitstreams, read in random steps.
     for i in 0..per_command {
         let len = rng.range(if i % 10 == 0 { 0 } else { 1 }, 24) as usize;
@@ -764,9 +821,10 @@ fn corpus_requests() -> Vec<String> {
     requests
 }
 
-/// FNV-1a, to record long answers by their hash.
-fn fnv64(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+/// FNV-1a, to record long answers by their hash, and to answer with outputs
+/// briefly.
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
@@ -776,7 +834,7 @@ fn recorded_form(answer: &str) -> String {
     if answer.len() <= 160 {
         answer.to_string()
     } else {
-        format!("fnv64:{:016x}", fnv64(answer))
+        format!("fnv64:{:016x}", fnv64(answer.as_bytes()))
     }
 }
 

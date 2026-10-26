@@ -189,6 +189,7 @@ dependencies = [
 name = "zstd-bench"
 version = "0.0.0"
 dependencies = [
+ "hivepack-zstd",
  "zstd",
 ]
 

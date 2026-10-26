@@ -18,6 +18,9 @@ homepage.workspace = true
 workspace = true
 
 [dev-dependencies]
-zstd.workspace = true
+# Without libzstd's x86-64 assembly for Huffman decoding, as the oracle is
+# built: the port follows the C loops, and on damaged input the assembly
+# need not stop where they do.
+zstd = { workspace = true, features = ["no_asm"] }
 serde.workspace = true
 serde_json.workspace = true

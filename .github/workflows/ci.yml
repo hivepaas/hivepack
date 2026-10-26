@@ -67,13 +67,17 @@ jobs:
         include:
           - os: ubuntu-latest
             groups: core,generated
+            cache: core-generated
           - os: ubuntu-24.04-arm
             groups: core,generated
+            cache: core-generated
           - os: macos-latest
             groups: core,generated
+            cache: core-generated
           # Generating needs make, which the Windows runners do not have.
           - os: windows-latest
             groups: core
+            cache: core
     env:
       HIVEPACK_TESTDATA_REQUIRED: ${{ matrix.groups }}
     steps:
@@ -88,7 +92,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: target/testdata
-          key: testdata-${{ runner.os }}-${{ runner.arch }}-${{ matrix.groups }}-${{ hashFiles('testdata/manifest.json', 'scripts/testdata.py') }}
+          key: testdata-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache }}-${{ hashFiles('testdata/manifest.json', 'scripts/testdata.py') }}
       - name: Fetch test data
         shell: bash
         run: |

@@ -1,0 +1,262 @@
+{
+  "about": "Test data for hivepack-zstd. Sets with a path are committed under testdata/. Sets with fetch are downloaded by scripts/testdata.py into target/testdata/<name>, and sets with generate are made there by zstd's own tools. See testdata/README.md.",
+  "upstream": {
+    "version": "1.5.7",
+    "commit": "f8745da6ff1ad1e7bab384bd1f9d742439278e99"
+  },
+  "sets": [
+    {
+      "name": "zstd-golden-decompression",
+      "path": "zstd/golden-decompression",
+      "source": "https://github.com/facebook/zstd/tree/v1.5.7/tests/golden-decompression",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "zeros": { "rle-first-block.zst": 1048576, "empty-block.zst": 0 }
+    },
+    {
+      "name": "zstd-golden-decompression-errors",
+      "path": "zstd/golden-decompression-errors",
+      "source": "https://github.com/facebook/zstd/tree/v1.5.7/tests/golden-decompression-errors",
+      "license": "BSD-3-Clause",
+      "kind": "bad-frames"
+    },
+    {
+      "name": "zstd-golden-compression",
+      "path": "zstd/golden-compression",
+      "source": "https://github.com/facebook/zstd/tree/v1.5.7/tests/golden-compression",
+      "license": "BSD-3-Clause",
+      "kind": "inputs"
+    },
+    {
+      "name": "zstd-golden-dictionaries",
+      "path": "zstd/dictionaries",
+      "source": "https://github.com/facebook/zstd/tree/v1.5.7/tests (golden-dictionaries and dict-files)",
+      "license": "BSD-3-Clause",
+      "kind": "dictionaries",
+      "inputs": {
+        "http-dict-missing-symbols": ["zstd/golden-compression/http"],
+        "zero-weight-dict": ["zstd/dictionaries/zero-weight-dict"]
+      }
+    },
+    {
+      "name": "klauspost-good",
+      "path": "klauspost/good",
+      "source": "https://github.com/klauspost/compress/blob/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/good.zip",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "originals": "beside",
+      "expect": {
+        "2274d31e0d569fe9e31bedc4f9fddd9c9f114c2f.zst": {
+          "result": "fails",
+          "why": "A compressed block of 2 bytes with no literals and no sequences. Go's decoder accepts it; libzstd 1.5.7 (the zstd command line and the streaming API) reports \"Src size is incorrect\"."
+        }
+      }
+    },
+    {
+      "name": "klauspost-bad",
+      "path": "klauspost/bad",
+      "source": "https://github.com/klauspost/compress/blob/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/bad.zip",
+      "license": "BSD-3-Clause",
+      "kind": "bad-frames"
+    },
+    {
+      "name": "aircompressor-frames",
+      "path": "aircompressor",
+      "source": "https://github.com/airlift/aircompressor/tree/2ff50bed29e6e936e5096f8eba5e5a2c2ca2fb91/src/test/resources/data/zstd",
+      "license": "Apache-2.0",
+      "kind": "frames",
+      "originals": "beside",
+      "files": ["multiple-frames.zst", "with-checksum.zst"]
+    },
+    {
+      "name": "aircompressor-bad",
+      "path": "aircompressor",
+      "source": "https://github.com/airlift/aircompressor/tree/2ff50bed29e6e936e5096f8eba5e5a2c2ca2fb91/src/test/resources/data/zstd",
+      "license": "Apache-2.0",
+      "kind": "bad-frames",
+      "files": ["bad-second-frame.zst", "offset-before-start.zst"]
+    },
+    {
+      "name": "aircompressor-inputs",
+      "path": "aircompressor",
+      "source": "https://github.com/airlift/aircompressor/tree/2ff50bed29e6e936e5096f8eba5e5a2c2ca2fb91/src/test/resources/data/zstd",
+      "license": "Apache-2.0",
+      "kind": "inputs",
+      "files": ["incompressible", "large-rle", "small-literals-after-incompressible-literals"]
+    },
+    {
+      "name": "ruzstd-window",
+      "path": "ruzstd/window",
+      "source": "https://github.com/KillingSpark/zstd-rs/tree/91a3a6eb4cb8a0252ef73f5a561e30c790635774/ruzstd/test_fixtures",
+      "license": "MIT",
+      "kind": "frames",
+      "expect": {
+        "window_256mib.zst": {
+          "result": "fails",
+          "why": "Its 256 MiB window is over libzstd's default limit of 128 MiB (ZSTD_WINDOWLOG_LIMIT_DEFAULT 27), so it fails unless the caller raises the limit."
+        }
+      }
+    },
+    {
+      "name": "ruzstd-dict",
+      "path": "ruzstd/dict",
+      "source": "https://github.com/KillingSpark/zstd-rs/tree/91a3a6eb4cb8a0252ef73f5a561e30c790635774/ruzstd/dict_tests",
+      "license": "MIT",
+      "kind": "frames",
+      "originals": "beside",
+      "dictionary": "dictionary"
+    },
+    {
+      "name": "ruzstd-fuzz-decode",
+      "path": "ruzstd/fuzz-decode",
+      "source": "https://github.com/KillingSpark/zstd-rs/tree/91a3a6eb4cb8a0252ef73f5a561e30c790635774/ruzstd/fuzz/artifacts/decode",
+      "license": "MIT",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-regression-data",
+      "fetch": {
+        "group": "core",
+        "files": [
+          { "url": "https://github.com/facebook/zstd/releases/download/regression-data/silesia.tar.zst", "sha256": "c9e5947e2f869c4fb4612944251801d086be6d42174db4c70608cd57b44fc0b9" },
+          { "url": "https://github.com/facebook/zstd/releases/download/regression-data/github.tar.zst", "sha256": "aa3a49084cfaff5b3ada174fef43bf57d2f480448598be53e7351177dea03162" },
+          { "url": "https://github.com/facebook/zstd/releases/download/regression-data/github.dict.zst", "sha256": "1232682fc32888765e7e5e1d662466379d91e2ecbee610dabb6f683dbaa839d5" }
+        ]
+      },
+      "source": "https://github.com/facebook/zstd/releases/tag/regression-data (used by tests/regression)",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "regression": { "silesia.tar.zst": "silesia.tar", "github.tar.zst": "github.tar" }
+    },
+    {
+      "name": "klauspost-decoder",
+      "fetch": { "group": "core", "files": [{ "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/decoder.zip", "sha256": "e7eda39301d29fdd6fa4de3e14a619e25ca852f05cadb63494b985b8baea17a7", "unpack": "zip" }] },
+      "source": "https://github.com/klauspost/compress/tree/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "originals": "beside"
+    },
+    {
+      "name": "klauspost-large",
+      "fetch": { "group": "core", "files": [{ "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/large.zip", "sha256": "4132ef459ca092439ee6c5740b3454d159a0a776b37573de4847e8b6ed24f1d2", "unpack": "zip" }] },
+      "source": "https://github.com/klauspost/compress/tree/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "originals": "beside"
+    },
+    {
+      "name": "klauspost-benchdecoder",
+      "fetch": { "group": "core", "files": [{ "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/benchdecoder.zip", "sha256": "e337e6309a468388c38161eb6ff5e01b9712273d6118c3a430a2081cbfdfe178", "unpack": "zip" }] },
+      "source": "https://github.com/klauspost/compress/tree/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata",
+      "license": "BSD-3-Clause",
+      "kind": "frames"
+    },
+    {
+      "name": "klauspost-dicts",
+      "fetch": { "group": "core", "files": [{ "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/dict-tests-small.zip", "sha256": "4bf138cc3ab5756a4295c299bcf8620e438616bcb39c72dbd37fb18489bb4345", "unpack": "zip" }] },
+      "source": "https://github.com/klauspost/compress/tree/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata",
+      "license": "BSD-3-Clause",
+      "kind": "dict-frames"
+    },
+    {
+      "name": "klauspost-comp-crashers",
+      "fetch": { "group": "core", "files": [{ "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/comp-crashers.zip", "sha256": "6e7c366ca7a0ea228a2af556c4ba795e54fa1e3193fb3b1f475d8db16b68d414", "unpack": "zip" }] },
+      "source": "https://github.com/klauspost/compress/tree/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata",
+      "license": "BSD-3-Clause",
+      "kind": "inputs"
+    },
+    {
+      "name": "klauspost-regression",
+      "fetch": {
+        "group": "core",
+        "files": [
+          { "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/regression.zip", "sha256": "999dbe71a87e92d4cf7620a9b6bb1d7752045775a734ee96b69cb2f37043296f", "unpack": "zip" },
+          { "url": "https://raw.githubusercontent.com/klauspost/compress/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata/decode-regression.zip", "sha256": "d73513c2c4c6ebf0d391e0316ffa6bac85a5fe1329d6a776cb7ca1c0dd7a1d87", "unpack": "zip" }
+        ]
+      },
+      "source": "https://github.com/klauspost/compress/tree/4bc1f08dc7c8043e74df2d7e6b2d0f1984bbb908/zstd/testdata",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-1.5.7-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz", "sha256": "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3", "unpack": "tar.gz" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/v1.5.7",
+      "license": "BSD-3-Clause OR GPL-2.0-only",
+      "kind": "source"
+    },
+    {
+      "name": "decodecorpus",
+      "generate": { "group": "generated", "from": "zstd-1.5.7-source", "tool": "decodecorpus", "args": ["-n300", "-s1"] },
+      "source": "Generated by tests/decodecorpus.c from zstd 1.5.7",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "originals": "beside"
+    },
+    {
+      "name": "decodecorpus-dict",
+      "generate": { "group": "generated", "from": "zstd-1.5.7-source", "tool": "decodecorpus", "args": ["-n100", "-s2", "--use-dict=32768"] },
+      "source": "Generated by tests/decodecorpus.c from zstd 1.5.7",
+      "license": "BSD-3-Clause",
+      "kind": "frames",
+      "originals": "beside",
+      "dictionary": "dictionary"
+    },
+    {
+      "name": "zstd-fuzz-simple-decompress",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/simple_decompress_seed_corpus.zip", "sha256": "0fdfe2fe5717ec09202a88d16c37b2abc5aaaa8c2cacaa4127bd9949369d8181", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-fuzz-stream-decompress",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/stream_decompress_seed_corpus.zip", "sha256": "7434eba13e322a2a9b504ddb57217cf3568d360df309e3c9003956bd449e1de8", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-fuzz-block-decompress",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/block_decompress_seed_corpus.zip", "sha256": "f9586c9779e39fa5b54dcfd0ea4448e69e44e74bdcff1a19f2315bb3f51f62bd", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-fuzz-frame-info",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/zstd_frame_info_seed_corpus.zip", "sha256": "e19d9089772d352a98d4ef457be8578d833bec4381dbf66a70594a83d1408f83", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-fuzz-huf-decompress",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/huf_decompress_seed_corpus.zip", "sha256": "115214d0a8f53e72ec29ee2441b448ea05b9ceca1978a326815f3894f0a2e56b", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-fuzz-fse-read-ncount",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/fse_read_ncount_seed_corpus.zip", "sha256": "b4a005f0d52d74105ad2c647e5294a4c545615a82a022f54dc1fb8e3d0a5d2ae", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "zstd-fuzz-decompress-cross-format",
+      "fetch": { "group": "fuzz", "files": [{ "url": "https://github.com/facebook/zstd/releases/download/fuzz-corpora/decompress_cross_format_seed_corpus.zip", "sha256": "e3be96baa25fe62a99969de6246b5535c9dc2a764a414f2a4fcbe0e5beb15062", "unpack": "zip" }] },
+      "source": "https://github.com/facebook/zstd/releases/tag/fuzz-corpora",
+      "license": "BSD-3-Clause",
+      "kind": "fuzz"
+    },
+    {
+      "name": "silesia",
+      "fetch": { "group": "bench", "files": [{ "url": "https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip", "sha256": "0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af", "unpack": "zip" }] },
+      "source": "https://sun.aei.polsl.pl//~sdeor/index.php?page=silesia",
+      "license": "unstated; downloaded, never committed",
+      "kind": "bench"
+    }
+  ]
+}

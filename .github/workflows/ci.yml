@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Format, lints and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: python3 -m py_compile scripts/testdata.py
+
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check -p hivepack-zstd --lib --locked
+
+  licenses:
+    name: Dependency licenses and advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            groups: core,generated
+          - os: ubuntu-24.04-arm
+            groups: core,generated
+          - os: macos-latest
+            groups: core,generated
+          # Generating needs make, which the Windows runners do not have.
+          - os: windows-latest
+            groups: core
+    env:
+      HIVEPACK_TESTDATA_REQUIRED: ${{ matrix.groups }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: actions/cache@v6
+        with:
+          path: target/testdata
+          key: testdata-${{ runner.os }}-${{ runner.arch }}-${{ matrix.groups }}-${{ hashFiles('testdata/manifest.json', 'scripts/testdata.py') }}
+      - name: Fetch test data
+        shell: bash
+        run: |
+          args=()
+          for group in ${HIVEPACK_TESTDATA_REQUIRED//,/ }; do args+=(--group "$group"); done
+          python scripts/testdata.py fetch "${args[@]}"
+      - run: cargo test --workspace --locked
+
+  cross:
+    name: Test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # 32-bit, and big-endian: the format is little-endian and the port
+        # must read it so on every machine.
+        target: [i686-unknown-linux-gnu, s390x-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      # Only the committed sets: libzstd's speed under emulation does not
+      # matter, the port's results do.
+      - run: cross test --workspace --locked --target ${{ matrix.target }}

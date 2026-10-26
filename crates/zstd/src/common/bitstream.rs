@@ -93,6 +93,19 @@ impl<'a> BitDStream<'a> {
         }
     }
 
+    /// A reader positioned at `ptr` in `src`, with `bits_consumed` bits of
+    /// the register already read: what `HUF_initRemainingDStream` builds to
+    /// finish a stream after the fast Huffman loop. `src` is the whole input
+    /// of that loop, so the reader may go back as far as its start.
+    pub(crate) fn from_parts(src: &'a [u8], ptr: usize, bits_consumed: u32) -> Self {
+        BitDStream {
+            bit_container: read_le64(src, ptr),
+            bits_consumed,
+            ptr,
+            src,
+        }
+    }
+
     /// `BIT_lookBits`: the next `nb_bits` bits, without consuming them. Reads
     /// past the register give unspecified bits, as in C.
     #[inline(always)]

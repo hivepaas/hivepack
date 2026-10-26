@@ -25,6 +25,7 @@ use crate::common::entropy_common::{
     HUF_READ_STATS_WORKSPACE_SIZE, fse_read_ncount, huf_read_stats_wksp,
 };
 use crate::common::error_private::Error;
+use crate::common::error_private::ErrorCode;
 use crate::common::fse::{
     FSE_MAX_SYMBOL_VALUE, FSE_MAX_TABLELOG, FseDTable, fse_build_dtable_wksp_size_u32,
     fse_decompress_wksp_size_u32,
@@ -32,11 +33,12 @@ use crate::common::fse::{
 use crate::common::fse_decompress::{
     FseBuildDTableWksp, FseDecompressWksp, fse_build_dtable_internal, fse_decompress_wksp,
 };
-use crate::common::huf::HUF_TABLELOG_MAX;
+use crate::common::huf::{HUF_FLAGS_DISABLE_FAST, HUF_TABLELOG_MAX};
 use crate::common::xxhash::xxh64;
 use crate::decompress::huf_decompress::{
-    HufDTable, HufReadDTableX1Workspace, HufReadDTableX2Workspace, huf_read_dtable_x1_wksp,
-    huf_read_dtable_x2_wksp,
+    HufDTable, HufDecompressWksp, HufReadDTableX1Workspace, HufReadDTableX2Workspace,
+    huf_decompress1x_dctx_wksp, huf_decompress1x_using_dtable, huf_decompress4x_huf_only_wksp,
+    huf_decompress4x_using_dtable, huf_read_dtable_x1_wksp, huf_read_dtable_x2_wksp,
 };
 
 /// The largest workspace the oracle gives `FSE_decompress_wksp_bmi2`.
@@ -282,6 +284,52 @@ pub(crate) fn answer(request: &str) -> String {
                 Err(error) => failed(error),
             }
         }
+        ["hufdec", table, streams, fast, dst_size, src] => {
+            let src = unhex(src);
+            let mut output = vec![0u8; dst_size.parse().expect("dstSize")];
+            let mut dtable = Box::new(HufDTable::new(12));
+            let mut wksp = Box::new(HufDecompressWksp::default());
+            let flags = if fast == "1" {
+                0
+            } else {
+                HUF_FLAGS_DISABLE_FAST
+            };
+            let result = match (table, streams) {
+                ("auto", "1") => {
+                    huf_decompress1x_dctx_wksp(&mut dtable, &mut output, &src, &mut wksp, flags)
+                }
+                ("auto", _) => {
+                    huf_decompress4x_huf_only_wksp(&mut dtable, &mut output, &src, &mut wksp, flags)
+                }
+                (table, streams) => {
+                    let h_size = if table == "x2" {
+                        huf_read_dtable_x2_wksp(&mut dtable, &src, &mut wksp.x2)
+                    } else {
+                        huf_read_dtable_x1_wksp(&mut dtable, &src, &mut wksp.x1)
+                    };
+                    match h_size {
+                        Err(error) => Err(error),
+                        Ok(h_size) if h_size >= src.len() => Err(ErrorCode::SrcSizeWrong.into()),
+                        Ok(h_size) if streams == "1" => huf_decompress1x_using_dtable(
+                            &mut output,
+                            &src[h_size..],
+                            &dtable,
+                            flags,
+                        ),
+                        Ok(h_size) => huf_decompress4x_using_dtable(
+                            &mut output,
+                            &src[h_size..],
+                            &dtable,
+                            flags,
+                        ),
+                    }
+                }
+            };
+            match result {
+                Ok(size) => format!("ok {size} {}", hex(&output[..size])),
+                Err(error) => failed(error),
+            }
+        }
         ["xxh64", seed, src] => format!(
             "ok {:016x}",
             xxh64(&unhex(src), seed.parse().expect("seed"))
@@ -313,6 +361,28 @@ impl Rng {
 
     pub(crate) fn bytes(&mut self, len: usize) -> Vec<u8> {
         (0..len).map(|_| self.next() as u8).collect()
+    }
+
+    /// Bytes for Huffman coding: text-like, a small alphabet, one dominant
+    /// symbol, or a skew over all 256 values.
+    pub(crate) fn huffman_data(&mut self, len: usize) -> Vec<u8> {
+        let kind = self.range(0, 3);
+        let alphabet = self.range(2, 64);
+        (0..len)
+            .map(|_| match kind {
+                // The smaller of two draws favours the low symbols.
+                0 => b' ' + self.range(0, alphabet - 1).min(self.range(0, alphabet - 1)) as u8,
+                1 => self.range(0, alphabet.min(16) - 1) as u8,
+                2 => {
+                    if self.range(0, 9) == 0 {
+                        self.next() as u8
+                    } else {
+                        b'a'
+                    }
+                }
+                _ => (self.next().trailing_zeros() * 8 + self.range(0, 7) as u32) as u8,
+            })
+            .collect()
     }
 
     /// Symbol counts as real data tends to have them: a few frequent
@@ -466,6 +536,39 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         }
     }
 
+    // Huffman-coded streams from libzstd's encoder, decoded with every table
+    // and loop, at the right size and wrong ones, and damaged.
+    for i in 0..per_command {
+        let len = if i % 20 == 0 {
+            rng.range(1, 128 * 1024)
+        } else {
+            rng.range(1, 3000)
+        } as usize;
+        let data = rng.huffman_data(len);
+        let streams = if rng.range(0, 3) == 0 { 1 } else { 4 };
+        let max_nb_bits = rng.range(9, 12);
+        let request = format!("mkhufstream {streams} {max_nb_bits} {}", hex(&data));
+        let Some(made) = made(oracle, &request) else {
+            continue;
+        };
+        let (src, dst_size) = match i % 8 {
+            0 => (mutate(rng, &made), len),
+            1 => (
+                made,
+                (len as u64 + rng.range(0, 2)).saturating_sub(1) as usize,
+            ),
+            _ => (made, len),
+        };
+        let src = hex(&src);
+        let table = ["auto", "x1", "x2"][rng.range(0, 2) as usize];
+        let fast = rng.range(0, 3).min(1);
+        requests.push(format!("hufdec {table} {streams} {fast} {dst_size} {src}"));
+        if i % 4 == 0 {
+            let other = if table == "x1" { "x2" } else { "x1" };
+            requests.push(format!("hufdec {other} {streams} {fast} {dst_size} {src}"));
+        }
+    }
+
     // Bitstreams, read in random steps.
     for i in 0..per_command {
         let len = rng.range(if i % 10 == 0 { 0 } else { 1 }, 24) as usize;
@@ -576,6 +679,15 @@ fn port_matches_libzstd() {
         }
     }
     eprintln!("compared {} requests with libzstd", requests.len());
+    // Both 4-stream loops, for both tables, must have been reached.
+    let runs = crate::decompress::huf_decompress::LOOP_RUNS
+        .each_ref()
+        .map(|r| r.load(std::sync::atomic::Ordering::Relaxed));
+    eprintln!("4-stream loops run (fast X1, fallback X1, fast X2, fallback X2): {runs:?}");
+    assert!(
+        runs.iter().all(|&n| n >= 20),
+        "some 4-stream loops were barely reached: {runs:?}"
+    );
     assert!(
         problems.is_empty(),
         "{} requests checked, differences:\n{}",
@@ -609,6 +721,10 @@ fn record_oracle_answers() {
          # Regenerate with: cargo test -p hivepack-zstd record_oracle_answers -- --ignored\n",
     );
     for request in requests(&mut oracle, &mut rng, 300) {
+        // Keep the file small: the large inputs are for the live comparison.
+        if request.len() > 12_000 {
+            continue;
+        }
         let reply = oracle.ask(&request);
         let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
     }

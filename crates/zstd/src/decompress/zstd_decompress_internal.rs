@@ -8,12 +8,16 @@
 //! tag saying which buffer each one is in, and passes the buffers to the
 //! functions that use them.
 
+use std::sync::Arc;
+
 use crate::common::fse_decompress::FseBuildDTableWksp;
+use crate::common::xxhash::Xxh64State;
 use crate::common::zstd_internal::{
     LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG, REP_START_VALUE,
     ZSTD_BLOCKSIZE_MAX, ZSTD_REP_NUM,
 };
 use crate::decompress::huf_decompress::{HufDTable, HufDecompressWksp};
+use crate::decompress::zstd_ddict::DDict;
 
 /// `LL_base`
 pub(crate) const LL_BASE: [u32; MAX_LL as usize + 1] = [
@@ -135,6 +139,9 @@ pub(crate) enum TableRef {
     Default,
     /// The context's own table, in `entropy`.
     Own,
+    /// The table of the dictionary in use (a `ZSTD_DDict`), which the
+    /// caller passes along.
+    Dict,
 }
 
 /// `ZSTD_DECODER_INTERNAL_BUFFER`
@@ -212,16 +219,94 @@ impl ExtDict<'_> {
     }
 }
 
-/// The part of `ZSTD_DCtx` that block decoding uses. The frame and
-/// streaming state comes with that part of the port.
-pub(crate) struct DCtx {
+/// `ZSTD_format_e`: whether frames start with the magic number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Format {
+    /// The zstd frame format, with the magic number (`ZSTD_f_zstd1`).
+    #[default]
+    Zstd1,
+    /// Frames without the 4-byte magic number (`ZSTD_f_zstd1_magicless`).
+    Zstd1Magicless,
+}
+
+/// `ZSTD_FrameType_e`
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FrameType {
+    /// A zstd frame.
+    #[default]
+    Frame,
+    /// A skippable frame, whose content decoders skip.
+    Skippable,
+}
+
+/// `ZSTD_CONTENTSIZE_UNKNOWN`: the frame header does not give its content
+/// size.
+pub const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
+
+/// `ZSTD_FrameHeader`: what a frame header says.
+///
+/// As in libzstd, an unknown content size is [`CONTENTSIZE_UNKNOWN`]; a
+/// header that stores that value itself means the same.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FrameHeader {
+    /// The size of the frame's content, or [`CONTENTSIZE_UNKNOWN`]. For a
+    /// skippable frame: the size of its content.
+    pub frame_content_size: u64,
+    /// The window the frame needs. 0 for a skippable frame.
+    pub window_size: u64,
+    /// The largest block: the window size, at most 128 KiB.
+    pub block_size_max: u32,
+    pub frame_type: FrameType,
+    /// The size of the header, in bytes.
+    pub header_size: u32,
+    /// The dictionary the frame needs, 0 for none. For a skippable frame:
+    /// the magic number's variant, 0 to 15.
+    pub dict_id: u32,
+    /// Whether the frame ends with a checksum of its content.
+    pub checksum_flag: bool,
+}
+
+impl FrameHeader {
+    /// The content size, when the header gives it.
+    pub fn content_size(&self) -> Option<u64> {
+        (self.frame_content_size != CONTENTSIZE_UNKNOWN).then_some(self.frame_content_size)
+    }
+}
+
+/// `ZSTD_dictUses_e`: for how long the context uses its dictionary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DictUses {
+    /// Until told otherwise.
+    Indefinitely,
+    /// Not at all (any dictionary is dropped).
+    DontUse,
+    /// For the next frame only.
+    Once,
+}
+
+/// `ZSTD_DDictHashSet`: the dictionaries referenced with
+/// [`DParameter::RefMultipleDDicts`](crate::DParameter::RefMultipleDDicts)
+/// on, by dictionary ID, in an open-addressing table.
+#[derive(Debug)]
+pub(crate) struct DDictHashSet {
+    /// `ddictPtrTable`; its length (`ddictPtrTableSize`) is a power of 2.
+    pub(crate) table: Vec<Option<Arc<DDict>>>,
+    /// `ddictPtrCount`
+    pub(crate) count: usize,
+}
+
+/// `ZSTD_DCtx`: a decompression context, reused across frames.
+///
+/// Create one with [`DCtx::new`] and keep it: it holds tables and buffers
+/// that would otherwise be set up for every call.
+pub struct DCtx {
     pub(crate) ll_tptr: TableRef,
     pub(crate) ml_tptr: TableRef,
     pub(crate) of_tptr: TableRef,
     pub(crate) huf_ptr: TableRef,
-    pub(crate) entropy: EntropyDTables,
+    pub(crate) entropy: Box<EntropyDTables>,
     /// `workspace`: for building Huffman tables.
-    pub(crate) workspace: HufDecompressWksp,
+    pub(crate) workspace: Box<HufDecompressWksp>,
     /// `fParams.blockSizeMax`, used when decompressing a frame.
     pub(crate) block_size_max: usize,
     pub(crate) lit_entropy: bool,
@@ -236,23 +321,60 @@ pub(crate) struct DCtx {
     pub(crate) lit_buffer_end: LitPos,
     pub(crate) lit_buffer_location: LitLocation,
     pub(crate) lit_extra_buffer: Box<[u8]>,
+
+    // The frame.
+    pub(crate) f_params: FrameHeader,
+    pub(crate) processed_c_size: u64,
+    pub(crate) decoded_size: u64,
+    pub(crate) validate_checksum: bool,
+    pub(crate) xxh_state: Xxh64State,
+
+    // Parameters.
+    pub(crate) format: Format,
+    pub(crate) max_window_size: usize,
+    /// `outBufferMode == ZSTD_bm_stable` (streaming).
+    pub(crate) stable_out_buffer: bool,
+    pub(crate) force_ignore_checksum: bool,
+    pub(crate) ref_multiple_ddicts: bool,
+    pub(crate) max_block_size_param: u32,
+
+    // The dictionary.
+    pub(crate) dict_id: u32,
+    pub(crate) ddict: Option<Arc<DDict>>,
+    pub(crate) dict_uses: DictUses,
+    pub(crate) ddict_set: Option<DDictHashSet>,
+
+    /// libzstd's `dictEnd` and `previousDstEnd`, as addresses. The port
+    /// keeps the window as slices, but libzstd compares these pointers to
+    /// tell whether a dictionary is still in the processor's cache
+    /// (`ddictIsCold`), which picks the sequence loop, so the port tracks
+    /// them too. They are never dereferenced.
+    pub(crate) dict_end: usize,
+    pub(crate) previous_dst_end: usize,
 }
 
+/// `ZSTD_WINDOWLOG_LIMIT_DEFAULT`
+pub(crate) const ZSTD_WINDOWLOG_LIMIT_DEFAULT: u32 = 27;
+/// `ZSTD_MAXWINDOWSIZE_DEFAULT`
+pub(crate) const ZSTD_MAXWINDOWSIZE_DEFAULT: usize = (1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1;
+
 impl DCtx {
-    pub(crate) fn new() -> Self {
+    /// `ZSTD_createDCtx`
+    pub fn new() -> Self {
         DCtx {
             ll_tptr: TableRef::Own,
             ml_tptr: TableRef::Own,
             of_tptr: TableRef::Own,
             huf_ptr: TableRef::Own,
-            entropy: EntropyDTables::default(),
-            workspace: HufDecompressWksp::default(),
+            entropy: Box::default(),
+            workspace: Box::default(),
             block_size_max: ZSTD_BLOCKSIZE_MAX,
             lit_entropy: false,
             fse_entropy: false,
             lit_ptr: LitPos::new(LitBuf::Extra, 0),
             lit_size: 0,
-            is_frame_decompression: false,
+            // ZSTD_initDCtx_internal
+            is_frame_decompression: true,
             ddict_is_cold: false,
             disable_huf_asm: false,
             lit_buffer: LitPos::new(LitBuf::Extra, 0),
@@ -260,6 +382,23 @@ impl DCtx {
             lit_buffer_location: LitLocation::NotInDst,
             lit_extra_buffer: vec![0; ZSTD_LITBUFFEREXTRASIZE + WILDCOPY_OVERLENGTH]
                 .into_boxed_slice(),
+            f_params: FrameHeader::default(),
+            processed_c_size: 0,
+            decoded_size: 0,
+            validate_checksum: false,
+            xxh_state: Xxh64State::new(0),
+            format: Format::Zstd1,
+            max_window_size: ZSTD_MAXWINDOWSIZE_DEFAULT,
+            stable_out_buffer: false,
+            force_ignore_checksum: false,
+            ref_multiple_ddicts: false,
+            max_block_size_param: 0,
+            dict_id: 0,
+            ddict: None,
+            dict_uses: DictUses::DontUse,
+            ddict_set: None,
+            dict_end: 0,
+            previous_dst_end: 0,
         }
     }
 
@@ -275,5 +414,21 @@ impl DCtx {
         self.ml_tptr = TableRef::Own;
         self.of_tptr = TableRef::Own;
         self.huf_ptr = TableRef::Own;
+    }
+}
+
+impl Default for DCtx {
+    fn default() -> Self {
+        DCtx::new()
+    }
+}
+
+impl std::fmt::Debug for DCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DCtx")
+            .field("format", &self.format)
+            .field("max_window_size", &self.max_window_size)
+            .field("dict_id", &self.dict_id)
+            .finish_non_exhaustive()
     }
 }

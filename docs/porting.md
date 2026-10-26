@@ -17,7 +17,7 @@ The port follows libzstd **1.5.7** (tag `v1.5.7`, commit `f8745da6ff1ad1e7bab384
 
 ## How it is shown
 
-The reference is libzstd 1.5.7 itself, built by the `zstd` crate (0.14.3, with zstd-sys 2.1.2+zstd.1.5.7). It is a development dependency only. The tests in `crates/zstd/tests/testdata.rs` check that it is exactly that release: it compresses zstd's regression data to the sizes zstd's own harness records in `tests/regression/results.csv`.
+The reference is libzstd 1.5.7 itself, built by the `zstd` crate (0.14.3, with zstd-sys 2.1.2+zstd.1.5.7). It is a development dependency only. The tests in `crates/zstd/tests/testdata.rs` check that it is exactly that release: it compresses zstd's regression data to the sizes zstd's own harness records in `tests/regression/results.csv`. The tests build it without its x86-64 assembly loop for Huffman decoding (the `no_asm` feature), as the oracle below is built: the port follows the C loop, and on damaged input the assembly need not stop where it does.
 
 - **Compression:** the port's output is identical, byte for byte, to libzstd's for the same input and parameters. That holds at every level and strategy, with and without a dictionary, and when compressing on several threads (libzstd's output then does not depend on the thread count).
 - **Decompression:** the port gives the same output. On a bad input it fails with the same error code.
@@ -31,7 +31,7 @@ At least 0.95× libzstd's speed, for compression at each level and for decompres
 - **How:** with `tools/zstd-bench`, which runs the implementations in turn on the same inputs.
 - **Inputs:** the Silesia corpus, zstd's regression data, and small JSON files with a dictionary.
 
-libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes it on x86-64 outside Windows, as the official build does. On Windows and on other processors, libzstd runs the C loop instead, and the benchmark's column header shows "no asm".
+libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes it on x86-64 outside Windows, as the official build does. On Windows and on other processors, libzstd runs the C loop instead, and the benchmark's column header shows "no asm". Run the benchmark on its own (`cargo run --release -p zstd-bench`): built together with the tests, it gets their reference, which leaves the assembly out.
 
 ## Progress
 
@@ -46,14 +46,27 @@ libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes
 | `common/zstd_internal.h` (format constants) | `common/zstd_internal.rs` | done | used by the decoder |
 | `decompress/huf_decompress.c` (tables) | `decompress/huf_decompress.rs` | done | `hufx1` and `hufx2`: every cell of the table |
 | `decompress/huf_decompress.c` (decoding) | `decompress/huf_decompress.rs` | done | `hufdec`: streams made by libzstd's encoder, decoded with each table and loop (the fast loop and the fallback, which check input differently), at the right size and wrong ones, and damaged |
-| `decompress/zstd_decompress_internal.h` | `decompress/zstd_decompress_internal.rs` | the parts blocks use | |
+| `decompress/zstd_decompress_internal.h` | `decompress/zstd_decompress_internal.rs` | done (streaming state comes with streaming) | |
 | `decompress/zstd_decompress_block.c` | `decompress/zstd_decompress_block.rs` | done | `blocks`: blocks from libzstd's block compressor at several levels and block sizes, decoded one after the other into outputs of various sizes (so the literals sit in the extra buffer, the input, the output, or split), stored blocks in between, and damaged blocks. Test-only counters check that every literal placement and sequence loop is reached; the prefetching loop, which libzstd uses after loading a dictionary or past 16 MiB of history, is forced on every block libzstd decodes |
-| frames, dictionaries and streaming (the rest of `lib/decompress`) | | next | |
+| `decompress/zstd_ddict.c` | `decompress/zstd_ddict.rs` | done | the frame tests below, with every dictionary as a `ZSTD_DDict` too |
+| `decompress/zstd_decompress.c` (frames, one call) | `decompress/zstd_decompress.rs` | done | `tests/decompress.rs`: every test file decoded with `ZSTD_decompressDCtx` (`_usingDict`, `_usingDDict` where the set has a dictionary), and the frame information functions (`ZSTD_getFrameContentSize`, `ZSTD_findDecompressedSize`, `ZSTD_findFrameCompressedSize`, `ZSTD_decompressBound`, `ZSTD_getDictID_fromFrame`). `tests/dctx.rs`: contexts used for several calls in a row, with random parameters, dictionaries loaded, referenced, used as a prefix or several at once, on frames from libzstd's compressor, some damaged. `frames` in the oracle: the block size limit (`ZSTD_d_maxBlockSize`), which libzstd's public API cannot reach from Rust |
+| `decompress/zstd_decompress.c` (streaming) | | next | |
 | `lib/compress`, `lib/dictBuilder` | | later | |
 
 The comparisons go through `tools/zstd-oracle`, a small C program built with libzstd 1.5.7's sources that answers requests by calling the internal C function. `crates/zstd/src/oracle.rs` asks the port the same requests and compares the answers as text: thousands per run where the oracle is built (Linux and macOS in CI). `testdata/oracle/common.txt` replays about 2,400 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
 
+The frame tests call libzstd through the `zstd` crate. On 32-bit and big-endian machines, libzstd itself behaves differently from the port on some inputs: it accepts windows up to 2^30 only on 32-bit machines, checks damaged Huffman input with its older loop, and places dictionary IDs differently in its set. There the tests compare only the files libzstd decodes, and `tests/dctx.rs` does not run.
+
 For 4-stream Huffman input, libzstd uses a fast loop when it can and an older loop otherwise, and the two check corrupted input differently. libzstd skips the fast loop on processors without BMI2 and on big-endian or 32-bit machines; the port always tries it, as libzstd does on the 64-bit little-endian machines it mostly runs on. The oracle sets `HUF_flags_bmi2` the way the decoder does, so it takes the same path.
+
+libzstd decodes in place when the input sits at the end of the output buffer. The port takes the output and the input as separate slices, which cannot overlap, so that case does not arise.
+
+Two places in libzstd 1.5.7's handling of several dictionaries at once (`ZSTD_d_refMultipleDDicts`) read or write memory they should not. The port does what libzstd means to do, and the tests stay away from both:
+
+- **A use-after-free.** When a frame names a dictionary in the set, `ZSTD_DCtx_selectFrameDDict` calls `ZSTD_clearDict`, which frees a dictionary loaded with `ZSTD_DCtx_loadDictionary` (or a prefix) while that frame and the rest of the call still decode with it. AddressSanitizer reports it. It is still there in libzstd's development branch in October 2026. The port keeps the dictionary alive, so the result is what libzstd gives when the freed memory happens to be intact.
+- **Reads and writes one slot past the set's table**, when a search starts in its last slot. libzstd's development branch fixes it (commit c6f91a4), and the port takes that fix: the search wraps around to the first slot.
+
+Otherwise the set behaves as libzstd's does, including a quirk: a search stops at the first DDict of ID 0 (raw content), which libzstd takes for an empty slot, and returns it whatever ID was asked for. Which DDict comes back depends on where each one sits in the table, so the port uses the same table, hash and growth rule. The ID is hashed as little-endian bytes; libzstd hashes it in the machine's byte order, so on big-endian machines its slots differ.
 
 Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes past the end of a copy, the port copies exact lengths. The extra bytes always land where later writes go, on literals already read, or past the output, so the result is the same. libzstd keeps literals inside the output buffer when it has room, and the port puts them in the same place: corrupted input can make the output run over them, and the result must still match.
 

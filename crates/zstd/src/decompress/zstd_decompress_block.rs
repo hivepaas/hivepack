@@ -32,8 +32,8 @@ use crate::decompress::huf_decompress::{
     huf_decompress4x_using_dtable,
 };
 use crate::decompress::zstd_decompress_internal::{
-    DCtx, ExtDict, LL_BASE, LitBuf, LitLocation, LitPos, ML_BASE, OF_BASE, OF_BITS, SeqDTable,
-    SeqSymbol, TableRef, WILDCOPY_OVERLENGTH, ZSTD_LITBUFFEREXTRASIZE, sym,
+    DCtx, EntropyDTables, ExtDict, LL_BASE, LitBuf, LitLocation, LitPos, ML_BASE, OF_BASE, OF_BITS,
+    SeqDTable, SeqSymbol, TableRef, WILDCOPY_OVERLENGTH, ZSTD_LITBUFFEREXTRASIZE, sym,
 };
 
 /// How often each path ran, so the tests can check they reach all of them:
@@ -196,6 +196,7 @@ fn decode_literals_block(
     dst: usize,
     dst_capacity: usize,
     streaming: bool,
+    dict: Option<&EntropyDTables>,
 ) -> Result<usize> {
     let src_size = src.len();
     if src_size < MIN_CBLOCK_SIZE {
@@ -281,12 +282,15 @@ fn decode_literals_block(
             let huf_success = {
                 let lits = lit_buffer_mut(out, &mut dctx.lit_extra_buffer, lit_buffer, lit_size);
                 if lit_enc_type == SymbolEncodingType::Repeat {
-                    // dctx.huf_ptr is always the context's own table so far.
+                    let huf_table = match (dctx.huf_ptr, dict) {
+                        (TableRef::Dict, Some(dict)) => &dict.huf_table,
+                        _ => &dctx.entropy.huf_table,
+                    };
                     if single_stream {
-                        huf_decompress1x_using_dtable(lits, c_src, &dctx.entropy.huf_table, flags)
+                        huf_decompress1x_using_dtable(lits, c_src, huf_table, flags)
                     } else {
                         debug_assert!(lit_size >= MIN_LITERALS_FOR_4_STREAMS);
-                        huf_decompress4x_using_dtable(lits, c_src, &dctx.entropy.huf_table, flags)
+                        huf_decompress4x_using_dtable(lits, c_src, huf_table, flags)
                     }
                 } else if single_stream {
                     huf_decompress1x1_dctx_wksp(
@@ -927,18 +931,24 @@ struct SeqTableView<'a> {
 fn seq_table<'a, const N: usize>(
     which: TableRef,
     own: &'a SeqDTable<N>,
+    dict: Option<&'a SeqDTable<N>>,
     default: &'a [SeqSymbol],
     default_log: u32,
 ) -> SeqTableView<'a> {
-    match which {
-        TableRef::Default => SeqTableView {
-            cells: default,
-            table_log: default_log,
-        },
-        TableRef::Own => SeqTableView {
-            cells: &own.cells,
-            table_log: own.table_log,
-        },
+    let table = match which {
+        TableRef::Default => {
+            return SeqTableView {
+                cells: default,
+                table_log: default_log,
+            };
+        }
+        TableRef::Own => own,
+        // Only set while a dictionary is in use, which the caller passes.
+        TableRef::Dict => dict.unwrap_or(own),
+    };
+    SeqTableView {
+        cells: &table.cells,
+        table_log: table.table_log,
     }
 }
 
@@ -1324,28 +1334,33 @@ pub(crate) struct BlockOut<'o, 'e> {
     pub(crate) prefix_start: usize,
     /// The older segment of the window.
     pub(crate) ext: ExtDict<'e>,
+    /// The tables of the dictionary in use, for [`TableRef::Dict`].
+    pub(crate) dict: Option<&'e EntropyDTables>,
 }
 
 /// The three tables `dctx` points to. A macro rather than a function, so
 /// that it borrows only the fields it reads.
 macro_rules! dctx_tables {
-    ($dctx:expr) => {
+    ($dctx:expr, $dict:expr) => {
         SeqTables {
             ll: seq_table(
                 $dctx.ll_tptr,
                 &$dctx.entropy.ll_table,
+                $dict.map(|d: &EntropyDTables| &d.ll_table),
                 &LL_DEFAULT_DTABLE,
                 LL_DEFAULT_NORM_LOG,
             ),
             of: seq_table(
                 $dctx.of_tptr,
                 &$dctx.entropy.of_table,
+                $dict.map(|d: &EntropyDTables| &d.of_table),
                 &OF_DEFAULT_DTABLE,
                 OF_DEFAULT_NORM_LOG,
             ),
             ml: seq_table(
                 $dctx.ml_tptr,
                 &$dctx.entropy.ml_table,
+                $dict.map(|d: &EntropyDTables| &d.ml_table),
                 &ML_DEFAULT_DTABLE,
                 ML_DEFAULT_NORM_LOG,
             ),
@@ -1415,7 +1430,7 @@ fn decompress_sequences_body(
     // Regenerate the sequences.
     if nb_seq > 0 {
         dctx.fse_entropy = true;
-        let tables = dctx_tables!(dctx);
+        let tables = dctx_tables!(dctx, bo.dict);
         let mut seq_state = init_seq_state(&dctx.entropy.rep, tables, seq_src)?;
         for remaining in (1..=nb_seq).rev() {
             let sequence = decode_sequence(&mut seq_state, tables, remaining == 1);
@@ -1472,7 +1487,7 @@ fn decompress_sequences_body_split_lit_buffer(
 
     if nb_seq > 0 {
         dctx.fse_entropy = true;
-        let tables = dctx_tables!(dctx);
+        let tables = dctx_tables!(dctx, bo.dict);
         let mut seq_state = init_seq_state(&dctx.entropy.rep, tables, seq_src)?;
 
         // Decode without overrunning where the literals in the output begin.
@@ -1617,7 +1632,7 @@ fn decompress_sequences_long_body(
         let mut sequences = [Seq::default(); STORED_SEQS];
         let seq_advance = nb_seq.min(ADVANCED_SEQS);
         dctx.fse_entropy = true;
-        let tables = dctx_tables!(dctx);
+        let tables = dctx_tables!(dctx, bo.dict);
         let mut seq_state = init_seq_state(&dctx.entropy.rep, tables, seq_src)?;
 
         // Prepare in advance.
@@ -1799,7 +1814,15 @@ pub(crate) fn decompress_block_internal(
     }
 
     // The literals section.
-    let lit_c_size = decode_literals_block(dctx, src, bo.out, bo.dst, bo.dst_capacity, streaming)?;
+    let lit_c_size = decode_literals_block(
+        dctx,
+        src,
+        bo.out,
+        bo.dst,
+        bo.dst_capacity,
+        streaming,
+        bo.dict,
+    )?;
     let ip = lit_c_size;
 
     count_path(match (dctx.lit_buffer_location, dctx.lit_ptr.buf) {
@@ -1826,7 +1849,7 @@ pub(crate) fn decompress_block_internal(
     }
 
     if !use_prefetch_decoder && total_history_size > (1 << 24) && nb_seq > 8 {
-        let tables = dctx_tables!(dctx);
+        let tables = dctx_tables!(dctx, bo.dict);
         let info = get_offset_info(tables.of, nb_seq);
         // A heuristic: 2.73% of long offsets.
         let min_share = 7;

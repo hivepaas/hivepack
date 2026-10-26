@@ -77,6 +77,8 @@ pub enum Kind {
     Fuzz,
     /// Source code that the script builds tools from.
     Source,
+    /// A program the script builds, such as the oracle.
+    Tool,
     /// Benchmark inputs, too big for the tests.
     Bench,
 }

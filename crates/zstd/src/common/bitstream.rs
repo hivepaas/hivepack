@@ -1,0 +1,200 @@
+//! Reading bitstreams backwards: port of the decoding half of
+//! `common/bitstream.h`.
+//!
+//! zstd writes its entropy-coded streams forwards and reads them backwards,
+//! from the last byte to the first. The reader keeps a window of the stream
+//! in a register and refills it from memory.
+//!
+//! Differs from libzstd:
+//! - The register is 64 bits on every machine. libzstd uses `size_t`, so 32
+//!   bits on 32-bit machines, where it refills more often. The bits read are
+//!   the same.
+//! - The position is an index into the stream instead of a pointer. Every
+//!   read stays inside the stream, as in C: the position starts 8 bytes
+//!   before the end (or at the start of a shorter stream) and only moves
+//!   towards the start.
+//! - When too many bits have been read, libzstd points the reader at a word
+//!   of zeros. The port leaves the position alone. Once that has happened
+//!   every refill reports [`BitDStatus::Overflow`] before looking at the
+//!   position, and [`BitDStream::end_of_dstream`] is false, so where the
+//!   position points no longer matters.
+
+use super::bits::highbit32;
+use super::error_private::{Result, error};
+use super::mem::read_le64;
+
+/// The size of the register, in bytes: `sizeof(bitD->bitContainer)` on a
+/// 64-bit machine.
+const CONTAINER_BYTES: usize = 8;
+const CONTAINER_BITS: u32 = 64;
+
+/// `BIT_DStream_status`: what a refill found.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum BitDStatus {
+    /// The register is full again.
+    Unfinished = 0,
+    /// The start of the stream is near: the register holds fewer bits.
+    EndOfBuffer = 1,
+    /// Every bit of the stream has been read, exactly.
+    Completed = 2,
+    /// More bits were read than the stream holds.
+    Overflow = 3,
+}
+
+/// `BIT_DStream_t`
+#[derive(Clone)]
+pub(crate) struct BitDStream<'a> {
+    pub(crate) bit_container: u64,
+    pub(crate) bits_consumed: u32,
+    /// Where the register was read from, as an index into `src`: libzstd's
+    /// `ptr - start`. `limitPtr` is `start + CONTAINER_BYTES`.
+    ptr: usize,
+    src: &'a [u8],
+}
+
+impl<'a> BitDStream<'a> {
+    /// `BIT_initDStream`. `src` must be exactly the bitstream.
+    pub(crate) fn new(src: &'a [u8]) -> Result<Self> {
+        let size = src.len();
+        if size < 1 {
+            return error!(SrcSizeWrong);
+        }
+        let last_byte = src[size - 1];
+        if size >= CONTAINER_BYTES {
+            // The normal case.
+            let ptr = size - CONTAINER_BYTES;
+            if last_byte == 0 {
+                // No end mark.
+                return error!(Generic);
+            }
+            Ok(BitDStream {
+                bit_container: read_le64(src, ptr),
+                bits_consumed: 8 - highbit32(u32::from(last_byte)),
+                ptr,
+                src,
+            })
+        } else {
+            // libzstd's switch, whose cases fall through from srcSize down to 2.
+            let mut bit_container = u64::from(src[0]);
+            for (i, &byte) in src.iter().enumerate().skip(1) {
+                bit_container += u64::from(byte) << (8 * i);
+            }
+            if last_byte == 0 {
+                // No end mark.
+                return error!(CorruptionDetected);
+            }
+            let bits_consumed = 8 - highbit32(u32::from(last_byte));
+            Ok(BitDStream {
+                bit_container,
+                bits_consumed: bits_consumed + ((CONTAINER_BYTES - size) as u32) * 8,
+                ptr: 0,
+                src,
+            })
+        }
+    }
+
+    /// `BIT_lookBits`: the next `nb_bits` bits, without consuming them. Reads
+    /// past the register give unspecified bits, as in C.
+    #[inline(always)]
+    pub(crate) fn look_bits(&self, nb_bits: u32) -> u64 {
+        // BIT_getMiddleBits
+        debug_assert!(nb_bits < 32);
+        let start = CONTAINER_BITS
+            .wrapping_sub(self.bits_consumed)
+            .wrapping_sub(nb_bits);
+        (self.bit_container >> (start & (CONTAINER_BITS - 1))) & ((1u64 << nb_bits) - 1)
+    }
+
+    /// `BIT_lookBitsFast`: only for `nb_bits >= 1`.
+    #[inline(always)]
+    pub(crate) fn look_bits_fast(&self, nb_bits: u32) -> u64 {
+        debug_assert!(nb_bits >= 1);
+        let reg_mask = CONTAINER_BITS - 1;
+        (self.bit_container << (self.bits_consumed & reg_mask))
+            >> ((reg_mask + 1).wrapping_sub(nb_bits) & reg_mask)
+    }
+
+    /// `BIT_skipBits`
+    #[inline(always)]
+    pub(crate) fn skip_bits(&mut self, nb_bits: u32) {
+        self.bits_consumed = self.bits_consumed.wrapping_add(nb_bits);
+    }
+
+    /// `BIT_readBits`
+    #[inline(always)]
+    pub(crate) fn read_bits(&mut self, nb_bits: u32) -> u64 {
+        let value = self.look_bits(nb_bits);
+        self.skip_bits(nb_bits);
+        value
+    }
+
+    /// `BIT_readBitsFast`: only for `nb_bits >= 1`.
+    #[inline(always)]
+    pub(crate) fn read_bits_fast(&mut self, nb_bits: u32) -> u64 {
+        let value = self.look_bits_fast(nb_bits);
+        self.skip_bits(nb_bits);
+        value
+    }
+
+    /// `BIT_reloadDStream_internal`: needs `bits_consumed <= 64`, and enough
+    /// bytes before the position to move back by.
+    #[inline(always)]
+    fn reload_internal(&mut self) -> BitDStatus {
+        debug_assert!(self.bits_consumed <= CONTAINER_BITS);
+        self.ptr -= (self.bits_consumed >> 3) as usize;
+        self.bits_consumed &= 7;
+        self.bit_container = read_le64(self.src, self.ptr);
+        BitDStatus::Unfinished
+    }
+
+    /// `BIT_reloadDStreamFast`: needs `bits_consumed <= 64`. Reports
+    /// [`BitDStatus::Overflow`] near the start of the stream, where
+    /// [`BitDStream::reload`] has to take over.
+    #[inline(always)]
+    pub(crate) fn reload_fast(&mut self) -> BitDStatus {
+        if self.ptr < CONTAINER_BYTES {
+            return BitDStatus::Overflow;
+        }
+        self.reload_internal()
+    }
+
+    /// `BIT_reloadDStream`: refills the register without reading outside
+    /// the stream. After [`BitDStatus::Unfinished`] it holds at least 57 bits.
+    #[inline(always)]
+    pub(crate) fn reload(&mut self) -> BitDStatus {
+        if self.bits_consumed > CONTAINER_BITS {
+            // Overflow: an error, or the end of the stream. Once in this
+            // state, the stream stays in it.
+            return BitDStatus::Overflow;
+        }
+        if self.ptr >= CONTAINER_BYTES {
+            return self.reload_internal();
+        }
+        if self.ptr == 0 {
+            // The end of the bitstream: nothing to refill.
+            if self.bits_consumed < CONTAINER_BITS {
+                return BitDStatus::EndOfBuffer;
+            }
+            return BitDStatus::Completed;
+        }
+        // 0 < ptr < limitPtr: move back carefully.
+        let mut nb_bytes = (self.bits_consumed >> 3) as usize;
+        let mut result = BitDStatus::Unfinished;
+        if self.ptr < nb_bytes {
+            nb_bytes = self.ptr;
+            result = BitDStatus::EndOfBuffer;
+        }
+        self.ptr -= nb_bytes;
+        self.bits_consumed -= (nb_bytes as u32) * 8;
+        // The stream is longer than the register here (a shorter one starts
+        // at ptr == 0), so the read stays inside it.
+        self.bit_container = read_le64(self.src, self.ptr);
+        result
+    }
+
+    /// `BIT_endOfDStream`: whether every bit has been read, exactly.
+    #[inline(always)]
+    pub(crate) fn end_of_dstream(&self) -> bool {
+        self.ptr == 0 && self.bits_consumed == CONTAINER_BITS
+    }
+}

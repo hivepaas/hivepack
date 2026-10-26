@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/zstd", "tools/zstd-bench"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["HivePaaS"]
+repository = "https://github.com/hivepaas/hivepack"
+homepage = "https://github.com/hivepaas/hivepack"
+
+[workspace.dependencies]
+hivepack-zstd = { path = "crates/zstd" }
+# The official library, used only as the reference in tests and benchmarks.
+# zstd 0.14.3 builds libzstd 1.5.7, the release hivepack-zstd ports. The
+# legacy formats (v0.1 to v0.7) are left out, as the port does not read them.
+zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The safety rules in docs/safety.md, enforced for every crate.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+# Tests compare against large inputs; an unoptimised libzstd makes them slow
+# for no benefit.
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
+[profile.release]
+debug = "line-tables-only"

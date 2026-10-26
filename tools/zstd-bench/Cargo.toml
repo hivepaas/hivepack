@@ -1,0 +1,14 @@
+[package]
+name = "zstd-bench"
+version = "0.0.0"
+description = "Times hivepack-zstd against libzstd on the same inputs"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zstd.workspace = true

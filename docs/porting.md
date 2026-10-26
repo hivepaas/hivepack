@@ -46,12 +46,16 @@ libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes
 | `common/zstd_internal.h` (format constants) | `common/zstd_internal.rs` | done | used by the decoder |
 | `decompress/huf_decompress.c` (tables) | `decompress/huf_decompress.rs` | done | `hufx1` and `hufx2`: every cell of the table |
 | `decompress/huf_decompress.c` (decoding) | `decompress/huf_decompress.rs` | done | `hufdec`: streams made by libzstd's encoder, decoded with each table and loop (the fast loop and the fallback, which check input differently), at the right size and wrong ones, and damaged |
-| the rest of `lib/decompress` | | next | |
+| `decompress/zstd_decompress_internal.h` | `decompress/zstd_decompress_internal.rs` | the parts blocks use | |
+| `decompress/zstd_decompress_block.c` | `decompress/zstd_decompress_block.rs` | done | `blocks`: blocks from libzstd's block compressor at several levels and block sizes, decoded one after the other into outputs of various sizes (so the literals sit in the extra buffer, the input, the output, or split), stored blocks in between, and damaged blocks. Test-only counters check that every literal placement and sequence loop is reached; the prefetching loop, which libzstd uses after loading a dictionary or past 16 MiB of history, is forced on every block libzstd decodes |
+| frames, dictionaries and streaming (the rest of `lib/decompress`) | | next | |
 | `lib/compress`, `lib/dictBuilder` | | later | |
 
 The comparisons go through `tools/zstd-oracle`, a small C program built with libzstd 1.5.7's sources that answers requests by calling the internal C function. `crates/zstd/src/oracle.rs` asks the port the same requests and compares the answers as text: thousands per run where the oracle is built (Linux and macOS in CI). `testdata/oracle/common.txt` replays about 2,400 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
 
 For 4-stream Huffman input, libzstd uses a fast loop when it can and an older loop otherwise, and the two check corrupted input differently. libzstd skips the fast loop on processors without BMI2 and on big-endian or 32-bit machines; the port always tries it, as libzstd does on the 64-bit little-endian machines it mostly runs on. The oracle sets `HUF_flags_bmi2` the way the decoder does, so it takes the same path.
+
+Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes past the end of a copy, the port copies exact lengths. The extra bytes always land where later writes go, on literals already read, or past the output, so the result is the same. libzstd keeps literals inside the output buffer when it has room, and the port puts them in the same place: corrupted input can make the output run over them, and the result must still match.
 
 ## The order of work
 

@@ -32,6 +32,16 @@
  *   mkncount <tableLog> <counts>      FSE_normalizeCount, FSE_writeNCount
  *   mkhuf <maxNbBits> <counts>        HUF_buildCTable_wksp, HUF_writeCTable_wksp; maxNbBits
  *                                     must be at least HUF_minTableLog, as in libzstd
+ *   blocks <dstCapacity> <blocks>    decodes compressed blocks one after the other into one
+ *                                     output, with ZSTD_decompressBegin then
+ *                                     ZSTD_decompressBlock for each "c<hex>" block and
+ *                                     ZSTD_insertBlock for each stored "r<hex>" block
+ *                                     (comma-separated); a failure is answered
+ *                                     "err <code> <block index>", and a stored block that
+ *                                     does not fit "short <block index>"
+ *   mkblocks <level> <blockSize> <hex>
+ *                                     <hex> compressed block by block with ZSTD_compressBegin
+ *                                     and ZSTD_compressBlock, as the list "blocks" takes
  *   mkhufstream <streams> <maxNbBits> <hex>
  *                                     a Huffman table description followed by <hex>
  *                                     compressed with it (HUF_compress{1,4}X_usingCTable),
@@ -43,6 +53,7 @@
 #define FSE_STATIC_LINKING_ONLY
 #define HUF_STATIC_LINKING_ONLY
 #define ZSTD_STATIC_LINKING_ONLY
+#define ZSTD_DISABLE_DEPRECATE_WARNINGS
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +66,7 @@
 #include "common/huf.h"
 #include "common/xxhash.h"
 #include "compress/hist.h"
+#include "zstd.h"
 
 /* Large enough for every request the tests send. */
 #define MAX_BYTES (1 << 20)
@@ -368,6 +380,100 @@ static void mkhufstream(char** args, int nargs)
     puts("");
 }
 
+/* An output line of any length. */
+static char* line_out;
+static size_t line_len, line_cap;
+
+static void line_reset(void) { line_len = 0; }
+
+static void line_append(const char* text, size_t n)
+{
+    if (line_len + n + 1 > line_cap) {
+        line_cap = (line_len + n + 1) * 2;
+        line_out = (char*)realloc(line_out, line_cap);
+        if (!line_out) { puts("bad"); exit(1); }
+    }
+    memcpy(line_out + line_len, text, n);
+    line_len += n;
+    line_out[line_len] = 0;
+}
+
+static void line_append_hex(const unsigned char* bytes, size_t n)
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t i;
+    for (i = 0; i < n; i++) {
+        char pair[2];
+        pair[0] = digits[bytes[i] >> 4];
+        pair[1] = digits[bytes[i] & 15];
+        line_append(pair, 2);
+    }
+}
+
+static void mkblocks(char** args, int nargs)
+{
+    static ZSTD_CCtx* cctx;
+    size_t blockSize, pos, r;
+    long n;
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    if (!cctx) cctx = ZSTD_createCCtx();
+    blockSize = strtoul(args[1], NULL, 10);
+    if (blockSize == 0 || blockSize > ZSTD_BLOCKSIZE_MAX) { puts("bad"); return; }
+    r = ZSTD_compressBegin(cctx, atoi(args[0]));
+    if (ZSTD_isError(r)) { answer_error(r); return; }
+    if (blockSize > ZSTD_getBlockSize(cctx)) blockSize = ZSTD_getBlockSize(cctx);
+    line_reset();
+    line_append("ok ", 3);
+    for (pos = 0; pos < (size_t)n; pos += blockSize) {
+        size_t const chunk = (size_t)n - pos < blockSize ? (size_t)n - pos : blockSize;
+        size_t const c = ZSTD_compressBlock(cctx, output, MAX_BYTES, input + pos, chunk);
+        if (ZSTD_isError(c)) { answer_error(c); return; }
+        if (pos) line_append(",", 1);
+        if (c == 0) { line_append("r", 1); line_append_hex(input + pos, chunk); }
+        else { line_append("c", 1); line_append_hex(output, c); }
+    }
+    puts(line_out);
+}
+
+static void blocks(char** args, int nargs)
+{
+    static ZSTD_DCtx* dctx;
+    size_t cap, pos = 0;
+    char* item;
+    int index = 0;
+    if (nargs != 2) { puts("bad"); return; }
+    if (!dctx) dctx = ZSTD_createDCtx();
+    cap = strtoul(args[0], NULL, 10);
+    if (cap > MAX_BYTES) { puts("bad"); return; }
+    ZSTD_decompressBegin(dctx);
+    for (item = args[1]; item && *item; index++) {
+        char* const next = strchr(item, ',');
+        long n;
+        if (next) *next = 0;
+        n = parse_hex(item + 1);
+        if (n < 0) { puts("bad"); return; }
+        if (item[0] == 'c') {
+            size_t const r = ZSTD_decompressBlock(dctx, output + pos, cap - pos, input, (size_t)n);
+            if (ZSTD_isError(r)) { printf("err %d %d\n", (int)ERR_getErrorCode(r), index); return; }
+            pos += r;
+        } else {
+            if ((size_t)n > cap - pos) { printf("short %d\n", index); return; }
+            memcpy(output + pos, input, (size_t)n);
+            ZSTD_insertBlock(dctx, output + pos, (size_t)n);
+            pos += (size_t)n;
+        }
+        item = next ? next + 1 : NULL;
+    }
+    line_reset();
+    {   char head[64];
+        int const k = snprintf(head, sizeof(head), "ok %u ", (unsigned)pos);
+        line_append(head, (size_t)k);
+    }
+    if (pos == 0) line_append("-", 1);
+    line_append_hex(output, pos);
+    puts(line_out);
+}
+
 int main(void)
 {
     static char line[4 * MAX_BYTES];
@@ -390,6 +496,8 @@ int main(void)
         else if (!strcmp(command, "mkhuf")) mkhuf(args, nargs);
         else if (!strcmp(command, "hufdec")) hufdec(args, nargs);
         else if (!strcmp(command, "mkhufstream")) mkhufstream(args, nargs);
+        else if (!strcmp(command, "mkblocks")) mkblocks(args, nargs);
+        else if (!strcmp(command, "blocks")) blocks(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

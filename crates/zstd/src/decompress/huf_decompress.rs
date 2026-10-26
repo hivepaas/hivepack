@@ -84,15 +84,20 @@ pub(crate) struct HufDTable {
 }
 
 impl HufDTable {
+    /// The descriptor of an empty table that allows `max_table_log`.
+    pub(crate) fn new_desc(max_table_log: u32) -> DTableDesc {
+        DTableDesc {
+            max_table_log: max_table_log as u8,
+            table_type: 0,
+            table_log: 0,
+        }
+    }
+
     /// A table whose descriptor allows `max_table_log`, as
     /// `HUF_CREATE_STATIC_DTABLEX1` and the decoder set it up.
     pub(crate) fn new(max_table_log: u32) -> Self {
         HufDTable {
-            desc: DTableDesc {
-                max_table_log: max_table_log as u8,
-                table_type: 0,
-                table_log: 0,
-            },
+            desc: Self::new_desc(max_table_log),
             x1: [HufDEltX1::default(); HUF_DTABLE_CELLS],
             x2: [HufDEltX2::default(); HUF_DTABLE_CELLS],
         }

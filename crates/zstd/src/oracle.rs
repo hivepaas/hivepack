@@ -40,6 +40,8 @@ use crate::decompress::huf_decompress::{
     huf_decompress1x_dctx_wksp, huf_decompress1x_using_dtable, huf_decompress4x_huf_only_wksp,
     huf_decompress4x_using_dtable, huf_read_dtable_x1_wksp, huf_read_dtable_x2_wksp,
 };
+use crate::decompress::zstd_decompress_block::{BlockOut, decompress_block};
+use crate::decompress::zstd_decompress_internal::{DCtx, ExtDict};
 
 /// The largest workspace the oracle gives `FSE_decompress_wksp_bmi2`.
 const FSE_DECOMPRESS_MAX_WKSP: usize =
@@ -330,6 +332,38 @@ pub(crate) fn answer(request: &str) -> String {
                 Err(error) => failed(error),
             }
         }
+        ["blocks", capacity, blocks] => {
+            let capacity: usize = capacity.parse().expect("capacity");
+            let mut out = vec![0u8; capacity];
+            // ZSTD_decompressBegin
+            let mut dctx = Box::new(DCtx::new());
+            dctx.reset_entropy();
+            let mut pos = 0;
+            for (index, block) in blocks.split(',').enumerate() {
+                let data = unhex(&block[1..]);
+                if block.starts_with('c') {
+                    let mut bo = BlockOut {
+                        out: &mut out,
+                        dst: pos,
+                        dst_capacity: capacity - pos,
+                        prefix_start: 0,
+                        ext: ExtDict::None,
+                    };
+                    match decompress_block(&mut dctx, &mut bo, &data) {
+                        Ok(size) => pos += size,
+                        Err(error) => return format!("err {} {index}", error.code().number()),
+                    }
+                } else {
+                    // ZSTD_insertBlock, after copying the block in.
+                    if data.len() > capacity - pos {
+                        return format!("short {index}");
+                    }
+                    out[pos..pos + data.len()].copy_from_slice(&data);
+                    pos += data.len();
+                }
+            }
+            format!("ok {pos} {}", hex(&out[..pos]))
+        }
         ["xxh64", seed, src] => format!(
             "ok {:016x}",
             xxh64(&unhex(src), seed.parse().expect("seed"))
@@ -383,6 +417,41 @@ impl Rng {
                 _ => (self.next().trailing_zeros() * 8 + self.range(0, 7) as u32) as u8,
             })
             .collect()
+    }
+
+    /// Data with the structure LZ77 finds: runs of literals, and copies of
+    /// earlier data from near and far, some overlapping themselves.
+    pub(crate) fn lz_data(&mut self, len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len + 2000);
+        let alphabet = self.range(4, 64);
+        let binary = self.range(0, 4) == 0;
+        while data.len() < len {
+            if data.len() > 8 && self.range(0, 2) != 0 {
+                let offset = match self.range(0, 3) {
+                    0 => self.range(1, 8),
+                    1 => self.range(1, 64),
+                    _ => self.range(1, data.len() as u64),
+                } as usize;
+                let offset = offset.min(data.len());
+                let longest = if self.range(0, 9) == 0 { 2000 } else { 40 };
+                let length = self.range(3, longest) as usize;
+                for _ in 0..length {
+                    let byte = data[data.len() - offset];
+                    data.push(byte);
+                }
+            } else {
+                for _ in 0..self.range(1, 30) {
+                    let byte = if binary {
+                        self.next() as u8
+                    } else {
+                        b'a' + self.range(0, alphabet - 1) as u8
+                    };
+                    data.push(byte);
+                }
+            }
+        }
+        data.truncate(len);
+        data
     }
 
     /// Symbol counts as real data tends to have them: a few frequent
@@ -569,6 +638,57 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         }
     }
 
+    // Blocks from libzstd's compressor, decoded one after the other into
+    // outputs of various sizes, which move the literals between the extra
+    // buffer, the output, and both; and damaged.
+    for i in 0..per_command / 2 {
+        let len = if i % 10 == 0 || i % 5 == 3 {
+            rng.range(1, 400_000)
+        } else {
+            rng.range(1, 20_000)
+        } as usize;
+        // Mostly matches; or mostly literals, with large literal sections
+        // that libzstd splits between the output and its extra buffer; or
+        // incompressible bytes, which make stored blocks.
+        let data = match i % 5 {
+            0..=2 => rng.lz_data(len),
+            3 => rng.huffman_data(len),
+            _ => rng.bytes(len),
+        };
+        let level = [-5i64, 1, 3, 7, 12, 19][rng.range(0, 5) as usize];
+        let block_size = [
+            1024u64,
+            4096,
+            32 * 1024,
+            128 * 1024,
+            rng.range(1, 128 * 1024),
+        ][rng.range(0, 4) as usize];
+        // Literal-heavy data in full-size blocks, decoded into an output just
+        // large enough, is what makes libzstd split the literals.
+        let split_prone = i % 5 == 3 && rng.range(0, 1) == 0;
+        let block_size = if split_prone { 128 * 1024 } else { block_size };
+        let request = format!("mkblocks {level} {block_size} {}", hex(&data));
+        let Some(reply) = oracle.ask(&request).strip_prefix("ok ").map(str::to_string) else {
+            continue;
+        };
+        let mut blocks: Vec<String> = reply.split(',').map(str::to_string).collect();
+        if i % 6 == 0 {
+            // Damage one compressed block.
+            if let Some(block) = blocks.iter_mut().find(|b| b.starts_with('c')) {
+                *block = format!("c{}", hex(&mutate(rng, &unhex(&block[1..]))));
+            }
+        }
+        // Room: exactly enough, a lot more (up to the oracle's 1 MiB), or
+        // a little less.
+        let capacity = match if split_prone { 0 } else { rng.range(0, 3) } {
+            0 => len,
+            1 => (len + 300_000).min(1 << 20),
+            2 => len.saturating_sub(rng.range(1, 100) as usize),
+            _ => (len + rng.range(0, 200_000) as usize).min(1 << 20),
+        };
+        requests.push(format!("blocks {capacity} {}", blocks.join(",")));
+    }
+
     // Bitstreams, read in random steps.
     for i in 0..per_command {
         let len = rng.range(if i % 10 == 0 { 0 } else { 1 }, 24) as usize;
@@ -672,6 +792,15 @@ fn port_matches_libzstd() {
     for request in &requests {
         let want = oracle.ask(request);
         let got = answer(request);
+        // Blocks libzstd decodes must decode the same with every loop.
+        if request.starts_with("blocks ") && want.starts_with("ok") {
+            let long = answer_with_long_loop(request);
+            if long != want && problems.len() < 20 {
+                problems.push(format!(
+                    "{request:.300}\n  libzstd: {want:.300}\n  port, long loop: {long:.300}"
+                ));
+            }
+        }
         if got != want && problems.len() < 20 {
             problems.push(format!(
                 "{request:.300}\n  libzstd: {want:.300}\n  port:    {got:.300}"
@@ -688,12 +817,53 @@ fn port_matches_libzstd() {
         runs.iter().all(|&n| n >= 20),
         "some 4-stream loops were barely reached: {runs:?}"
     );
+    let paths = crate::decompress::zstd_decompress_block::PATH_RUNS
+        .each_ref()
+        .map(|r| r.load(std::sync::atomic::Ordering::Relaxed));
+    eprintln!(
+        "literals (extra, input, output, split), then sequence loops (plain, split, long): {paths:?}"
+    );
     assert!(
         problems.is_empty(),
         "{} requests checked, differences:\n{}",
         requests.len(),
         problems.join("\n")
     );
+}
+
+#[test]
+fn the_prefetching_loop_decodes_valid_blocks_like_libzstd() {
+    // libzstd takes this loop after loading a dictionary, or with over
+    // 16 MiB of history; here it is forced, on the blocks libzstd decodes.
+    let text = std::fs::read_to_string(recorded_path()).expect("testdata/oracle/common.txt");
+    let blocks: Vec<(&str, &str)> = text
+        .lines()
+        .filter(|l| l.starts_with("blocks "))
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(_, want)| want.starts_with("ok") || want.starts_with("fnv64"))
+        .collect();
+    assert!(
+        blocks.len() > 30,
+        "only {} valid block requests recorded",
+        blocks.len()
+    );
+    for (request, want) in blocks {
+        assert_eq!(
+            recorded_form(&answer_with_long_loop(request)),
+            want,
+            "{request:.200}"
+        );
+    }
+}
+
+/// The port's answer with the prefetching sequence loop forced, on this
+/// thread only.
+fn answer_with_long_loop(request: &str) -> String {
+    use crate::decompress::zstd_decompress_block::FORCE_LONG_LOOP;
+    FORCE_LONG_LOOP.with(|force| force.set(true));
+    let answer = answer(request);
+    FORCE_LONG_LOOP.with(|force| force.set(false));
+    answer
 }
 
 #[test]

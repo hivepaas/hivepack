@@ -13,8 +13,8 @@ use super::fse::{
 /// The workspace of `FSE_buildDTable_internal`: `symbolNext`, then `spread`
 /// with 8 bytes to spare for its 8-byte writes.
 pub(crate) struct FseBuildDTableWksp {
-    symbol_next: [u16; FSE_MAX_SYMBOL_VALUE as usize + 1],
-    spread: [u8; FSE_MAX_TABLESIZE + 8],
+    pub(crate) symbol_next: [u16; FSE_MAX_SYMBOL_VALUE as usize + 1],
+    pub(crate) spread: [u8; FSE_MAX_TABLESIZE + 8],
 }
 
 impl Default for FseBuildDTableWksp {

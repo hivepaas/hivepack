@@ -2,7 +2,7 @@
 
 Zstandard (zstd) compression and decompression in safe Rust, ported from the official library, [libzstd](https://github.com/facebook/zstd) 1.5.7.
 
-> **Status:** decompression of whole frames in one call works, with dictionaries, and gives the same output and errors as libzstd on all the test data. It does not go as fast as libzstd yet. Streaming decompression comes next, then the encoder. This crate is not on crates.io.
+> **Status:** decompression works, in one call or streaming, with dictionaries, and gives the same output and errors as libzstd on all the test data. It does not go as fast as libzstd yet: that comes next, then the encoder. This crate is not on crates.io.
 
 ```rust
 let frame = [

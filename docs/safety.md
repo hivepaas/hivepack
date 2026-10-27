@@ -37,6 +37,7 @@ Library code returns errors and never panics, whatever the input:
 ## Bounded resources
 
 - Decoding refuses windows larger than libzstd's default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`, 2^27 bytes = 128 MiB) unless the caller raises it, as `ZSTD_d_windowLogMax` does.
+- Streaming keeps one block of input and, unless the output buffer is stable, the window plus two blocks of output, at most the frame's content size. Buffers much larger than the frames need shrink after 128 frames, as in libzstd.
 - No allocation is sized from a header before that size is checked against the limits.
 - Nothing recurses to a depth the input chooses.
 

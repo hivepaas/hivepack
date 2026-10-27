@@ -13,11 +13,12 @@ use std::sync::Arc;
 use crate::common::fse_decompress::FseBuildDTableWksp;
 use crate::common::xxhash::Xxh64State;
 use crate::common::zstd_internal::{
-    LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG, REP_START_VALUE,
-    ZSTD_BLOCKSIZE_MAX, ZSTD_REP_NUM,
+    BlockType, LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG, REP_START_VALUE,
+    ZSTD_REP_NUM,
 };
 use crate::decompress::huf_decompress::{HufDTable, HufDecompressWksp};
 use crate::decompress::zstd_ddict::DDict;
+use crate::decompress::zstd_decompress::FRAMEHEADER_SIZE_MAX;
 
 /// `LL_base`
 pub(crate) const LL_BASE: [u32; MAX_LL as usize + 1] = [
@@ -208,6 +209,15 @@ pub(crate) enum ExtDict<'a> {
     None,
     /// A buffer of its own.
     Separate(&'a [u8]),
+    /// Earlier output in the buffer the block is decoded into, from `start`
+    /// to `end`: when streaming, libzstd goes back to the start of its
+    /// output buffer, and what was decoded before stays in the window. The
+    /// block's own output can write over it, as in libzstd, where both are
+    /// the same memory.
+    InOut {
+        start: usize,
+        end: usize,
+    },
 }
 
 impl ExtDict<'_> {
@@ -215,8 +225,58 @@ impl ExtDict<'_> {
         match self {
             ExtDict::None => 0,
             ExtDict::Separate(content) => content.len(),
+            ExtDict::InOut { start, end } => end - start,
         }
     }
+}
+
+/// A segment of the window while streaming, as libzstd's pointers give it:
+/// `prefixStart` to `previousDstEnd` for the current one, `virtualStart`
+/// and `dictEnd` for the older one. The port keeps which buffer each
+/// segment is in, and positions in it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Segment {
+    /// libzstd's NULL pointers, or an older segment of no length.
+    None,
+    /// The content of the dictionary the frame uses.
+    Dict,
+    /// `start..end` in the output buffer: the context's own (`outBuff`), or
+    /// the caller's with [`DParameter::StableOutBuffer`](crate::DParameter::StableOutBuffer).
+    Out { start: usize, end: usize },
+}
+
+/// `ZSTD_dStage`: what [`DCtx::decompress_stream`](crate::DCtx::decompress_stream)
+/// reads next within a frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DStage {
+    GetFrameHeaderSize,
+    DecodeFrameHeader,
+    DecodeBlockHeader,
+    DecompressBlock,
+    DecompressLastBlock,
+    CheckChecksum,
+    DecodeSkippableHeader,
+    SkipFrame,
+}
+
+/// `ZSTD_dStreamStage`: where [`DCtx::decompress_stream`](crate::DCtx::decompress_stream)
+/// is between calls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DStreamStage {
+    Init,
+    LoadHeader,
+    Read,
+    Load,
+    Flush,
+}
+
+/// The output buffer a streaming call was given, as libzstd's
+/// `expectedOutBuffer` keeps it: where it is, its size, and the position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct OutBufferId {
+    pub(crate) address: usize,
+    pub(crate) size: usize,
+    pub(crate) pos: usize,
 }
 
 /// `ZSTD_format_e`: whether frames start with the magic number.
@@ -295,10 +355,13 @@ pub(crate) struct DDictHashSet {
     pub(crate) count: usize,
 }
 
-/// `ZSTD_DCtx`: a decompression context, reused across frames.
+/// `ZSTD_DCtx`, which is also libzstd's `ZSTD_DStream`: a decompression
+/// context, reused across frames.
 ///
 /// Create one with [`DCtx::new`] and keep it: it holds tables and buffers
-/// that would otherwise be set up for every call.
+/// that would otherwise be set up for every call. It decodes whole frames
+/// in one call ([`DCtx::decompress`]), or streams them in pieces of any
+/// size ([`DCtx::decompress_stream`]).
 pub struct DCtx {
     pub(crate) ll_tptr: TableRef,
     pub(crate) ml_tptr: TableRef,
@@ -307,8 +370,6 @@ pub struct DCtx {
     pub(crate) entropy: Box<EntropyDTables>,
     /// `workspace`: for building Huffman tables.
     pub(crate) workspace: Box<HufDecompressWksp>,
-    /// `fParams.blockSizeMax`, used when decompressing a frame.
-    pub(crate) block_size_max: usize,
     pub(crate) lit_entropy: bool,
     pub(crate) fse_entropy: bool,
     pub(crate) lit_ptr: LitPos,
@@ -351,6 +412,41 @@ pub struct DCtx {
     /// them too. They are never dereferenced.
     pub(crate) dict_end: usize,
     pub(crate) previous_dst_end: usize,
+
+    // Streaming: the frame, read piece by piece (ZSTD_decompressContinue).
+    /// `expected`: how much input the stage needs.
+    pub(crate) expected: usize,
+    pub(crate) stage: DStage,
+    /// `bType`
+    pub(crate) b_type: BlockType,
+    pub(crate) rle_size: u32,
+    pub(crate) header_size: usize,
+    pub(crate) header_buffer: [u8; FRAMEHEADER_SIZE_MAX],
+    /// The window, as `prefixStart` to `previousDstEnd`.
+    pub(crate) stream_prefix: Segment,
+    /// The older segment of the window, as `virtualStart` and `dictEnd`.
+    pub(crate) stream_ext: Segment,
+    /// The dictionary the frame being streamed uses: libzstd points into
+    /// it, so the port keeps it alive until the next frame.
+    pub(crate) frame_ddict: Option<Arc<DDict>>,
+
+    // Streaming: the buffers (ZSTD_decompressStream).
+    pub(crate) stream_stage: DStreamStage,
+    /// `inBuff`, whose length is `inBuffSize`: a block, gathered when the
+    /// input comes in smaller pieces.
+    pub(crate) in_buff: Vec<u8>,
+    pub(crate) in_pos: usize,
+    /// `outBuff`, whose length is `outBuffSize`: the window and the block
+    /// being decoded, when the output buffer is not stable.
+    pub(crate) out_buff: Vec<u8>,
+    pub(crate) out_start: usize,
+    pub(crate) out_end: usize,
+    /// `lhSize`: how much of the frame header is in `header_buffer`.
+    pub(crate) lh_size: usize,
+    pub(crate) hostage_byte: bool,
+    pub(crate) no_forward_progress: u32,
+    pub(crate) expected_out_buffer: OutBufferId,
+    pub(crate) oversized_duration: usize,
 }
 
 /// `ZSTD_WINDOWLOG_LIMIT_DEFAULT`
@@ -368,7 +464,6 @@ impl DCtx {
             huf_ptr: TableRef::Own,
             entropy: Box::default(),
             workspace: Box::default(),
-            block_size_max: ZSTD_BLOCKSIZE_MAX,
             lit_entropy: false,
             fse_entropy: false,
             lit_ptr: LitPos::new(LitBuf::Extra, 0),
@@ -399,6 +494,26 @@ impl DCtx {
             ddict_set: None,
             dict_end: 0,
             previous_dst_end: 0,
+            expected: 0,
+            stage: DStage::GetFrameHeaderSize,
+            b_type: BlockType::Reserved,
+            rle_size: 0,
+            header_size: 0,
+            header_buffer: [0; FRAMEHEADER_SIZE_MAX],
+            stream_prefix: Segment::None,
+            stream_ext: Segment::None,
+            frame_ddict: None,
+            stream_stage: DStreamStage::Init,
+            in_buff: Vec::new(),
+            in_pos: 0,
+            out_buff: Vec::new(),
+            out_start: 0,
+            out_end: 0,
+            lh_size: 0,
+            hostage_byte: false,
+            no_forward_progress: 0,
+            expected_out_buffer: OutBufferId::default(),
+            oversized_duration: 0,
         }
     }
 

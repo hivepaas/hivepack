@@ -40,7 +40,7 @@ use crate::decompress::huf_decompress::{
     huf_decompress1x_dctx_wksp, huf_decompress1x_using_dtable, huf_decompress4x_huf_only_wksp,
     huf_decompress4x_using_dtable, huf_read_dtable_x1_wksp, huf_read_dtable_x2_wksp,
 };
-use crate::decompress::zstd_decompress::DParameter;
+use crate::decompress::zstd_decompress::{DParameter, InBuffer, OutBuffer};
 use crate::decompress::zstd_decompress_block::{BlockOut, decompress_block};
 use crate::decompress::zstd_decompress_internal::{DCtx, ExtDict};
 
@@ -365,6 +365,62 @@ pub(crate) fn answer(request: &str) -> String {
                 }
             }
             format!("ok {pos} {}", hex(&out[..pos]))
+        }
+        [
+            "stream",
+            max_block_size,
+            stable,
+            window_log_max,
+            capacity,
+            steps,
+            src,
+        ] => {
+            let capacity: usize = capacity.parse().expect("capacity");
+            let stable = stable == "1";
+            let steps: Vec<usize> = unlist(steps).into_iter().map(|v| v as usize).collect();
+            let src = unhex(src);
+            let mut dctx = DCtx::new();
+            let set = dctx
+                .set_parameter(DParameter::MaxBlockSize(
+                    max_block_size.parse().expect("block size"),
+                ))
+                .and_then(|()| dctx.set_parameter(DParameter::StableOutBuffer(stable)))
+                .and_then(|()| {
+                    dctx.set_parameter(DParameter::WindowLogMax(
+                        window_log_max.parse().expect("window log"),
+                    ))
+                });
+            if let Err(error) = set {
+                return failed(error);
+            }
+            let mut out = vec![0u8; capacity];
+            let (mut in_pos, mut out_pos) = (0usize, 0usize);
+            let mut text = String::from("ok");
+            for step in steps.chunks(2) {
+                let in_end = (in_pos + step[0]).min(src.len());
+                let out_end = if stable {
+                    capacity
+                } else {
+                    (out_pos + step[1]).min(capacity)
+                };
+                let mut input = InBuffer {
+                    src: &src[..in_end],
+                    pos: in_pos,
+                };
+                let mut output = OutBuffer {
+                    dst: &mut out[..out_end],
+                    pos: out_pos,
+                };
+                let result = dctx.decompress_stream_internal(&mut output, &mut input);
+                in_pos = input.pos;
+                out_pos = output.pos;
+                let _ = match result {
+                    Ok(hint) => write!(text, " {hint}/{in_pos}/{out_pos}"),
+                    Err(error) => write!(text, " e{}/{in_pos}/{out_pos}", error.code().number()),
+                };
+            }
+            let _ = write!(text, " {:016x}", fnv64(&out[..out_pos]));
+            text
         }
         ["frames", max_block_size, capacity, src] => {
             let capacity: usize = capacity.parse().expect("capacity");
@@ -780,6 +836,93 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         requests.push(format!("xxh64 {seed} {}", hex(&src)));
     }
 
+    // Frames streamed in random steps, with a block size limit, a stable
+    // output buffer and a window limit (ZSTD_d_maxBlockSize, which the
+    // tests against libzstd's public API cannot set), sometimes damaged.
+    // libzstd goes on after errors, and so does the request.
+    for i in 0..per_command / 10 {
+        let level = [-5i64, 1, 3, 9, 19][rng.range(0, 4) as usize];
+        let mut src = Vec::new();
+        let mut len = 0;
+        let mut block_size = 128 * 1024;
+        for _ in 0..rng.range(1, 2) {
+            // Half of them small enough for the replay file.
+            let frame_len = if i % 2 == 0 {
+                rng.range(0, 4000)
+            } else {
+                rng.range(0, if level == 19 { 50_000 } else { 200_000 })
+            } as usize;
+            let data = if i % 3 == 0 {
+                rng.huffman_data(frame_len)
+            } else {
+                rng.lz_data(frame_len)
+            };
+            block_size = [
+                1024u64,
+                4096,
+                65_536,
+                128 * 1024,
+                rng.range(1024, 128 * 1024),
+            ][rng.range(0, 4) as usize];
+            let Some(frame) = made(
+                oracle,
+                &format!("mkframe {level} {block_size} {}", hex(&data)),
+            ) else {
+                continue;
+            };
+            if rng.range(0, 3) == 0 {
+                // A skippable frame first.
+                let content_len = rng.range(0, 300) as usize;
+                let content = rng.bytes(content_len);
+                src.extend_from_slice(&(0x184D_2A50u32 + rng.range(0, 15) as u32).to_le_bytes());
+                src.extend_from_slice(&(content.len() as u32).to_le_bytes());
+                src.extend_from_slice(&content);
+            }
+            src.extend_from_slice(&frame);
+            len += frame_len;
+        }
+        if i % 4 == 0 {
+            src = mutate(rng, &src);
+        }
+        let limit = match rng.range(0, 5) {
+            0 | 1 => 0,
+            2 => block_size,
+            3 => rng.range(1024, block_size),
+            _ => rng.range(block_size, 128 * 1024),
+        };
+        let stable = u64::from(rng.range(0, 3) == 0);
+        let window_log_max = if rng.range(0, 4) == 0 {
+            rng.range(10, 20)
+        } else {
+            0
+        };
+        let capacity = match rng.range(0, 3) {
+            0 => len,
+            1 => (len + 300_000).min(1 << 20),
+            _ => len.saturating_sub(rng.range(1, 100) as usize),
+        };
+        let mut steps = Vec::new();
+        for _ in 0..rng.range(1, 60) {
+            for _ in 0..2 {
+                steps.push(match rng.range(0, 3) {
+                    0 => rng.range(0, 8),
+                    1 => rng.range(0, 300),
+                    2 => rng.range(0, 20_000),
+                    _ => rng.range(0, 2 * 131_075),
+                });
+            }
+        }
+        if rng.range(0, 2) == 0 {
+            // Then all the rest, a few times.
+            steps.extend([1 << 20, 1 << 20, 1 << 20, 1 << 20, 0, 0, 0, 0]);
+        }
+        requests.push(format!(
+            "stream {limit} {stable} {window_log_max} {capacity} {} {}",
+            list(steps),
+            hex(&src)
+        ));
+    }
+
     requests
 }
 
@@ -847,9 +990,21 @@ fn port_matches_libzstd() {
     let mut requests = requests(&mut oracle, &mut rng, 2000);
     requests.extend(corpus_requests());
     let mut problems = Vec::new();
+    // The errors streamed frames ran into, by libzstd's code.
+    let mut stream_errors = std::collections::BTreeMap::<String, usize>::new();
     for request in &requests {
         let want = oracle.ask(request);
         let got = answer(request);
+        if request.starts_with("stream ") {
+            for code in want
+                .split(' ')
+                .filter(|call| call.contains('/'))
+                .filter_map(|call| call.strip_prefix('e'))
+            {
+                let code = code.split('/').next().unwrap_or_default().to_string();
+                *stream_errors.entry(code).or_default() += 1;
+            }
+        }
         // Blocks libzstd decodes must decode the same with every loop.
         if request.starts_with("blocks ") && want.starts_with("ok") {
             let long = answer_with_long_loop(request);
@@ -866,6 +1021,7 @@ fn port_matches_libzstd() {
         }
     }
     eprintln!("compared {} requests with libzstd", requests.len());
+    eprintln!("streaming calls that failed, by error code: {stream_errors:?}");
     // Both 4-stream loops, for both tables, must have been reached.
     let runs = crate::decompress::huf_decompress::LOOP_RUNS
         .each_ref()

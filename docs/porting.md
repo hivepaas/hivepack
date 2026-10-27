@@ -46,11 +46,11 @@ libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes
 | `common/zstd_internal.h` (format constants) | `common/zstd_internal.rs` | done | used by the decoder |
 | `decompress/huf_decompress.c` (tables) | `decompress/huf_decompress.rs` | done | `hufx1` and `hufx2`: every cell of the table |
 | `decompress/huf_decompress.c` (decoding) | `decompress/huf_decompress.rs` | done | `hufdec`: streams made by libzstd's encoder, decoded with each table and loop (the fast loop and the fallback, which check input differently), at the right size and wrong ones, and damaged |
-| `decompress/zstd_decompress_internal.h` | `decompress/zstd_decompress_internal.rs` | done (streaming state comes with streaming) | |
+| `decompress/zstd_decompress_internal.h` | `decompress/zstd_decompress_internal.rs` | done | |
 | `decompress/zstd_decompress_block.c` | `decompress/zstd_decompress_block.rs` | done | `blocks`: blocks from libzstd's block compressor at several levels and block sizes, decoded one after the other into outputs of various sizes (so the literals sit in the extra buffer, the input, the output, or split), stored blocks in between, and damaged blocks. Test-only counters check that every literal placement and sequence loop is reached; the prefetching loop, which libzstd uses after loading a dictionary or past 16 MiB of history, is forced on every block libzstd decodes |
 | `decompress/zstd_ddict.c` | `decompress/zstd_ddict.rs` | done | the frame tests below, with every dictionary as a `ZSTD_DDict` too |
 | `decompress/zstd_decompress.c` (frames, one call) | `decompress/zstd_decompress.rs` | done | `tests/decompress.rs`: every test file decoded with `ZSTD_decompressDCtx` (`_usingDict`, `_usingDDict` where the set has a dictionary), and the frame information functions (`ZSTD_getFrameContentSize`, `ZSTD_findDecompressedSize`, `ZSTD_findFrameCompressedSize`, `ZSTD_decompressBound`, `ZSTD_getDictID_fromFrame`). `tests/dctx.rs`: contexts used for several calls in a row, with random parameters, dictionaries loaded, referenced, used as a prefix or several at once, on frames from libzstd's compressor, some damaged. `frames` in the oracle: the block size limit (`ZSTD_d_maxBlockSize`), which libzstd's public API cannot reach from Rust |
-| `decompress/zstd_decompress.c` (streaming) | | next | |
+| `decompress/zstd_decompress.c` (streaming) | `decompress/zstd_decompress.rs` | done | `tests/stream.rs`: every test file streamed through `ZSTD_decompressStream` and the port in the same pieces (all at once, block by block, random sizes from one byte up, one byte at a time, and with a stable output buffer), comparing each call's result, how far it reads and writes, and its output; frames up to 40 times longer than their window, so that the decoder's buffer wraps around, with dictionaries, skippable frames and damage; parameters and dictionaries refused in the middle of a frame. `tests/dctx.rs`: streaming mixed with one-call decompression on the same contexts, with dictionaries and DDict sets. `stream` in the oracle: the block size limit, and calls that go on after an error, which the `zstd` crate refuses |
 | `lib/compress`, `lib/dictBuilder` | | later | |
 
 The comparisons go through `tools/zstd-oracle`, a small C program built with libzstd 1.5.7's sources that answers requests by calling the internal C function. `crates/zstd/src/oracle.rs` asks the port the same requests and compares the answers as text: thousands per run where the oracle is built (Linux and macOS in CI). `testdata/oracle/common.txt` replays about 2,400 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
@@ -68,7 +68,13 @@ Two places in libzstd 1.5.7's handling of several dictionaries at once (`ZSTD_d_
 
 Otherwise the set behaves as libzstd's does, including a quirk: a search stops at the first DDict of ID 0 (raw content), which libzstd takes for an empty slot, and returns it whatever ID was asked for. Which DDict comes back depends on where each one sits in the table, so the port uses the same table, hash and growth rule. The ID is hashed as little-endian bytes; libzstd hashes it in the machine's byte order, so on big-endian machines its slots differ.
 
-Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes past the end of a copy, the port copies exact lengths. The extra bytes always land where later writes go, on literals already read, or past the output, so the result is the same. libzstd keeps literals inside the output buffer when it has room, and the port puts them in the same place: corrupted input can make the output run over them, and the result must still match.
+Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes past the end of a copy, the port copies exact lengths. The extra bytes always land where later writes go, on literals already read, or past the output, so the result is the same. When streaming, libzstd's own buffer is a ring: past the end of a block may be the oldest output, still in the buffer though out of the window. A damaged frame whose offsets reach back further than its window then reads, in libzstd, what those extra bytes wrote there, and in the port, what was there before. Valid frames never reach that far, and libzstd does not check offsets against the window either.
+
+When streaming, the port follows libzstd's ring buffer exactly: its size, when the decoder goes back to the buffer's start, and where the older part of the window is, so that even damaged frames give the same output. Three differences:
+
+- **Positions after an error.** When `decompress_stream` fails, the input and output positions stay where they were. libzstd leaves them too, except after an error in the first bytes of a header, where it marks the input as read.
+- **Where the window is.** libzstd tells whether output continues the previous output by comparing addresses; the port compares positions within the frame's buffer. They differ only if another buffer happened to end exactly where that one starts.
+- **No bufferless API.** `ZSTD_decompressBegin`, `ZSTD_decompressContinue`, `ZSTD_nextSrcSizeToDecompress`, `ZSTD_nextInputType` and `ZSTD_insertBlock` keep the caller's earlier output buffers as the window between calls, which safe Rust cannot. The port has them inside, for `decompress_stream`. libzstd keeps literals inside the output buffer when it has room, and the port puts them in the same place: corrupted input can make the output run over them, and the result must still match.
 
 ## The order of work
 
@@ -99,8 +105,11 @@ Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes past t
 - Parts that exist only because the library is in C:
   - custom allocators (`ZSTD_customMem`);
   - static contexts (`ZSTD_initStatic*`);
+  - the sizes of C structures (`ZSTD_sizeof_*`, `ZSTD_estimate*Size`);
   - libzstd's own thread pool (the port uses Rust threads);
   - `ZSTD_trace`.
+- Deprecated functions that other calls replace: `ZSTD_initDStream_usingDict`, `ZSTD_initDStream_usingDDict` and `ZSTD_resetDStream` are `reset` followed by `load_dictionary` or `ref_ddict`.
+- The bufferless streaming API (see above).
 
 ## Following new releases
 

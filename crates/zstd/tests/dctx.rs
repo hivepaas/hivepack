@@ -15,93 +15,12 @@
 #![cfg(all(target_pointer_width = "64", target_endian = "little"))]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::sync::Arc;
 
-use zstd::zstd_safe::{self, CParameter, DParameter, FrameFormat};
-
-/// SplitMix64.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn range(&mut self, low: u64, high: u64) -> u64 {
-        low + self.next() % (high - low + 1)
-    }
-
-    fn chance(&mut self, one_in: u64) -> bool {
-        self.range(1, one_in) == 1
-    }
-
-    /// [`Rng::data`] of a length from `low` to `high`.
-    fn data_between(&mut self, low: u64, high: u64, base: &[u8]) -> Vec<u8> {
-        let len = self.range(low, high) as usize;
-        self.data(len, base)
-    }
-
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        for i in (1..items.len()).rev() {
-            items.swap(i, self.range(0, i as u64) as usize);
-        }
-    }
-
-    /// A zstd dictionary trained on samples drawn from `base`, if training
-    /// works out.
-    fn trained_dict(&mut self, base: &[u8]) -> Option<Vec<u8>> {
-        let samples: Vec<Vec<u8>> = (0..200).map(|_| self.data_between(50, 400, base)).collect();
-        zstd::dict::from_samples(&samples, self.range(1024, 16 * 1024) as usize).ok()
-    }
-
-    /// A piece of `base`, as raw content.
-    fn raw_dict(&mut self, base: &[u8]) -> Vec<u8> {
-        let at = self.range(0, base.len() as u64 / 2) as usize;
-        let len = self.range(1, (base.len() - at) as u64) as usize;
-        base[at..at + len].to_vec()
-    }
-
-    /// Text-like data with repeats near and far, drawn from `base` when
-    /// given, so that a dictionary built from it helps.
-    fn data(&mut self, len: usize, base: &[u8]) -> Vec<u8> {
-        let mut data = Vec::with_capacity(len + 64);
-        while data.len() < len {
-            match self.range(0, 3) {
-                0 if !base.is_empty() => {
-                    let at = self.range(0, base.len() as u64 - 1) as usize;
-                    let n = (self.range(4, 60) as usize).min(base.len() - at);
-                    data.extend_from_slice(&base[at..at + n]);
-                }
-                1 if data.len() > 8 => {
-                    let offset = self.range(1, data.len() as u64) as usize;
-                    for _ in 0..self.range(3, 50) {
-                        let byte = data[data.len() - offset];
-                        data.push(byte);
-                    }
-                }
-                _ => {
-                    for _ in 0..self.range(1, 12) {
-                        data.push(b'a' + self.range(0, 25) as u8);
-                    }
-                }
-            }
-        }
-        data.truncate(len);
-        data
-    }
-}
-
-/// A skippable frame, as `ZSTD_writeSkippableFrame` writes it.
-fn skippable_frame(variant: u32, content: &[u8]) -> Vec<u8> {
-    let mut frame = (0x184D_2A50 + variant).to_le_bytes().to_vec();
-    frame.extend_from_slice(&(content.len() as u32).to_le_bytes());
-    frame.extend_from_slice(content);
-    frame
-}
+use support::{Pieces, Rng, skippable_frame, stream_both};
+use zstd::zstd_safe::{self, CParameter, DParameter, FrameFormat, ResetDirective};
 
 /// Dictionary IDs that XXH64 puts in slot 50 or 51 of libzstd's DDict hash
 /// set, next to ID 0's slot 52: a search for one of them can end at a
@@ -139,6 +58,8 @@ struct Dicts {
 enum Call {
     /// `ZSTD_decompressDCtx`, with whatever the context holds.
     Plain,
+    /// `ZSTD_decompressStream`, with whatever the context holds.
+    Stream,
     /// `ZSTD_decompress_usingDict`
     UsingDict(usize),
     /// `ZSTD_decompress_usingDDict`
@@ -166,6 +87,34 @@ fn outcome_port(result: hivepack_zstd::Result<usize>, out: &[u8]) -> String {
         Ok(size) => format!("ok {size} {:016x}", hivepack_hash(&out[..size])),
         Err(error) => format!("err {}", error.code().message()),
     }
+}
+
+/// Streams `src` on both contexts in random pieces (see
+/// [`stream_both`]), then leaves both where the next call can start: after
+/// an error the `zstd` crate refuses to go on until the context is reset,
+/// and a frame cut short leaves the stream inside it, where the dictionary
+/// cannot change. Returns how the stream ended.
+fn stream(
+    c: &mut zstd_safe::DCtx<'_>,
+    p: &mut hivepack_zstd::DCtx,
+    src: &[u8],
+    capacity: usize,
+    rng: &mut Rng,
+) -> Result<String, String> {
+    let pieces = match rng.range(0, 3) {
+        0 => Pieces::Whole,
+        1 => Pieces::Stable(rng.next()),
+        _ => Pieces::Random(rng.next()),
+    };
+    let outcome =
+        stream_both(c, p, src, capacity, pieces).map_err(|e| format!("{pieces:?}: {e}"))?;
+    if !outcome.starts_with("ok") {
+        c.reset(ResetDirective::SessionOnly)
+            .expect("libzstd resets");
+        p.reset(hivepack_zstd::ResetDirective::SessionOnly)
+            .expect("port resets");
+    }
+    Ok(outcome)
 }
 
 /// FNV-1a, to compare outputs briefly.
@@ -316,12 +265,18 @@ fn contexts_used_many_times_behave_as_libzstd() {
             set_used = true;
         }
 
+        // Whether the zstd crate's context streamed since its last reset: its
+        // one-call functions then reset the session after they run.
+        let mut streamed = false;
         for step in 0..rng.range(1, 6) {
             let pick = |rng: &mut Rng| rng.range(0, dicts.raw.len().max(1) as u64 - 1) as usize;
+            // Load, Prefix and RefDDict decode by streaming as often.
+            let streaming = rng.chance(2);
             let call = if dicts.raw.is_empty() {
-                Call::Plain
+                if streaming { Call::Stream } else { Call::Plain }
             } else {
                 match rng.range(0, 5) {
+                    0 if streaming => Call::Stream,
                     0 => Call::Plain,
                     1 => Call::UsingDict(pick(&mut rng)),
                     2 => Call::UsingDDict(pick(&mut rng)),
@@ -340,7 +295,26 @@ fn contexts_used_many_times_behave_as_libzstd() {
             }
             let mut c_out = Vec::with_capacity(capacity);
             let mut p_out = vec![0u8; capacity];
+            let mut decode = |c: &mut zstd_safe::DCtx<'_>,
+                              p: &mut hivepack_zstd::DCtx,
+                              rng: &mut Rng,
+                              c_out: &mut Vec<u8>,
+                              p_out: &mut Vec<u8>| {
+                if streaming {
+                    streamed = true;
+                    let outcome = stream(c, p, &src, capacity, rng).unwrap_or_else(|problem| {
+                        panic!("case {case}, call {step}: {call:?}: {problem}")
+                    });
+                    (outcome.clone(), outcome)
+                } else {
+                    (
+                        outcome_libzstd(c.decompress(c_out, &src), c_out),
+                        outcome_port(p.decompress(p_out, &src), p_out),
+                    )
+                }
+            };
             let (want, got) = match call {
+                Call::Stream => decode(&mut c, &mut p, &mut rng, &mut c_out, &mut p_out),
                 Call::Plain => (
                     outcome_libzstd(c.decompress(&mut c_out, &src), &mut c_out),
                     outcome_port(p.decompress(&mut p_out, &src), &p_out),
@@ -372,28 +346,30 @@ fn contexts_used_many_times_behave_as_libzstd() {
                 Call::Load(d) => {
                     c.load_dictionary(&dicts.raw[d]).expect("libzstd loads");
                     p.load_dictionary(&dicts.raw[d]).expect("port loads");
-                    (
-                        outcome_libzstd(c.decompress(&mut c_out, &src), &mut c_out),
-                        outcome_port(p.decompress(&mut p_out, &src), &p_out),
-                    )
+                    decode(&mut c, &mut p, &mut rng, &mut c_out, &mut p_out)
                 }
                 Call::Prefix(d) => {
                     c.ref_prefix(&dicts.raw[d]).expect("libzstd prefix");
                     p.ref_prefix(&dicts.raw[d]).expect("port prefix");
-                    (
-                        outcome_libzstd(c.decompress(&mut c_out, &src), &mut c_out),
-                        outcome_port(p.decompress(&mut p_out, &src), &p_out),
-                    )
+                    decode(&mut c, &mut p, &mut rng, &mut c_out, &mut p_out)
                 }
                 Call::RefDDict(d) => {
                     c.ref_ddict(&c_ddicts[d]).expect("libzstd references");
                     p.ref_ddict(p_ddicts[d].clone()).expect("port references");
-                    (
-                        outcome_libzstd(c.decompress(&mut c_out, &src), &mut c_out),
-                        outcome_port(p.decompress(&mut p_out, &src), &p_out),
-                    )
+                    decode(&mut c, &mut p, &mut rng, &mut c_out, &mut p_out)
                 }
             };
+            let streams = match call {
+                Call::Stream => true,
+                Call::Load(_) | Call::Prefix(_) | Call::RefDDict(_) => streaming,
+                _ => false,
+            };
+            if !streams && streamed {
+                // As the zstd crate does after a one-call decompression.
+                p.reset(hivepack_zstd::ResetDirective::SessionOnly)
+                    .expect("port resets");
+                streamed = false;
+            }
             assert_eq!(
                 got, want,
                 "case {case}, call {step}: {call:?} (magicless {magicless}, multiple {multiple}, \
@@ -476,11 +452,13 @@ fn frames_find_their_dictionary_in_the_set_as_in_libzstd() {
 
         // Each call can leave the context with another dictionary for the
         // next. No dictionary is loaded: see the other test.
+        let mut streamed = false;
         for step in 0..rng.range(2, 5) {
             let d = rng.range(0, dicts.len() as u64 - 1) as usize;
             let call = match rng.range(0, 5) {
                 0 => Call::UsingDDict(d),
                 1 => Call::RefDDict(d),
+                2 | 3 => Call::Stream,
                 _ => Call::Plain,
             };
             let mut c_out = Vec::with_capacity(total);
@@ -491,6 +469,12 @@ fn frames_find_their_dictionary_in_the_set_as_in_libzstd() {
                     .expect("port references");
             }
             let (want, got) = match call {
+                Call::Stream => {
+                    streamed = true;
+                    let outcome = stream(&mut c, &mut p, &src, total, &mut rng)
+                        .unwrap_or_else(|problem| panic!("case {case}, call {step}: {problem}"));
+                    (outcome.clone(), outcome)
+                }
                 Call::UsingDDict(d) => (
                     outcome_libzstd(
                         c.decompress_using_ddict(&mut c_out, &src, &c_ddicts[d]),
@@ -506,6 +490,12 @@ fn frames_find_their_dictionary_in_the_set_as_in_libzstd() {
                     outcome_port(p.decompress(&mut p_out, &src), &p_out),
                 ),
             };
+            if !matches!(call, Call::Stream) && streamed {
+                // As the zstd crate does after a one-call decompression.
+                p.reset(hivepack_zstd::ResetDirective::SessionOnly)
+                    .expect("port resets");
+                streamed = false;
+            }
             assert_eq!(got, want, "case {case}, call {step}: {call:?}");
             calls += 1;
         }

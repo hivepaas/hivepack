@@ -31,6 +31,16 @@
  *                                     ZSTD_decompressDCtx, on a new context with
  *                                     ZSTD_d_maxBlockSize set (0 for none), answered
  *                                     "ok <size> <FNV-1a of the output>"
+ *   stream <maxBlockSize> <stable> <windowLogMax> <dstCapacity> <steps> <hex>
+ *                                     ZSTD_decompressStream, called once per pair of
+ *                                     <steps> on a new context with ZSTD_d_maxBlockSize,
+ *                                     ZSTD_d_stableOutBuffer and ZSTD_d_windowLogMax set:
+ *                                     before each call the input ends the pair's first
+ *                                     number past its position, and the output the second
+ *                                     (all of it when stable). It goes on after errors.
+ *                                     Answered "ok", then "<result>/<input pos>/<output
+ *                                     pos>" for each call, where a failure is "e<code>",
+ *                                     then the FNV-1a of the output
  *
  * And two that make valid inputs for the others, from symbol counts:
  *   mkncount <tableLog> <counts>      FSE_normalizeCount, FSE_writeNCount
@@ -528,6 +538,54 @@ static void frames(char** args, int nargs)
     printf("ok %u %016llx\n", (unsigned)r, fnv64(output, r));
 }
 
+static void stream(char** args, int nargs)
+{
+    static long long steps[2 * 1024];
+    ZSTD_DCtx* dctx;
+    size_t cap, r, inPos = 0, outPos = 0;
+    long n, nsteps, i;
+    int stable;
+    char text[80];
+    if (nargs != 6 || (n = parse_hex(args[5])) < 0) { puts("bad"); return; }
+    cap = strtoul(args[3], NULL, 10);
+    nsteps = parse_list(args[4], steps, 2 * 1024);
+    if (cap > MAX_BYTES || nsteps < 0 || nsteps % 2) { puts("bad"); return; }
+    stable = atoi(args[1]);
+    dctx = ZSTD_createDCtx();
+    r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_maxBlockSize, atoi(args[0]));
+    if (!ZSTD_isError(r)) r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_stableOutBuffer, stable);
+    if (!ZSTD_isError(r)) r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, atoi(args[2]));
+    if (ZSTD_isError(r)) { ZSTD_freeDCtx(dctx); answer_error(r); return; }
+    line_reset();
+    line_append("ok", 2);
+    for (i = 0; i < nsteps; i += 2) {
+        ZSTD_inBuffer in;
+        ZSTD_outBuffer out;
+        size_t const inEnd = inPos + (size_t)steps[i];
+        size_t const outEnd = outPos + (size_t)steps[i + 1];
+        in.src = input;
+        in.size = inEnd < (size_t)n ? inEnd : (size_t)n;
+        in.pos = inPos;
+        out.dst = output;
+        out.size = stable || outEnd > cap ? cap : outEnd;
+        out.pos = outPos;
+        r = ZSTD_decompressStream(dctx, &out, &in);
+        inPos = in.pos;
+        outPos = out.pos;
+        if (ZSTD_isError(r))
+            snprintf(text, sizeof(text), " e%d/%u/%u", (int)ERR_getErrorCode(r),
+                     (unsigned)inPos, (unsigned)outPos);
+        else
+            snprintf(text, sizeof(text), " %u/%u/%u", (unsigned)r, (unsigned)inPos,
+                     (unsigned)outPos);
+        line_append(text, strlen(text));
+    }
+    ZSTD_freeDCtx(dctx);
+    snprintf(text, sizeof(text), " %016llx", fnv64(output, outPos));
+    line_append(text, strlen(text));
+    puts(line_out);
+}
+
 int main(void)
 {
     static char line[4 * MAX_BYTES];
@@ -554,6 +612,7 @@ int main(void)
         else if (!strcmp(command, "blocks")) blocks(args, nargs);
         else if (!strcmp(command, "mkframe")) mkframe(args, nargs);
         else if (!strcmp(command, "frames")) frames(args, nargs);
+        else if (!strcmp(command, "stream")) stream(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

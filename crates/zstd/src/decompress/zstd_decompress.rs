@@ -1,9 +1,16 @@
-//! Decoding frames: port of the one-call half of
-//! `decompress/zstd_decompress.c` (streaming comes later).
+//! Decoding frames: port of `decompress/zstd_decompress.c`, in one call
+//! ([`DCtx::decompress`]) or streaming ([`DCtx::decompress_stream`]).
 //!
 //! libzstd decodes into a caller's buffer that may overlap the input
 //! ("in-place" decompression). The port takes an output slice and an input
 //! slice, which cannot overlap, so that case does not arise.
+//!
+//! libzstd's bufferless streaming functions (`ZSTD_decompressBegin`,
+//! `ZSTD_decompressContinue` and the ones around them) keep the caller's
+//! earlier output buffers as the window, between calls. Safe Rust cannot
+//! hold on to them, so the port keeps those functions for
+//! [`DCtx::decompress_stream`], which passes them its own buffer (or the
+//! caller's stable one), and does not offer them on their own.
 
 use std::sync::Arc;
 
@@ -23,9 +30,10 @@ use crate::decompress::zstd_decompress_block::{
     BlockOut, BlockProperties, build_fse_table, decompress_block_internal, get_c_block_size,
 };
 use crate::decompress::zstd_decompress_internal::{
-    CONTENTSIZE_UNKNOWN, DCtx, DDictHashSet, DictUses, EntropyDTables, ExtDict, Format,
-    FrameHeader, FrameType, LL_BASE, ML_BASE, OF_BASE, OF_BITS, TableRef,
-    ZSTD_MAXWINDOWSIZE_DEFAULT, ZSTD_WINDOWLOG_LIMIT_DEFAULT,
+    CONTENTSIZE_UNKNOWN, DCtx, DDictHashSet, DStage, DStreamStage, DictUses, EntropyDTables,
+    ExtDict, Format, FrameHeader, FrameType, LL_BASE, ML_BASE, OF_BASE, OF_BITS, OutBufferId,
+    Segment, TableRef, WILDCOPY_OVERLENGTH, ZSTD_MAXWINDOWSIZE_DEFAULT,
+    ZSTD_WINDOWLOG_LIMIT_DEFAULT,
 };
 
 /// `ZSTD_SKIPPABLEHEADERSIZE`
@@ -220,6 +228,25 @@ pub enum FrameHeaderState {
 
 /// `ZSTD_getFrameHeader_advanced`
 pub fn get_frame_header_advanced(src: &[u8], format: Format) -> Result<FrameHeaderState> {
+    let mut zfh = FrameHeader::default();
+    match get_frame_header_into(&mut zfh, src, format)? {
+        0 => Ok(FrameHeaderState::Complete(zfh)),
+        needed => Ok(FrameHeaderState::NeedsInput(needed)),
+    }
+}
+
+/// `ZSTD_getFrameHeader_advanced` as libzstd has it: fills `zfh` and
+/// returns 0 once the header is complete, or else the input size it needs.
+///
+/// As in libzstd, `zfh` is cleared as soon as `src` holds
+/// `ZSTD_startingInputLength` bytes, before the header is known to be
+/// complete or valid, and left alone before that. The streaming decoder
+/// looks up the frame's dictionary from `zfh` whatever this returns.
+pub(crate) fn get_frame_header_into(
+    zfh: &mut FrameHeader,
+    src: &[u8],
+    format: Format,
+) -> Result<usize> {
     let ip = src;
     let src_size = src.len();
     let min_input_size = starting_input_length(format);
@@ -242,22 +269,22 @@ pub fn get_frame_header_advanced(src: &[u8], format: Format) -> Result<FrameHead
                 }
             }
         }
-        return Ok(FrameHeaderState::NeedsInput(min_input_size));
+        return Ok(min_input_size);
     }
 
-    let mut zfh = FrameHeader::default();
+    *zfh = FrameHeader::default();
     if format != Format::Zstd1Magicless && read_le32(src, 0) != ZSTD_MAGICNUMBER {
         if (read_le32(src, 0) & ZSTD_MAGIC_SKIPPABLE_MASK) == ZSTD_MAGIC_SKIPPABLE_START {
             // A skippable frame.
             if src_size < SKIPPABLE_HEADER_SIZE {
                 // The magic number and the frame length.
-                return Ok(FrameHeaderState::NeedsInput(SKIPPABLE_HEADER_SIZE));
+                return Ok(SKIPPABLE_HEADER_SIZE);
             }
             zfh.frame_type = FrameType::Skippable;
             zfh.dict_id = read_le32(src, 0) - ZSTD_MAGIC_SKIPPABLE_START;
             zfh.header_size = SKIPPABLE_HEADER_SIZE as u32;
             zfh.frame_content_size = u64::from(read_le32(src, ZSTD_FRAMEIDSIZE));
-            return Ok(FrameHeaderState::Complete(zfh));
+            return Ok(0);
         }
         return error!(PrefixUnknown);
     }
@@ -265,7 +292,7 @@ pub fn get_frame_header_advanced(src: &[u8], format: Format) -> Result<FrameHead
     // Enough input to read the whole header?
     let fh_size = frame_header_size_internal(src, format)?;
     if src_size < fh_size {
-        return Ok(FrameHeaderState::NeedsInput(fh_size));
+        return Ok(fh_size);
     }
     zfh.header_size = fh_size as u32;
 
@@ -328,7 +355,7 @@ pub fn get_frame_header_advanced(src: &[u8], format: Format) -> Result<FrameHead
     zfh.block_size_max = window_size.min(ZSTD_BLOCKSIZE_MAX as u64) as u32;
     zfh.dict_id = dict_id;
     zfh.checksum_flag = checksum_flag;
-    Ok(FrameHeaderState::Complete(zfh))
+    Ok(0)
 }
 
 /// `ZSTD_getFrameHeader`: reads the frame header at the start of `src`.
@@ -718,12 +745,18 @@ impl FrameDict<'_> {
 impl DCtx {
     /// `ZSTD_decompressBegin`: gets ready for a new frame.
     pub(crate) fn decompress_begin(&mut self) {
+        self.expected = starting_input_length(self.format);
+        self.stage = DStage::GetFrameHeaderSize;
         self.processed_c_size = 0;
         self.decoded_size = 0;
         self.previous_dst_end = 0;
         self.dict_end = 0;
+        self.stream_prefix = Segment::None;
+        self.stream_ext = Segment::None;
+        self.frame_ddict = None;
         self.reset_entropy();
         self.dict_id = 0;
+        self.b_type = BlockType::Reserved;
         self.is_frame_decompression = true;
     }
 
@@ -796,6 +829,9 @@ impl DCtx {
     /// `ZSTD_copyDDictParameters`
     fn copy_ddict_parameters(&mut self, ddict: &DDict) {
         self.dict_id = ddict.dict_id;
+        // prefixStart and virtualStart at the content's start.
+        self.stream_prefix = Segment::Dict;
+        self.stream_ext = Segment::None;
         self.dict_end = address(&ddict.content, ddict.content.len());
         self.previous_dst_end = self.dict_end;
         if ddict.entropy_present {
@@ -851,9 +887,8 @@ impl DCtx {
 
     /// `ZSTD_decodeFrameHeader`: reads the header, whose size is known.
     fn decode_frame_header(&mut self, src: &[u8]) -> Result<()> {
-        match get_frame_header_advanced(src, self.format)? {
-            FrameHeaderState::NeedsInput(_) => return error!(SrcSizeWrong),
-            FrameHeaderState::Complete(zfh) => self.f_params = zfh,
+        if get_frame_header_into(&mut self.f_params, src, self.format)? > 0 {
+            return error!(SrcSizeWrong);
         }
 
         // With several dictionaries, use the one the frame names.
@@ -906,10 +941,9 @@ impl DCtx {
         }
 
         // A smaller maximum block size, if set.
-        self.block_size_max = self.f_params.block_size_max as usize;
         if self.max_block_size_param != 0 {
-            self.block_size_max = self.block_size_max.min(self.max_block_size_param as usize);
-            self.f_params.block_size_max = self.block_size_max as u32;
+            self.f_params.block_size_max =
+                self.f_params.block_size_max.min(self.max_block_size_param);
         }
 
         // Each block.
@@ -1109,6 +1143,9 @@ impl DCtx {
         dict: &[u8],
         content_type: DictContentType,
     ) -> Result<()> {
+        if self.stream_stage != DStreamStage::Init {
+            return error!(StageWrong);
+        }
         self.clear_dict();
         if !dict.is_empty() {
             // libzstd reports any failure here as an allocation failure.
@@ -1139,6 +1176,9 @@ impl DCtx {
     /// none. With [`DParameter::RefMultipleDDicts`] on, each one referenced
     /// is kept, and a frame uses the one it names.
     pub fn ref_ddict(&mut self, ddict: Option<Arc<DDict>>) -> Result<()> {
+        if self.stream_stage != DStreamStage::Init {
+            return error!(StageWrong);
+        }
         self.clear_dict();
         if let Some(ddict) = ddict {
             self.ddict = Some(ddict.clone());
@@ -1157,6 +1197,9 @@ impl DCtx {
     pub fn set_max_window_size(&mut self, max_window_size: usize) -> Result<()> {
         let min = 1usize << ZSTD_WINDOWLOG_ABSOLUTEMIN;
         let max = 1usize << WINDOWLOG_MAX;
+        if self.stream_stage != DStreamStage::Init {
+            return error!(StageWrong);
+        }
         if max_window_size < min || max_window_size > max {
             return error!(ParameterOutOfBound);
         }
@@ -1166,6 +1209,9 @@ impl DCtx {
 
     /// `ZSTD_DCtx_setParameter`
     pub fn set_parameter(&mut self, parameter: DParameter) -> Result<()> {
+        if self.stream_stage != DStreamStage::Init {
+            return error!(StageWrong);
+        }
         match parameter {
             DParameter::WindowLogMax(value) => {
                 let value = if value == 0 {
@@ -1217,12 +1263,17 @@ impl DCtx {
             reset,
             ResetDirective::SessionOnly | ResetDirective::SessionAndParameters
         ) {
+            self.stream_stage = DStreamStage::Init;
+            self.no_forward_progress = 0;
             self.is_frame_decompression = true;
         }
         if matches!(
             reset,
             ResetDirective::Parameters | ResetDirective::SessionAndParameters
         ) {
+            if self.stream_stage != DStreamStage::Init {
+                return error!(StageWrong);
+            }
             self.clear_dict();
             // ZSTD_DCtx_resetParameters
             self.format = Format::Zstd1;
@@ -1237,6 +1288,852 @@ impl DCtx {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+/// `ZSTD_NO_FORWARD_PROGRESS_MAX`: how many calls in a row may neither read
+/// nor write before [`DCtx::decompress_stream`] fails.
+const ZSTD_NO_FORWARD_PROGRESS_MAX: u32 = 16;
+/// `ZSTD_WORKSPACETOOLARGE_FACTOR`: buffers this many times larger than a
+/// frame needs are too large...
+const ZSTD_WORKSPACETOOLARGE_FACTOR: usize = 3;
+/// `ZSTD_WORKSPACETOOLARGE_MAXDURATION`: ...for this many frames in a row,
+/// after which they shrink.
+const ZSTD_WORKSPACETOOLARGE_MAXDURATION: usize = 128;
+
+/// `ZSTD_inBuffer`: input for [`DCtx::decompress_stream`], read from `pos`
+/// on.
+#[derive(Clone, Copy, Debug)]
+pub struct InBuffer<'a> {
+    pub src: &'a [u8],
+    /// How much of `src` has been read. Each call moves it forward.
+    pub pos: usize,
+}
+
+impl<'a> InBuffer<'a> {
+    /// All of `src`, from its start.
+    pub fn new(src: &'a [u8]) -> Self {
+        InBuffer { src, pos: 0 }
+    }
+}
+
+/// `ZSTD_outBuffer`: where [`DCtx::decompress_stream`] writes, from `pos`
+/// on.
+#[derive(Debug)]
+pub struct OutBuffer<'a> {
+    pub dst: &'a mut [u8],
+    /// How much of `dst` has been written. Each call moves it forward.
+    pub pos: usize,
+}
+
+impl<'a> OutBuffer<'a> {
+    /// All of `dst`, from its start.
+    pub fn new(dst: &'a mut [u8]) -> Self {
+        OutBuffer { dst, pos: 0 }
+    }
+}
+
+impl OutBufferId {
+    fn of(output: &OutBuffer<'_>) -> OutBufferId {
+        OutBufferId {
+            address: output.dst.as_ptr() as usize,
+            size: output.dst.len(),
+            pos: output.pos,
+        }
+    }
+}
+
+/// `ZSTD_DStreamInSize`: the input size that suits
+/// [`DCtx::decompress_stream`] best, a whole block with its header.
+pub const fn dstream_in_size() -> usize {
+    ZSTD_BLOCKSIZE_MAX + ZSTD_BLOCKHEADERSIZE
+}
+
+/// `ZSTD_DStreamOutSize`: an output size that holds any block, so that
+/// each call can flush one.
+pub const fn dstream_out_size() -> usize {
+    ZSTD_BLOCKSIZE_MAX
+}
+
+/// `ZSTD_decodingBufferSize_internal`
+fn decoding_buffer_size_internal(
+    window_size: u64,
+    frame_content_size: u64,
+    block_size_max: usize,
+) -> Result<usize> {
+    let block_size = (window_size.min(ZSTD_BLOCKSIZE_MAX as u64) as usize).min(block_size_max);
+    // A block and WILDCOPY_OVERLENGTH bytes past the window, so that a
+    // block ending there can start again at the buffer's start and still
+    // keep a whole window; and another block, so that split literals at the
+    // end of a block do not overwrite the older part of the window.
+    let needed_rb_size = window_size
+        .wrapping_add(block_size as u64 * 2)
+        .wrapping_add(WILDCOPY_OVERLENGTH as u64 * 2);
+    let needed_size = frame_content_size.min(needed_rb_size);
+    match usize::try_from(needed_size) {
+        Ok(min_rb_size) => Ok(min_rb_size),
+        Err(_) => error!(FrameParameterWindowTooLarge),
+    }
+}
+
+/// `ZSTD_decodingBufferSize_min`: the buffer [`DCtx::decompress_stream`]
+/// keeps for a frame with this window and content size (unless the output
+/// buffer is stable).
+pub fn decoding_buffer_size_min(window_size: u64, frame_content_size: u64) -> Result<usize> {
+    decoding_buffer_size_internal(window_size, frame_content_size, ZSTD_BLOCKSIZE_MAX)
+}
+
+impl DCtx {
+    /// `ZSTD_nextSrcSizeToDecompressWithInputSize`: the input the stage
+    /// needs. A stored block can be taken in pieces, as much as there is.
+    fn next_src_size_to_decompress_with_input_size(&self, input_size: usize) -> usize {
+        if !matches!(
+            self.stage,
+            DStage::DecompressBlock | DStage::DecompressLastBlock
+        ) {
+            return self.expected;
+        }
+        if self.b_type != BlockType::Raw {
+            return self.expected;
+        }
+        input_size.min(self.expected).max(1)
+    }
+
+    /// `ZSTD_isSkipFrame`
+    fn is_skip_frame(&self) -> bool {
+        self.stage == DStage::SkipFrame
+    }
+
+    /// `ZSTD_checkContinuity`, while streaming: output written anywhere but
+    /// where the previous output ended starts a new segment of the window,
+    /// and the current one becomes the older one.
+    ///
+    /// The addresses libzstd compares are tracked for `ddictIsCold`; the
+    /// window itself is decided on positions in `out`, the buffer of the
+    /// whole frame. The two agree, unless another buffer happens to end
+    /// right where `out` starts.
+    fn check_continuity_stream(&mut self, out: &[u8], dst: usize, dst_size: usize) {
+        if dst_size == 0 {
+            return;
+        }
+        let dst_address = address(out, dst);
+        if dst_address != self.previous_dst_end {
+            self.dict_end = self.previous_dst_end;
+            self.previous_dst_end = dst_address;
+        }
+        if !matches!(self.stream_prefix, Segment::Out { end, .. } if end == dst) {
+            self.stream_ext = self.stream_prefix;
+            self.stream_prefix = Segment::Out {
+                start: dst,
+                end: dst,
+            };
+        }
+    }
+
+    /// The compressed block of `ZSTD_decompressContinue`: decodes `src` to
+    /// `out[dst..]`, with the window as the stream left it.
+    fn decompress_stream_block(
+        &mut self,
+        out: &mut [u8],
+        dst: usize,
+        dst_capacity: usize,
+        src: &[u8],
+    ) -> Result<usize> {
+        let ddict = self.frame_ddict.clone();
+        let ext = match self.stream_ext {
+            Segment::None => ExtDict::None,
+            Segment::Dict => ddict
+                .as_deref()
+                .map_or(ExtDict::None, |ddict| ExtDict::Separate(&ddict.content)),
+            Segment::Out { start, end } => ExtDict::InOut { start, end },
+        };
+        let prefix_start = match self.stream_prefix {
+            Segment::Out { start, .. } => start,
+            // Only before any output, when there is no room for any.
+            Segment::None | Segment::Dict => dst,
+        };
+        let mut bo = BlockOut {
+            out,
+            dst,
+            dst_capacity,
+            prefix_start,
+            ext,
+            dict: ddict
+                .as_deref()
+                .filter(|ddict| ddict.entropy_present)
+                .map(|ddict| &*ddict.entropy),
+        };
+        decompress_block_internal(self, &mut bo, src, true)
+    }
+
+    /// `ZSTD_decompressContinue`, as the streaming decoder calls it: decodes
+    /// `src`, exactly the input the stage expects, to
+    /// `out[dst..dst + dst_capacity]`. Returns the size decoded.
+    ///
+    /// `src_size` is the size of `src`, except for the content of a
+    /// skippable frame, which libzstd counts without reading it: the
+    /// streaming decoder does not keep it, and passes no bytes.
+    fn decompress_continue(
+        &mut self,
+        out: &mut [u8],
+        dst: usize,
+        dst_capacity: usize,
+        src: &[u8],
+        src_size: usize,
+    ) -> Result<usize> {
+        debug_assert!(src.len() == src_size || self.is_skip_frame());
+        if src_size != self.next_src_size_to_decompress_with_input_size(src_size) {
+            return error!(SrcSizeWrong);
+        }
+        self.check_continuity_stream(out, dst, dst_capacity);
+
+        self.processed_c_size += src_size as u64;
+
+        match self.stage {
+            DStage::GetFrameHeaderSize => {
+                // A skippable frame? The stream decoder reads headers on its
+                // own, so only a frame begun by the one-call functions ends
+                // up here.
+                if self.format == Format::Zstd1
+                    && src.len() >= ZSTD_FRAMEIDSIZE
+                    && (read_le32(src, 0) & ZSTD_MAGIC_SKIPPABLE_MASK) == ZSTD_MAGIC_SKIPPABLE_START
+                {
+                    self.header_buffer[..src.len()].copy_from_slice(src);
+                    // What is left of the skippable frame header.
+                    self.expected = SKIPPABLE_HEADER_SIZE - src.len();
+                    self.stage = DStage::DecodeSkippableHeader;
+                    return Ok(0);
+                }
+                self.header_size = frame_header_size_internal(src, self.format)?;
+                self.header_buffer[..src.len()].copy_from_slice(src);
+                self.expected = self.header_size - src.len();
+                self.stage = DStage::DecodeFrameHeader;
+                Ok(0)
+            }
+
+            DStage::DecodeFrameHeader => {
+                self.header_buffer[self.header_size - src.len()..self.header_size]
+                    .copy_from_slice(src);
+                let header = self.header_buffer;
+                self.decode_frame_header(&header[..self.header_size])?;
+                self.expected = ZSTD_BLOCKHEADERSIZE;
+                self.stage = DStage::DecodeBlockHeader;
+                Ok(0)
+            }
+
+            DStage::DecodeBlockHeader => {
+                let mut bp = BlockProperties {
+                    block_type: BlockType::Raw,
+                    last_block: false,
+                    orig_size: 0,
+                };
+                let c_block_size = get_c_block_size(src, &mut bp)?;
+                if c_block_size > self.f_params.block_size_max as usize {
+                    // Larger than the frame allows.
+                    return error!(CorruptionDetected);
+                }
+                self.expected = c_block_size;
+                self.b_type = bp.block_type;
+                self.rle_size = bp.orig_size;
+                if c_block_size != 0 {
+                    self.stage = if bp.last_block {
+                        DStage::DecompressLastBlock
+                    } else {
+                        DStage::DecompressBlock
+                    };
+                    return Ok(0);
+                }
+                // An empty block. As in libzstd, an empty last block ends the
+                // frame without checking its content size.
+                if bp.last_block {
+                    if self.f_params.checksum_flag {
+                        self.expected = 4;
+                        self.stage = DStage::CheckChecksum;
+                    } else {
+                        // The end of the frame.
+                        self.expected = 0;
+                        self.stage = DStage::GetFrameHeaderSize;
+                    }
+                } else {
+                    // On to the next block header.
+                    self.expected = ZSTD_BLOCKHEADERSIZE;
+                    self.stage = DStage::DecodeBlockHeader;
+                }
+                Ok(0)
+            }
+
+            DStage::DecompressBlock | DStage::DecompressLastBlock => {
+                let r_size = match self.b_type {
+                    BlockType::Compressed => {
+                        debug_assert!(self.is_frame_decompression);
+                        let r_size = self.decompress_stream_block(out, dst, dst_capacity, src);
+                        // A compressed block comes whole. As in libzstd, this
+                        // holds after an error too.
+                        self.expected = 0;
+                        r_size?
+                    }
+                    BlockType::Raw => {
+                        // ZSTD_copyRawBlock
+                        debug_assert!(src.len() <= self.expected);
+                        if src.len() > dst_capacity {
+                            return error!(DstSizeTooSmall);
+                        }
+                        out[dst..dst + src.len()].copy_from_slice(src);
+                        self.expected -= src.len();
+                        src.len()
+                    }
+                    BlockType::Rle => {
+                        // ZSTD_setRleBlock
+                        let regen_size = self.rle_size as usize;
+                        self.expected = 0;
+                        if regen_size > dst_capacity {
+                            return error!(DstSizeTooSmall);
+                        }
+                        out[dst..dst + regen_size].fill(src[0]);
+                        regen_size
+                    }
+                    BlockType::Reserved => return error!(CorruptionDetected),
+                };
+                if r_size > self.f_params.block_size_max as usize {
+                    // Decoded to more than the frame allows.
+                    return error!(CorruptionDetected);
+                }
+                self.decoded_size += r_size as u64;
+                if self.validate_checksum {
+                    self.xxh_state.update(&out[dst..dst + r_size]);
+                }
+                self.previous_dst_end = address(out, dst + r_size);
+                if let Segment::Out { end, .. } = &mut self.stream_prefix
+                    && *end == dst
+                {
+                    *end = dst + r_size;
+                }
+
+                // Stay on this stage until the stored block is all in.
+                if self.expected > 0 {
+                    return Ok(r_size);
+                }
+
+                if self.stage == DStage::DecompressLastBlock {
+                    // The end of the frame.
+                    if self.f_params.frame_content_size != CONTENTSIZE_UNKNOWN
+                        && self.decoded_size != self.f_params.frame_content_size
+                    {
+                        return error!(CorruptionDetected);
+                    }
+                    if self.f_params.checksum_flag {
+                        // Then the frame's checksum.
+                        self.expected = 4;
+                        self.stage = DStage::CheckChecksum;
+                    } else {
+                        self.expected = 0;
+                        self.stage = DStage::GetFrameHeaderSize;
+                    }
+                } else {
+                    self.stage = DStage::DecodeBlockHeader;
+                    self.expected = ZSTD_BLOCKHEADERSIZE;
+                }
+                Ok(r_size)
+            }
+
+            DStage::CheckChecksum => {
+                if self.validate_checksum {
+                    let h32 = self.xxh_state.digest() as u32;
+                    let check32 = read_le32(src, 0);
+                    if check32 != h32 {
+                        return error!(ChecksumWrong);
+                    }
+                }
+                self.expected = 0;
+                self.stage = DStage::GetFrameHeaderSize;
+                Ok(0)
+            }
+
+            DStage::DecodeSkippableHeader => {
+                debug_assert!(src.len() <= SKIPPABLE_HEADER_SIZE);
+                self.header_buffer[SKIPPABLE_HEADER_SIZE - src.len()..SKIPPABLE_HEADER_SIZE]
+                    .copy_from_slice(src);
+                // The content's size, which can be far larger than any buffer.
+                self.expected = read_le32(&self.header_buffer, ZSTD_FRAMEIDSIZE) as usize;
+                self.stage = DStage::SkipFrame;
+                Ok(0)
+            }
+
+            DStage::SkipFrame => {
+                self.expected = 0;
+                self.stage = DStage::GetFrameHeaderSize;
+                Ok(0)
+            }
+        }
+    }
+
+    /// `ZSTD_DCtx_updateOversizedDuration`: counts the frames in a row for
+    /// which the buffers are much larger than needed.
+    fn update_oversized_duration(
+        &mut self,
+        needed_in_buff_size: usize,
+        needed_out_buff_size: usize,
+    ) {
+        // ZSTD_DCtx_isOverflow
+        let held = self.in_buff.len().wrapping_add(self.out_buff.len());
+        let needed = needed_in_buff_size.wrapping_add(needed_out_buff_size);
+        if held >= needed.wrapping_mul(ZSTD_WORKSPACETOOLARGE_FACTOR) {
+            self.oversized_duration += 1;
+        } else {
+            self.oversized_duration = 0;
+        }
+    }
+
+    /// `ZSTD_checkOutBuffer`: with a stable output buffer, each call of a
+    /// frame must get the buffer the previous call left, at the same
+    /// position.
+    fn check_out_buffer(&self, output: &OutBuffer<'_>) -> Result<()> {
+        if !self.stable_out_buffer {
+            return Ok(());
+        }
+        // Any buffer can start a frame.
+        if self.stream_stage == DStreamStage::Init {
+            return Ok(());
+        }
+        if self.expected_out_buffer == OutBufferId::of(output) {
+            return Ok(());
+        }
+        error!(DstBufferWrong)
+    }
+
+    /// `ZSTD_decompressContinueStream`: decodes `src` (see
+    /// [`DCtx::decompress_continue`] for `src_size`) into the context's
+    /// buffer, or straight into `dst[*op..oend]` when the output buffer is
+    /// stable, and moves on to the stage that follows.
+    fn decompress_continue_stream(
+        &mut self,
+        dst: &mut [u8],
+        op: &mut usize,
+        oend: usize,
+        src: &[u8],
+        src_size: usize,
+    ) -> Result<()> {
+        let is_skip_frame = self.is_skip_frame();
+        if !self.stable_out_buffer {
+            let dst_size = if is_skip_frame {
+                0
+            } else {
+                self.out_buff.len() - self.out_start
+            };
+            let mut out_buff = std::mem::take(&mut self.out_buff);
+            let decoded_size =
+                self.decompress_continue(&mut out_buff, self.out_start, dst_size, src, src_size);
+            self.out_buff = out_buff;
+            let decoded_size = decoded_size?;
+            if decoded_size == 0 && !is_skip_frame {
+                self.stream_stage = DStreamStage::Read;
+            } else {
+                self.out_end = self.out_start + decoded_size;
+                self.stream_stage = DStreamStage::Flush;
+            }
+        } else {
+            // Straight into the output buffer.
+            let dst_size = if is_skip_frame { 0 } else { oend - *op };
+            let decoded_size = self.decompress_continue(dst, *op, dst_size, src, src_size)?;
+            *op += decoded_size;
+            // Nothing to flush.
+            self.stream_stage = DStreamStage::Read;
+        }
+        Ok(())
+    }
+
+    /// `ZSTD_decompressStream`: decodes as much of `input` to `output` as
+    /// both allow, frame after frame, and moves their positions forward.
+    ///
+    /// Returns 0 when a frame is decoded and all of it flushed, at the end
+    /// of that frame: the next call starts the next frame. Otherwise, a
+    /// hint at how much input the next step needs (the rest of a block, and
+    /// the next block's header), which the caller can ignore. Call again
+    /// with more input, or more room in `output`: some output may still be
+    /// held back, even when all the input is read.
+    ///
+    /// Unless [`DParameter::StableOutBuffer`] is set, the context keeps a
+    /// window of output of its own, as large as the frame's window plus
+    /// two blocks (at most the frame's content size), so `output` can be of
+    /// any size, and a different buffer at each call.
+    ///
+    /// After an error the context is in no state to go on: reset it with
+    /// [`DCtx::reset`] before the next frame.
+    ///
+    /// Differs from libzstd: when the call fails, `input.pos` and
+    /// `output.pos` are left as they were. libzstd leaves them too, but
+    /// for one error, about the first bytes of a header, where it marks
+    /// the input as read.
+    pub fn decompress_stream(
+        &mut self,
+        output: &mut OutBuffer<'_>,
+        input: &mut InBuffer<'_>,
+    ) -> Result<usize> {
+        let (in_pos, out_pos) = (input.pos, output.pos);
+        let result = self.decompress_stream_internal(output, input);
+        if result.is_err() {
+            input.pos = in_pos;
+            output.pos = out_pos;
+        }
+        result
+    }
+
+    /// `ZSTD_decompressStream`, leaving the positions where libzstd leaves
+    /// them when it fails.
+    pub(crate) fn decompress_stream_internal(
+        &mut self,
+        output: &mut OutBuffer<'_>,
+        input: &mut InBuffer<'_>,
+    ) -> Result<usize> {
+        let src = input.src;
+        let istart = input.pos;
+        let iend = src.len();
+        let mut ip = istart;
+        let ostart = output.pos;
+        let oend = output.dst.len();
+        let mut op = ostart;
+        let mut some_more_work = true;
+
+        if input.pos > input.src.len() {
+            return error!(SrcSizeWrong);
+        }
+        if output.pos > output.dst.len() {
+            return error!(DstSizeTooSmall);
+        }
+        self.check_out_buffer(output)?;
+
+        while some_more_work {
+            match self.stream_stage {
+                DStreamStage::Init => {
+                    // A transparent reset.
+                    self.stream_stage = DStreamStage::LoadHeader;
+                    self.lh_size = 0;
+                    self.in_pos = 0;
+                    self.out_start = 0;
+                    self.out_end = 0;
+                    self.hostage_byte = false;
+                    self.expected_out_buffer = OutBufferId::of(output);
+                }
+
+                DStreamStage::LoadHeader => {
+                    let header = self.header_buffer;
+                    let h_size = get_frame_header_into(
+                        &mut self.f_params,
+                        &header[..self.lh_size],
+                        self.format,
+                    );
+                    if self.ref_multiple_ddicts && self.ddict_set.is_some() {
+                        self.select_frame_ddict();
+                    }
+                    let h_size = h_size?;
+                    if h_size != 0 {
+                        // More input needed (h_size > lh_size).
+                        let to_load = h_size - self.lh_size;
+                        let remaining_input = iend - ip;
+                        if to_load > remaining_input {
+                            // Not enough for the whole header.
+                            if remaining_input > 0 {
+                                self.header_buffer[self.lh_size..self.lh_size + remaining_input]
+                                    .copy_from_slice(&src[ip..iend]);
+                                self.lh_size += remaining_input;
+                            }
+                            input.pos = input.src.len();
+                            // Check the first few bytes.
+                            let header = self.header_buffer;
+                            get_frame_header_into(
+                                &mut self.f_params,
+                                &header[..self.lh_size],
+                                self.format,
+                            )?;
+                            // The rest of the header, and the next block's.
+                            return Ok(frame_header_size_min(self.format).max(h_size)
+                                - self.lh_size
+                                + ZSTD_BLOCKHEADERSIZE);
+                        }
+                        self.header_buffer[self.lh_size..h_size]
+                            .copy_from_slice(&src[ip..ip + to_load]);
+                        self.lh_size = h_size;
+                        ip += to_load;
+                        continue;
+                    }
+
+                    // The whole frame in one call, when the input holds it
+                    // and the output has room for it.
+                    if self.f_params.frame_content_size != CONTENTSIZE_UNKNOWN
+                        && self.f_params.frame_type != FrameType::Skippable
+                        && (oend - op) as u64 >= self.f_params.frame_content_size
+                    {
+                        // As in libzstd, from where this call's input starts.
+                        if let Ok(info) = find_frame_size_info(&src[istart..iend], self.format)
+                            && info.compressed_size <= iend - istart
+                        {
+                            let c_size = info.compressed_size;
+                            let ddict = self.get_ddict();
+                            let decompressed_size = self.decompress_multi_frame(
+                                &mut output.dst[op..oend],
+                                &src[istart..istart + c_size],
+                                None,
+                                ddict.as_deref(),
+                            )?;
+                            ip = istart + c_size;
+                            op += decompressed_size;
+                            self.expected = 0;
+                            self.stream_stage = DStreamStage::Init;
+                            some_more_work = false;
+                            continue;
+                        }
+                    }
+
+                    // A stable output buffer must hold the whole frame.
+                    if self.stable_out_buffer
+                        && self.f_params.frame_type != FrameType::Skippable
+                        && self.f_params.frame_content_size != CONTENTSIZE_UNKNOWN
+                        && ((oend - op) as u64) < self.f_params.frame_content_size
+                    {
+                        return error!(DstSizeTooSmall);
+                    }
+
+                    // Take in the header (see DStage::DecodeFrameHeader).
+                    let ddict = self.get_ddict();
+                    self.decompress_begin_using_ddict(ddict.as_deref());
+                    self.frame_ddict = ddict;
+
+                    if self.format == Format::Zstd1
+                        && (read_le32(&self.header_buffer, 0) & ZSTD_MAGIC_SKIPPABLE_MASK)
+                            == ZSTD_MAGIC_SKIPPABLE_START
+                    {
+                        // A skippable frame.
+                        self.expected = read_le32(&self.header_buffer, ZSTD_FRAMEIDSIZE) as usize;
+                        self.stage = DStage::SkipFrame;
+                    } else {
+                        let header = self.header_buffer;
+                        self.decode_frame_header(&header[..self.lh_size])?;
+                        self.expected = ZSTD_BLOCKHEADERSIZE;
+                        self.stage = DStage::DecodeBlockHeader;
+                    }
+
+                    // Bound the memory used.
+                    self.f_params.window_size = self
+                        .f_params
+                        .window_size
+                        .max(1 << ZSTD_WINDOWLOG_ABSOLUTEMIN);
+                    if self.f_params.window_size > self.max_window_size as u64 {
+                        return error!(FrameParameterWindowTooLarge);
+                    }
+                    if self.max_block_size_param != 0 {
+                        self.f_params.block_size_max =
+                            self.f_params.block_size_max.min(self.max_block_size_param);
+                    }
+
+                    // Buffers as large as the frame needs.
+                    let needed_in_buff_size = (self.f_params.block_size_max as usize).max(4);
+                    let needed_out_buff_size = if self.stable_out_buffer {
+                        0
+                    } else {
+                        decoding_buffer_size_internal(
+                            self.f_params.window_size,
+                            self.f_params.frame_content_size,
+                            self.f_params.block_size_max as usize,
+                        )?
+                    };
+                    self.update_oversized_duration(needed_in_buff_size, needed_out_buff_size);
+                    let too_small = self.in_buff.len() < needed_in_buff_size
+                        || self.out_buff.len() < needed_out_buff_size;
+                    let too_large = self.oversized_duration >= ZSTD_WORKSPACETOOLARGE_MAXDURATION;
+                    if too_small || too_large {
+                        // The old buffers go first, as in libzstd.
+                        self.in_buff = Vec::new();
+                        self.out_buff = Vec::new();
+                        self.in_buff = vec![0; needed_in_buff_size];
+                        self.out_buff = vec![0; needed_out_buff_size];
+                    }
+                    self.stream_stage = DStreamStage::Read;
+                }
+
+                DStreamStage::Read => {
+                    let needed_in_size =
+                        self.next_src_size_to_decompress_with_input_size(iend - ip);
+                    if needed_in_size == 0 {
+                        // The end of the frame.
+                        self.stream_stage = DStreamStage::Init;
+                        some_more_work = false;
+                        continue;
+                    }
+                    if iend - ip >= needed_in_size {
+                        // Straight from the input.
+                        self.decompress_continue_stream(
+                            output.dst,
+                            &mut op,
+                            oend,
+                            &src[ip..ip + needed_in_size],
+                            needed_in_size,
+                        )?;
+                        ip += needed_in_size;
+                        continue;
+                    }
+                    if ip == iend {
+                        // No more input.
+                        some_more_work = false;
+                        continue;
+                    }
+                    self.stream_stage = DStreamStage::Load;
+                }
+
+                DStreamStage::Load => {
+                    let needed_in_size = self.expected;
+                    // The part not loaded yet. libzstd's size_t wraps around
+                    // if a one-call decompression ran in the middle of a
+                    // stream; the check below then fails.
+                    let to_load = needed_in_size.wrapping_sub(self.in_pos);
+                    let is_skip_frame = self.is_skip_frame();
+                    let loaded_size = to_load.min(iend - ip);
+                    if !is_skip_frame {
+                        if self.in_pos > self.in_buff.len()
+                            || to_load > self.in_buff.len() - self.in_pos
+                        {
+                            // Should never happen.
+                            return error!(CorruptionDetected);
+                        }
+                        self.in_buff[self.in_pos..self.in_pos + loaded_size]
+                            .copy_from_slice(&src[ip..ip + loaded_size]);
+                    }
+                    ip += loaded_size;
+                    self.in_pos += loaded_size;
+                    if loaded_size < to_load {
+                        // Not enough input: wait for more.
+                        some_more_work = false;
+                        continue;
+                    }
+
+                    // Decode what is loaded.
+                    self.in_pos = 0;
+                    let in_buff = std::mem::take(&mut self.in_buff);
+                    let loaded: &[u8] = if is_skip_frame {
+                        &[]
+                    } else {
+                        &in_buff[..needed_in_size]
+                    };
+                    let result = self.decompress_continue_stream(
+                        output.dst,
+                        &mut op,
+                        oend,
+                        loaded,
+                        needed_in_size,
+                    );
+                    self.in_buff = in_buff;
+                    result?;
+                }
+
+                DStreamStage::Flush => {
+                    let to_flush_size = self.out_end - self.out_start;
+                    let flushed_size = to_flush_size.min(oend - op);
+                    output.dst[op..op + flushed_size].copy_from_slice(
+                        &self.out_buff[self.out_start..self.out_start + flushed_size],
+                    );
+                    op += flushed_size;
+                    self.out_start += flushed_size;
+                    if flushed_size == to_flush_size {
+                        // All flushed.
+                        self.stream_stage = DStreamStage::Read;
+                        if (self.out_buff.len() as u64) < self.f_params.frame_content_size
+                            && self.out_start + self.f_params.block_size_max as usize
+                                > self.out_buff.len()
+                        {
+                            // Too near the end for another block: start
+                            // filling the buffer from its start again.
+                            self.out_start = 0;
+                            self.out_end = 0;
+                        }
+                        continue;
+                    }
+                    // The output is full.
+                    some_more_work = false;
+                }
+            }
+        }
+
+        // The result.
+        input.pos = ip;
+        output.pos = op;
+
+        // What a stable output buffer must be at the next call.
+        self.expected_out_buffer = OutBufferId::of(output);
+
+        if ip == istart && op == ostart {
+            // No progress.
+            self.no_forward_progress += 1;
+            if self.no_forward_progress >= ZSTD_NO_FORWARD_PROGRESS_MAX {
+                if op == oend {
+                    return error!(NoForwardProgressDestFull);
+                }
+                if ip == iend {
+                    return error!(NoForwardProgressInputEmpty);
+                }
+            }
+        } else {
+            self.no_forward_progress = 0;
+        }
+
+        let mut next_src_size_hint = self.expected;
+        if next_src_size_hint == 0 {
+            // The frame is decoded.
+            if self.out_end == self.out_start {
+                // And all of it flushed.
+                if self.hostage_byte {
+                    if input.pos >= input.src.len() {
+                        // The hostage byte is not there to release.
+                        self.stream_stage = DStreamStage::Read;
+                        return Ok(1);
+                    }
+                    // Release it.
+                    input.pos += 1;
+                }
+                return Ok(0);
+            }
+            if !self.hostage_byte {
+                // Output is left to flush: keep the frame's last input byte
+                // back until it is, so that the caller calls again. The
+                // call that ended the frame read it, so there is one.
+                input.pos = input.pos.saturating_sub(1);
+                self.hostage_byte = true;
+            }
+            return Ok(1);
+        }
+        // Ask for the next block's header too.
+        if self.stage == DStage::DecompressBlock {
+            next_src_size_hint += ZSTD_BLOCKHEADERSIZE;
+        }
+        // Less what is already loaded.
+        Ok(next_src_size_hint.wrapping_sub(self.in_pos))
+    }
+
+    /// `ZSTD_decompressStream_simpleArgs`: [`DCtx::decompress_stream`] with
+    /// the buffers and positions as separate arguments.
+    pub fn decompress_stream_simple_args(
+        &mut self,
+        dst: &mut [u8],
+        dst_pos: &mut usize,
+        src: &[u8],
+        src_pos: &mut usize,
+    ) -> Result<usize> {
+        let mut output = OutBuffer { dst, pos: *dst_pos };
+        let mut input = InBuffer { src, pos: *src_pos };
+        let result = self.decompress_stream(&mut output, &mut input);
+        *dst_pos = output.pos;
+        *src_pos = input.pos;
+        result
+    }
+
+    /// `ZSTD_initDStream`: abandons any frame being streamed and drops the
+    /// dictionary. Returns the input size the first call needs at least.
+    pub fn init_dstream(&mut self) -> Result<usize> {
+        self.reset(ResetDirective::SessionOnly)?;
+        self.ref_ddict(None)?;
+        Ok(starting_input_length(self.format))
+    }
+}
+
 /// `ZSTD_dParameter`, with its value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DParameter {
@@ -1246,7 +2143,12 @@ pub enum DParameter {
     WindowLogMax(u32),
     /// Frames with or without the magic number.
     Format(Format),
-    /// When streaming, the output buffer stays the same between calls.
+    /// When streaming, the output buffer stays the same between calls: the
+    /// decoder then writes straight into it and keeps no window of its own.
+    /// Each call of a frame must get the same buffer, at the position the
+    /// previous call left (or fails with
+    /// [`ErrorCode::DstBufferWrong`]), and the buffer must hold the whole
+    /// frame.
     StableOutBuffer(bool),
     /// Do not check checksums.
     ForceIgnoreChecksum(bool),

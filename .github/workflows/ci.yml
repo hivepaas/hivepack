@@ -180,4 +180,6 @@ jobs:
         run: |
           mkdir -p fuzz/corpus/decompress
           find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
-      - run: cargo fuzz run --features unsafe-fast decompress -- -max_total_time=300
+      # The prebuilt cargo-fuzz is a musl binary and would default to that
+      # target, which the sanitizer does not support.
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=300

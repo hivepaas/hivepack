@@ -53,7 +53,14 @@ It was 0.35–0.55× before the speed work. What made the difference, the larges
 
 Tried, and not worth it: prefetching each match as libzstd does on arm64 (the numbers are in [safety.md](safety.md)), and copying long matches with `copy_within` or in 64-byte pieces. x86-64 is not measured yet.
 
-What is left is bounds checks. With the copies of the sequence loop and the bitstreams' 8-byte reads unchecked, an experiment with `unsafe`, decompression in one call averages 0.97× (0.92–1.00×), 44 of the 48 cases at 0.95× or more, against 10 of 48 now. libzstd's fast-path condition keeps those accesses in bounds, but the compiler cannot see it. Making that an exception is HivePaaS's decision; see [safety.md](safety.md).
+What is left is bounds checks: libzstd's fast-path condition keeps the sequence loop's copies in bounds, but the compiler cannot see it. The `unsafe-fast` feature, off by default, makes those copies without them (see [unsafe.md](unsafe.md)):
+
+| With `unsafe-fast` | Mean | Range | At 0.95× or more |
+|---|---|---|---|
+| In one call | 0.95× | 0.92–0.98× | 29 of 48 (safe: 7) |
+| Streaming | 0.96× | 0.87–1.00× | 41 of 48 (safe: 2) |
+
+How much it gains depends on how the compiler lays out the loop, which is fragile: a version of the same copies that returned an error from the loop when its buffers did not fit was slower than the safe code, by up to 10%, through spilled registers alone. Measure again after changing the loop.
 
 ## Progress
 

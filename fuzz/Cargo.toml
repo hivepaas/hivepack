@@ -1,0 +1,31 @@
+[package]
+name = "hivepack-fuzz"
+version = "0.0.0"
+description = "Fuzzers that compare hivepack-zstd with libzstd"
+publish = false
+license = "MIT"
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+# Fuzz the build with the sequence loop's unchecked copies.
+unsafe-fast = ["hivepack-zstd/unsafe-fast"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hivepack-zstd = { path = "../crates/zstd" }
+# libzstd 1.5.7, without the x86-64 Huffman assembly, as the tests build it.
+zstd = { version = "0.14.3", default-features = false, features = ["experimental", "no_asm"] }
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+# Not in the main workspace: cargo-fuzz builds it with nightly and its own
+# flags.
+[workspace]

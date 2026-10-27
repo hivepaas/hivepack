@@ -1043,6 +1043,19 @@ fn port_matches_libzstd() {
     eprintln!(
         "literals (extra, input, output, split), then sequence loops (plain, split, long): {paths:?}"
     );
+    // With the `unsafe-fast` feature, the plain loop always runs unchecked:
+    // the decoder's buffers always meet the limits it checks.
+    #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+    {
+        let [unchecked, checked] = crate::decompress::zstd_decompress_block::UNCHECKED_RUNS
+            .each_ref()
+            .map(|r| r.load(std::sync::atomic::Ordering::Relaxed));
+        eprintln!("plain loops run unchecked, then checked: {unchecked}, {checked}");
+        assert!(
+            unchecked > 0 && checked == 0,
+            "the plain loop ran checked {checked} times, unchecked {unchecked}"
+        );
+    }
     assert!(
         problems.is_empty(),
         "{} requests checked, differences:\n{}",

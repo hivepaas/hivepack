@@ -32,6 +32,8 @@ use crate::decompress::huf_decompress::{
     huf_decompress1x_using_dtable, huf_decompress1x1_dctx_wksp, huf_decompress4x_huf_only_wksp,
     huf_decompress4x_using_dtable,
 };
+#[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+use crate::decompress::unchecked;
 use crate::decompress::zstd_decompress_internal::{
     DCtx, EntropyDTables, ExtDict, LL_BASE, LL_TABLE_CELLS, LitBuf, LitLocation, LitPos, ML_BASE,
     ML_TABLE_CELLS, OF_BASE, OF_BITS, OF_TABLE_CELLS, SeqDTable, SeqSymbol, TableRef,
@@ -44,6 +46,13 @@ use crate::decompress::zstd_decompress_internal::{
 #[cfg(test)]
 pub(crate) static PATH_RUNS: [std::sync::atomic::AtomicUsize; 7] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+
+/// With the `unsafe-fast` feature, how often the main sequence loop ran
+/// without bounds checks, and how often its buffers did not allow it, so
+/// the tests can check that the decoder always meets libzstd's limits.
+#[cfg(all(test, feature = "unsafe-fast", target_pointer_width = "64"))]
+pub(crate) static UNCHECKED_RUNS: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 
 #[cfg(test)]
 fn count_path(which: usize) {
@@ -1076,14 +1085,15 @@ fn decode_sequence(seq_state: &mut SeqState<'_>, tables: SeqTables<'_>, is_last_
     }
 
     if ml_bits > 0 {
-        seq.match_length += d.read_bits_fast(ml_bits) as usize;
+        // As `u32`, so that lengths are known to stay below 2^33.
+        seq.match_length += d.read_bits_fast(ml_bits) as u32 as usize;
     }
     if total_bits >= STREAM_ACCUMULATOR_MIN_64 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG) {
         d.reload();
     }
     // There are now enough bits for the rest.
     if ll_bits > 0 {
-        seq.lit_length += d.read_bits_fast(ll_bits) as usize;
+        seq.lit_length += d.read_bits_fast(ll_bits) as u32 as usize;
     }
 
     if !is_last_seq {
@@ -1113,13 +1123,18 @@ enum Lits<'a> {
 /// What a copy reads from, chosen when the code is compiled where it can
 /// be: the main sequence loop has a copy for each kind of literal buffer, so
 /// that its copies need not ask which one each time.
-trait Source: Copy {
+pub(crate) trait Source: Copy {
     /// 16 bytes from `at`.
     fn read16(self, out: &[u8], at: usize) -> [u8; 16];
     fn byte(self, out: &[u8], at: usize) -> u8;
     /// Copies `len` bytes from `at` to `op` exactly, as `memmove` within the
     /// output.
     fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize);
+    /// The buffer read from, given the output.
+    #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+    fn slice<'s>(self, out: &'s [u8]) -> &'s [u8]
+    where
+        Self: 's;
 }
 
 /// The output buffer itself.
@@ -1155,6 +1170,15 @@ impl Source for FromOut {
     fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize) {
         out.copy_within(at..at + len, op);
     }
+
+    #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+    #[inline(always)]
+    fn slice<'s>(self, out: &'s [u8]) -> &'s [u8]
+    where
+        Self: 's,
+    {
+        out
+    }
 }
 
 /// Another buffer: the extra buffer, or the block's input.
@@ -1175,6 +1199,15 @@ impl Source for &[u8] {
     #[inline(always)]
     fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize) {
         out[op..op + len].copy_from_slice(&self[at..at + len]);
+    }
+
+    #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+    #[inline(always)]
+    fn slice<'s>(self, _out: &'s [u8]) -> &'s [u8]
+    where
+        Self: 's,
+    {
+        self
     }
 }
 
@@ -1203,6 +1236,18 @@ impl Source for Lits<'_> {
             Lits::Buf(buf) => buf.copy_exact(out, op, at, len),
         }
     }
+
+    #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+    #[inline(always)]
+    fn slice<'s>(self, out: &'s [u8]) -> &'s [u8]
+    where
+        Self: 's,
+    {
+        match self {
+            Lits::Out => out,
+            Lits::Buf(buf) => buf,
+        }
+    }
 }
 
 // libzstd's copies, `ZSTD_copy16`, `ZSTD_wildcopy` and the ones built on
@@ -1212,6 +1257,44 @@ impl Source for Lits<'_> {
 // bytes included: libzstd keeps the margins they need (WILDCOPY_OVERLENGTH)
 // in every buffer, and the callers check them. Each piece is read before it
 // is written, as libzstd's vector loads and stores do.
+
+/// How the copies below read and write their 16- and 32-byte pieces:
+/// [`Checked`], with bounds checks, or with the `unsafe-fast` feature
+/// `unchecked::Unchecked`, without.
+pub(crate) trait Mode: Copy {
+    fn read16<S: Source>(self, src: S, out: &[u8], at: usize) -> [u8; 16];
+    fn read32(self, out: &[u8], at: usize) -> [u8; 32];
+    fn write16(self, out: &mut [u8], at: usize, piece: [u8; 16]);
+    fn write32(self, out: &mut [u8], at: usize, piece: [u8; 32]);
+}
+
+/// Pieces read and written with bounds checks.
+#[derive(Clone, Copy)]
+struct Checked;
+
+impl Mode for Checked {
+    #[inline(always)]
+    fn read16<S: Source>(self, src: S, out: &[u8], at: usize) -> [u8; 16] {
+        src.read16(out, at)
+    }
+
+    #[inline(always)]
+    fn read32(self, out: &[u8], at: usize) -> [u8; 32] {
+        FromOut.read32(out, at)
+    }
+
+    #[inline(always)]
+    fn write16(self, out: &mut [u8], at: usize, piece: [u8; 16]) {
+        let at = idx(at);
+        out[at..at + 16].copy_from_slice(&piece);
+    }
+
+    #[inline(always)]
+    fn write32(self, out: &mut [u8], at: usize, piece: [u8; 32]) {
+        let at = idx(at);
+        out[at..at + 32].copy_from_slice(&piece);
+    }
+}
 
 /// `ZSTD_copy4`
 #[inline(always)]
@@ -1232,29 +1315,35 @@ fn copy8_within(out: &mut [u8], op: usize, ip: usize) {
 
 /// `ZSTD_copy16`
 #[inline(always)]
-fn copy16<S: Source>(out: &mut [u8], op: usize, src: S, ip: usize) {
-    let piece = src.read16(out, ip);
-    let op = idx(op);
-    out[op..op + 16].copy_from_slice(&piece);
+fn copy16<S: Source, M: Mode>(out: &mut [u8], op: usize, src: S, ip: usize, mode: M) {
+    let piece = mode.read16(src, out, ip);
+    mode.write16(out, op, piece);
 }
 
 /// `ZSTD_wildcopy` with `ZSTD_no_overlap`: `src` and the output are at
 /// least 16 bytes apart, or in different buffers. Copies `length` bytes
 /// and up to 32 more.
 #[inline(always)]
-fn wildcopy<S: Source>(out: &mut [u8], mut op: usize, src: S, mut ip: usize, length: usize) {
+fn wildcopy<S: Source, M: Mode>(
+    out: &mut [u8],
+    mut op: usize,
+    src: S,
+    mut ip: usize,
+    length: usize,
+    mode: M,
+) {
     let oend = op + length;
     // The length is almost always short, so one piece first, then two at
     // a time.
-    copy16(out, op, src, ip);
+    copy16(out, op, src, ip, mode);
     if length <= 16 {
         return;
     }
     op += 16;
     ip += 16;
     loop {
-        copy16(out, op, src, ip);
-        copy16(out, op + 16, src, ip + 16);
+        copy16(out, op, src, ip, mode);
+        copy16(out, op + 16, src, ip + 16, mode);
         op += 32;
         ip += 32;
         if op >= oend {
@@ -1267,9 +1356,9 @@ fn wildcopy<S: Source>(out: &mut [u8], mut op: usize, src: S, mut ip: usize, len
 /// from 32 bytes back on, the two pieces of each step are copied as one,
 /// the same bytes with half the bounds checks.
 #[inline(always)]
-fn wildcopy_match(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
+fn wildcopy_match<M: Mode>(out: &mut [u8], mut op: usize, mut ip: usize, length: usize, mode: M) {
     let oend = op + length;
-    copy16(out, op, FromOut, ip);
+    copy16(out, op, FromOut, ip, mode);
     if length <= 16 {
         return;
     }
@@ -1277,9 +1366,8 @@ fn wildcopy_match(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
     ip += 16;
     if op - ip >= 32 {
         loop {
-            let piece: [u8; 32] = FromOut.read32(out, ip);
-            let at = idx(op);
-            out[at..at + 32].copy_from_slice(&piece);
+            let piece = mode.read32(out, ip);
+            mode.write32(out, op, piece);
             op += 32;
             ip += 32;
             if op >= oend {
@@ -1289,8 +1377,8 @@ fn wildcopy_match(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
         return;
     }
     loop {
-        copy16(out, op, FromOut, ip);
-        copy16(out, op + 16, FromOut, ip + 16);
+        copy16(out, op, FromOut, ip, mode);
+        copy16(out, op + 16, FromOut, ip + 16, mode);
         op += 32;
         ip += 32;
         if op >= oend {
@@ -1302,7 +1390,7 @@ fn wildcopy_match(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
 /// `ZSTD_wildcopy` with `ZSTD_overlap_src_before_dst`, within the output:
 /// a match that starts at least 8 bytes back.
 #[inline(always)]
-fn wildcopy_overlap(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
+fn wildcopy_overlap<M: Mode>(out: &mut [u8], mut op: usize, mut ip: usize, length: usize, mode: M) {
     if op - ip < 16 {
         // A short offset: 8 bytes at a time.
         let oend = op + length;
@@ -1315,7 +1403,7 @@ fn wildcopy_overlap(out: &mut [u8], mut op: usize, mut ip: usize, length: usize)
             }
         }
     } else {
-        wildcopy(out, op, FromOut, ip, length);
+        wildcopy(out, op, FromOut, ip, length, mode);
     }
 }
 
@@ -1342,6 +1430,41 @@ fn overlap_copy8(out: &mut [u8], op: &mut usize, ip: &mut usize, offset: usize) 
         *ip += 8;
     }
     *op += 8;
+}
+
+/// The literal copy of the fast sequence path: `copy16`, then `wildcopy`
+/// past 16 bytes.
+#[inline(always)]
+fn fast_literals<S: Source, M: Mode>(
+    out: &mut [u8],
+    op: usize,
+    lits: S,
+    at: usize,
+    len: usize,
+    mode: M,
+) {
+    copy16(out, op, lits, at, mode);
+    if len > 16 {
+        wildcopy(out, op + 16, lits, at + 16, len - 16, mode);
+    }
+}
+
+/// The match copy of the fast sequence path, within the current segment:
+/// `len` bytes at `op` from `m`, before it.
+#[inline(always)]
+fn fast_match<M: Mode>(out: &mut [u8], mut op: usize, mut m: usize, len: usize, mode: M) {
+    let offset = op - m;
+    // Nearly all offsets are at least 16, so the copy needs no care for
+    // overlap.
+    if offset >= WILDCOPY_VECLEN {
+        wildcopy_match(out, op, m, len, mode);
+        return;
+    }
+    // 8 bytes, and the offset at least 8 from then on.
+    overlap_copy8(out, &mut op, &mut m, offset);
+    if len > 8 {
+        wildcopy_overlap(out, op, m, len - 8, mode);
+    }
 }
 
 /// `ZSTD_safecopy`: copies `length` bytes, writing nothing past
@@ -1380,9 +1503,9 @@ fn safecopy<S: Source>(
     if oend as isize <= oend_w {
         // No risk of writing too far.
         if overlap {
-            wildcopy_overlap(out, op, ip, length);
+            wildcopy_overlap(out, op, ip, length, Checked);
         } else {
-            wildcopy(out, op, src, ip, length);
+            wildcopy(out, op, src, ip, length, Checked);
         }
         return;
     }
@@ -1390,9 +1513,9 @@ fn safecopy<S: Source>(
         // Wildcopy until near the end.
         let n = (oend_w - op as isize) as usize;
         if overlap {
-            wildcopy_overlap(out, op, ip, n);
+            wildcopy_overlap(out, op, ip, n, Checked);
         } else {
-            wildcopy(out, op, src, ip, n);
+            wildcopy(out, op, src, ip, n, Checked);
         }
         ip += n;
         op += n;
@@ -1422,7 +1545,7 @@ fn safecopy_dst_before_src(out: &mut [u8], mut op: usize, mut ip: usize, length:
     }
     if op + WILDCOPY_OVERLENGTH <= oend && diff < -(WILDCOPY_VECLEN as isize) {
         let n = oend - WILDCOPY_OVERLENGTH - op;
-        wildcopy(out, op, FromOut, ip, n);
+        wildcopy(out, op, FromOut, ip, n, Checked);
         ip += n;
         op += n;
     }
@@ -1517,16 +1640,17 @@ fn copy_sequence_match_end(
 /// The match part of `ZSTD_execSequence` and its split-literals variant,
 /// with room for wildcopies past its end.
 #[inline(always)]
-fn copy_sequence_match(
+fn copy_sequence_match<M: Mode>(
     out: &mut [u8],
     o_lit_end: usize,
     seq: Seq,
     prefix_start: usize,
     ext: &ExtDict<'_>,
+    mode: M,
 ) -> Result<()> {
     let mut op = o_lit_end;
     let mut match_length = seq.match_length;
-    let mut m;
+    let m;
     if seq.offset > o_lit_end - prefix_start {
         // The offset goes past the current segment.
         match copy_ext_part(out, o_lit_end, seq, prefix_start, ext)? {
@@ -1540,18 +1664,9 @@ fn copy_sequence_match(
     } else {
         m = o_lit_end - seq.offset;
     }
-
-    // Nearly all offsets are at least 16, so the copy needs no care for
-    // overlap.
-    if seq.offset >= WILDCOPY_VECLEN {
-        wildcopy_match(out, op, m, match_length);
-        return Ok(());
-    }
-    // 8 bytes, and the offset at least 8 from then on.
-    overlap_copy8(out, &mut op, &mut m, seq.offset);
-    if match_length > 8 {
-        wildcopy_overlap(out, op, m, match_length - 8);
-    }
+    // Here `op - m` is the offset, whether or not the match began in the
+    // older segment.
+    fast_match(out, op, m, match_length, mode);
     Ok(())
 }
 
@@ -1591,9 +1706,14 @@ fn exec_sequence_end<S: Source>(
 
 /// `ZSTD_execSequence`: writes one sequence's literals and match at `op`.
 /// Returns its length.
+///
+/// The fast path copies in `mode`: without bounds checks only in the main
+/// loop with the `unsafe-fast` feature, which makes sure its buffers meet
+/// libzstd's limits (see `unchecked_loop_fits`). Its condition then keeps
+/// every copy inside them.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn exec_sequence<S: Source>(
+fn exec_sequence<S: Source, M: Mode>(
     out: &mut [u8],
     op: usize,
     oend: usize,
@@ -1603,6 +1723,7 @@ fn exec_sequence<S: Source>(
     lit_limit: usize,
     prefix_start: usize,
     ext: &ExtDict<'_>,
+    mode: M,
 ) -> Result<usize> {
     let o_lit_end = op + seq.lit_length;
     let sequence_length = seq.lit_length + seq.match_length;
@@ -1626,13 +1747,33 @@ fn exec_sequence<S: Source>(
     }
 
     // The literals: nearly always 16 bytes or fewer.
-    copy16(out, op, lits, *lit_ptr);
-    if seq.lit_length > 16 {
-        wildcopy(out, op + 16, lits, *lit_ptr + 16, seq.lit_length - 16);
-    }
+    fast_literals(out, op, lits, *lit_ptr, seq.lit_length, mode);
     *lit_ptr = i_lit_end;
-    copy_sequence_match(out, o_lit_end, seq, prefix_start, ext)?;
+    copy_sequence_match(out, o_lit_end, seq, prefix_start, ext, mode)?;
     Ok(sequence_length)
+}
+
+/// Whether the main sequence loop may copy without bounds checks: the
+/// output reaches `oend`, the literals have libzstd's 32 bytes of margin
+/// past `lit_end`, and `prefix_start <= op <= oend`, `lit_ptr <= lit_end`.
+/// The decoder always meets this; the loop then keeps the last two true.
+#[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+fn unchecked_loop_fits<S: Source>(
+    out: &[u8],
+    oend: usize,
+    lits: S,
+    lit_ptr: usize,
+    lit_end: usize,
+    prefix_start: usize,
+    op: usize,
+) -> bool {
+    let lit_size = lits.slice(out).len();
+    oend <= out.len()
+        && lit_end <= lit_size
+        && lit_size - lit_end >= WILDCOPY_OVERLENGTH
+        && prefix_start <= op
+        && op <= oend
+        && lit_ptr <= lit_end
 }
 
 /// `ZSTD_execSequenceEndSplitLitBuffer`: like [`exec_sequence_end`], while
@@ -1707,12 +1848,9 @@ fn exec_sequence_split_lit_buffer(
         );
     }
 
-    copy16(out, op, FromOut, *lit_ptr);
-    if seq.lit_length > 16 {
-        wildcopy(out, op + 16, FromOut, *lit_ptr + 16, seq.lit_length - 16);
-    }
+    fast_literals(out, op, FromOut, *lit_ptr, seq.lit_length, Checked);
     *lit_ptr = i_lit_end;
-    copy_sequence_match(out, o_lit_end, seq, prefix_start, ext)?;
+    copy_sequence_match(out, o_lit_end, seq, prefix_start, ext, Checked)?;
     Ok(sequence_length)
 }
 
@@ -1878,6 +2016,7 @@ fn exec_sequences<S: Source>(
             lit_end,
             prefix_start,
             ext,
+            Checked,
         )?;
     }
     *seq_state = state;
@@ -1898,11 +2037,59 @@ struct SeqRun<'a> {
 
 /// The loop of `ZSTD_decompressSequences_body`, for literals read from
 /// `lits`.
+///
+/// With the `unsafe-fast` feature, on 64-bit machines, the loop's fast path
+/// copies without bounds checks once the buffers are known to meet
+/// libzstd's limits: see `unchecked_loop_fits`. The decoder always meets
+/// them; were it not to, the loop runs with the checks.
 fn decompress_sequences_body_with<S: Source>(
     bo: &mut BlockOut<'_, '_>,
     rep: &mut [u32; ZSTD_REP_NUM],
     run: SeqRun<'_>,
     lits: S,
+) -> Result<usize> {
+    #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]
+    if unchecked_loop_fits(
+        bo.out,
+        run.oend,
+        lits,
+        run.lit_ptr,
+        run.lit_end,
+        bo.prefix_start,
+        bo.dst,
+    ) {
+        // SAFETY: every copy made in this mode is a fast-path copy of
+        // `exec_sequence` in the loop. `unchecked_loop_fits` found `oend <=
+        // out.len()`, at least 32 bytes in `lits` past `lit_end`,
+        // `prefix_start <= op <= oend` and `lit_ptr <= lit_end`. The loop
+        // keeps the last two true: the fast path moves `op` to `o_match_end
+        // <= oend - 32` and `lit_ptr` to `i_lit_end <= lit_end`, and
+        // `exec_sequence_end` refuses sequences past `oend` or `lit_end`.
+        // Then each fast-path copy stays inside: the literals read under
+        // `i_lit_end + 32 <= lit_end + 32` and written under `o_lit_end +
+        // 32`, the match read from `m >= prefix_start` up to no further than
+        // it writes, and written under `o_match_end + 32 <= oend`. None of
+        // the sums overflows: positions are under 2^63, the buffers' lengths
+        // being at most `isize::MAX`, and lengths under 2^33 (a `u32` base
+        // plus a `u32` of extra bits, in `decode_sequence`).
+        #[allow(unsafe_code)]
+        let mode = unsafe { unchecked::Unchecked::new() };
+        #[cfg(test)]
+        UNCHECKED_RUNS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return sequences_loop(bo, rep, run, lits, mode);
+    }
+    #[cfg(all(test, feature = "unsafe-fast", target_pointer_width = "64"))]
+    UNCHECKED_RUNS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sequences_loop(bo, rep, run, lits, Checked)
+}
+
+/// [`decompress_sequences_body_with`], copying in `mode`.
+fn sequences_loop<S: Source, M: Mode>(
+    bo: &mut BlockOut<'_, '_>,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    run: SeqRun<'_>,
+    lits: S,
+    mode: M,
 ) -> Result<usize> {
     let SeqRun {
         oend,
@@ -1921,7 +2108,7 @@ fn decompress_sequences_body_with<S: Source>(
         let mut seq_state = init_seq_state(rep, tables, seq_src)?;
         for remaining in (1..=nb_seq).rev() {
             let sequence = decode_sequence(&mut seq_state, tables, remaining == 1);
-            let one_seq_size = exec_sequence(
+            op += exec_sequence(
                 out,
                 op,
                 oend,
@@ -1931,8 +2118,8 @@ fn decompress_sequences_body_with<S: Source>(
                 lit_end,
                 bo.prefix_start,
                 &bo.ext,
+                mode,
             )?;
-            op += one_seq_size;
         }
 
         // The bitstream must end exactly here.
@@ -2025,6 +2212,7 @@ fn decompress_sequences_body_split_lit_buffer(
                 lit_buffer_end,
                 prefix_start,
                 ext,
+                Checked,
             )?;
             op += one_seq_size;
             nb_seq -= 1;
@@ -2163,6 +2351,7 @@ fn decompress_sequences_long_body(
                     *lit_buffer_end,
                     prefix_start,
                     ext,
+                    Checked,
                 )?;
             } else if *location == LitLocation::Split {
                 *op += exec_sequence_split_lit_buffer(
@@ -2187,6 +2376,7 @@ fn decompress_sequences_long_body(
                     *lit_buffer_end,
                     prefix_start,
                     ext,
+                    Checked,
                 )?;
             }
             Ok(())
@@ -2370,4 +2560,90 @@ pub(crate) fn decompress_block(
 ) -> Result<usize> {
     dctx.is_frame_decompression = false;
     decompress_block_internal(dctx, bo, src, false)
+}
+
+#[cfg(all(test, feature = "unsafe-fast", target_pointer_width = "64"))]
+mod unchecked_tests {
+    //! The fast path's copies in `Unchecked` mode against `Checked`, where
+    //! the main sequence loop would make them, with the margins it keeps and
+    //! no more: the same bytes everywhere. CI runs this under Miri too,
+    //! which catches any access outside the buffers.
+
+    #![allow(unsafe_code)]
+
+    use super::unchecked::Unchecked;
+    use super::*;
+    use crate::oracle::Rng;
+
+    /// `len` bytes to copy, mostly short as in real sequences.
+    fn length(rng: &mut Rng, min: u64) -> usize {
+        let len = match rng.range(0, 3) {
+            0 => rng.range(min, 300),
+            _ => rng.range(min, 40),
+        };
+        len as usize
+    }
+
+    #[test]
+    fn unchecked_copies_are_the_checked_ones() {
+        let mut rng = Rng::new(0x5eed);
+        // SAFETY: every copy below stays within `WILDCOPY_OVERLENGTH` of the
+        // end of what it copies, and its buffers have that margin.
+        let unchecked = unsafe { Unchecked::new() };
+        let rounds = if cfg!(miri) { 400 } else { 50_000 };
+        for _ in 0..rounds {
+            // Literals, from the output, another buffer, or either as
+            // `Lits`, to `op`, read from `at` in a buffer that ends 32 bytes
+            // after them, as the loop checks.
+            let len = length(&mut rng, 0);
+            let op = rng.range(0, 64) as usize;
+            let slack = rng.range(0, 3) as usize;
+            let out = rng.bytes(op + len + WILDCOPY_OVERLENGTH + slack);
+            let before = rng.range(0, 64) as usize;
+            let extra = rng.bytes(before + len + WILDCOPY_OVERLENGTH);
+            let at = rng.range(0, before as u64) as usize;
+            let (mut a, mut b) = (out.clone(), out.clone());
+            match rng.range(0, 3) {
+                0 => {
+                    fast_literals(&mut a, op, &extra[..], at, len, Checked);
+                    fast_literals(&mut b, op, &extra[..], at, len, unchecked);
+                }
+                1 => {
+                    fast_literals(&mut a, op, Lits::Buf(&extra), at, len, Checked);
+                    fast_literals(&mut b, op, Lits::Buf(&extra), at, len, unchecked);
+                }
+                kind => {
+                    // In the output, after where they go: `ZSTD_in_dst`.
+                    let lits = rng.bytes(len + WILDCOPY_OVERLENGTH);
+                    let at = a.len();
+                    a.extend_from_slice(&lits);
+                    b.extend_from_slice(&lits);
+                    if kind == 2 {
+                        fast_literals(&mut a, op, FromOut, at, len, Checked);
+                        fast_literals(&mut b, op, FromOut, at, len, unchecked);
+                    } else {
+                        fast_literals(&mut a, op, Lits::Out, at, len, Checked);
+                        fast_literals(&mut b, op, Lits::Out, at, len, unchecked);
+                    }
+                }
+            }
+            assert_eq!(a, b, "literals: {len} bytes to {op} from {at}");
+
+            // A match, at every short offset and some long ones, ending 32
+            // bytes before the end of the output, as the loop checks.
+            let offset = match rng.range(0, 2) {
+                0 => rng.range(1, 40),
+                _ => rng.range(1, 400),
+            };
+            let offset = offset as usize;
+            let len = length(&mut rng, 3);
+            let op = offset + rng.range(0, 64) as usize;
+            let slack = rng.range(0, 3) as usize;
+            let out = rng.bytes(op + len + WILDCOPY_OVERLENGTH + slack);
+            let (mut a, mut b) = (out.clone(), out);
+            fast_match(&mut a, op, op - offset, len, Checked);
+            fast_match(&mut b, op, op - offset, len, unchecked);
+            assert_eq!(a, b, "match: {len} bytes to {op} from {offset} back");
+        }
+    }
 }

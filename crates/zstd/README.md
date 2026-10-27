@@ -2,7 +2,7 @@
 
 Zstandard (zstd) compression and decompression in safe Rust, ported from the official library, [libzstd](https://github.com/facebook/zstd) 1.5.7.
 
-> **Status:** decompression works, in one call or streaming, with dictionaries, and gives the same output and errors as libzstd on all the test data. It runs at about 0.9× libzstd's speed on Apple M1 (x86-64 is not measured yet). The encoder comes next. This crate is not on crates.io.
+> **Status:** decompression works, in one call or streaming, with dictionaries, and gives the same output and errors as libzstd on all the test data. It runs at about 0.9× libzstd's speed on Apple M1, and about 0.95× with the `unsafe-fast` feature (x86-64 is not measured yet). The encoder comes next. This crate is not on crates.io.
 
 ```rust
 let frame = [
@@ -17,7 +17,7 @@ assert_eq!(&out[..size], b"hello");
 
 The goals:
 
-- **No unsafe code.** The crate forbids it; see [docs/safety.md](../../docs/safety.md).
+- **No unsafe code.** The crate forbids it; see [docs/safety.md](../../docs/safety.md). The one exception is opt-in: the `unsafe-fast` feature copies without bounds checks in the decoder's hottest loop, for 4–6% more speed. See [docs/unsafe.md](../../docs/unsafe.md).
 - **The same output as libzstd.** Compressed output is identical byte for byte at every level. Decompression gives the same result and the same errors.
 - **The same speed as libzstd**, on x86-64 and arm64.
 

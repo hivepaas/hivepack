@@ -6,15 +6,15 @@ These rules hold for every crate in the repository. CI checks the parts a tool c
 
 The workspace sets `unsafe_code = "forbid"`, and every crate inherits it with `[lints] workspace = true`. `forbid` cannot be lifted by an `allow` further in, so no `unsafe` block, `unsafe fn` or `#[no_mangle]` compiles anywhere.
 
-There are no exceptions today. Adding one takes all of these steps:
+There is one exception, and it is opt-in: the `unsafe-fast` feature of `hivepack-zstd`, which copies without bounds checks in the decoder's main sequence loop (see [unsafe.md](unsafe.md)). Without the feature, that crate forbids unsafe code too. Adding an exception takes all of these steps:
 
 1. Show with numbers from `tools/zstd-bench` (same machine, interleaved rounds) that the safe code misses the speed target in [porting.md](porting.md), and that the unsafe code closes the gap.
 2. Keep the unsafe code in one module, as small as it can be. Every block gets a `// SAFETY:` comment that says why it is sound, and preconditions are checked once at the module's entry.
 3. Cover it with tests, fuzzing and Miri.
 4. Record it in [unsafe.md](unsafe.md): where it is, why, the numbers, and how it is checked.
-5. HivePaaS approves it before it merges. Only that crate then moves from `forbid` to `deny`, with `#[allow(unsafe_code)]` on that one module.
+5. HivePaaS approves it before it merges. Only that crate then moves from `forbid` to `deny`, with `#[allow(unsafe_code)]` on that one module. Where it can be, it is a feature that is off by default, and the crate forbids unsafe code without it.
 
-These are the places in libzstd where safe Rust is known to fall short. None of them is an exception yet; each one is measured first, while the safe code is tried.
+These are the places in libzstd where safe Rust is known to fall short. Each one is measured first, while the safe code is tried; only the last but one is an exception so far, behind a feature.
 
 | In libzstd | Why safe Rust cannot do the same (Rust 1.99) | Safe approach first |
 |---|---|---|
@@ -22,7 +22,7 @@ These are the places in libzstd where safe Rust is known to fall short. None of 
 | The x86-64 Huffman decoding loop in assembly (`huf_decompress_amd64.S`) | No assembly | Port the C loop that libzstd uses everywhere else |
 | SSE2 and NEON in the row-based match finder (`zstd_lazy.c`) | Loads through `core::arch` take raw pointers, and any `#[target_feature]` call needs `unsafe`, even for SSE2 and NEON, which are always present | Eight-byte words (SWAR), and loops the compiler vectorises |
 | Prefetching (`PREFETCH_L1`) in the decoder and the match finders | No safe prefetch on stable Rust | Measure what it is worth. In the decoder it is worth nothing: a `prfm` where libzstd prefetches each match, tried through `asm!`, changed speeds by −2.5% to +0.2% (Apple M1 Pro, October 2026). The match finders are measured with the encoder |
-| Unchecked reads in hot loops | Bounds checks cost time | Buffers with slack and fixed-size arrays, so the checks fold away. Measured in the decoder (Apple M1 Pro, October 2026): with the sequence loop's copies and the bitstreams' 8-byte reads unchecked, decompression goes from 0.92× to 0.97× libzstd on average over Silesia. The compiler cannot see that libzstd's fast-path condition keeps them in bounds. A candidate exception, not approved |
+| Unchecked reads in hot loops | Bounds checks cost time | Buffers with slack and fixed-size arrays, so the checks fold away. Measured in the decoder (Apple M1 Pro, October 2026): the compiler cannot see that libzstd's fast-path condition keeps the sequence loop's copies in bounds. With them unchecked, decompression goes from 0.92× to 0.95× libzstd on average over Silesia in one call, and from 0.90× to 0.96× streaming: the `unsafe-fast` feature, approved (see [unsafe.md](unsafe.md)). The bitstreams' 8-byte reads stay checked |
 | Output buffers that are never initialised | Needs `unsafe` | Zero them first, which costs little |
 
 ## Untrusted input never panics

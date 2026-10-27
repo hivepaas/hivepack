@@ -118,7 +118,11 @@ struct Hivepack {
 
 impl Codec for Hivepack {
     fn name(&self) -> String {
-        "hivepack-zstd".into()
+        if hivepack_zstd::UNSAFE_FAST {
+            "hivepack-zstd (unsafe-fast)".into()
+        } else {
+            "hivepack-zstd".into()
+        }
     }
 
     fn compresses(&self) -> bool {

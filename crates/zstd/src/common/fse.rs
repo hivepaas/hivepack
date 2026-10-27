@@ -1,6 +1,6 @@
-//! Finite State Entropy: port of the decoding parts of `common/fse.h`.
+//! Finite State Entropy: port of `common/fse.h`.
 
-use super::bitstream::BitDStream;
+use super::bitstream::{BitCStream, BitDStream};
 
 /// `FSE_MAX_MEMORY_USAGE`
 pub(crate) const FSE_MAX_MEMORY_USAGE: u32 = 14;
@@ -155,4 +155,188 @@ impl FseDState {
     pub(crate) fn end_of_dstate(&self) -> bool {
         self.state == 0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding
+
+/// `FSE_NCOUNTBOUND`: the largest table description.
+pub(crate) const FSE_NCOUNTBOUND: usize = 512;
+
+/// `FSE_BLOCKBOUND`: the largest FSE-compressed size of `size` bytes, with
+/// a 64-bit register.
+pub(crate) const fn fse_blockbound(size: usize) -> usize {
+    size + (size >> 7) + 4 + 8
+}
+
+/// `FSE_COMPRESSBOUND`
+pub(crate) const fn fse_compressbound(size: usize) -> usize {
+    FSE_NCOUNTBOUND + fse_blockbound(size)
+}
+
+/// `FSE_CTABLE_SIZE_U32`: the words of an `FSE_CTable` for tables up to
+/// `max_table_log` and symbols up to `max_symbol_value`.
+pub(crate) const fn fse_ctable_size_u32(max_table_log: u32, max_symbol_value: u32) -> usize {
+    1 + (1 << (max_table_log - 1)) + (max_symbol_value as usize + 1) * 2
+}
+
+// An `FSE_CTable` is an array of `U32` words, laid out as libzstd lays it
+// out, since libzstd keeps tables from block to block and reads them back
+// through the same layout: a header of two `U16` (the table log and the
+// largest symbol), then the state table, `1 << tableLog` `U16`, then from
+// word `1 + (1 << (tableLog - 1))` (word 2 for the RLE table of log 0) an
+// `FSE_symbolCompressionTransform` of two words per symbol. The `U16` are
+// the halves of the words, the low half first, as on the little-endian
+// machines where libzstd runs.
+
+/// The `U16` at index `at` of an `FSE_CTable`.
+#[inline(always)]
+pub(crate) fn ctable_u16(ct: &[u32], at: usize) -> u16 {
+    (ct[at / 2] >> (16 * (at % 2))) as u16
+}
+
+/// Sets the `U16` at index `at` of an `FSE_CTable`.
+#[inline(always)]
+pub(crate) fn set_ctable_u16(ct: &mut [u32], at: usize, value: u16) {
+    let shift = 16 * (at % 2);
+    let word = &mut ct[at / 2];
+    *word = (*word & !(0xFFFF << shift)) | (u32::from(value) << shift);
+}
+
+/// The word index of the symbol transforms in a table of `table_log`.
+#[inline(always)]
+pub(crate) const fn symbol_tt_start(table_log: u32) -> usize {
+    1 + if table_log > 0 {
+        1 << (table_log - 1)
+    } else {
+        1
+    }
+}
+
+/// `FSE_symbolCompressionTransform`
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FseSymbolTransform {
+    pub(crate) delta_find_state: i32,
+    pub(crate) delta_nb_bits: u32,
+}
+
+/// The transform of `symbol`, from the transforms at word `symbol_tt`.
+#[inline(always)]
+pub(crate) fn symbol_transform(ct: &[u32], symbol_tt: usize, symbol: u32) -> FseSymbolTransform {
+    let at = symbol_tt + 2 * symbol as usize;
+    FseSymbolTransform {
+        delta_find_state: ct[at] as i32,
+        delta_nb_bits: ct[at + 1],
+    }
+}
+
+/// Sets the transform of `symbol`.
+#[inline(always)]
+pub(crate) fn set_symbol_transform(
+    ct: &mut [u32],
+    symbol_tt: usize,
+    symbol: u32,
+    transform: FseSymbolTransform,
+) {
+    let at = symbol_tt + 2 * symbol as usize;
+    ct[at] = transform.delta_find_state as u32;
+    ct[at + 1] = transform.delta_nb_bits;
+}
+
+/// `FSE_CState_t`: an encoder's state, over the table it encodes with.
+pub(crate) struct FseCState<'a> {
+    value: i64,
+    ct: &'a [u32],
+    /// Where the symbol transforms start, in words.
+    symbol_tt: usize,
+    state_log: u32,
+}
+
+impl<'a> FseCState<'a> {
+    /// `FSE_initCState`
+    #[inline(always)]
+    pub(crate) fn new(ct: &'a [u32]) -> Self {
+        let table_log = u32::from(ctable_u16(ct, 0));
+        FseCState {
+            value: 1 << table_log,
+            ct,
+            symbol_tt: symbol_tt_start(table_log),
+            state_log: table_log,
+        }
+    }
+
+    /// `FSE_initCState2`: starts with `symbol`, the last one the decoder
+    /// will read, at the smallest state that has it, which saves its bits.
+    #[inline(always)]
+    pub(crate) fn new2(ct: &'a [u32], symbol: u32) -> Self {
+        let mut state = FseCState::new(ct);
+        let transform = symbol_transform(ct, state.symbol_tt, symbol);
+        let nb_bits_out = transform.delta_nb_bits.wrapping_add(1 << 15) >> 16;
+        let value = (nb_bits_out << 16).wrapping_sub(transform.delta_nb_bits);
+        state.value = state.next_state(i64::from(value) >> nb_bits_out, transform);
+        state
+    }
+
+    /// The state table's entry for `base` plus the symbol's offset.
+    #[inline(always)]
+    fn next_state(&self, base: i64, transform: FseSymbolTransform) -> i64 {
+        let at = base + i64::from(transform.delta_find_state);
+        i64::from(ctable_u16(self.ct, 2 + at as usize))
+    }
+
+    /// The word where the symbol transforms start, for [`fse_bit_cost`] and
+    /// [`fse_get_max_nb_bits`].
+    pub(crate) fn symbol_tt(&self) -> usize {
+        self.symbol_tt
+    }
+
+    /// `FSE_encodeSymbol`
+    #[inline(always)]
+    pub(crate) fn encode_symbol(&mut self, bit_c: &mut BitCStream<'_>, symbol: u32) {
+        let transform = symbol_transform(self.ct, self.symbol_tt, symbol);
+        let nb_bits_out = ((self.value + i64::from(transform.delta_nb_bits)) >> 16) as u32;
+        bit_c.add_bits(self.value as u64, nb_bits_out);
+        self.value = self.next_state(self.value >> nb_bits_out, transform);
+    }
+
+    /// `FSE_flushCState`
+    #[inline(always)]
+    pub(crate) fn flush(&self, bit_c: &mut BitCStream<'_>) {
+        bit_c.add_bits(self.value as u64, self.state_log);
+        bit_c.flush_bits();
+    }
+}
+
+/// `FSE_getMaxNbBits`: about the most bits `symbol` costs, rounded up; for
+/// a symbol absent from the table, `tableLog + 1`.
+#[inline(always)]
+pub(crate) fn fse_get_max_nb_bits(ct: &[u32], symbol_tt: usize, symbol: u32) -> u32 {
+    symbol_transform(ct, symbol_tt, symbol)
+        .delta_nb_bits
+        .wrapping_add((1 << 16) - 1)
+        >> 16
+}
+
+/// `FSE_bitCost`: about the cost of `symbol`, in bits with `accuracy_log`
+/// fractional bits; for a symbol absent from the table, `tableLog + 1`.
+#[inline(always)]
+pub(crate) fn fse_bit_cost(
+    ct: &[u32],
+    symbol_tt: usize,
+    table_log: u32,
+    symbol: u32,
+    accuracy_log: u32,
+) -> u32 {
+    let delta_nb_bits = symbol_transform(ct, symbol_tt, symbol).delta_nb_bits;
+    let min_nb_bits = delta_nb_bits >> 16;
+    let threshold = (min_nb_bits + 1) << 16;
+    debug_assert!(table_log < 16);
+    debug_assert!(accuracy_log < 31 - table_log);
+    let table_size = 1u32 << table_log;
+    let delta_from_threshold = threshold.wrapping_sub(delta_nb_bits.wrapping_add(table_size));
+    // A linear interpolation, very approximate.
+    let normalized_delta_from_threshold =
+        delta_from_threshold.wrapping_shl(accuracy_log) >> table_log;
+    let bit_multiplier = 1u32 << accuracy_log;
+    ((min_nb_bits + 1) * bit_multiplier).wrapping_sub(normalized_delta_from_threshold)
 }

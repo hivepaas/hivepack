@@ -1,11 +1,18 @@
-//! Reading bitstreams backwards: port of the decoding half of
+//! Bitstreams, written forwards and read backwards: port of
 //! `common/bitstream.h`.
 //!
 //! zstd writes its entropy-coded streams forwards and reads them backwards,
-//! from the last byte to the first. The reader keeps a window of the stream
-//! in a register and refills it from memory.
+//! from the last byte to the first. The writer collects bits in a register
+//! and flushes whole bytes to memory; the reader keeps a window of the
+//! stream in a register and refills it from memory.
 //!
-//! Differs from libzstd:
+//! The writer's register is 64 bits on every machine, as on 64-bit machines
+//! in libzstd; the bytes written are the same with a 32-bit one, which
+//! flushes more often. What does depend on it is when a stream is found not
+//! to fit (see [`BitCStream::close`]), and there the port does what libzstd
+//! does on 64-bit machines.
+//!
+//! Differs from libzstd, for the reader:
 //! - The register is 64 bits on every machine. libzstd uses `size_t`, so 32
 //!   bits on 32-bit machines, where it refills more often. The bits read are
 //!   the same.
@@ -21,12 +28,119 @@
 
 use super::bits::highbit32;
 use super::error_private::{Result, error};
-use super::mem::read_le64;
+use super::mem::{read_le64, write_le64};
 
 /// The size of the register, in bytes: `sizeof(bitD->bitContainer)` on a
 /// 64-bit machine.
 const CONTAINER_BYTES: usize = 8;
 const CONTAINER_BITS: u32 = 64;
+
+/// `BIT_mask`: the low `n` bits, for `n` up to 31.
+const BIT_MASK: [u32; 32] = {
+    let mut mask = [0u32; 32];
+    let mut n = 0;
+    while n < 32 {
+        mask[n] = ((1u64 << n) - 1) as u32;
+        n += 1;
+    }
+    mask
+};
+
+/// `BIT_CStream_t`: a bitstream being written into `dst`.
+///
+/// Positions are indices into `dst`, as libzstd's pointers would be. Every
+/// flush writes a whole register at the position, which never passes
+/// `dst.len() - 8` (`endPtr`), so the write stays inside `dst`.
+pub(crate) struct BitCStream<'a> {
+    bit_container: u64,
+    bit_pos: u32,
+    dst: &'a mut [u8],
+    ptr: usize,
+    end_ptr: usize,
+}
+
+impl<'a> BitCStream<'a> {
+    /// `BIT_initCStream`: `dst` must be longer than the register.
+    pub(crate) fn new(dst: &'a mut [u8]) -> Result<Self> {
+        if dst.len() <= CONTAINER_BYTES {
+            return error!(DstSizeTooSmall);
+        }
+        let end_ptr = dst.len() - CONTAINER_BYTES;
+        Ok(BitCStream {
+            bit_container: 0,
+            bit_pos: 0,
+            dst,
+            ptr: 0,
+            end_ptr,
+        })
+    }
+
+    /// The bits the register holds, not yet flushed.
+    pub(crate) fn bit_pos(&self) -> u32 {
+        self.bit_pos
+    }
+
+    /// `BIT_addBits`: up to 31 bits, the low ones of `value`. The register
+    /// must have room for them.
+    #[inline(always)]
+    pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
+        debug_assert!(nb_bits < 32);
+        debug_assert!(nb_bits + self.bit_pos < CONTAINER_BITS);
+        // BIT_getLowerBits
+        self.bit_container |= (value & u64::from(BIT_MASK[nb_bits as usize])) << self.bit_pos;
+        self.bit_pos += nb_bits;
+    }
+
+    /// `BIT_addBitsFast`: `value` must have no bits above `nb_bits`.
+    #[inline(always)]
+    pub(crate) fn add_bits_fast(&mut self, value: u64, nb_bits: u32) {
+        debug_assert!(value >> nb_bits == 0);
+        debug_assert!(nb_bits + self.bit_pos < CONTAINER_BITS);
+        self.bit_container |= value << self.bit_pos;
+        self.bit_pos += nb_bits;
+    }
+
+    /// `BIT_flushBitsFast`: only when the stream is known to fit, so that
+    /// the position stays at or before `endPtr`.
+    #[inline(always)]
+    pub(crate) fn flush_bits_fast(&mut self) {
+        let nb_bytes = (self.bit_pos >> 3) as usize;
+        debug_assert!(self.bit_pos < CONTAINER_BITS);
+        debug_assert!(self.ptr <= self.end_ptr);
+        write_le64(self.dst, self.ptr, self.bit_container);
+        self.ptr += nb_bytes;
+        self.bit_pos &= 7;
+        self.bit_container = self.bit_container.wrapping_shr(nb_bytes as u32 * 8);
+    }
+
+    /// `BIT_flushBits`: never moves past `endPtr`. A stream that does not
+    /// fit shows only when it is closed.
+    #[inline(always)]
+    pub(crate) fn flush_bits(&mut self) {
+        let nb_bytes = (self.bit_pos >> 3) as usize;
+        debug_assert!(self.bit_pos < CONTAINER_BITS);
+        debug_assert!(self.ptr <= self.end_ptr);
+        write_le64(self.dst, self.ptr, self.bit_container);
+        self.ptr += nb_bytes;
+        if self.ptr > self.end_ptr {
+            self.ptr = self.end_ptr;
+        }
+        self.bit_pos &= 7;
+        self.bit_container = self.bit_container.wrapping_shr(nb_bytes as u32 * 8);
+    }
+
+    /// `BIT_closeCStream`: adds the end mark and flushes. Returns the size
+    /// of the stream, or 0 if it did not fit: when it reached `endPtr`,
+    /// 8 bytes before the end of `dst`.
+    pub(crate) fn close(mut self) -> usize {
+        self.add_bits_fast(1, 1); // the end mark
+        self.flush_bits();
+        if self.ptr >= self.end_ptr {
+            return 0;
+        }
+        self.ptr + usize::from(self.bit_pos > 0)
+    }
+}
 
 /// `BIT_DStream_status`: what a refill found.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]

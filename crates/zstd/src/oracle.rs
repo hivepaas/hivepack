@@ -48,7 +48,7 @@ use crate::decompress::zstd_decompress_internal::{DCtx, ExtDict};
 const FSE_DECOMPRESS_MAX_WKSP: usize =
     fse_decompress_wksp_size_u32(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE) * 4;
 
-fn repository() -> PathBuf {
+pub(crate) fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
@@ -119,7 +119,7 @@ impl Drop for Oracle {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "-".into();
     }
@@ -130,7 +130,7 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-fn unhex(text: &str) -> Vec<u8> {
+pub(crate) fn unhex(text: &str) -> Vec<u8> {
     if text == "-" {
         return Vec::new();
     }
@@ -139,7 +139,7 @@ fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn list<T: std::fmt::Display>(values: impl IntoIterator<Item = T>) -> String {
+pub(crate) fn list<T: std::fmt::Display>(values: impl IntoIterator<Item = T>) -> String {
     let text: Vec<String> = values.into_iter().map(|v| v.to_string()).collect();
     if text.is_empty() {
         "-".into()
@@ -148,7 +148,7 @@ fn list<T: std::fmt::Display>(values: impl IntoIterator<Item = T>) -> String {
     }
 }
 
-fn unlist(text: &str) -> Vec<i64> {
+pub(crate) fn unlist(text: &str) -> Vec<i64> {
     if text == "-" {
         return Vec::new();
     }
@@ -157,7 +157,7 @@ fn unlist(text: &str) -> Vec<i64> {
         .collect()
 }
 
-fn failed(error: Error) -> String {
+pub(crate) fn failed(error: Error) -> String {
     format!("err {}", error.code().number())
 }
 
@@ -445,7 +445,8 @@ pub(crate) fn answer(request: &str) -> String {
             "ok {:016x}",
             xxh64(&unhex(src), seed.parse().expect("seed"))
         ),
-        _ => panic!("unknown request {request:.200}"),
+        // The encoder's requests.
+        _ => crate::oracle_compress::answer(request),
     }
 }
 
@@ -552,7 +553,7 @@ impl Rng {
 }
 
 /// A copy of `bytes` with one bit flipped, a byte changed, or cut short.
-fn mutate(rng: &mut Rng, bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn mutate(rng: &mut Rng, bytes: &[u8]) -> Vec<u8> {
     let mut bytes = bytes.to_vec();
     if bytes.is_empty() {
         return bytes;
@@ -574,7 +575,7 @@ fn mutate(rng: &mut Rng, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Valid table descriptions from libzstd's own encoder.
-fn made(oracle: &mut Oracle, request: &str) -> Option<Vec<u8>> {
+pub(crate) fn made(oracle: &mut Oracle, request: &str) -> Option<Vec<u8>> {
     let reply = oracle.ask(request);
     reply.strip_prefix("ok ").map(unhex)
 }
@@ -972,14 +973,14 @@ fn corpus_requests() -> Vec<String> {
 
 /// FNV-1a, to record long answers by their hash, and to answer with outputs
 /// briefly.
-fn fnv64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
 /// What the replay file keeps of an answer: all of it, or the hash of a long one.
-fn recorded_form(answer: &str) -> String {
+pub(crate) fn recorded_form(answer: &str) -> String {
     if answer.len() <= 160 {
         answer.to_string()
     } else {

@@ -47,4 +47,4 @@ Each set has a `kind`:
 
 zstd's `tests/gzip` is GPLv3, and nothing is taken from it.
 
-`oracle/common.txt` holds answers the oracle gave (requests, then libzstd's answer or its FNV-1a hash when long). The port's tests replay them where the oracle cannot be built; `cargo test -p hivepack-zstd record_oracle_answers -- --ignored` rewrites the file.
+`oracle/common.txt` holds answers the oracle gave (requests, then libzstd's answer or its FNV-1a hash when long). The port's tests replay them where the oracle cannot be built; `cargo test -p hivepack-zstd record_oracle_answers -- --ignored` rewrites the file. `oracle/compress.txt` does the same for the encoder's requests, and `cargo test -p hivepack-zstd record_compress_answers -- --ignored` rewrites it.

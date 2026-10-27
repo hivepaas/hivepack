@@ -245,7 +245,7 @@ pub(crate) fn answer(request: &str) -> String {
                 Ok(size) => {
                     let mut text = format!("ok {size} {}", dtable.desc.table_log);
                     for cell in &dtable.x1[..1 << dtable.desc.table_log] {
-                        let _ = write!(text, " {}:{}", cell.nb_bits, cell.byte);
+                        let _ = write!(text, " {}:{}", cell.nb_bits(), cell.byte());
                     }
                     text
                 }
@@ -259,7 +259,13 @@ pub(crate) fn answer(request: &str) -> String {
                 Ok(size) => {
                     let mut text = format!("ok {size} {}", dtable.desc.table_log);
                     for cell in &dtable.x2[..1 << dtable.desc.table_log] {
-                        let _ = write!(text, " {}:{}:{}", cell.sequence, cell.nb_bits, cell.length);
+                        let _ = write!(
+                            text,
+                            " {}:{}:{}",
+                            cell.sequence(),
+                            cell.nb_bits(),
+                            cell.length()
+                        );
                     }
                     text
                 }

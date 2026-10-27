@@ -4,11 +4,12 @@
 //! coded) and a sequences section: FSE-coded (literal length, match length,
 //! offset) triples that rebuild the block from the literals and the window.
 //!
-//! Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes
-//! past the end of a copy, the port copies the exact length, with the same
-//! result: the extra bytes libzstd writes always land where later writes go,
-//! on literals already read, or past the decoded output. libzstd keeps
-//! literals in the output buffer when it has room (`ZSTD_in_dst`,
+//! Literals and matches are copied as libzstd copies them, with
+//! `ZSTD_wildcopy` and the copies built on it: in pieces of 8, 16 or 32
+//! bytes, which write up to 32 bytes past the end of a copy, within the
+//! margins (`WILDCOPY_OVERLENGTH`) libzstd keeps in every buffer. The output
+//! then holds what libzstd's holds, those extra bytes included. libzstd
+//! keeps literals in the output buffer when it has room (`ZSTD_in_dst`,
 //! `ZSTD_split`), and the port puts them in the same place, since corrupted
 //! input can make the output run over them; the checks libzstd makes there
 //! are ported too.
@@ -20,7 +21,7 @@ use crate::common::error_private::{Error, ErrorCode, Result, error};
 use crate::common::fse::fse_tablestep;
 use crate::common::fse_decompress::FseBuildDTableWksp;
 use crate::common::huf::{HUF_FLAGS_BMI2, HUF_FLAGS_DISABLE_ASM};
-use crate::common::mem::{read_le16, read_le24, read_le32};
+use crate::common::mem::{idx, read_le16, read_le24, read_le32};
 use crate::common::zstd_internal::{
     BlockType, LL_BITS, LL_DEFAULT_NORM_LOG, LL_FSE_LOG, LONGNBSEQ, MAX_LL, MAX_ML, MAX_OFF,
     MAX_SEQ, MIN_CBLOCK_SIZE, MIN_LITERALS_FOR_4_STREAMS, MIN_SEQUENCES_SIZE, ML_BITS,
@@ -32,8 +33,9 @@ use crate::decompress::huf_decompress::{
     huf_decompress4x_using_dtable,
 };
 use crate::decompress::zstd_decompress_internal::{
-    DCtx, EntropyDTables, ExtDict, LL_BASE, LitBuf, LitLocation, LitPos, ML_BASE, OF_BASE, OF_BITS,
-    SeqDTable, SeqSymbol, TableRef, WILDCOPY_OVERLENGTH, ZSTD_LITBUFFEREXTRASIZE, sym,
+    DCtx, EntropyDTables, ExtDict, LL_BASE, LL_TABLE_CELLS, LitBuf, LitLocation, LitPos, ML_BASE,
+    ML_TABLE_CELLS, OF_BASE, OF_BITS, OF_TABLE_CELLS, SeqDTable, SeqSymbol, TableRef,
+    WILDCOPY_OVERLENGTH, ZSTD_LITBUFFEREXTRASIZE, sym,
 };
 
 /// How often each path ran, so the tests can check they reach all of them:
@@ -628,12 +630,7 @@ pub(crate) const ML_DEFAULT_DTABLE: [SeqSymbol; 64] = [
 fn build_seq_table_rle<const N: usize>(dt: &mut SeqDTable<N>, base_value: u32, nb_add_bits: u8) {
     dt.table_log = 0;
     dt.fast_mode = false;
-    dt.cells[0] = SeqSymbol {
-        nb_bits: 0,
-        next_state: 0,
-        nb_additional_bits: nb_add_bits,
-        base_value,
-    };
+    dt.cells[0] = sym(0, nb_add_bits, 0, base_value);
 }
 
 /// `ZSTD_buildFSETable`: the decoding table of one field (literal lengths,
@@ -666,7 +663,7 @@ pub(crate) fn build_fse_table<const N: usize>(
         let large_limit = (1i32 << (table_log - 1)) as i16;
         for s in 0..max_sv1 {
             if normalized_counter[s] == -1 {
-                table_decode[high_threshold as usize].base_value = s as u32;
+                table_decode[high_threshold as usize] = sym(0, 0, 0, s as u32);
                 high_threshold = high_threshold.wrapping_sub(1);
                 symbol_next[s] = 1;
             } else {
@@ -705,7 +702,7 @@ pub(crate) fn build_fse_table<const N: usize>(
         while s < table_size as usize {
             for u in 0..2 {
                 let u_position = (position + u * step) & table_mask;
-                table_decode[u_position].base_value = u32::from(wksp.spread[s + u]);
+                table_decode[u_position] = sym(0, 0, 0, u32::from(wksp.spread[s + u]));
             }
             position = (position + 2 * step) & table_mask;
             s += 2;
@@ -718,7 +715,7 @@ pub(crate) fn build_fse_table<const N: usize>(
         for s in 0..max_sv1 {
             let n = i32::from(normalized_counter[s]);
             for _ in 0..n {
-                table_decode[position as usize].base_value = s as u32;
+                table_decode[position as usize] = sym(0, 0, 0, s as u32);
                 position = (position + step) & table_mask;
                 while position > high_threshold {
                     // The low-probability area.
@@ -731,14 +728,16 @@ pub(crate) fn build_fse_table<const N: usize>(
 
     // Build the decoding table.
     for u in 0..table_size as usize {
-        let symbol = table_decode[u].base_value as usize;
+        let symbol = table_decode[u].base_value() as usize;
         let next_state = u32::from(symbol_next[symbol]);
         symbol_next[symbol] = symbol_next[symbol].wrapping_add(1);
         let nb_bits = (table_log - highbit32(next_state)) as u8;
-        table_decode[u].nb_bits = nb_bits;
-        table_decode[u].next_state = ((next_state << nb_bits) - table_size) as u16;
-        table_decode[u].nb_additional_bits = nb_additional_bits[symbol];
-        table_decode[u].base_value = base_value[symbol];
+        table_decode[u] = sym(
+            ((next_state << nb_bits) - table_size) as u16,
+            nb_additional_bits[symbol],
+            nb_bits,
+            base_value[symbol],
+        );
     }
 }
 
@@ -922,19 +921,46 @@ pub(crate) fn decode_seq_headers(
 }
 
 /// A table that `LLTptr`, `OFTptr` or `MLTptr` points to: its cells and log.
+///
+/// Every table has room for the largest log, so that a state, always below
+/// `1 << table_log`, can index it with a mask instead of a bounds check.
 #[derive(Clone, Copy)]
-struct SeqTableView<'a> {
-    cells: &'a [SeqSymbol],
+struct SeqTableView<'a, const N: usize> {
+    cells: &'a [SeqSymbol; N],
     table_log: u32,
 }
+
+impl<const N: usize> SeqTableView<'_, N> {
+    /// The cell of `state`.
+    #[inline(always)]
+    fn cell(&self, state: usize) -> SeqSymbol {
+        const { assert!(N.is_power_of_two()) };
+        self.cells[state & (N - 1)]
+    }
+}
+
+/// A predefined table, with room for the largest log.
+const fn padded<const M: usize, const N: usize>(table: &[SeqSymbol; M]) -> [SeqSymbol; N] {
+    let mut cells = [sym(0, 0, 0, 0); N];
+    let mut i = 0;
+    while i < M {
+        cells[i] = table[i];
+        i += 1;
+    }
+    cells
+}
+
+static LL_DEFAULT_CELLS: [SeqSymbol; LL_TABLE_CELLS] = padded(&LL_DEFAULT_DTABLE);
+static OF_DEFAULT_CELLS: [SeqSymbol; OF_TABLE_CELLS] = padded(&OF_DEFAULT_DTABLE);
+static ML_DEFAULT_CELLS: [SeqSymbol; ML_TABLE_CELLS] = padded(&ML_DEFAULT_DTABLE);
 
 fn seq_table<'a, const N: usize>(
     which: TableRef,
     own: &'a SeqDTable<N>,
     dict: Option<&'a SeqDTable<N>>,
-    default: &'a [SeqSymbol],
+    default: &'a [SeqSymbol; N],
     default_log: u32,
-) -> SeqTableView<'a> {
+) -> SeqTableView<'a, N> {
     let table = match which {
         TableRef::Default => {
             return SeqTableView {
@@ -966,6 +992,7 @@ struct Seq {
 
 /// `seqState_t`, with the three FSE states (`ZSTD_fseState`) as just the
 /// state; the tables are passed alongside.
+#[derive(Clone)]
 struct SeqState<'a> {
     d_stream: BitDStream<'a>,
     state_ll: usize,
@@ -977,13 +1004,13 @@ struct SeqState<'a> {
 /// The three tables the sequences are decoded with.
 #[derive(Clone, Copy)]
 struct SeqTables<'a> {
-    ll: SeqTableView<'a>,
-    of: SeqTableView<'a>,
-    ml: SeqTableView<'a>,
+    ll: SeqTableView<'a, LL_TABLE_CELLS>,
+    of: SeqTableView<'a, OF_TABLE_CELLS>,
+    ml: SeqTableView<'a, ML_TABLE_CELLS>,
 }
 
 /// `ZSTD_initFseState`
-fn init_fse_state(bit_d: &mut BitDStream<'_>, table: SeqTableView<'_>) -> usize {
+fn init_fse_state<const N: usize>(bit_d: &mut BitDStream<'_>, table: SeqTableView<'_, N>) -> usize {
     let state = bit_d.read_bits(table.table_log) as usize;
     bit_d.reload();
     state
@@ -996,18 +1023,18 @@ const STREAM_ACCUMULATOR_MIN_64: u32 = 57;
 /// in the middle (the `longOffsets` case of 32-bit machines).
 #[inline(always)]
 fn decode_sequence(seq_state: &mut SeqState<'_>, tables: SeqTables<'_>, is_last_seq: bool) -> Seq {
-    let ll_d_info = tables.ll.cells[seq_state.state_ll];
-    let ml_d_info = tables.ml.cells[seq_state.state_ml];
-    let of_d_info = tables.of.cells[seq_state.state_offb];
+    let ll_d_info = tables.ll.cell(seq_state.state_ll);
+    let ml_d_info = tables.ml.cell(seq_state.state_ml);
+    let of_d_info = tables.of.cell(seq_state.state_offb);
     let mut seq = Seq {
-        match_length: ml_d_info.base_value as usize,
-        lit_length: ll_d_info.base_value as usize,
+        match_length: ml_d_info.base_value() as usize,
+        lit_length: ll_d_info.base_value() as usize,
         offset: 0,
     };
-    let of_base = of_d_info.base_value as usize;
-    let ll_bits = u32::from(ll_d_info.nb_additional_bits);
-    let ml_bits = u32::from(ml_d_info.nb_additional_bits);
-    let of_bits = u32::from(of_d_info.nb_additional_bits);
+    let of_base = of_d_info.base_value() as usize;
+    let ll_bits = u32::from(ll_d_info.nb_additional_bits());
+    let ml_bits = u32::from(ml_d_info.nb_additional_bits());
+    let of_bits = u32::from(of_d_info.nb_additional_bits());
     let total_bits = ll_bits + ml_bits + of_bits;
     let d = &mut seq_state.d_stream;
     let prev = &mut seq_state.prev_offset;
@@ -1022,7 +1049,7 @@ fn decode_sequence(seq_state: &mut SeqState<'_>, tables: SeqTables<'_>, is_last_
             prev[1] = prev[0];
             prev[0] = offset;
         } else {
-            let ll0 = usize::from(ll_d_info.base_value == 0);
+            let ll0 = usize::from(ll_d_info.base_value() == 0);
             if of_bits == 0 {
                 offset = prev[ll0];
                 prev[1] = prev[1 - ll0];
@@ -1061,110 +1088,470 @@ fn decode_sequence(seq_state: &mut SeqState<'_>, tables: SeqTables<'_>, is_last_
 
     if !is_last_seq {
         // The last sequence does not move the states.
-        seq_state.state_ll =
-            usize::from(ll_d_info.next_state) + d.read_bits(u32::from(ll_d_info.nb_bits)) as usize;
-        seq_state.state_ml =
-            usize::from(ml_d_info.next_state) + d.read_bits(u32::from(ml_d_info.nb_bits)) as usize;
-        seq_state.state_offb =
-            usize::from(of_d_info.next_state) + d.read_bits(u32::from(of_d_info.nb_bits)) as usize;
+        seq_state.state_ll = usize::from(ll_d_info.next_state())
+            + d.read_bits(u32::from(ll_d_info.nb_bits())) as usize;
+        seq_state.state_ml = usize::from(ml_d_info.next_state())
+            + d.read_bits(u32::from(ml_d_info.nb_bits())) as usize;
+        seq_state.state_offb = usize::from(of_d_info.next_state())
+            + d.read_bits(u32::from(of_d_info.nb_bits())) as usize;
         d.reload();
     }
 
     seq
 }
 
-/// Where a sequence's literals are read from.
+/// Where a copy reads from.
 #[derive(Clone, Copy)]
 enum Lits<'a> {
-    /// The output buffer itself (`ZSTD_in_dst`, and the first part of
-    /// `ZSTD_split`).
+    /// The output buffer itself: literals in it (`ZSTD_in_dst`, and the
+    /// first part of `ZSTD_split`), or a match.
     Out,
     /// The extra buffer, or the block's input.
     Buf(&'a [u8]),
 }
 
-/// Copies `len` literals from `lit_pos` to `op`. Within the output, the copy
-/// behaves as `memmove`, as libzstd's copies do there.
-#[inline(always)]
-fn copy_literals(out: &mut [u8], op: usize, lits: Lits<'_>, lit_pos: usize, len: usize) {
-    match lits {
-        Lits::Out => out.copy_within(lit_pos..lit_pos + len, op),
-        Lits::Buf(buf) => out[op..op + len].copy_from_slice(&buf[lit_pos..lit_pos + len]),
+/// What a copy reads from, chosen when the code is compiled where it can
+/// be: the main sequence loop has a copy for each kind of literal buffer, so
+/// that its copies need not ask which one each time.
+trait Source: Copy {
+    /// 16 bytes from `at`.
+    fn read16(self, out: &[u8], at: usize) -> [u8; 16];
+    fn byte(self, out: &[u8], at: usize) -> u8;
+    /// Copies `len` bytes from `at` to `op` exactly, as `memmove` within the
+    /// output.
+    fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize);
+}
+
+/// The output buffer itself.
+#[derive(Clone, Copy)]
+struct FromOut;
+
+impl FromOut {
+    /// 32 bytes from `at`.
+    #[inline(always)]
+    fn read32(self, out: &[u8], at: usize) -> [u8; 32] {
+        let at = idx(at);
+        let mut piece = [0u8; 32];
+        piece.copy_from_slice(&out[at..at + 32]);
+        piece
     }
 }
 
-/// Copies a match of `length` bytes from `offset` bytes back, byte by byte
-/// as LZ77 means it: when the match overlaps its own output, the copied
-/// bytes repeat. This is what libzstd's copies produce.
+impl Source for FromOut {
+    #[inline(always)]
+    fn read16(self, out: &[u8], at: usize) -> [u8; 16] {
+        let at = idx(at);
+        let mut piece = [0u8; 16];
+        piece.copy_from_slice(&out[at..at + 16]);
+        piece
+    }
+
+    #[inline(always)]
+    fn byte(self, out: &[u8], at: usize) -> u8 {
+        out[at]
+    }
+
+    #[inline(always)]
+    fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize) {
+        out.copy_within(at..at + len, op);
+    }
+}
+
+/// Another buffer: the extra buffer, or the block's input.
+impl Source for &[u8] {
+    #[inline(always)]
+    fn read16(self, _out: &[u8], at: usize) -> [u8; 16] {
+        let at = idx(at);
+        let mut piece = [0u8; 16];
+        piece.copy_from_slice(&self[at..at + 16]);
+        piece
+    }
+
+    #[inline(always)]
+    fn byte(self, _out: &[u8], at: usize) -> u8 {
+        self[at]
+    }
+
+    #[inline(always)]
+    fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize) {
+        out[op..op + len].copy_from_slice(&self[at..at + len]);
+    }
+}
+
+/// Either, decided as it runs.
+impl Source for Lits<'_> {
+    #[inline(always)]
+    fn read16(self, out: &[u8], at: usize) -> [u8; 16] {
+        match self {
+            Lits::Out => FromOut.read16(out, at),
+            Lits::Buf(buf) => buf.read16(out, at),
+        }
+    }
+
+    #[inline(always)]
+    fn byte(self, out: &[u8], at: usize) -> u8 {
+        match self {
+            Lits::Out => out[at],
+            Lits::Buf(buf) => buf[at],
+        }
+    }
+
+    #[inline(always)]
+    fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize) {
+        match self {
+            Lits::Out => FromOut.copy_exact(out, op, at, len),
+            Lits::Buf(buf) => buf.copy_exact(out, op, at, len),
+        }
+    }
+}
+
+// libzstd's copies, `ZSTD_copy16`, `ZSTD_wildcopy` and the ones built on
+// them, which copy in pieces of 8 or 16 bytes and so write up to 32 bytes
+// past the end of what they copy. The port does the same, in the same
+// pieces, so that the output buffer holds what libzstd's would, those extra
+// bytes included: libzstd keeps the margins they need (WILDCOPY_OVERLENGTH)
+// in every buffer, and the callers check them. Each piece is read before it
+// is written, as libzstd's vector loads and stores do.
+
+/// `ZSTD_copy4`
 #[inline(always)]
-fn copy_match(out: &mut [u8], op: usize, offset: usize, length: usize) {
-    if offset == 0 {
-        // Valid sequences never have it (see decode_sequence); libzstd would
-        // copy the bytes onto themselves, which changes nothing.
+fn copy4_within(out: &mut [u8], op: usize, ip: usize) {
+    let mut piece = [0u8; 4];
+    piece.copy_from_slice(&out[ip..ip + 4]);
+    out[op..op + 4].copy_from_slice(&piece);
+}
+
+/// `ZSTD_copy8`
+#[inline(always)]
+fn copy8_within(out: &mut [u8], op: usize, ip: usize) {
+    let (op, ip) = (idx(op), idx(ip));
+    let mut piece = [0u8; 8];
+    piece.copy_from_slice(&out[ip..ip + 8]);
+    out[op..op + 8].copy_from_slice(&piece);
+}
+
+/// `ZSTD_copy16`
+#[inline(always)]
+fn copy16<S: Source>(out: &mut [u8], op: usize, src: S, ip: usize) {
+    let piece = src.read16(out, ip);
+    let op = idx(op);
+    out[op..op + 16].copy_from_slice(&piece);
+}
+
+/// `ZSTD_wildcopy` with `ZSTD_no_overlap`: `src` and the output are at
+/// least 16 bytes apart, or in different buffers. Copies `length` bytes
+/// and up to 32 more.
+#[inline(always)]
+fn wildcopy<S: Source>(out: &mut [u8], mut op: usize, src: S, mut ip: usize, length: usize) {
+    let oend = op + length;
+    // The length is almost always short, so one piece first, then two at
+    // a time.
+    copy16(out, op, src, ip);
+    if length <= 16 {
         return;
     }
-    let src = op - offset;
-    if offset >= length {
-        out.copy_within(src..src + length, op);
+    op += 16;
+    ip += 16;
+    loop {
+        copy16(out, op, src, ip);
+        copy16(out, op + 16, src, ip + 16);
+        op += 32;
+        ip += 32;
+        if op >= oend {
+            break;
+        }
+    }
+}
+
+/// [`wildcopy`] for a match at least 16 bytes back, which is often long:
+/// from 32 bytes back on, the two pieces of each step are copied as one,
+/// the same bytes with half the bounds checks.
+#[inline(always)]
+fn wildcopy_match(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
+    let oend = op + length;
+    copy16(out, op, FromOut, ip);
+    if length <= 16 {
         return;
     }
-    // The output repeats every `offset` bytes, so it also repeats every
-    // multiple of that; copy from as far back as has been written, which
-    // doubles the step each time.
-    let mut copied = 0;
-    while copied < length {
-        let period = (offset + copied) / offset * offset;
-        let n = (length - copied).min(period);
-        out.copy_within(op + copied - period..op + copied - period + n, op + copied);
-        copied += n;
+    op += 16;
+    ip += 16;
+    if op - ip >= 32 {
+        loop {
+            let piece: [u8; 32] = FromOut.read32(out, ip);
+            let at = idx(op);
+            out[at..at + 32].copy_from_slice(&piece);
+            op += 32;
+            ip += 32;
+            if op >= oend {
+                break;
+            }
+        }
+        return;
     }
+    loop {
+        copy16(out, op, FromOut, ip);
+        copy16(out, op + 16, FromOut, ip + 16);
+        op += 32;
+        ip += 32;
+        if op >= oend {
+            break;
+        }
+    }
+}
+
+/// `ZSTD_wildcopy` with `ZSTD_overlap_src_before_dst`, within the output:
+/// a match that starts at least 8 bytes back.
+#[inline(always)]
+fn wildcopy_overlap(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
+    if op - ip < 16 {
+        // A short offset: 8 bytes at a time.
+        let oend = op + length;
+        loop {
+            copy8_within(out, op, ip);
+            op += 8;
+            ip += 8;
+            if op >= oend {
+                break;
+            }
+        }
+    } else {
+        wildcopy(out, op, FromOut, ip, length);
+    }
+}
+
+/// `ZSTD_overlapCopy8`: copies 8 bytes of a match that starts `offset`
+/// bytes back, 1 to 7 bytes repeating themselves, and moves `op` and `ip`
+/// on so that they are then at least 8 bytes apart.
+#[inline(always)]
+fn overlap_copy8(out: &mut [u8], op: &mut usize, ip: &mut usize, offset: usize) {
+    if offset < 8 {
+        // Close: the bytes overlap.
+        const DEC32_TABLE: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4]; // added
+        const DEC64_TABLE: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11]; // subtracted
+        let (o, i) = (*op, *ip);
+        out[o] = out[i];
+        out[o + 1] = out[i + 1];
+        out[o + 2] = out[i + 2];
+        out[o + 3] = out[i + 3];
+        let i = i + DEC32_TABLE[offset];
+        copy4_within(out, o + 4, i);
+        // libzstd subtracts, then adds 8; together they never go below 0.
+        *ip = i + 8 - DEC64_TABLE[offset];
+    } else {
+        copy8_within(out, *op, *ip);
+        *ip += 8;
+    }
+    *op += 8;
+}
+
+/// `ZSTD_safecopy`: copies `length` bytes, writing nothing past
+/// `oend_w + WILDCOPY_OVERLENGTH`, and nothing past `oend_w` beyond the
+/// copy itself. With `overlap`, `src` is the output and the copy is a match
+/// (`ZSTD_overlap_src_before_dst`); otherwise they are at least 8 bytes
+/// apart, or `op` is past `oend_w`. `oend_w` is signed, since it can be
+/// before the start of the buffer.
+#[inline(never)]
+fn safecopy<S: Source>(
+    out: &mut [u8],
+    mut op: usize,
+    oend_w: isize,
+    src: S,
+    mut ip: usize,
+    mut length: usize,
+    overlap: bool,
+) {
+    let oend = op + length;
+    if length < 8 {
+        // Short lengths.
+        while op < oend {
+            out[op] = src.byte(out, ip);
+            op += 1;
+            ip += 1;
+        }
+        return;
+    }
+    if overlap {
+        // 8 bytes, and the offset at least 8 from then on.
+        let diff = op - ip;
+        overlap_copy8(out, &mut op, &mut ip, diff);
+        length -= 8;
+    }
+
+    if oend as isize <= oend_w {
+        // No risk of writing too far.
+        if overlap {
+            wildcopy_overlap(out, op, ip, length);
+        } else {
+            wildcopy(out, op, src, ip, length);
+        }
+        return;
+    }
+    if op as isize <= oend_w {
+        // Wildcopy until near the end.
+        let n = (oend_w - op as isize) as usize;
+        if overlap {
+            wildcopy_overlap(out, op, ip, n);
+        } else {
+            wildcopy(out, op, src, ip, n);
+        }
+        ip += n;
+        op += n;
+    }
+    // The rest, byte by byte.
+    while op < oend {
+        out[op] = src.byte(out, ip);
+        op += 1;
+        ip += 1;
+    }
+}
+
+/// `ZSTD_safecopyDstBeforeSrc`: copies `length` bytes within the output,
+/// to before where they are or after; never past the copy's end.
+fn safecopy_dst_before_src(out: &mut [u8], mut op: usize, mut ip: usize, length: usize) {
+    let diff = op as isize - ip as isize;
+    let oend = op + length;
+    if length < 8 || diff > -8 {
+        // Short lengths, close overlaps, and the output after the source:
+        // byte by byte.
+        while op < oend {
+            out[op] = out[ip];
+            op += 1;
+            ip += 1;
+        }
+        return;
+    }
+    if op + WILDCOPY_OVERLENGTH <= oend && diff < -(WILDCOPY_VECLEN as isize) {
+        let n = oend - WILDCOPY_OVERLENGTH - op;
+        wildcopy(out, op, FromOut, ip, n);
+        ip += n;
+        op += n;
+    }
+    // The rest.
+    while op < oend {
+        out[op] = out[ip];
+        op += 1;
+        ip += 1;
+    }
+}
+
+/// `WILDCOPY_VECLEN`
+const WILDCOPY_VECLEN: usize = 16;
+
+/// Copies `len` literals from `lit_pos` to `op` exactly, as libzstd's
+/// `ZSTD_memmove` and `ZSTD_memcpy` do for the last literals of a block.
+#[inline(always)]
+fn copy_literals<S: Source>(out: &mut [u8], op: usize, lits: S, lit_pos: usize, len: usize) {
+    lits.copy_exact(out, op, lit_pos, len);
 }
 
 /// Copies `len` bytes from position `at` of the older segment of the window.
 /// Within the output, the copy behaves as `memmove`, as libzstd's does.
 #[inline(always)]
-fn copy_from_ext(out: &mut [u8], op: usize, ext: ExtDict<'_>, at: usize, len: usize) {
-    match ext {
+fn copy_from_ext(out: &mut [u8], op: usize, ext: &ExtDict<'_>, at: usize, len: usize) {
+    match *ext {
         ExtDict::None => debug_assert!(len == 0),
         ExtDict::Separate(content) => out[op..op + len].copy_from_slice(&content[at..at + len]),
         ExtDict::InOut { start, .. } => out.copy_within(start + at..start + at + len, op),
     }
 }
 
-/// The match part of `ZSTD_execSequence` and its variants: copies the match
-/// of `seq` to `o_lit_end`, from the older segment, the prefix, or both.
+/// The match of a sequence that reaches back past the current segment of
+/// the window: copies what is in the older segment, exactly, as libzstd's
+/// `ZSTD_memmove` does. Returns `None` when that is the whole match, or
+/// where the rest of it goes and how long it is: it then starts at
+/// `prefix_start`.
+#[inline(always)]
+fn copy_ext_part(
+    out: &mut [u8],
+    o_lit_end: usize,
+    seq: Seq,
+    prefix_start: usize,
+    ext: &ExtDict<'_>,
+) -> Result<Option<(usize, usize)>> {
+    let ext_len = ext.len();
+    if seq.offset > o_lit_end - prefix_start + ext_len {
+        return error!(CorruptionDetected);
+    }
+    // dictEnd - (prefixStart - match)
+    let at = ext_len - (seq.offset - (o_lit_end - prefix_start));
+    if at + seq.match_length <= ext_len {
+        copy_from_ext(out, o_lit_end, ext, at, seq.match_length);
+        return Ok(None);
+    }
+    // It spans the older segment and the current one.
+    let length1 = ext_len - at;
+    copy_from_ext(out, o_lit_end, ext, at, length1);
+    Ok(Some((o_lit_end + length1, seq.match_length - length1)))
+}
+
+/// The match part of `ZSTD_execSequenceEnd` and its variants: copies the
+/// match of `seq` to `o_lit_end` with `ZSTD_safecopy`.
+#[inline(always)]
+fn copy_sequence_match_end(
+    out: &mut [u8],
+    o_lit_end: usize,
+    oend_w: isize,
+    seq: Seq,
+    prefix_start: usize,
+    ext: &ExtDict<'_>,
+) -> Result<()> {
+    let (mut op, mut match_length) = (o_lit_end, seq.match_length);
+    let m;
+    if seq.offset > o_lit_end - prefix_start {
+        // The offset goes past the current segment.
+        match copy_ext_part(out, o_lit_end, seq, prefix_start, ext)? {
+            None => return Ok(()),
+            Some((rest_op, rest_length)) => {
+                op = rest_op;
+                match_length = rest_length;
+                m = prefix_start;
+            }
+        }
+    } else {
+        m = o_lit_end - seq.offset;
+    }
+    safecopy(out, op, oend_w, FromOut, m, match_length, true);
+    Ok(())
+}
+
+/// The match part of `ZSTD_execSequence` and its split-literals variant,
+/// with room for wildcopies past its end.
 #[inline(always)]
 fn copy_sequence_match(
     out: &mut [u8],
     o_lit_end: usize,
     seq: Seq,
     prefix_start: usize,
-    ext: ExtDict<'_>,
+    ext: &ExtDict<'_>,
 ) -> Result<()> {
     let mut op = o_lit_end;
     let mut match_length = seq.match_length;
+    let mut m;
     if seq.offset > o_lit_end - prefix_start {
-        // The offset goes past the prefix, into the older segment.
-        let ext_len = ext.len();
-        if seq.offset > o_lit_end - prefix_start + ext_len {
-            return error!(CorruptionDetected);
+        // The offset goes past the current segment.
+        match copy_ext_part(out, o_lit_end, seq, prefix_start, ext)? {
+            None => return Ok(()),
+            Some((rest_op, rest_length)) => {
+                op = rest_op;
+                match_length = rest_length;
+                m = prefix_start;
+            }
         }
-        // dictEnd - (prefixStart - match)
-        let at = ext_len - (seq.offset - (o_lit_end - prefix_start));
-        if at + match_length <= ext_len {
-            copy_from_ext(out, op, ext, at, match_length);
-            return Ok(());
-        }
-        // It spans the older segment and the prefix.
-        let length1 = ext_len - at;
-        copy_from_ext(out, op, ext, at, length1);
-        op += length1;
-        match_length -= length1;
-        // The rest starts at prefixStart.
-        copy_match(out, op, op - prefix_start, match_length);
+    } else {
+        m = o_lit_end - seq.offset;
+    }
+
+    // Nearly all offsets are at least 16, so the copy needs no care for
+    // overlap.
+    if seq.offset >= WILDCOPY_VECLEN {
+        wildcopy_match(out, op, m, match_length);
         return Ok(());
     }
-    copy_match(out, op, seq.offset, match_length);
+    // 8 bytes, and the offset at least 8 from then on.
+    overlap_copy8(out, &mut op, &mut m, seq.offset);
+    if match_length > 8 {
+        wildcopy_overlap(out, op, m, match_length - 8);
+    }
     Ok(())
 }
 
@@ -1172,19 +1559,20 @@ fn copy_sequence_match(
 /// whose literals run past their buffer; checks bounds carefully.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn exec_sequence_end(
+fn exec_sequence_end<S: Source>(
     out: &mut [u8],
     op: usize,
     oend: usize,
     seq: Seq,
-    lits: Lits<'_>,
+    lits: S,
     lit_ptr: &mut usize,
     lit_limit: usize,
     prefix_start: usize,
-    ext: ExtDict<'_>,
+    ext: &ExtDict<'_>,
 ) -> Result<usize> {
     let o_lit_end = op + seq.lit_length;
     let sequence_length = seq.lit_length + seq.match_length;
+    let oend_w = oend as isize - WILDCOPY_OVERLENGTH as isize;
 
     if sequence_length > oend - op {
         // The last match must fit in the output.
@@ -1195,9 +1583,9 @@ fn exec_sequence_end(
         return error!(CorruptionDetected);
     }
 
-    copy_literals(out, op, lits, *lit_ptr, seq.lit_length);
+    safecopy(out, op, oend_w, lits, *lit_ptr, seq.lit_length, false);
     *lit_ptr += seq.lit_length;
-    copy_sequence_match(out, o_lit_end, seq, prefix_start, ext)?;
+    copy_sequence_match_end(out, o_lit_end, oend_w, seq, prefix_start, ext)?;
     Ok(sequence_length)
 }
 
@@ -1205,16 +1593,16 @@ fn exec_sequence_end(
 /// Returns its length.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn exec_sequence(
+fn exec_sequence<S: Source>(
     out: &mut [u8],
     op: usize,
     oend: usize,
     seq: Seq,
-    lits: Lits<'_>,
+    lits: S,
     lit_ptr: &mut usize,
     lit_limit: usize,
     prefix_start: usize,
-    ext: ExtDict<'_>,
+    ext: &ExtDict<'_>,
 ) -> Result<usize> {
     let o_lit_end = op + seq.lit_length;
     let sequence_length = seq.lit_length + seq.match_length;
@@ -1237,7 +1625,11 @@ fn exec_sequence(
         );
     }
 
-    copy_literals(out, op, lits, *lit_ptr, seq.lit_length);
+    // The literals: nearly always 16 bytes or fewer.
+    copy16(out, op, lits, *lit_ptr);
+    if seq.lit_length > 16 {
+        wildcopy(out, op + 16, lits, *lit_ptr + 16, seq.lit_length - 16);
+    }
     *lit_ptr = i_lit_end;
     copy_sequence_match(out, o_lit_end, seq, prefix_start, ext)?;
     Ok(sequence_length)
@@ -1251,11 +1643,12 @@ fn exec_sequence_end_split_lit_buffer(
     out: &mut [u8],
     op: usize,
     oend: usize,
+    oend_w: isize,
     seq: Seq,
     lit_ptr: &mut usize,
     lit_limit: usize,
     prefix_start: usize,
-    ext: ExtDict<'_>,
+    ext: &ExtDict<'_>,
 ) -> Result<usize> {
     let o_lit_end = op + seq.lit_length;
     let sequence_length = seq.lit_length + seq.match_length;
@@ -1271,10 +1664,9 @@ fn exec_sequence_end_split_lit_buffer(
     if op > *lit_ptr && op < *lit_ptr + seq.lit_length {
         return error!(DstSizeTooSmall);
     }
-    // ZSTD_safecopyDstBeforeSrc: a forward copy within the output.
-    out.copy_within(*lit_ptr..*lit_ptr + seq.lit_length, op);
+    safecopy_dst_before_src(out, op, *lit_ptr, seq.lit_length);
     *lit_ptr += seq.lit_length;
-    copy_sequence_match(out, o_lit_end, seq, prefix_start, ext)?;
+    copy_sequence_match_end(out, o_lit_end, oend_w, seq, prefix_start, ext)?;
     Ok(sequence_length)
 }
 
@@ -1292,19 +1684,21 @@ fn exec_sequence_split_lit_buffer(
     lit_ptr: &mut usize,
     lit_limit: usize,
     prefix_start: usize,
-    ext: ExtDict<'_>,
+    ext: &ExtDict<'_>,
 ) -> Result<usize> {
     let o_lit_end = op + seq.lit_length;
     let sequence_length = seq.lit_length + seq.match_length;
     let o_match_end = op + sequence_length;
     let i_lit_end = *lit_ptr + seq.lit_length;
+    // litPtr + litLength - WILDCOPY_OVERLENGTH
+    let oend_w = i_lit_end as isize - WILDCOPY_OVERLENGTH as isize;
 
-    // oend_w is litPtr + litLength - WILDCOPY_OVERLENGTH.
-    if i_lit_end > lit_limit || o_match_end + WILDCOPY_OVERLENGTH > i_lit_end {
+    if i_lit_end > lit_limit || o_match_end as isize > oend_w {
         return exec_sequence_end_split_lit_buffer(
             out,
             op,
             oend,
+            oend_w,
             seq,
             lit_ptr,
             lit_limit,
@@ -1313,7 +1707,10 @@ fn exec_sequence_split_lit_buffer(
         );
     }
 
-    copy_literals(out, op, Lits::Out, *lit_ptr, seq.lit_length);
+    copy16(out, op, FromOut, *lit_ptr);
+    if seq.lit_length > 16 {
+        wildcopy(out, op + 16, FromOut, *lit_ptr + 16, seq.lit_length - 16);
+    }
     *lit_ptr = i_lit_end;
     copy_sequence_match(out, o_lit_end, seq, prefix_start, ext)?;
     Ok(sequence_length)
@@ -1349,21 +1746,21 @@ macro_rules! dctx_tables {
                 $dctx.ll_tptr,
                 &$dctx.entropy.ll_table,
                 $dict.map(|d: &EntropyDTables| &d.ll_table),
-                &LL_DEFAULT_DTABLE,
+                &LL_DEFAULT_CELLS,
                 LL_DEFAULT_NORM_LOG,
             ),
             of: seq_table(
                 $dctx.of_tptr,
                 &$dctx.entropy.of_table,
                 $dict.map(|d: &EntropyDTables| &d.of_table),
-                &OF_DEFAULT_DTABLE,
+                &OF_DEFAULT_CELLS,
                 OF_DEFAULT_NORM_LOG,
             ),
             ml: seq_table(
                 $dctx.ml_tptr,
                 &$dctx.entropy.ml_table,
                 $dict.map(|d: &EntropyDTables| &d.ml_table),
-                &ML_DEFAULT_DTABLE,
+                &ML_DEFAULT_CELLS,
                 ML_DEFAULT_NORM_LOG,
             ),
         }
@@ -1417,23 +1814,111 @@ fn decompress_sequences_body(
     nb_seq: usize,
     block_src: &[u8],
 ) -> Result<usize> {
-    let ostart = bo.dst;
     let oend = if dctx.lit_buffer_location == LitLocation::NotInDst {
-        ostart + bo.dst_capacity
+        bo.dst + bo.dst_capacity
     } else {
         dctx.lit_buffer.pos
     };
-    let mut op = ostart;
-    let mut lit_ptr = dctx.lit_ptr.pos;
+    let lit_ptr = dctx.lit_ptr.pos;
     let lit_end = lit_ptr + dctx.lit_size;
-    let lits = lits_at(dctx.lit_ptr, &dctx.lit_extra_buffer, block_src);
+    if nb_seq > 0 {
+        dctx.fse_entropy = true;
+    }
+    let tables = dctx_tables!(dctx, bo.dict);
+    let rep = &mut dctx.entropy.rep;
+    let extra: &[u8] = &dctx.lit_extra_buffer;
+    let run = SeqRun {
+        oend,
+        seq_src,
+        nb_seq,
+        tables,
+        lit_ptr,
+        lit_end,
+    };
+    match dctx.lit_ptr.buf {
+        LitBuf::Out => decompress_sequences_body_with(bo, rep, run, FromOut),
+        LitBuf::Extra => decompress_sequences_body_with(bo, rep, run, extra),
+        LitBuf::Src => decompress_sequences_body_with(bo, rep, run, block_src),
+    }
+}
+
+/// The second half of `ZSTD_decompressSequences_bodySplitLitBuffer`, once
+/// its literals are in the extra buffer: decodes `nb_seq` sequences and
+/// executes them at `op`, with literals from `lits`. Returns where the
+/// output ends.
+///
+/// It works on a copy of `seq_state`, which then lives in registers, and
+/// writes it back at the end.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn exec_sequences<S: Source>(
+    out: &mut [u8],
+    mut op: usize,
+    oend: usize,
+    seq_state: &mut SeqState<'_>,
+    tables: SeqTables<'_>,
+    nb_seq: usize,
+    lits: S,
+    lit_ptr: &mut usize,
+    lit_end: usize,
+    prefix_start: usize,
+    ext: &ExtDict<'_>,
+) -> Result<usize> {
+    let mut state = seq_state.clone();
+    let mut lp = *lit_ptr;
+    for remaining in (1..=nb_seq).rev() {
+        let sequence = decode_sequence(&mut state, tables, remaining == 1);
+        op += exec_sequence(
+            out,
+            op,
+            oend,
+            sequence,
+            lits,
+            &mut lp,
+            lit_end,
+            prefix_start,
+            ext,
+        )?;
+    }
+    *seq_state = state;
+    *lit_ptr = lp;
+    Ok(op)
+}
+
+/// What [`decompress_sequences_body_with`] works on, besides the output.
+#[derive(Clone, Copy)]
+struct SeqRun<'a> {
+    oend: usize,
+    seq_src: &'a [u8],
+    nb_seq: usize,
+    tables: SeqTables<'a>,
+    lit_ptr: usize,
+    lit_end: usize,
+}
+
+/// The loop of `ZSTD_decompressSequences_body`, for literals read from
+/// `lits`.
+fn decompress_sequences_body_with<S: Source>(
+    bo: &mut BlockOut<'_, '_>,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    run: SeqRun<'_>,
+    lits: S,
+) -> Result<usize> {
+    let SeqRun {
+        oend,
+        seq_src,
+        nb_seq,
+        tables,
+        mut lit_ptr,
+        lit_end,
+    } = run;
+    let ostart = bo.dst;
+    let mut op = ostart;
     let out = &mut *bo.out;
 
     // Regenerate the sequences.
     if nb_seq > 0 {
-        dctx.fse_entropy = true;
-        let tables = dctx_tables!(dctx, bo.dict);
-        let mut seq_state = init_seq_state(&dctx.entropy.rep, tables, seq_src)?;
+        let mut seq_state = init_seq_state(rep, tables, seq_src)?;
         for remaining in (1..=nb_seq).rev() {
             let sequence = decode_sequence(&mut seq_state, tables, remaining == 1);
             let one_seq_size = exec_sequence(
@@ -1445,7 +1930,7 @@ fn decompress_sequences_body(
                 &mut lit_ptr,
                 lit_end,
                 bo.prefix_start,
-                bo.ext,
+                &bo.ext,
             )?;
             op += one_seq_size;
         }
@@ -1455,7 +1940,7 @@ fn decompress_sequences_body(
             return error!(CorruptionDetected);
         }
         let prev_offset = seq_state.prev_offset;
-        save_reps(&mut dctx.entropy.rep, &prev_offset);
+        save_reps(rep, &prev_offset);
     }
 
     // The last literals.
@@ -1483,7 +1968,7 @@ fn decompress_sequences_body_split_lit_buffer(
     debug_assert!(dctx.lit_ptr.buf == LitBuf::Out);
     let mut lit_ptr = dctx.lit_ptr.pos;
     let mut lit_buffer_end = dctx.lit_buffer_end.pos;
-    let (prefix_start, ext) = (bo.prefix_start, bo.ext);
+    let (prefix_start, ext) = (bo.prefix_start, &bo.ext);
     let out = &mut *bo.out;
     let mut location = dctx.lit_buffer_location;
 
@@ -1493,10 +1978,11 @@ fn decompress_sequences_body_split_lit_buffer(
         let mut seq_state = init_seq_state(&dctx.entropy.rep, tables, seq_src)?;
 
         // Decode without overrunning where the literals in the output begin.
+        let split_end = dctx.lit_buffer_end.pos;
         let mut sequence = Seq::default();
         while nb_seq > 0 {
             sequence = decode_sequence(&mut seq_state, tables, nb_seq == 1);
-            if lit_ptr + sequence.lit_length > dctx.lit_buffer_end.pos {
+            if lit_ptr + sequence.lit_length > split_end {
                 break;
             }
             let one_seq_size = exec_sequence_split_lit_buffer(
@@ -1516,20 +2002,19 @@ fn decompress_sequences_body_split_lit_buffer(
         // The rest of the sequences read their literals from the extra
         // buffer: copy what remains in the output, and switch.
         if nb_seq > 0 {
-            let leftover_lit = dctx.lit_buffer_end.pos - lit_ptr;
+            let leftover_lit = split_end - lit_ptr;
             if leftover_lit > 0 {
                 if leftover_lit > oend - op {
                     return error!(DstSizeTooSmall);
                 }
-                // ZSTD_safecopyDstBeforeSrc
-                out.copy_within(lit_ptr..lit_ptr + leftover_lit, op);
+                safecopy_dst_before_src(out, op, lit_ptr, leftover_lit);
                 sequence.lit_length -= leftover_lit;
                 op += leftover_lit;
             }
             lit_ptr = 0;
             lit_buffer_end = ZSTD_LITBUFFEREXTRASIZE;
             location = LitLocation::NotInDst;
-            let extra = Lits::Buf(&dctx.lit_extra_buffer);
+            let extra: &[u8] = &dctx.lit_extra_buffer;
             let one_seq_size = exec_sequence(
                 out,
                 op,
@@ -1546,23 +2031,21 @@ fn decompress_sequences_body_split_lit_buffer(
         }
 
         // The remaining literals are in the extra buffer.
-        let extra = Lits::Buf(&dctx.lit_extra_buffer);
-        while nb_seq > 0 {
-            let sequence = decode_sequence(&mut seq_state, tables, nb_seq == 1);
-            let one_seq_size = exec_sequence(
-                out,
-                op,
-                oend,
-                sequence,
-                extra,
-                &mut lit_ptr,
-                lit_buffer_end,
-                prefix_start,
-                ext,
-            )?;
-            op += one_seq_size;
-            nb_seq -= 1;
-        }
+        let extra: &[u8] = &dctx.lit_extra_buffer;
+        op = exec_sequences(
+            out,
+            op,
+            oend,
+            &mut seq_state,
+            tables,
+            nb_seq,
+            extra,
+            &mut lit_ptr,
+            lit_buffer_end,
+            prefix_start,
+            ext,
+        )?;
+        nb_seq = 0;
 
         // The bitstream must end exactly here.
         if nb_seq > 0 {
@@ -1627,7 +2110,7 @@ fn decompress_sequences_long_body(
     let mut op = ostart;
     let mut lit_ptr = dctx.lit_ptr;
     let mut lit_buffer_end = dctx.lit_buffer_end.pos;
-    let (prefix_start, ext) = (bo.prefix_start, bo.ext);
+    let (prefix_start, ext) = (bo.prefix_start, &bo.ext);
     let out = &mut *bo.out;
 
     if nb_seq > 0 {
@@ -1663,7 +2146,7 @@ fn decompress_sequences_long_body(
                     if leftover_lit > oend - *op {
                         return error!(DstSizeTooSmall);
                     }
-                    out.copy_within(lit_ptr.pos..lit_ptr.pos + leftover_lit, *op);
+                    safecopy_dst_before_src(out, *op, lit_ptr.pos, leftover_lit);
                     sequence.lit_length -= leftover_lit;
                     *op += leftover_lit;
                 }
@@ -1778,7 +2261,7 @@ struct OffsetInfo {
 /// `ZSTD_getOffsetInfo`: the share of long offsets (over 2^23) in the offset
 /// table, scaled to a table of `OffFSELog`, and the largest number of extra
 /// bits.
-fn get_offset_info(of_table: SeqTableView<'_>, nb_seq: usize) -> OffsetInfo {
+fn get_offset_info(of_table: SeqTableView<'_, OF_TABLE_CELLS>, nb_seq: usize) -> OffsetInfo {
     let mut info = OffsetInfo {
         long_offset_share: 0,
         max_nb_additional_bits: 0,
@@ -1790,8 +2273,8 @@ fn get_offset_info(of_table: SeqTableView<'_>, nb_seq: usize) -> OffsetInfo {
         for cell in &of_table.cells[..max] {
             info.max_nb_additional_bits = info
                 .max_nb_additional_bits
-                .max(u32::from(cell.nb_additional_bits));
-            if cell.nb_additional_bits > 22 {
+                .max(u32::from(cell.nb_additional_bits()));
+            if cell.nb_additional_bits() > 22 {
                 info.long_offset_share += 1;
             }
         }

@@ -57,12 +57,48 @@ pub(crate) const ML_BASE: [u32; MAX_ML as usize + 1] = [
 ];
 
 /// `ZSTD_seqSymbol`: one cell of a sequence decoding table.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub(crate) struct SeqSymbol {
-    pub(crate) next_state: u16,
-    pub(crate) nb_additional_bits: u8,
-    pub(crate) nb_bits: u8,
-    pub(crate) base_value: u32,
+///
+/// The four fields are packed in one `u64`, in libzstd's layout: the
+/// decoder then reads a cell in one load, as libzstd does on 64-bit
+/// machines, rather than one per field.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SeqSymbol(u64);
+
+impl SeqSymbol {
+    /// `nextState`
+    #[inline(always)]
+    pub(crate) const fn next_state(self) -> u16 {
+        self.0 as u16
+    }
+
+    /// `nbAdditionalBits`
+    #[inline(always)]
+    pub(crate) const fn nb_additional_bits(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+
+    /// `nbBits`
+    #[inline(always)]
+    pub(crate) const fn nb_bits(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+
+    /// `baseValue`
+    #[inline(always)]
+    pub(crate) const fn base_value(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
+
+impl std::fmt::Debug for SeqSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeqSymbol")
+            .field("next_state", &self.next_state())
+            .field("nb_additional_bits", &self.nb_additional_bits())
+            .field("nb_bits", &self.nb_bits())
+            .field("base_value", &self.base_value())
+            .finish()
+    }
 }
 
 /// A cell, in the order libzstd writes them in its tables.
@@ -72,12 +108,12 @@ pub(crate) const fn sym(
     nb_bits: u8,
     base_value: u32,
 ) -> SeqSymbol {
-    SeqSymbol {
-        next_state,
-        nb_additional_bits,
-        nb_bits,
-        base_value,
-    }
+    SeqSymbol(
+        next_state as u64
+            | (nb_additional_bits as u64) << 16
+            | (nb_bits as u64) << 24
+            | (base_value as u64) << 32,
+    )
 }
 
 /// A sequence decoding table of up to `N` cells, with its header

@@ -22,7 +22,7 @@ use crate::common::fse_decompress::FseDecompressWksp;
 use crate::common::huf::{
     HUF_FLAGS_DISABLE_FAST, HUF_SYMBOLVALUE_MAX, HUF_TABLELOG_ABSOLUTEMAX, HUF_TABLELOG_MAX,
 };
-use crate::common::mem::{read_le16, read_le64};
+use crate::common::mem::{idx, read_le16, read_le64};
 
 /// How often each 4-stream loop ran, so the tests can check that they reach
 /// both: [fast X1, fallback X1, fast X2, fallback X2].
@@ -54,21 +54,78 @@ pub(crate) struct DTableDesc {
     pub(crate) table_log: u8,
 }
 
-/// `HUF_DEltX1`: one symbol per lookup.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub(crate) struct HufDEltX1 {
-    pub(crate) nb_bits: u8,
-    pub(crate) byte: u8,
+/// `HUF_DEltX1`: one symbol per lookup. Its two bytes, `nbBits` and then
+/// `byte`, are kept as one `u16` that the decoder reads at once, as
+/// libzstd's fast loop does.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HufDEltX1(u16);
+
+impl HufDEltX1 {
+    pub(crate) const fn new(nb_bits: u8, byte: u8) -> Self {
+        HufDEltX1(nb_bits as u16 | (byte as u16) << 8)
+    }
+
+    /// `nbBits`
+    #[inline(always)]
+    pub(crate) const fn nb_bits(self) -> u8 {
+        self.0 as u8
+    }
+
+    /// `byte`
+    #[inline(always)]
+    pub(crate) const fn byte(self) -> u8 {
+        (self.0 >> 8) as u8
+    }
+}
+
+impl std::fmt::Debug for HufDEltX1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HufDEltX1")
+            .field("nb_bits", &self.nb_bits())
+            .field("byte", &self.byte())
+            .finish()
+    }
 }
 
 /// `HUF_DEltX2`: up to two symbols per lookup. `sequence` holds them as the
 /// two bytes to write, in little-endian order: the first symbol in the low
-/// byte.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub(crate) struct HufDEltX2 {
-    pub(crate) sequence: u16,
-    pub(crate) nb_bits: u8,
-    pub(crate) length: u8,
+/// byte. The fields are kept in one `u32`, in libzstd's layout, so that the
+/// decoder reads a cell at once.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HufDEltX2(u32);
+
+impl HufDEltX2 {
+    pub(crate) const fn new(sequence: u16, nb_bits: u8, length: u8) -> Self {
+        HufDEltX2(sequence as u32 | (nb_bits as u32) << 16 | (length as u32) << 24)
+    }
+
+    /// `sequence`
+    #[inline(always)]
+    pub(crate) const fn sequence(self) -> u16 {
+        self.0 as u16
+    }
+
+    /// `nbBits`
+    #[inline(always)]
+    pub(crate) const fn nb_bits(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+
+    /// `length`
+    #[inline(always)]
+    pub(crate) const fn length(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+}
+
+impl std::fmt::Debug for HufDEltX2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HufDEltX2")
+            .field("sequence", &self.sequence())
+            .field("nb_bits", &self.nb_bits())
+            .field("length", &self.length())
+            .finish()
+    }
 }
 
 /// `HUF_DTable`.
@@ -244,10 +301,7 @@ pub(crate) fn huf_read_dtable_x1_wksp(
             let nb_bits = (table_log + 1 - w) as u8;
             let mut u_start = rank_start;
             for s in 0..symbol_count {
-                let d = HufDEltX1 {
-                    nb_bits,
-                    byte: wksp.symbols[symbol + s],
-                };
+                let d = HufDEltX1::new(nb_bits, wksp.symbols[symbol + s]);
                 dt[u_start..u_start + length].fill(d);
                 u_start += length;
             }
@@ -266,11 +320,7 @@ fn huf_build_delt_x2(symbol: u32, nb_bits: u32, base_seq: u32, level: u32) -> Hu
     } else {
         base_seq + (symbol << 8)
     };
-    HufDEltX2 {
-        sequence: sequence as u16,
-        nb_bits: nb_bits as u8,
-        length: level as u8,
-    }
+    HufDEltX2::new(sequence as u16, nb_bits as u8, level as u8)
 }
 
 /// `HUF_fillDTableX2ForWeight`: fills the cells from `at` for the symbols
@@ -671,8 +721,8 @@ fn huf_decode_symbol_x1(
     // dtLog >= 1
     let val = bit_d.look_bits_fast(dt_log) as usize;
     let cell = dt[val];
-    bit_d.skip_bits(u32::from(cell.nb_bits));
-    cell.byte
+    bit_d.skip_bits(u32::from(cell.nb_bits()));
+    cell.byte()
 }
 
 /// `HUF_decodeStreamX1`: decodes into `dst[p..p_end]`, which it always fills.
@@ -874,14 +924,22 @@ fn huf_decompress4x1_using_dtable_internal_fast_c_loop(
         }
 
         loop {
-            // Decode 5 symbols in each of the 4 streams.
+            // Decode 5 symbols in each of the 4 streams. libzstd writes each
+            // symbol as it goes; the port gathers each stream's five in a
+            // register and writes them at once, the same bytes with one
+            // bounds check instead of five.
+            let mut symbols = [0u64; 4];
             for symbol in 0..5 {
                 for stream in 0..4 {
                     let index = (bits[stream] >> 53) as usize;
-                    let entry = dt[index];
-                    bits[stream] <<= entry.nb_bits & 0x3F;
-                    dst[op[stream] + symbol] = entry.byte;
+                    let entry = dt[index].0;
+                    bits[stream] <<= entry & 0x3F;
+                    symbols[stream] |= u64::from(entry >> 8) << (8 * symbol);
                 }
+            }
+            for stream in 0..4 {
+                let bytes = symbols[stream].to_le_bytes();
+                dst[op[stream]..op[stream] + 5].copy_from_slice(&bytes[..5]);
             }
             // Reload each of the 4 bitstreams.
             for stream in 0..4 {
@@ -973,9 +1031,9 @@ fn huf_decode_symbol_x2(
     // dtLog >= 1
     let val = bit_d.look_bits_fast(dt_log) as usize;
     let cell = dt[val];
-    dst[p..p + 2].copy_from_slice(&cell.sequence.to_le_bytes());
-    bit_d.skip_bits(u32::from(cell.nb_bits));
-    usize::from(cell.length)
+    dst[p..p + 2].copy_from_slice(&cell.sequence().to_le_bytes());
+    bit_d.skip_bits(u32::from(cell.nb_bits()));
+    usize::from(cell.length())
 }
 
 /// `HUF_decodeLastSymbolX2`: writes one byte at `p`.
@@ -990,11 +1048,11 @@ fn huf_decode_last_symbol_x2(
     // dtLog >= 1
     let val = bit_d.look_bits_fast(dt_log) as usize;
     let cell = dt[val];
-    dst[p] = cell.sequence as u8;
-    if cell.length == 1 {
-        bit_d.skip_bits(u32::from(cell.nb_bits));
+    dst[p] = cell.sequence() as u8;
+    if cell.length() == 1 {
+        bit_d.skip_bits(u32::from(cell.nb_bits()));
     } else if bit_d.bits_consumed < 64 {
-        bit_d.skip_bits(u32::from(cell.nb_bits));
+        bit_d.skip_bits(u32::from(cell.nb_bits()));
         if bit_d.bits_consumed > 64 {
             // libzstd's "ugly hack": it works only because this is the last
             // symbol.
@@ -1153,9 +1211,10 @@ fn huf_decompress4x2_using_dtable_internal_fast_c_loop(
     let decode = |stream: usize, bits: &mut [u64; 4], op: &mut [usize; 4], dst: &mut [u8]| {
         let index = (bits[stream] >> 53) as usize;
         let entry = dt[index];
-        dst[op[stream]..op[stream] + 2].copy_from_slice(&entry.sequence.to_le_bytes());
-        bits[stream] <<= entry.nb_bits & 0x3F;
-        op[stream] += usize::from(entry.length);
+        let at = idx(op[stream]);
+        dst[at..at + 2].copy_from_slice(&entry.sequence().to_le_bytes());
+        bits[stream] <<= entry.nb_bits() & 0x3F;
+        op[stream] += usize::from(entry.length());
     };
 
     'out: loop {

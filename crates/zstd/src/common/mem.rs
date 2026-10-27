@@ -5,6 +5,14 @@
 //! of undefined behaviour. Callers keep the same guarantees as in C, which
 //! makes the panic unreachable.
 
+/// `at`, as an index no slice can reach past: no slice is longer than
+/// `isize::MAX`, so this changes no index that could be valid, and lets the
+/// compiler see that `at + N` does not overflow, which saves a check.
+#[inline(always)]
+pub(crate) const fn idx(at: usize) -> usize {
+    at & (isize::MAX as usize)
+}
+
 /// `MEM_readLE16`
 #[inline(always)]
 pub(crate) fn read_le16(src: &[u8], at: usize) -> u16 {

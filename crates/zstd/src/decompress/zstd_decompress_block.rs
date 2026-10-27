@@ -21,7 +21,7 @@ use crate::common::error_private::{Error, ErrorCode, Result, error};
 use crate::common::fse::fse_tablestep;
 use crate::common::fse_decompress::FseBuildDTableWksp;
 use crate::common::huf::{HUF_FLAGS_BMI2, HUF_FLAGS_DISABLE_ASM};
-use crate::common::mem::{read_le16, read_le24, read_le32};
+use crate::common::mem::{idx, read_le16, read_le24, read_le32};
 use crate::common::zstd_internal::{
     BlockType, LL_BITS, LL_DEFAULT_NORM_LOG, LL_FSE_LOG, LONGNBSEQ, MAX_LL, MAX_ML, MAX_OFF,
     MAX_SEQ, MIN_CBLOCK_SIZE, MIN_LITERALS_FOR_4_STREAMS, MIN_SEQUENCES_SIZE, ML_BITS,
@@ -1120,14 +1120,6 @@ trait Source: Copy {
     /// Copies `len` bytes from `at` to `op` exactly, as `memmove` within the
     /// output.
     fn copy_exact(self, out: &mut [u8], op: usize, at: usize, len: usize);
-}
-
-/// `at`, as an index no slice can reach past: no slice is longer than
-/// `isize::MAX`, so this changes no index that could be valid, and lets the
-/// compiler see that `at + 16` does not overflow, which saves a check.
-#[inline(always)]
-const fn idx(at: usize) -> usize {
-    at & (isize::MAX as usize)
 }
 
 /// The output buffer itself.

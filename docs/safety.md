@@ -22,7 +22,7 @@ These are the places in libzstd where safe Rust is known to fall short. None of 
 | The x86-64 Huffman decoding loop in assembly (`huf_decompress_amd64.S`) | No assembly | Port the C loop that libzstd uses everywhere else |
 | SSE2 and NEON in the row-based match finder (`zstd_lazy.c`) | Loads through `core::arch` take raw pointers, and any `#[target_feature]` call needs `unsafe`, even for SSE2 and NEON, which are always present | Eight-byte words (SWAR), and loops the compiler vectorises |
 | Prefetching (`PREFETCH_L1`) in the decoder and the match finders | No safe prefetch on stable Rust | Measure what it is worth. In the decoder it is worth nothing: a `prfm` where libzstd prefetches each match, tried through `asm!`, changed speeds by −2.5% to +0.2% (Apple M1 Pro, October 2026). The match finders are measured with the encoder |
-| Unchecked reads in hot loops | Bounds checks cost time | Buffers with slack and fixed-size arrays, so the checks fold away. In the decoder's copies, once they work as libzstd's do (see [porting.md](porting.md#the-speed-target)), unchecked copies were 8% faster on one input and 4–9% slower on others: no case for an exception |
+| Unchecked reads in hot loops | Bounds checks cost time | Buffers with slack and fixed-size arrays, so the checks fold away. Measured in the decoder (Apple M1 Pro, October 2026): with the sequence loop's copies and the bitstreams' 8-byte reads unchecked, decompression goes from 0.92× to 0.97× libzstd on average over Silesia. The compiler cannot see that libzstd's fast-path condition keeps them in bounds. A candidate exception, not approved |
 | Output buffers that are never initialised | Needs `unsafe` | Zero them first, which costs little |
 
 ## Untrusted input never panics

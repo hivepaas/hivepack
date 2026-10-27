@@ -39,18 +39,21 @@ On an Apple M1 Pro (October 2026), the Silesia corpus compressed by libzstd 1.5.
 
 | | Mean | Range |
 |---|---|---|
-| In one call (`ZSTD_decompressDCtx`) | 0.92× libzstd | 0.86–0.99× |
-| Streaming, in pieces of `ZSTD_DStreamInSize` and `ZSTD_DStreamOutSize` | 0.90× | 0.86–0.98× |
+| In one call (`ZSTD_decompressDCtx`) | 0.92× libzstd | 0.87–0.99× |
+| Streaming, in pieces of `ZSTD_DStreamInSize` and `ZSTD_DStreamOutSize` | 0.91× | 0.87–0.98× |
 
 It was 0.35–0.55× before the speed work. What made the difference, the largest first:
 
 - **Copies in pieces, as libzstd's.** The port used to copy each literal run and match with an exact-length `memmove`: a library call each, for a few bytes. It now copies in libzstd's pieces of 8, 16 and 32 bytes, which on its own doubled the speed.
 - **One sequence loop per literal buffer.** The main loop is compiled once for literals in the output, once for another buffer, so its copies do not ask which buffer each time.
-- **One load per table cell.** A sequence table cell is a packed `u64`, read at once, where the compiler had read its four fields separately.
+- **One load per table cell.** A sequence table cell is a packed `u64`, and a Huffman cell a packed `u16` or `u32`, read at once, where the compiler had read each field separately.
+- **Huffman symbols gathered.** The 4-stream X1 loop gathers each stream's five symbols in a register and writes them at once: one bounds check instead of five. On inputs whose literals dominate, such as `sao`, that is 9%.
 - **32-byte pieces for matches 32 bytes back or more**, the same bytes with half the bounds checks.
 - **Indices that cannot overflow.** Masking an index to `isize::MAX`, which changes no valid index, lets the compiler drop one of the two comparisons of each bounds check.
 
-Tried, and not worth it: unchecked copies (`unsafe`) and prefetching each match as libzstd does on arm64, with the numbers in [safety.md](safety.md); and writing each Huffman stream's symbols five at a time, which changed nothing. x86-64 is not measured yet.
+Tried, and not worth it: prefetching each match as libzstd does on arm64 (the numbers are in [safety.md](safety.md)), and copying long matches with `copy_within` or in 64-byte pieces. x86-64 is not measured yet.
+
+What is left is bounds checks. With the copies of the sequence loop and the bitstreams' 8-byte reads unchecked, an experiment with `unsafe`, decompression in one call averages 0.97× (0.92–1.00×), 44 of the 48 cases at 0.95× or more, against 10 of 48 now. libzstd's fast-path condition keeps those accesses in bounds, but the compiler cannot see it. Making that an exception is HivePaaS's decision; see [safety.md](safety.md).
 
 ## Progress
 

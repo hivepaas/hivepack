@@ -7,8 +7,8 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 authors = ["HivePaaS"]
-repository = "https://github.com/hivepaas/hivepack"
-homepage = "https://github.com/hivepaas/hivepack"
+repository = "https://github.com/hivepaas/hivepack-rs"
+homepage = "https://github.com/hivepaas/hivepack-rs"
 
 [workspace.dependencies]
 hivepack-zstd = { path = "crates/zstd" }

@@ -33,6 +33,25 @@ At least 0.95× libzstd's speed, for compression at each level and for decompres
 
 libzstd's x86-64 Huffman decoding loop is written in assembly. zstd-sys includes it on x86-64 outside Windows, as the official build does. On Windows and on other processors, libzstd runs the C loop instead, and the benchmark's column header shows "no asm". Run the benchmark on its own (`cargo run --release -p zstd-bench`): built together with the tests, it gets their reference, which leaves the assembly out.
 
+### Where decompression stands
+
+On an Apple M1 Pro (October 2026), the Silesia corpus compressed by libzstd 1.5.7 at levels 1, 3, 9 and 19, best of three rounds taken in turn:
+
+| | Mean | Range |
+|---|---|---|
+| In one call (`ZSTD_decompressDCtx`) | 0.92× libzstd | 0.86–0.99× |
+| Streaming, in pieces of `ZSTD_DStreamInSize` and `ZSTD_DStreamOutSize` | 0.90× | 0.86–0.98× |
+
+It was 0.35–0.55× before the speed work. What made the difference, the largest first:
+
+- **Copies in pieces, as libzstd's.** The port used to copy each literal run and match with an exact-length `memmove`: a library call each, for a few bytes. It now copies in libzstd's pieces of 8, 16 and 32 bytes, which on its own doubled the speed.
+- **One sequence loop per literal buffer.** The main loop is compiled once for literals in the output, once for another buffer, so its copies do not ask which buffer each time.
+- **One load per table cell.** A sequence table cell is a packed `u64`, read at once, where the compiler had read its four fields separately.
+- **32-byte pieces for matches 32 bytes back or more**, the same bytes with half the bounds checks.
+- **Indices that cannot overflow.** Masking an index to `isize::MAX`, which changes no valid index, lets the compiler drop one of the two comparisons of each bounds check.
+
+Tried, and not worth it: unchecked copies (`unsafe`) and prefetching each match as libzstd does on arm64, with the numbers in [safety.md](safety.md); and writing each Huffman stream's symbols five at a time, which changed nothing. x86-64 is not measured yet.
+
 ## Progress
 
 | libzstd | Port | Status | Checked against libzstd by |
@@ -68,13 +87,15 @@ Two places in libzstd 1.5.7's handling of several dictionaries at once (`ZSTD_d_
 
 Otherwise the set behaves as libzstd's does, including a quirk: a search stops at the first DDict of ID 0 (raw content), which libzstd takes for an empty slot, and returns it whatever ID was asked for. Which DDict comes back depends on where each one sits in the table, so the port uses the same table, hash and growth rule. The ID is hashed as little-endian bytes; libzstd hashes it in the machine's byte order, so on big-endian machines its slots differ.
 
-Where libzstd copies with `ZSTD_wildcopy`, which may write up to 32 bytes past the end of a copy, the port copies exact lengths. The extra bytes always land where later writes go, on literals already read, or past the output, so the result is the same. When streaming, libzstd's own buffer is a ring: past the end of a block may be the oldest output, still in the buffer though out of the window. A damaged frame whose offsets reach back further than its window then reads, in libzstd, what those extra bytes wrote there, and in the port, what was there before. Valid frames never reach that far, and libzstd does not check offsets against the window either.
+Where libzstd copies with `ZSTD_wildcopy` and the copies built on it, in pieces of 8, 16 or 32 bytes that may write up to 32 bytes past the end of a copy, the port copies in the same pieces. Its buffers then hold what libzstd's hold, those extra bytes included. The copies stay within the margins libzstd keeps for them (`WILDCOPY_OVERLENGTH`) in every buffer; in the port a mistake there would be a bounds-check panic, not a read out of bounds. The extra bytes can differ in one way: when libzstd copies them from memory it never wrote, such as its literals buffer before the first block, which the port starts as zeros. They land where later writes go, on literals already read, or past the output, so they do not show, with one exception. When streaming, libzstd's own buffer is a ring: past the end of a block may be the oldest output, still in the buffer though out of the window. A damaged frame whose offsets reach back further than its window can read those bytes. Valid frames never reach that far, and libzstd does not check offsets against the window either.
+
+libzstd keeps literals inside the output buffer when it has room, and the port puts them in the same place: corrupted input can make the output run over them, and the result must still match.
 
 When streaming, the port follows libzstd's ring buffer exactly: its size, when the decoder goes back to the buffer's start, and where the older part of the window is, so that even damaged frames give the same output. Three differences:
 
 - **Positions after an error.** When `decompress_stream` fails, the input and output positions stay where they were. libzstd leaves them too, except after an error in the first bytes of a header, where it marks the input as read.
 - **Where the window is.** libzstd tells whether output continues the previous output by comparing addresses; the port compares positions within the frame's buffer. They differ only if another buffer happened to end exactly where that one starts.
-- **No bufferless API.** `ZSTD_decompressBegin`, `ZSTD_decompressContinue`, `ZSTD_nextSrcSizeToDecompress`, `ZSTD_nextInputType` and `ZSTD_insertBlock` keep the caller's earlier output buffers as the window between calls, which safe Rust cannot. The port has them inside, for `decompress_stream`. libzstd keeps literals inside the output buffer when it has room, and the port puts them in the same place: corrupted input can make the output run over them, and the result must still match.
+- **No bufferless API.** `ZSTD_decompressBegin`, `ZSTD_decompressContinue`, `ZSTD_nextSrcSizeToDecompress`, `ZSTD_nextInputType` and `ZSTD_insertBlock` keep the caller's earlier output buffers as the window between calls, which safe Rust cannot. The port has them inside, for `decompress_stream`.
 
 ## The order of work
 

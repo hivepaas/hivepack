@@ -8,7 +8,8 @@ use crate::common::bitstream::BitCStream;
 use crate::common::error_private::{Error, ErrorCode, Result, error};
 use crate::common::fse::{FSE_NCOUNTBOUND, FseCState, ctable_u16, fse_bit_cost};
 use crate::common::zstd_internal::{
-    LL_BITS, LL_FSE_LOG, MAX_SEQ, ML_BITS, ML_FSE_LOG, OFF_FSE_LOG, SymbolEncodingType,
+    LL_BITS, LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, MAX_SEQ, ML_BITS, ML_FSE_LOG, OFF_FSE_LOG,
+    SymbolEncodingType,
 };
 use crate::compress::fse_compress::{
     fse_build_ctable_rle, fse_build_ctable_wksp, fse_normalize_count, fse_optimal_table_log,
@@ -311,12 +312,31 @@ pub(crate) fn zstd_encode_sequences(
         return Err(Error::from(ErrorCode::DstSizeTooSmall));
     };
 
-    // The first symbols.
+    // The first symbols. The tables are cut at the sizes of the largest
+    // ones, which the arrays they live in have room for, and their states
+    // copied out.
     let last = nb_seq - 1;
+    let mut ml_states = [[0; 2]; 1 << (ML_FSE_LOG - 1)];
+    let mut of_states = [[0; 2]; 1 << (OFF_FSE_LOG - 1)];
+    let mut ll_states = [[0; 2]; 1 << (LL_FSE_LOG - 1)];
     let mut state_match_length =
-        FseCState::new2(ctable_match_length, u32::from(ml_code_table[last]));
-    let mut state_offset_bits = FseCState::new2(ctable_offset_bits, u32::from(of_code_table[last]));
-    let mut state_lit_length = FseCState::new2(ctable_lit_length, u32::from(ll_code_table[last]));
+        FseCState::new2_copied::<{ 1 << (ML_FSE_LOG - 1) }, { MAX_ML as usize + 1 }>(
+            ctable_match_length,
+            u32::from(ml_code_table[last]),
+            &mut ml_states,
+        )?;
+    let mut state_offset_bits =
+        FseCState::new2_copied::<{ 1 << (OFF_FSE_LOG - 1) }, { MAX_OFF as usize + 1 }>(
+            ctable_offset_bits,
+            u32::from(of_code_table[last]),
+            &mut of_states,
+        )?;
+    let mut state_lit_length =
+        FseCState::new2_copied::<{ 1 << (LL_FSE_LOG - 1) }, { MAX_LL as usize + 1 }>(
+            ctable_lit_length,
+            u32::from(ll_code_table[last]),
+            &mut ll_states,
+        )?;
     block_stream.add_bits(
         u64::from(sequences[last].lit_length),
         u32::from(LL_BITS[usize::from(ll_code_table[last])]),

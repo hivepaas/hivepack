@@ -1137,9 +1137,9 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         _ => rng.range(4, 8) as i64,
     };
     steps.extend([7, 100, level]);
-    // The lazy strategies with the hash chain: the port has no row match
-    // finder yet.
-    steps.extend([7, 1011, 2]);
+    // The lazy strategies with the row match finder or the hash chain: on,
+    // off, or as the window decides.
+    steps.extend([7, 1011, rng.range(0, 2) as i64]);
     if rng.range(0, 1) == 0 {
         let window_log = if small {
             rng.range(9, 13)

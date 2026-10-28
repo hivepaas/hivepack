@@ -554,12 +554,18 @@ pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
     }
 }
 
+/// `ZSTD_ROW_HASH_CACHE_SIZE`: how many positions ahead the row match
+/// finder hashes.
+pub(crate) const ZSTD_ROW_HASH_CACHE_SIZE: usize = 8;
+
 /// `ZSTD_MatchState_t`: what the match finders keep from block to block.
 pub(crate) struct MatchState {
     pub(crate) window: Window,
+    /// The hash table; for the row match finder, its rows one after
+    /// another.
     pub(crate) hash_table: Vec<u32>,
     /// The chain table, or for `dfast` the short hash table; empty for
-    /// `fast`.
+    /// `fast` and the row match finder.
     pub(crate) chain_table: Vec<u32>,
     pub(crate) next_to_update: u32,
     /// The index after a loaded dictionary, or 0.
@@ -568,6 +574,22 @@ pub(crate) struct MatchState {
     /// insert only the positions they search.
     pub(crate) lazy_skipping: bool,
     pub(crate) c_params: CompressionParameters,
+
+    // The row match finder.
+    /// `rowHashLog`: the log of the number of rows.
+    pub(crate) row_hash_log: u32,
+    /// `tagTable`: a byte for each entry of the hash table. The first of
+    /// each row is the row's head; the others are the tags of the row's
+    /// entries, the low 8 bits of their hashes.
+    pub(crate) tag_table: Vec<u8>,
+    /// `hashCache`: the hashes of the next positions to insert, each at
+    /// its index modulo the size.
+    pub(crate) hash_cache: [u32; ZSTD_ROW_HASH_CACHE_SIZE],
+    /// `hashSalt`: mixed into the hashes, new at every frame.
+    pub(crate) hash_salt: u64,
+    /// `hashSaltEntropy`: the sum of the hashes searched, for the next
+    /// salt.
+    pub(crate) hash_salt_entropy: u32,
 }
 
 impl MatchState {
@@ -708,6 +730,22 @@ fn zstd_hash_top_u64(u: u64, mls: u32) -> u64 {
 #[inline(always)]
 fn zstd_hash_n<const N: u32>(u: u64, prime: u64) -> u64 {
     (u << (64 - 8 * N)).wrapping_mul(prime)
+}
+
+/// `ZSTD_hashPtrSalted`: [`zstd_hash_ptr`] with `salt` mixed in before the
+/// shift, as a `U32`; the 4-byte hash takes the salt's low 32 bits.
+///
+/// The 4-byte hash is in the top half of [`zstd_hash_top`]'s `u64`, so its
+/// salt goes there too: the top 32 bits are then libzstd's `U32`.
+#[inline(always)]
+pub(crate) fn zstd_hash_ptr_salted(src: &[u8], at: usize, h_bits: u32, mls: u32, salt: u64) -> u32 {
+    debug_assert!(h_bits <= 32);
+    let salt = match mls {
+        5..=8 => salt,
+        // 4, and anything else
+        _ => u64::from(salt as u32) << 32,
+    };
+    ((zstd_hash_top(src, at, mls) ^ salt) >> (64 - h_bits)) as u32
 }
 
 /// A match finder's hash table of `1 << h_bits` entries, and its hashes.

@@ -8,7 +8,8 @@ use crate::common::bitstream::BitCStream;
 use crate::common::error_private::{Error, ErrorCode, Result, error};
 use crate::common::fse::{FSE_NCOUNTBOUND, FseCState, ctable_u16, fse_bit_cost};
 use crate::common::zstd_internal::{
-    LL_BITS, LL_FSE_LOG, MAX_SEQ, ML_BITS, ML_FSE_LOG, OFF_FSE_LOG, SymbolEncodingType,
+    LL_BITS, LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, MAX_SEQ, ML_BITS, ML_FSE_LOG, OFF_FSE_LOG,
+    SymbolEncodingType,
 };
 use crate::compress::fse_compress::{
     fse_build_ctable_rle, fse_build_ctable_wksp, fse_normalize_count, fse_optimal_table_log,
@@ -277,6 +278,22 @@ pub(crate) fn zstd_build_ctable(
     }
 }
 
+/// `table`, padded with zeros to 256 entries, so that a code, a byte,
+/// indexes it without a bounds check.
+const fn padded<const N: usize>(table: [u8; N]) -> [u8; 256] {
+    let mut out = [0u8; 256];
+    let mut i = 0;
+    while i < N {
+        out[i] = table[i];
+        i += 1;
+    }
+    out
+}
+
+/// `LL_bits` and `ML_bits`, padded.
+const LL_BITS_256: [u8; 256] = padded(LL_BITS);
+const ML_BITS_256: [u8; 256] = padded(ML_BITS);
+
 /// `ZSTD_encodeSequences_body`: the sequences' bitstream, from the last to
 /// the first, with the three tables.
 #[allow(clippy::too_many_arguments)]
@@ -295,12 +312,31 @@ pub(crate) fn zstd_encode_sequences(
         return Err(Error::from(ErrorCode::DstSizeTooSmall));
     };
 
-    // The first symbols.
+    // The first symbols. The tables are cut at the sizes of the largest
+    // ones, which the arrays they live in have room for, and their states
+    // copied out.
     let last = nb_seq - 1;
+    let mut ml_states = [[0; 2]; 1 << (ML_FSE_LOG - 1)];
+    let mut of_states = [[0; 2]; 1 << (OFF_FSE_LOG - 1)];
+    let mut ll_states = [[0; 2]; 1 << (LL_FSE_LOG - 1)];
     let mut state_match_length =
-        FseCState::new2(ctable_match_length, u32::from(ml_code_table[last]));
-    let mut state_offset_bits = FseCState::new2(ctable_offset_bits, u32::from(of_code_table[last]));
-    let mut state_lit_length = FseCState::new2(ctable_lit_length, u32::from(ll_code_table[last]));
+        FseCState::new2_copied::<{ 1 << (ML_FSE_LOG - 1) }, { MAX_ML as usize + 1 }>(
+            ctable_match_length,
+            u32::from(ml_code_table[last]),
+            &mut ml_states,
+        )?;
+    let mut state_offset_bits =
+        FseCState::new2_copied::<{ 1 << (OFF_FSE_LOG - 1) }, { MAX_OFF as usize + 1 }>(
+            ctable_offset_bits,
+            u32::from(of_code_table[last]),
+            &mut of_states,
+        )?;
+    let mut state_lit_length =
+        FseCState::new2_copied::<{ 1 << (LL_FSE_LOG - 1) }, { MAX_LL as usize + 1 }>(
+            ctable_lit_length,
+            u32::from(ll_code_table[last]),
+            &mut ll_states,
+        )?;
     block_stream.add_bits(
         u64::from(sequences[last].lit_length),
         u32::from(LL_BITS[usize::from(ll_code_table[last])]),
@@ -315,13 +351,17 @@ pub(crate) fn zstd_encode_sequences(
     );
     block_stream.flush_bits();
 
-    for n in (0..nb_seq - 1).rev() {
-        let ll_code = ll_code_table[n];
-        let of_code = of_code_table[n];
-        let ml_code = ml_code_table[n];
-        let ll_bits = u32::from(LL_BITS[usize::from(ll_code)]);
+    // The other sequences, from the last but one back to the first.
+    for (((sequence, &ll_code), &of_code), &ml_code) in sequences[..last]
+        .iter()
+        .zip(&ll_code_table[..last])
+        .zip(&of_code_table[..last])
+        .zip(&ml_code_table[..last])
+        .rev()
+    {
+        let ll_bits = u32::from(LL_BITS_256[usize::from(ll_code)]);
         let of_bits = u32::from(of_code);
-        let ml_bits = u32::from(ML_BITS[usize::from(ml_code)]);
+        let ml_bits = u32::from(ML_BITS_256[usize::from(ml_code)]);
         // Bits in the register: (7), then 15, 24, 33, ... 31 at most.
         state_offset_bits.encode_symbol(&mut block_stream, u32::from(of_code));
         state_match_length.encode_symbol(&mut block_stream, u32::from(ml_code));
@@ -329,12 +369,12 @@ pub(crate) fn zstd_encode_sequences(
         if of_bits + ml_bits + ll_bits >= 64 - 7 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG) {
             block_stream.flush_bits();
         }
-        block_stream.add_bits(u64::from(sequences[n].lit_length), ll_bits);
-        block_stream.add_bits(u64::from(sequences[n].ml_base), ml_bits);
+        block_stream.add_bits(u64::from(sequence.lit_length), ll_bits);
+        block_stream.add_bits(u64::from(sequence.ml_base), ml_bits);
         if of_bits + ml_bits + ll_bits > 56 {
             block_stream.flush_bits();
         }
-        block_stream.add_bits(u64::from(sequences[n].off_base), of_bits);
+        block_stream.add_bits(u64::from(sequence.off_base), of_bits);
         block_stream.flush_bits();
     }
 

@@ -138,16 +138,8 @@ fn seq_block(
 ) -> String {
     let literals = unhex(literals);
     let triples = unlist(sequences);
-    let mut store = SeqStore {
-        sequences: Vec::with_capacity(triples.len() / 3),
-        literals,
-        ll_code: Vec::new(),
-        ml_code: Vec::new(),
-        of_code: Vec::new(),
-        long_length_type: LongLengthType::None,
-        long_length_pos: 0,
-    };
-    let mut block_size = store.literals.len();
+    let mut store = SeqStore::with_literals(&literals, triples.len() / 3);
+    let mut block_size = literals.len();
     for (i, triple) in triples.chunks(3).enumerate() {
         let (off_base, lit_length, match_length) = (triple[0], triple[1], triple[2]);
         let ml_base = match_length - 3;

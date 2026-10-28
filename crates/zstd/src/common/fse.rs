@@ -1,6 +1,7 @@
 //! Finite State Entropy: port of `common/fse.h`.
 
 use super::bitstream::{BitCStream, BitDStream};
+use super::error_private::{Result, error};
 
 /// `FSE_MAX_MEMORY_USAGE`
 pub(crate) const FSE_MAX_MEMORY_USAGE: u32 = 14;
@@ -243,12 +244,39 @@ pub(crate) fn set_symbol_transform(
     ct[at + 1] = transform.delta_nb_bits;
 }
 
+/// The state table an [`FseCState`] reads: the words of an `FSE_CTable`,
+/// whose halves are the `U16` states, or the states copied out of them.
+pub(crate) trait FseStateTable {
+    /// The state at `at`.
+    fn state(&self, at: usize) -> u16;
+}
+
+impl FseStateTable for [u32] {
+    #[inline(always)]
+    fn state(&self, at: usize) -> u16 {
+        (self[at / 2] >> (16 * (at % 2))) as u16
+    }
+}
+
+impl FseStateTable for [u16] {
+    #[inline(always)]
+    fn state(&self, at: usize) -> u16 {
+        self[at]
+    }
+}
+
 /// `FSE_CState_t`: an encoder's state, over the table it encodes with.
-pub(crate) struct FseCState<'a> {
+///
+/// Differs from libzstd: the state table and the symbol transforms are two
+/// slices, where libzstd keeps pointers into the table, so that each
+/// lookup takes one bounds check. The state table is the table's words
+/// from word 1, or with [`FseCState::new2_copied`] a copy of the states.
+pub(crate) struct FseCState<'a, S: ?Sized = [u32]> {
     value: i64,
-    ct: &'a [u32],
-    /// Where the symbol transforms start, in words.
-    symbol_tt: usize,
+    /// `stateTable`
+    states: &'a S,
+    /// `symbolTT`: the symbol transforms, two words each.
+    transforms: &'a [[u32; 2]],
     state_log: u32,
 }
 
@@ -257,10 +285,11 @@ impl<'a> FseCState<'a> {
     #[inline(always)]
     pub(crate) fn new(ct: &'a [u32]) -> Self {
         let table_log = u32::from(ctable_u16(ct, 0));
+        let symbol_tt = symbol_tt_start(table_log);
         FseCState {
             value: 1 << table_log,
-            ct,
-            symbol_tt: symbol_tt_start(table_log),
+            states: ct.get(1..).unwrap_or_default(),
+            transforms: ct.get(symbol_tt..).unwrap_or_default().as_chunks().0,
             state_log: table_log,
         }
     }
@@ -270,30 +299,91 @@ impl<'a> FseCState<'a> {
     #[inline(always)]
     pub(crate) fn new2(ct: &'a [u32], symbol: u32) -> Self {
         let mut state = FseCState::new(ct);
-        let transform = symbol_transform(ct, state.symbol_tt, symbol);
-        let nb_bits_out = transform.delta_nb_bits.wrapping_add(1 << 15) >> 16;
-        let value = (nb_bits_out << 16).wrapping_sub(transform.delta_nb_bits);
-        state.value = state.next_state(i64::from(value) >> nb_bits_out, transform);
+        state.start_with(symbol);
         state
-    }
-
-    /// The state table's entry for `base` plus the symbol's offset.
-    #[inline(always)]
-    fn next_state(&self, base: i64, transform: FseSymbolTransform) -> i64 {
-        let at = base + i64::from(transform.delta_find_state);
-        i64::from(ctable_u16(self.ct, 2 + at as usize))
     }
 
     /// The word where the symbol transforms start, for [`fse_bit_cost`] and
     /// [`fse_get_max_nb_bits`].
     pub(crate) fn symbol_tt(&self) -> usize {
-        self.symbol_tt
+        symbol_tt_start(self.state_log)
+    }
+}
+
+impl<'a> FseCState<'a, [u16]> {
+    /// [`FseCState::new2`] for a table in an array with room for tables of
+    /// up to `2 * S` states and `T` symbols, reading its states from
+    /// `states`, where it copies the first `2 * S`. Every symbol encoded
+    /// must be under `T`. An error when the table's log is too large for
+    /// the array, which a table the encoder built never is.
+    ///
+    /// Differs from libzstd, which reads the states from the table: from a
+    /// copy, each is one load rather than a load and a shift, and with the
+    /// lengths fixed the bounds checks compare with constants.
+    #[inline(always)]
+    pub(crate) fn new2_copied<const S: usize, const T: usize>(
+        ct: &'a [u32],
+        symbol: u32,
+        states: &'a mut [[u16; 2]; S],
+    ) -> Result<Self> {
+        let table_log = u32::from(ctable_u16(ct, 0));
+        let symbol_tt = symbol_tt_start(table_log);
+        let Some(words) = ct.get(1..).and_then(|words| words.first_chunk::<S>()) else {
+            return error!(Generic);
+        };
+        let Some(transforms) = ct
+            .get(symbol_tt..)
+            .and_then(|words| words.as_chunks().0.first_chunk::<T>())
+        else {
+            return error!(Generic);
+        };
+        for (pair, &word) in states.iter_mut().zip(words) {
+            *pair = [word as u16, (word >> 16) as u16];
+        }
+        let states: &'a [[u16; 2]; S] = states;
+        let mut state = FseCState {
+            value: 1 << table_log,
+            states: states.as_flattened(),
+            transforms,
+            state_log: table_log,
+        };
+        state.start_with(symbol);
+        Ok(state)
+    }
+}
+
+impl<S: ?Sized + FseStateTable> FseCState<'_, S> {
+    /// The rest of `FSE_initCState2`, after `FSE_initCState`.
+    #[inline(always)]
+    fn start_with(&mut self, symbol: u32) {
+        let transform = self.transform(symbol);
+        let nb_bits_out = transform.delta_nb_bits.wrapping_add(1 << 15) >> 16;
+        let value = (nb_bits_out << 16).wrapping_sub(transform.delta_nb_bits);
+        self.value = self.next_state(i64::from(value) >> nb_bits_out, transform);
+    }
+
+    /// The transform of `symbol`.
+    #[inline(always)]
+    fn transform(&self, symbol: u32) -> FseSymbolTransform {
+        let [delta_find_state, delta_nb_bits] = self.transforms[symbol as usize];
+        FseSymbolTransform {
+            delta_find_state: delta_find_state as i32,
+            delta_nb_bits,
+        }
+    }
+
+    /// The state table's entry for `base` plus the symbol's offset. The sum
+    /// is a state's index, under 2^15, so it is worked out in 32 bits.
+    #[inline(always)]
+    fn next_state(&self, base: i64, transform: FseSymbolTransform) -> i64 {
+        let at = (base as u32).wrapping_add(transform.delta_find_state as u32);
+        i64::from(self.states.state(at as usize))
     }
 
     /// `FSE_encodeSymbol`
     #[inline(always)]
     pub(crate) fn encode_symbol(&mut self, bit_c: &mut BitCStream<'_>, symbol: u32) {
-        let transform = symbol_transform(self.ct, self.symbol_tt, symbol);
+        let transform = self.transform(symbol);
         let nb_bits_out = ((self.value + i64::from(transform.delta_nb_bits)) >> 16) as u32;
         bit_c.add_bits(self.value as u64, nb_bits_out);
         self.value = self.next_state(self.value >> nb_bits_out, transform);

@@ -49,14 +49,18 @@ const BIT_MASK: [u32; 32] = {
 /// `BIT_CStream_t`: a bitstream being written into `dst`.
 ///
 /// Positions are indices into `dst`, as libzstd's pointers would be. Every
-/// flush writes a whole register at the position, which never passes
+/// flush writes a whole register, at a place that never passes
 /// `dst.len() - 8` (`endPtr`), so the write stays inside `dst`.
+///
+/// Differs from libzstd: `endPtr` is worked out from `dst` rather than
+/// kept, and [`BitCStream::flush_bits`] holds the position back at
+/// `endPtr` when it writes rather than after, so that the position itself
+/// may pass `endPtr` by up to 7 once the stream does not fit.
 pub(crate) struct BitCStream<'a> {
     bit_container: u64,
     bit_pos: u32,
     dst: &'a mut [u8],
     ptr: usize,
-    end_ptr: usize,
 }
 
 impl<'a> BitCStream<'a> {
@@ -65,14 +69,18 @@ impl<'a> BitCStream<'a> {
         if dst.len() <= CONTAINER_BYTES {
             return error!(DstSizeTooSmall);
         }
-        let end_ptr = dst.len() - CONTAINER_BYTES;
         Ok(BitCStream {
             bit_container: 0,
             bit_pos: 0,
             dst,
             ptr: 0,
-            end_ptr,
         })
+    }
+
+    /// `endPtr`: the last position a whole register can be written at.
+    #[inline(always)]
+    fn end_ptr(&self) -> usize {
+        self.dst.len() - CONTAINER_BYTES
     }
 
     /// The bits the register holds, not yet flushed.
@@ -86,8 +94,9 @@ impl<'a> BitCStream<'a> {
     pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
         debug_assert!(nb_bits < 32);
         debug_assert!(nb_bits + self.bit_pos < CONTAINER_BITS);
-        // BIT_getLowerBits
-        self.bit_container |= (value & u64::from(BIT_MASK[nb_bits as usize])) << self.bit_pos;
+        // BIT_getLowerBits, `BIT_mask[nb_bits]` worked out rather than
+        // looked up, which saves a bounds check.
+        self.bit_container |= (value & ((1u64 << nb_bits) - 1)) << self.bit_pos;
         self.bit_pos += nb_bits;
     }
 
@@ -106,25 +115,29 @@ impl<'a> BitCStream<'a> {
     pub(crate) fn flush_bits_fast(&mut self) {
         let nb_bytes = (self.bit_pos >> 3) as usize;
         debug_assert!(self.bit_pos < CONTAINER_BITS);
-        debug_assert!(self.ptr <= self.end_ptr);
+        debug_assert!(self.ptr <= self.end_ptr());
         write_le64(self.dst, self.ptr, self.bit_container);
         self.ptr += nb_bytes;
         self.bit_pos &= 7;
         self.bit_container = self.bit_container.wrapping_shr(nb_bytes as u32 * 8);
     }
 
-    /// `BIT_flushBits`: never moves past `endPtr`. A stream that does not
+    /// `BIT_flushBits`: never writes past `endPtr`. A stream that does not
     /// fit shows only when it is closed.
+    ///
+    /// Differs from libzstd: the position may pass `endPtr` by up to 7,
+    /// and the write goes to the position or `endPtr`, whichever is first.
+    /// libzstd holds the position back after the write instead, so it
+    /// writes at the same place. Held back here, the position is one the
+    /// compiler knows to be at most `endPtr`, and it drops the bounds check
+    /// of the write.
     #[inline(always)]
     pub(crate) fn flush_bits(&mut self) {
         let nb_bytes = (self.bit_pos >> 3) as usize;
         debug_assert!(self.bit_pos < CONTAINER_BITS);
-        debug_assert!(self.ptr <= self.end_ptr);
-        write_le64(self.dst, self.ptr, self.bit_container);
-        self.ptr += nb_bytes;
-        if self.ptr > self.end_ptr {
-            self.ptr = self.end_ptr;
-        }
+        let at = self.ptr.min(self.end_ptr());
+        self.dst[at..at + CONTAINER_BYTES].copy_from_slice(&self.bit_container.to_le_bytes());
+        self.ptr = at + nb_bytes;
         self.bit_pos &= 7;
         self.bit_container = self.bit_container.wrapping_shr(nb_bytes as u32 * 8);
     }
@@ -135,7 +148,7 @@ impl<'a> BitCStream<'a> {
     pub(crate) fn close(mut self) -> usize {
         self.add_bits_fast(1, 1); // the end mark
         self.flush_bits();
-        if self.ptr >= self.end_ptr {
+        if self.ptr >= self.end_ptr() {
             return 0;
         }
         self.ptr + usize::from(self.bit_pos > 0)

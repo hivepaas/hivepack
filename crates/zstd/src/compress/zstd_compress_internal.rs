@@ -4,7 +4,7 @@
 use crate::common::bits::{highbit32, nb_common_bytes};
 use crate::common::error_private::{Result, error};
 use crate::common::fse::fse_ctable_size_u32;
-use crate::common::mem::{read_le16, read_le32, read_le64};
+use crate::common::mem::{idx, read_le16, read_le32, read_le64};
 use crate::common::zstd_internal::ZSTD_BLOCKHEADERSIZE;
 use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG};
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
@@ -149,11 +149,15 @@ pub(crate) enum LongLengthType {
 /// sequences' lengths and offsets.
 ///
 /// Differs from libzstd: the buffers are vectors, and the positions their
-/// lengths, instead of pointers into the context's workspace.
+/// lengths (or, for the literals, `lit_len`), instead of pointers into the
+/// context's workspace.
 #[derive(Clone)]
 pub(crate) struct SeqStore {
     pub(crate) sequences: Vec<SeqDef>,
-    pub(crate) literals: Vec<u8>,
+    /// The literals, `lit_buffer[..lit_len]`, with `WILDCOPY_OVERLENGTH`
+    /// bytes more for the copies in pieces of 16 that may run past them.
+    lit_buffer: Vec<u8>,
+    lit_len: usize,
     pub(crate) ll_code: Vec<u8>,
     pub(crate) ml_code: Vec<u8>,
     pub(crate) of_code: Vec<u8>,
@@ -614,6 +618,42 @@ pub(crate) struct CompressedBlockState {
 // ---------------------------------------------------------------------------
 // Hashes
 
+/// `MEM_readLE16` on the input, its index masked with `idx`: the compiler
+/// then sees that the end of the read does not overflow, which saves a
+/// check.
+#[inline(always)]
+pub(crate) fn mem_read16(src: &[u8], at: usize) -> u16 {
+    read_le16(src, idx(at))
+}
+
+/// `MEM_readLE32` on the input; see [`mem_read16`].
+#[inline(always)]
+pub(crate) fn mem_read32(src: &[u8], at: usize) -> u32 {
+    read_le32(src, idx(at))
+}
+
+/// `MEM_readLE64` on the input; see [`mem_read16`].
+#[inline(always)]
+pub(crate) fn mem_read64(src: &[u8], at: usize) -> u64 {
+    read_le64(src, idx(at))
+}
+
+/// `MEM_readLE32` at `at`, or `None` where the 4 bytes are not all in
+/// `src`, whatever `at` is.
+#[inline(always)]
+pub(crate) fn mem_read32_within(src: &[u8], at: usize) -> Option<u32> {
+    let bytes: [u8; 4] = src.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// `MEM_readLE64` at `at`, or `None` where the 8 bytes are not all in
+/// `src`, whatever `at` is.
+#[inline(always)]
+pub(crate) fn mem_read64_within(src: &[u8], at: usize) -> Option<u64> {
+    let bytes: [u8; 8] = src.get(at..at.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
 const PRIME4BYTES: u32 = 2_654_435_761;
 const PRIME5BYTES: u64 = 889_523_592_379;
 const PRIME6BYTES: u64 = 227_718_039_650_203;
@@ -625,90 +665,174 @@ const PRIME8BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
 #[inline(always)]
 pub(crate) fn zstd_hash_ptr(src: &[u8], at: usize, h_bits: u32, mls: u32) -> usize {
     debug_assert!(h_bits <= 32);
+    (zstd_hash_top(src, at, mls) >> (64 - h_bits)) as usize
+}
+
+/// The hash of the `mls` bytes at `at` before its shift: the hash `h_bits`
+/// long is the top `h_bits` of it.
+///
+/// Differs from libzstd: `ZSTD_hash4` multiplies on 32 bits and shifts by
+/// `32 - h_bits`. Here the 4 bytes are in the top half of a `u64`, where the
+/// product has the same 32 bits, so that the hashes of every length shift by
+/// `64 - h_bits`, which [`HashTable`] depends on.
+#[inline(always)]
+fn zstd_hash_top(src: &[u8], at: usize, mls: u32) -> u64 {
     match mls {
-        5 => zstd_hash_n::<5>(read_le64(src, at), PRIME5BYTES, h_bits),
-        6 => zstd_hash_n::<6>(read_le64(src, at), PRIME6BYTES, h_bits),
-        7 => zstd_hash_n::<7>(read_le64(src, at), PRIME7BYTES, h_bits),
-        8 => (read_le64(src, at).wrapping_mul(PRIME8BYTES) >> (64 - h_bits)) as usize,
+        5 => zstd_hash_n::<5>(mem_read64(src, at), PRIME5BYTES),
+        6 => zstd_hash_n::<6>(mem_read64(src, at), PRIME6BYTES),
+        7 => zstd_hash_n::<7>(mem_read64(src, at), PRIME7BYTES),
+        8 => mem_read64(src, at).wrapping_mul(PRIME8BYTES),
         // 4, and anything else
-        _ => (read_le32(src, at).wrapping_mul(PRIME4BYTES) >> (32 - h_bits)) as usize,
+        _ => (u64::from(mem_read32(src, at)) << 32).wrapping_mul(u64::from(PRIME4BYTES)),
     }
 }
 
-/// `ZSTD_hash5` to `ZSTD_hash7`: the low `N` bytes of `u`.
+/// [`zstd_hash_top`] of the 8 bytes `u`, read at a position already: the
+/// hash of their low `mls` bytes before its shift.
 #[inline(always)]
-fn zstd_hash_n<const N: u32>(u: u64, prime: u64, h_bits: u32) -> usize {
-    ((u << (64 - 8 * N)).wrapping_mul(prime) >> (64 - h_bits)) as usize
+fn zstd_hash_top_u64(u: u64, mls: u32) -> u64 {
+    match mls {
+        5 => zstd_hash_n::<5>(u, PRIME5BYTES),
+        6 => zstd_hash_n::<6>(u, PRIME6BYTES),
+        7 => zstd_hash_n::<7>(u, PRIME7BYTES),
+        8 => u.wrapping_mul(PRIME8BYTES),
+        // 4, and anything else: the low 4 bytes
+        _ => (u << 32).wrapping_mul(u64::from(PRIME4BYTES)),
+    }
+}
+
+/// `ZSTD_hash5` to `ZSTD_hash7`, before the shift: the low `N` bytes of `u`.
+#[inline(always)]
+fn zstd_hash_n<const N: u32>(u: u64, prime: u64) -> u64 {
+    (u << (64 - 8 * N)).wrapping_mul(prime)
+}
+
+/// A match finder's hash table of `1 << h_bits` entries, and its hashes.
+///
+/// Differs from libzstd: the table is cut once to the entries a hash can
+/// reach, up to `u64::MAX >> shift`, `shift` being the `64 - h_bits` every
+/// hash shifts by. Where the compiler sees how a hash was made, it can then
+/// tell that the hash masked with `len - 1` is in bounds and that the mask
+/// leaves it as it is, and drops both: indexing costs nothing. A hash kept
+/// from one turn of a loop to the next may cost the mask, one `and`,
+/// instead of the check.
+pub(crate) struct HashTable<'a> {
+    table: &'a mut [u32],
+    shift: u32,
+}
+
+impl<'a> HashTable<'a> {
+    /// The first `1 << h_bits` entries of `table`, which has that many.
+    #[inline(always)]
+    pub(crate) fn new(table: &'a mut [u32], h_bits: u32) -> Self {
+        debug_assert!((1..=32).contains(&h_bits));
+        let shift = 64 - h_bits;
+        let table = &mut table[..=(u64::MAX >> shift) as usize];
+        HashTable { table, shift }
+    }
+
+    /// `ZSTD_hashPtr`: the hash of the `mls` bytes at `at`.
+    #[inline(always)]
+    pub(crate) fn hash(&self, src: &[u8], at: usize, mls: u32) -> usize {
+        (zstd_hash_top(src, at, mls) >> self.shift) as usize
+    }
+
+    /// [`Self::hash`] of the 8 bytes `u`, read at a position already.
+    #[inline(always)]
+    pub(crate) fn hash_u64(&self, u: u64, mls: u32) -> usize {
+        (zstd_hash_top_u64(u, mls) >> self.shift) as usize
+    }
+
+    /// The entry of `hash`, one of the table's hashes.
+    #[inline(always)]
+    pub(crate) fn get(&self, hash: usize) -> u32 {
+        self.table[hash & (self.table.len() - 1)]
+    }
+
+    /// Sets the entry of `hash`, one of the table's hashes.
+    #[inline(always)]
+    pub(crate) fn set(&mut self, hash: usize, value: u32) {
+        let mask = self.table.len() - 1;
+        self.table[hash & mask] = value;
+    }
 }
 
 /// `ZSTD_count`: how many bytes from `p_in` equal those from `p_match`,
 /// stopping at `p_in_limit`. `p_match` is before `p_in`.
 #[inline(always)]
-pub(crate) fn zstd_count(
-    src: &[u8],
-    mut p_in: usize,
-    mut p_match: usize,
-    p_in_limit: usize,
-) -> usize {
-    let p_start = p_in;
-    if p_in_limit >= 7 {
-        let p_in_loop_limit = p_in_limit - 7;
-        while p_in < p_in_loop_limit {
-            let diff = read_le64(src, p_match) ^ read_le64(src, p_in);
-            if diff != 0 {
-                return p_in + nb_common_bytes(diff) as usize - p_start;
-            }
-            p_in += 8;
-            p_match += 8;
-        }
-    }
-    if p_in + 3 < p_in_limit && read_le32(src, p_match) == read_le32(src, p_in) {
-        p_in += 4;
-        p_match += 4;
-    }
-    if p_in + 1 < p_in_limit && read_le16(src, p_match) == read_le16(src, p_in) {
-        p_in += 2;
-        p_match += 2;
-    }
-    if p_in < p_in_limit && src[p_match] == src[p_in] {
-        p_in += 1;
-    }
-    p_in - p_start
+pub(crate) fn zstd_count(src: &[u8], p_in: usize, p_match: usize, p_in_limit: usize) -> usize {
+    zstd_count_from(src, p_in, src, p_match, p_in_limit)
 }
 
-/// `ZSTD_count`, with the match in another buffer, `mbuf`.
+/// `ZSTD_count`, with the match in another buffer, `mbuf`. The match run,
+/// as long as the one from `p_in` to `p_in_limit`, must be in `mbuf`.
+///
+/// Differs from libzstd: the first 8 bytes, where most counts end, are read
+/// at the two positions, as in C; past them, the two runs are cut out of
+/// their buffers once and compared 8 bytes at a time, then 4, 2 and 1, with
+/// no bounds check for each read. `p_in_limit` is never past the end of
+/// `src`, so taking the smaller of the two changes nothing, and lets the
+/// test of the limit stand for the bounds check on `src`. Cutting the match
+/// run is what needs it whole in `mbuf`, where C reads only up to the first
+/// difference: every caller's match is before `p_in` in `src`, or in the
+/// older segment with the count stopping at its end.
 #[inline(always)]
 fn zstd_count_from(
     src: &[u8],
-    mut p_in: usize,
+    p_in: usize,
     mbuf: &[u8],
-    mut p_match: usize,
+    p_match: usize,
     p_in_limit: usize,
 ) -> usize {
-    let p_start = p_in;
-    if p_in_limit >= 7 {
-        let p_in_loop_limit = p_in_limit - 7;
-        while p_in < p_in_loop_limit {
-            let diff = read_le64(mbuf, p_match) ^ read_le64(src, p_in);
-            if diff != 0 {
-                return p_in + nb_common_bytes(diff) as usize - p_start;
-            }
-            p_in += 8;
-            p_match += 8;
+    let p_in_limit = p_in_limit.min(src.len());
+    // Masked, so that `p_in + 8` does not overflow; see `idx`.
+    let p_in = idx(p_in);
+    if p_in + 8 <= p_in_limit {
+        let diff = mem_read64(mbuf, p_match) ^ mem_read64(src, p_in);
+        if diff != 0 {
+            return nb_common_bytes(diff) as usize;
         }
+        // The rest of the two runs, as long as each other.
+        let input = &src[p_in + 8..p_in_limit];
+        let matched = &mbuf[p_match + 8..][..input.len()];
+        let (in_words, in_rest) = input.as_chunks::<8>();
+        let (m_words, m_rest) = matched.as_chunks::<8>();
+        for (i, (a, b)) in in_words.iter().zip(m_words).enumerate() {
+            let diff = u64::from_le_bytes(*b) ^ u64::from_le_bytes(*a);
+            if diff != 0 {
+                return 8 + 8 * i + nb_common_bytes(diff) as usize;
+            }
+        }
+        return 8 + 8 * in_words.len() + zstd_count_end(in_rest, m_rest);
     }
-    if p_in + 3 < p_in_limit && read_le32(mbuf, p_match) == read_le32(src, p_in) {
-        p_in += 4;
-        p_match += 4;
+    // Under 8 bytes before the limit.
+    if p_in >= p_in_limit {
+        return 0;
     }
-    if p_in + 1 < p_in_limit && read_le16(mbuf, p_match) == read_le16(src, p_in) {
-        p_in += 2;
-        p_match += 2;
+    let input = &src[p_in..p_in_limit];
+    zstd_count_end(input, &mbuf[p_match..][..input.len()])
+}
+
+/// The end of `ZSTD_count`, its tests of 4, 2 and 1 bytes: how many leading
+/// bytes of `input`, under 8, equal those of `matched`, which is as long.
+#[inline(always)]
+fn zstd_count_end(mut input: &[u8], mut matched: &[u8]) -> usize {
+    debug_assert!(input.len() < 8 && matched.len() == input.len());
+    let mut length = 0;
+    if input.len() >= 4 && input[..4] == matched[..4] {
+        length += 4;
+        input = &input[4..];
+        matched = &matched[4..];
     }
-    if p_in < p_in_limit && mbuf[p_match] == src[p_in] {
-        p_in += 1;
+    if input.len() >= 2 && input[..2] == matched[..2] {
+        length += 2;
+        input = &input[2..];
+        matched = &matched[2..];
     }
-    p_in - p_start
+    if !input.is_empty() && input[0] == matched[0] {
+        length += 1;
+    }
+    length
 }
 
 /// `ZSTD_count_2segments`: the length of a match at `ip` (of `src`, up to
@@ -750,7 +874,8 @@ impl SeqStore {
     pub(crate) fn with_capacity(block_size: usize, max_nb_seq: usize) -> Self {
         SeqStore {
             sequences: Vec::with_capacity(max_nb_seq),
-            literals: Vec::with_capacity(block_size),
+            lit_buffer: vec![0; block_size + WILDCOPY_OVERLENGTH],
+            lit_len: 0,
             ll_code: Vec::with_capacity(max_nb_seq),
             ml_code: Vec::with_capacity(max_nb_seq),
             of_code: Vec::with_capacity(max_nb_seq),
@@ -759,15 +884,34 @@ impl SeqStore {
         }
     }
 
+    /// A store of `literals` and room for `nb_seq` sequences, for tests.
+    pub(crate) fn with_literals(literals: &[u8], nb_seq: usize) -> Self {
+        let mut store = SeqStore::with_capacity(literals.len(), nb_seq);
+        store.lit_buffer[..literals.len()].copy_from_slice(literals);
+        store.lit_len = literals.len();
+        store
+    }
+
+    /// The literals stored.
+    #[inline(always)]
+    pub(crate) fn literals(&self) -> &[u8] {
+        &self.lit_buffer[..self.lit_len]
+    }
+
     /// `ZSTD_resetSeqStore`
     pub(crate) fn reset(&mut self) {
         self.sequences.clear();
-        self.literals.clear();
+        self.lit_len = 0;
         self.long_length_type = LongLengthType::None;
     }
 
     /// `ZSTD_storeSeq`: a sequence and its `lit_length` literals, at
     /// `literals` in `src`.
+    ///
+    /// As libzstd, the literals are copied in pieces of 16 bytes when the
+    /// source has 32 bytes more (libzstd counts them to the block's end,
+    /// the port to its buffer's): the bytes past them land in the store's
+    /// margin, where the next literals go.
     #[inline(always)]
     pub(crate) fn store_seq(
         &mut self,
@@ -777,8 +921,25 @@ impl SeqStore {
         off_base: u32,
         match_length: usize,
     ) {
-        self.literals
-            .extend_from_slice(&src[literals..literals + lit_length]);
+        let lit_end = literals + lit_length;
+        let op = self.lit_len;
+        if lit_end + WILDCOPY_OVERLENGTH <= src.len() {
+            // The common case: literals are likely short.
+            copy16(&mut self.lit_buffer, op, src, literals);
+            if lit_length > 16 {
+                wildcopy(
+                    &mut self.lit_buffer,
+                    op + 16,
+                    src,
+                    literals + 16,
+                    lit_length - 16,
+                );
+            }
+        } else {
+            // ZSTD_safecopyLiterals
+            self.lit_buffer[op..op + lit_length].copy_from_slice(&src[literals..lit_end]);
+        }
+        self.lit_len += lit_length;
         self.store_seq_only(lit_length, off_base, match_length);
     }
 
@@ -808,8 +969,38 @@ impl SeqStore {
 
     /// `ZSTD_storeLastLiterals`
     pub(crate) fn store_last_literals(&mut self, src: &[u8], anchor: usize, last_ll_size: usize) {
-        self.literals
-            .extend_from_slice(&src[anchor..anchor + last_ll_size]);
+        let op = self.lit_len;
+        self.lit_buffer[op..op + last_ll_size].copy_from_slice(&src[anchor..anchor + last_ll_size]);
+        self.lit_len += last_ll_size;
+    }
+}
+
+/// `WILDCOPY_OVERLENGTH`: how far past their end copies in pieces may
+/// write.
+pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
+
+/// `ZSTD_copy16`
+#[inline(always)]
+fn copy16(dst: &mut [u8], op: usize, src: &[u8], ip: usize) {
+    let (op, ip) = (idx(op), idx(ip));
+    let mut piece = [0u8; 16];
+    piece.copy_from_slice(&src[ip..ip + 16]);
+    dst[op..op + 16].copy_from_slice(&piece);
+}
+
+/// `ZSTD_wildcopy` with `ZSTD_no_overlap`: `length` bytes and up to 32
+/// more, in pieces of 16.
+#[inline(always)]
+fn wildcopy(dst: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, length: usize) {
+    let oend = op + length;
+    loop {
+        copy16(dst, op, src, ip);
+        copy16(dst, op + 16, src, ip + 16);
+        op += 32;
+        ip += 32;
+        if op >= oend {
+            break;
+        }
     }
 }
 

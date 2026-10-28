@@ -42,13 +42,17 @@ pub(crate) fn zstd_seq_to_codes(seq_store: &mut SeqStore) -> bool {
     seq_store.ll_code.resize(nb_seq, 0);
     seq_store.ml_code.resize(nb_seq, 0);
     seq_store.of_code.resize(nb_seq, 0);
-    for (u, seq) in seq_store.sequences.iter().enumerate() {
-        let llv = u32::from(seq.lit_length);
-        let of_code = highbit32(seq.off_base);
-        let mlv = u32::from(seq.ml_base);
-        seq_store.ll_code[u] = zstd_ll_code(llv) as u8;
-        seq_store.of_code[u] = of_code as u8;
-        seq_store.ml_code[u] = zstd_ml_code(mlv) as u8;
+    // Over slices, apart: written through the store, each code would make
+    // the compiler read its buffer's place again.
+    let codes = seq_store
+        .ll_code
+        .iter_mut()
+        .zip(seq_store.of_code.iter_mut())
+        .zip(seq_store.ml_code.iter_mut());
+    for (seq, ((ll_code, of_code), ml_code)) in seq_store.sequences.iter().zip(codes) {
+        *ll_code = zstd_ll_code(u32::from(seq.lit_length)) as u8;
+        *of_code = highbit32(seq.off_base) as u8;
+        *ml_code = zstd_ml_code(u32::from(seq.ml_base)) as u8;
     }
     let pos = seq_store.long_length_pos as usize;
     match seq_store.long_length_type {
@@ -230,7 +234,7 @@ fn zstd_entropy_compress_seq_store_internal(
     let mut count = [0u32; MAX_SEQ as usize + 1];
     let mut hist_wksp = [0u32; HIST_WKSP_SIZE_U32];
     let nb_seq = seq_store.sequences.len();
-    let literals = &seq_store.literals;
+    let literals = seq_store.literals();
     let oend = dst.len();
     let mut op = 0;
 

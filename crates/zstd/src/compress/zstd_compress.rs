@@ -26,6 +26,7 @@ use crate::compress::zstd_compress_literals::zstd_compress_literals;
 use crate::compress::zstd_compress_sequences::{
     DefaultPolicy, zstd_build_ctable, zstd_encode_sequences, zstd_select_encoding_type,
 };
+use crate::compress::zstd_double_fast::zstd_compress_block_double_fast;
 use crate::compress::zstd_fast::zstd_compress_block_fast;
 use crate::compress::zstd_pre_split::zstd_split_block;
 
@@ -387,6 +388,28 @@ pub(crate) const fn zstd_min_clevel() -> i32 {
     -(ZSTD_TARGETLENGTH_MAX as i32)
 }
 
+/// `ZSTD_minCLevel`: the fastest compression level, -131072.
+pub fn min_c_level() -> i32 {
+    zstd_min_clevel()
+}
+
+/// `ZSTD_maxCLevel`: the strongest compression level, 22.
+pub fn max_c_level() -> i32 {
+    ZSTD_MAX_CLEVEL
+}
+
+/// `ZSTD_defaultCLevel`: the level 0 stands for, 3.
+pub fn default_c_level() -> i32 {
+    ZSTD_CLEVEL_DEFAULT
+}
+
+/// `ZSTD_compressBound`: the most a frame of `src_size` bytes can take, so
+/// the room to give [`compress`] for it to always succeed; `None` for sizes
+/// too large for a frame.
+pub fn compress_bound(src_size: usize) -> Option<usize> {
+    zstd_compress_bound(src_size).ok()
+}
+
 /// `ZSTD_compressBound`: the most a frame of `src_size` bytes can take.
 pub(crate) fn zstd_compress_bound(src_size: usize) -> Result<usize> {
     if src_size as u64 >= ZSTD_MAX_INPUT_SIZE {
@@ -422,6 +445,12 @@ fn zstd_row_match_finder_supported(strategy: Strategy) -> bool {
 fn zstd_row_match_finder_used(strategy: Strategy, mode: ParamSwitch) -> bool {
     debug_assert!(mode != ParamSwitch::Auto);
     zstd_row_match_finder_supported(strategy) && mode == ParamSwitch::Enable
+}
+
+/// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for
+/// `dfast`, its short hash table).
+fn zstd_allocate_chain_table(strategy: Strategy, use_row_match_finder: ParamSwitch) -> bool {
+    strategy != Strategy::Fast && !zstd_row_match_finder_used(strategy, use_row_match_finder)
 }
 
 /// `ZSTD_cycleLog`
@@ -666,9 +695,12 @@ enum CompressionStage {
     Ending,
 }
 
-/// `ZSTD_CCtx`: a compression context, those parts the port has so far:
-/// compressing a frame in one call, without a dictionary.
-pub(crate) struct CCtx {
+/// `ZSTD_CCtx`: a compression context, reused across frames.
+///
+/// Create one with [`CCtx::new`] and keep it: it holds tables and buffers
+/// that would otherwise be set up for every call. So far it compresses whole
+/// frames in one call ([`CCtx::compress`]), without a dictionary.
+pub struct CCtx {
     stage: CompressionStage,
     applied_params: CCtxParams,
     /// The tables and repeat offsets of the block before, and of the one
@@ -688,7 +720,7 @@ pub(crate) struct CCtx {
 
 impl CCtx {
     /// `ZSTD_createCCtx`
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (c_params, f_params) = zstd_get_params_internal(
             ZSTD_CLEVEL_DEFAULT,
             ZSTD_CONTENTSIZE_UNKNOWN,
@@ -709,6 +741,7 @@ impl CCtx {
             match_state: MatchState {
                 window: Window::new(0),
                 hash_table: Vec::new(),
+                chain_table: Vec::new(),
                 next_to_update: 0,
                 loaded_dict_end: 0,
                 c_params,
@@ -761,6 +794,15 @@ impl CCtx {
         ms.loaded_dict_end = 0;
         ms.hash_table.clear();
         ms.hash_table.resize(1 << c_params.hash_log, 0);
+        // ZSTD_allocateChainTable: none for fast, nor for the row match
+        // finder, which the port does not have yet.
+        let chain_size = if zstd_allocate_chain_table(c_params.strategy, ParamSwitch::Disable) {
+            1 << c_params.chain_log
+        } else {
+            0
+        };
+        ms.chain_table.clear();
+        ms.chain_table.resize(chain_size, 0);
         ms.c_params = c_params;
 
         self.seq_store = SeqStore::with_capacity(block_size, max_nb_seq);
@@ -797,6 +839,14 @@ impl CCtx {
         self.next_cblock.rep = self.prev_cblock.rep;
         let last_ll_size = match self.applied_params.c_params.strategy {
             Strategy::Fast => zstd_compress_block_fast(
+                ms,
+                &mut self.seq_store,
+                &mut self.next_cblock.rep,
+                src,
+                istart,
+                iend,
+            ),
+            Strategy::Dfast => zstd_compress_block_double_fast(
                 ms,
                 &mut self.seq_store,
                 &mut self.next_cblock.rep,
@@ -1207,8 +1257,19 @@ impl CCtx {
         self.compress_end(dst, src)
     }
 
-    /// `ZSTD_compressCCtx`: `src` as one frame, at `compression_level`.
-    pub(crate) fn compress_cctx(
+    /// `ZSTD_compressCCtx`: `src` as one frame, at `compression_level`, into
+    /// `dst`. Returns the frame's size.
+    ///
+    /// The frame has the content size and no checksum, as libzstd's, and is
+    /// byte for byte the frame libzstd 1.5.7 writes. Levels go from
+    /// [`min_c_level`] to [`max_c_level`]; 0 is [`default_c_level`]. Room
+    /// for [`compress_bound`] bytes is always enough.
+    ///
+    /// Work in progress: the port has libzstd's `fast` and `dfast`
+    /// strategies so far, which are every level up to 3, and level 4 for
+    /// inputs over 256 KB. Other levels fail with
+    /// [`ErrorCode::ParameterUnsupported`](crate::ErrorCode::ParameterUnsupported).
+    pub fn compress(
         &mut self,
         dst: &mut [u8],
         src: &[u8],
@@ -1236,8 +1297,15 @@ fn zstd_is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
 }
 
-/// `ZSTD_compress`: `src` as one frame, at `compression_level`, with a new
-/// context.
-pub(crate) fn zstd_compress(dst: &mut [u8], src: &[u8], compression_level: i32) -> Result<usize> {
-    CCtx::new().compress_cctx(dst, src, compression_level)
+impl Default for CCtx {
+    fn default() -> Self {
+        CCtx::new()
+    }
+}
+
+/// `ZSTD_compress`: `src` as one frame, at `compression_level`, into `dst`.
+/// Returns the frame's size. Each call sets up a new context; reuse a
+/// [`CCtx`] to avoid that. See [`CCtx::compress`].
+pub fn compress(dst: &mut [u8], src: &[u8], compression_level: i32) -> Result<usize> {
+    CCtx::new().compress(dst, src, compression_level)
 }

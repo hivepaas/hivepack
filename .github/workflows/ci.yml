@@ -159,8 +159,9 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
 
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
-  # feature, under AddressSanitizer. A few minutes per run; longer runs are
-  # done by hand (see fuzz/README.md).
+  # feature, and the compressor's frames against libzstd's, under
+  # AddressSanitizer. A few minutes per target; longer runs are done by hand
+  # (see fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
@@ -182,4 +183,9 @@ jobs:
           find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
       # The prebuilt cargo-fuzz is a musl binary and would default to that
       # target, which the sanitizer does not support.
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=300
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=240
+      - name: Seed the compressor's corpus with the committed files
+        run: |
+          mkdir -p fuzz/corpus/compress
+          find testdata -type f -size -64k -exec cp {} fuzz/corpus/compress/ \;
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress -- -max_total_time=180

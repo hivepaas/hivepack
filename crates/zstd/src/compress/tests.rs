@@ -1,8 +1,7 @@
 //! Frames from the port's compressor against libzstd's, through the `zstd`
 //! crate (`ZSTD_compressCCtx`), byte for byte, and decoded back with the
-//! port's decoder. So far at the levels whose strategy is fast.
-
-use std::path::{Path, PathBuf};
+//! port's decoder, for random data, at the levels the port has. The test
+//! data is compressed in `tests/compress.rs`.
 
 use crate::compress::zstd_compress::{
     CCtx, CParamMode, zstd_compress_bound, zstd_get_cparams_internal,
@@ -11,10 +10,10 @@ use crate::compress::zstd_compress_internal::Strategy;
 use crate::decompress::zstd_decompress::decompress;
 use crate::oracle::Rng;
 
-/// Whether `level` compresses `len` bytes with the fast strategy.
+/// Whether `level` compresses `len` bytes with a strategy the port has.
 fn is_fast(level: i32, len: usize) -> bool {
     zstd_get_cparams_internal(level, len as u64, 0, CParamMode::NoAttachDict).strategy
-        == Strategy::Fast
+        <= Strategy::Dfast
 }
 
 /// Compresses `data` with the port and libzstd, and checks they agree and
@@ -22,7 +21,7 @@ fn is_fast(level: i32, len: usize) -> bool {
 fn check(cctx: &mut CCtx, data: &[u8], level: i32) -> Option<String> {
     let want = zstd::bulk::compress(data, level).expect("libzstd compresses");
     let mut got = vec![0u8; zstd_compress_bound(data.len()).expect("a bound")];
-    let size = match cctx.compress_cctx(&mut got, data, level) {
+    let size = match cctx.compress(&mut got, data, level) {
         Ok(size) => size,
         Err(error) => return Some(format!("the port failed: {error:?}")),
     };
@@ -69,7 +68,7 @@ fn frames_match_libzstd_at_fast_levels() {
                 data
             }
         };
-        let level = [-1, -3, -20, -1000, -131_072, 1, 1, 2][rng.range(0, 7) as usize];
+        let level = [-1, -3, -20, -1000, -131_072, 1, 1, 2, 3, 3, 4][rng.range(0, 10) as usize];
         if !is_fast(level, len) {
             continue;
         }
@@ -80,49 +79,5 @@ fn frames_match_libzstd_at_fast_levels() {
             ));
         }
     }
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
-}
-
-/// Every file of the test data up to 4 MB, committed or fetched: the inputs
-/// of the decoder's tests, their frames, dictionaries, corpora.
-fn test_files() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = Vec::new();
-    let mut folders = vec![root.join("testdata"), root.join("target/testdata")];
-    while let Some(folder) = folders.pop() {
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                folders.push(path);
-            } else if entry.metadata().is_ok_and(|m| m.len() <= 4 << 20) {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    files
-}
-
-#[test]
-fn test_data_matches_libzstd_at_fast_levels() {
-    let mut cctx = CCtx::new();
-    let mut problems = Vec::new();
-    let mut checked = 0;
-    for (i, file) in test_files().iter().enumerate() {
-        let data = std::fs::read(file).expect("a test file");
-        for level in [[-5, 1][i % 2], 2] {
-            if !is_fast(level, data.len()) {
-                continue;
-            }
-            checked += 1;
-            if let Some(problem) = check(&mut cctx, &data, level) {
-                problems.push(format!("{} at level {level}: {problem}", file.display()));
-            }
-        }
-    }
-    eprintln!("compressed {checked} test files at fast levels");
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

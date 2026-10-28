@@ -3,9 +3,25 @@
 //!
 //! Work in progress: decompression works, of whole frames in one call
 //! ([`decompress`], [`DCtx::decompress`]) or streaming
-//! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`];
-//! compression comes next. The plan, and the rules the port follows, are in
-//! the repository: `docs/porting.md` and `docs/safety.md`.
+//! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`].
+//! Compression works in one call ([`compress`], [`CCtx::compress`]) at the
+//! levels up to 3, giving the frames libzstd gives; the other levels,
+//! dictionaries and streaming come next. The plan, and the rules the port
+//! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_zstd::Error> {
+//! let data = b"hello, hello, hello, hello";
+//! let mut frame = vec![0; hivepack_zstd::compress_bound(data.len()).unwrap_or(0)];
+//! let size = hivepack_zstd::compress(&mut frame, data, 3)?;
+//! let mut out = vec![0; data.len()];
+//! assert_eq!(hivepack_zstd::decompress(&mut out, &frame[..size])?, data.len());
+//! assert_eq!(&out, data);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Decompressing a frame:
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -59,8 +75,8 @@
 // in `decompress/unchecked.rs`, and the one block of the main sequence loop
 // that turns it on (see `docs/unsafe.md`).
 #![cfg_attr(not(feature = "unsafe-fast"), forbid(unsafe_code))]
-// The common files are ported whole, with what only the encoder (still to
-// come) or the tests use.
+// The common files are ported whole, with what only parts still to come or
+// the tests use.
 #![allow(dead_code)]
 // Loops keep libzstd's indices, so the port reads side by side with the C.
 #![allow(clippy::needless_range_loop)]
@@ -75,6 +91,9 @@ mod oracle;
 mod oracle_compress;
 
 pub use common::error_private::{Error, ErrorCode, Result};
+pub use compress::zstd_compress::{
+    CCtx, compress, compress_bound, default_c_level, max_c_level, min_c_level,
+};
 pub use decompress::zstd_ddict::{DDict, DictContentType};
 pub use decompress::zstd_decompress::{
     BLOCKSIZE_MAX_MIN, ContentSize, DParameter, DParameterKind, FRAMEHEADER_SIZE_MAX,

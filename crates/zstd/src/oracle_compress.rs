@@ -1,7 +1,9 @@
 //! Comparison of the encoder's entropy coding with libzstd's: histograms,
-//! FSE and Huffman tables, their descriptions, and the streams written with
-//! them. `tools/zstd-oracle` answers the requests (see its comment for the
-//! commands); [`answer`] gives the port's answers in the same format.
+//! FSE and Huffman tables, their descriptions, the streams written with
+//! them, and whole blocks entropy-coded from their sequences, with the
+//! tables kept from block to block. `tools/zstd-oracle` answers the
+//! requests (see its comment for the commands); [`answer`] gives the
+//! port's answers in the same format.
 //!
 //! As for the decoder, the tests compare thousands of generated requests
 //! with libzstd live where the oracle is built, and replay recorded answers
@@ -13,6 +15,7 @@
 //! libzstd writes: libzstd keeps its tables from block to block, and reads
 //! old cells back.
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -32,8 +35,13 @@ use crate::compress::huf_compress::{
     huf_compress1x_repeat, huf_compress4x_repeat, huf_optimal_table_log, huf_read_ctable,
     huf_read_ctable_header, huf_write_ctable_wksp,
 };
+use crate::compress::zstd_compress::zstd_entropy_compress_seq_store;
+use crate::compress::zstd_compress_internal::{
+    EntropyCTables, FseRepeat, LongLengthType, ParamSwitch, SeqDef, SeqStore, Strategy,
+    zstd_literals_compression_is_disabled,
+};
 use crate::oracle::{
-    Oracle, Rng, failed, hex, list, mutate, recorded_form, repository, unhex, unlist,
+    Oracle, Rng, failed, fnv64, hex, list, mutate, recorded_form, repository, unhex, unlist,
 };
 
 /// The fillers the oracle starts its tables with.
@@ -80,6 +88,125 @@ fn table_unhex(text: &str) -> Box<HufCTable> {
         *word = u64::from_le_bytes(*chunk);
     }
     table
+}
+
+thread_local! {
+    /// The tables of the block before and of the next one, kept from
+    /// request to request as the oracle keeps them, and which is which.
+    static SEQ_ENTROPY: RefCell<([Box<EntropyCTables>; 2], usize)> = RefCell::new((
+        [EntropyCTables::filled(FILLER_WORD), EntropyCTables::filled(FILLER_WORD)],
+        0,
+    ));
+}
+
+/// The tables as the oracle hashes them: the FSE words, then the Huffman
+/// elements up to the table's largest symbol, little-endian.
+fn entropy_digest(entropy: &EntropyCTables) -> u64 {
+    let mut bytes = Vec::new();
+    for table in [
+        &entropy.fse.offcode_ctable[..],
+        &entropy.fse.matchlength_ctable[..],
+        &entropy.fse.litlength_ctable[..],
+    ] {
+        bytes.extend(table.iter().flat_map(|w| w.to_le_bytes()));
+    }
+    let used = usize::from(huf_read_ctable_header(&entropy.huf.ctable).max_symbol_value) + 2;
+    bytes.extend(
+        entropy.huf.ctable[..used]
+            .iter()
+            .flat_map(|w| w.to_le_bytes()),
+    );
+    fnv64(&bytes)
+}
+
+/// The port's answer to `seqblock`.
+fn seq_block(
+    strategy: &str,
+    literal_mode: &str,
+    target_length: &str,
+    dst_capacity: &str,
+    literals: &str,
+    sequences: &str,
+) -> String {
+    let literals = unhex(literals);
+    let triples = unlist(sequences);
+    let mut store = SeqStore {
+        sequences: Vec::with_capacity(triples.len() / 3),
+        literals,
+        ll_code: Vec::new(),
+        ml_code: Vec::new(),
+        of_code: Vec::new(),
+        long_length_type: LongLengthType::None,
+        long_length_pos: 0,
+    };
+    let mut block_size = store.literals.len();
+    for (i, triple) in triples.chunks(3).enumerate() {
+        let (off_base, lit_length, match_length) = (triple[0], triple[1], triple[2]);
+        let ml_base = match_length - 3;
+        if lit_length > 0xFFFF || ml_base > 0xFFFF {
+            store.long_length_type = if lit_length > 0xFFFF {
+                LongLengthType::LiteralLength
+            } else {
+                LongLengthType::MatchLength
+            };
+            store.long_length_pos = i as u32;
+        }
+        store.sequences.push(SeqDef {
+            off_base: off_base as u32,
+            lit_length: lit_length as u16,
+            ml_base: ml_base as u16,
+        });
+        block_size += match_length as usize;
+    }
+    let strategy = Strategy::from_number(number(strategy)).expect("a strategy");
+    let literal_mode = match literal_mode {
+        "1" => ParamSwitch::Enable,
+        "2" => ParamSwitch::Disable,
+        _ => ParamSwitch::Auto,
+    };
+    let disable =
+        zstd_literals_compression_is_disabled(literal_mode, strategy, number(target_length));
+    let mut dst = vec![0u8; number(dst_capacity)];
+    SEQ_ENTROPY.with(|state| {
+        let (tables, prev) = &mut *state.borrow_mut();
+        let (first, second) = tables.split_at_mut(1);
+        let (prev_entropy, next_entropy) = if *prev == 0 {
+            (&first[0], &mut second[0])
+        } else {
+            (&second[0], &mut first[0])
+        };
+        let result = zstd_entropy_compress_seq_store(
+            &mut store,
+            prev_entropy,
+            next_entropy,
+            strategy,
+            disable,
+            &mut dst,
+            block_size,
+            false,
+        );
+        let size = match result {
+            Ok(size) => size,
+            Err(error) => return failed(error),
+        };
+        // As ZSTD_compressBlock_internal does.
+        if size > 1 {
+            *prev = 1 - *prev;
+        }
+        let entropy = &mut tables[*prev];
+        if entropy.fse.offcode_repeat_mode == FseRepeat::Valid {
+            entropy.fse.offcode_repeat_mode = FseRepeat::Check;
+        }
+        format!(
+            "ok {size} {} {},{},{},{} {:016x}",
+            hex(&dst[..size]),
+            entropy.huf.repeat_mode as i32,
+            entropy.fse.offcode_repeat_mode as i32,
+            entropy.fse.matchlength_repeat_mode as i32,
+            entropy.fse.litlength_repeat_mode as i32,
+            entropy_digest(entropy)
+        )
+    })
 }
 
 /// The port's answer to one of the encoder's requests.
@@ -300,6 +427,34 @@ pub(crate) fn answer(request: &str) -> String {
                 Err(error) => failed(error),
             }
         }
+        ["seqreset"] => {
+            SEQ_ENTROPY.with(|state| {
+                *state.borrow_mut() = (
+                    [
+                        EntropyCTables::filled(FILLER_WORD),
+                        EntropyCTables::filled(FILLER_WORD),
+                    ],
+                    0,
+                );
+            });
+            "ok".into()
+        }
+        [
+            "seqblock",
+            strategy,
+            literal_mode,
+            target_length,
+            dst_capacity,
+            literals,
+            sequences,
+        ] => seq_block(
+            strategy,
+            literal_mode,
+            target_length,
+            dst_capacity,
+            literals,
+            sequences,
+        ),
         _ => panic!("unknown request {request:.200}"),
     }
 }
@@ -690,6 +845,13 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         }
     }
 
+    // Blocks of sequences in runs, each run with the tables kept from block
+    // to block, its sequences drawn the same way throughout, so that the
+    // tables are used again.
+    for chain in 0..per_command / 8 {
+        requests.extend(seq_chain(rng, chain));
+    }
+
     // Valid tables, as a dictionary gives them: used without a look when
     // the flags prefer them, otherwise when they cost less.
     for _ in 0..per_command / 10 {
@@ -720,6 +882,194 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
     requests
 }
 
+/// How a run of blocks draws its sequences.
+struct SeqProfile {
+    max_literals: u64,
+    max_match: u64,
+    repeat_one_in: u64,
+    max_offset_log: u64,
+}
+
+/// One length, mostly small, up to `max`.
+fn small_length(rng: &mut Rng, max: u64) -> u64 {
+    match rng.range(0, 9) {
+        0 => rng.range(0, max),
+        1..=3 => rng.range(0, max.min(64)),
+        _ => rng.range(0, max.min(12)),
+    }
+}
+
+/// A run of blocks of sequences: `seqreset`, then the blocks.
+fn seq_chain(rng: &mut Rng, chain: usize) -> Vec<String> {
+    let mut requests = vec!["seqreset".to_string()];
+    let strategy = match rng.range(0, 1) {
+        0 => rng.range(1, 9),
+        _ => rng.range(1, 2),
+    };
+    let literal_mode = [0, 0, 0, 1, 2][rng.range(0, 4) as usize];
+    let target_length = if rng.range(0, 3) == 0 {
+        rng.range(1, 64)
+    } else {
+        0
+    };
+    let profile = SeqProfile {
+        max_literals: [8, 40, 300, 3000][rng.range(0, 3) as usize],
+        max_match: [8, 40, 300, 70_000][rng.range(0, 3) as usize],
+        repeat_one_in: rng.range(2, 8),
+        max_offset_log: rng.range(3, 27),
+    };
+    // The literals of all the blocks come from one source, so that a
+    // block's Huffman table may serve the next; sometimes they are one
+    // byte repeated.
+    let literal_source = match chain % 10 {
+        3 => vec![rng.next() as u8; 1 << 17],
+        4 => rng.bytes(1 << 17),
+        _ => rng.huffman_data(1 << 17),
+    };
+    // Mostly small blocks; some full ones; now and then one with so many
+    // sequences that their count takes 3 bytes, or exactly as many as the
+    // count's sizes change at.
+    let many = chain % 25 == 7;
+    let exactly =
+        (chain % 25 == 8).then(|| [127usize, 128, 0x7EFF, 0x7F00][rng.range(0, 3) as usize]);
+    for _ in 0..rng.range(1, 8) {
+        let budget = if many {
+            128 * 1024
+        } else if rng.range(0, 7) == 0 {
+            rng.range(20_000, 128 * 1024)
+        } else {
+            rng.range(0, 6000)
+        } as usize;
+        let mut triples = Vec::new();
+        let mut literal_count = 0usize;
+        let mut size = 0usize;
+        let mut long_used = false;
+        loop {
+            if exactly.is_some_and(|n| triples.len() == 3 * n) {
+                break;
+            }
+            let (lit_length, match_length) = if many || exactly.is_some() {
+                (0, 3)
+            } else {
+                let mut lit_length = small_length(rng, profile.max_literals);
+                let mut match_length = 3 + small_length(rng, profile.max_match);
+                if !long_used && rng.range(0, 60) == 0 {
+                    // A length over 0xFFFF, as one sequence of a block may
+                    // have.
+                    long_used = true;
+                    if rng.range(0, 1) == 0 {
+                        lit_length = rng.range(0x10000, 0x10000 + 2000);
+                    } else {
+                        match_length = rng.range(0x10003, 0x10003 + 2000);
+                    }
+                }
+                (lit_length, match_length)
+            };
+            if exactly.is_none()
+                && size + (lit_length + match_length) as usize > budget.min(128 * 1024 - 64)
+            {
+                break;
+            }
+            let off_base = if rng.range(0, profile.repeat_one_in - 1) == 0 {
+                rng.range(1, 3)
+            } else {
+                let offset_log = rng.range(0, profile.max_offset_log);
+                3 + rng.range(1, 1 << offset_log)
+            };
+            triples.extend([off_base, lit_length, match_length]);
+            literal_count += lit_length as usize;
+            size += (lit_length + match_length) as usize;
+        }
+        // The last literals, after the last sequence.
+        let last = rng.range(0, 64) as usize;
+        literal_count += last;
+        size += last;
+        let start = rng.range(0, ((1 << 17) - literal_count) as u64) as usize;
+        let literals = &literal_source[start..start + literal_count];
+        let capacity = match rng.range(0, 5) {
+            0 => rng.range(0, size as u64),
+            1 => rng.range(0, 30),
+            _ => (size + 1000).min(1 << 20) as u64,
+        };
+        requests.push(format!(
+            "seqblock {strategy} {literal_mode} {target_length} {capacity} {} {}",
+            hex(literals),
+            list(triples)
+        ));
+    }
+    requests
+}
+
+/// How a compressed block encodes its parts: its literals, and each kind of
+/// code, for the statistics of the live comparison.
+fn seq_block_kinds(block: &[u8]) -> Vec<String> {
+    const NAMES: [&str; 4] = ["basic", "rle", "compressed", "repeat"];
+    let lit_type = usize::from(block[0] & 3);
+    let size_format = (block[0] >> 2) & 3;
+    let header = u32::from_le_bytes([
+        block[0],
+        *block.get(1).unwrap_or(&0),
+        *block.get(2).unwrap_or(&0),
+        *block.get(3).unwrap_or(&0),
+    ]);
+    let lit_section = match (lit_type, size_format) {
+        (0 | 1, 0 | 2) => {
+            1 + if lit_type == 0 {
+                (block[0] >> 3) as usize
+            } else {
+                1
+            }
+        }
+        (0 | 1, 1) => {
+            2 + if lit_type == 0 {
+                ((header & 0xFFFF) >> 4) as usize
+            } else {
+                1
+            }
+        }
+        (0 | 1, _) => {
+            3 + if lit_type == 0 {
+                ((header & 0xFF_FFFF) >> 4) as usize
+            } else {
+                1
+            }
+        }
+        (_, 0 | 1) => 3 + ((header >> 14) & 0x3FF) as usize,
+        (_, 2) => 4 + (header >> 18) as usize,
+        _ => 5 + ((header >> 22) as usize | (usize::from(block[4]) << 10)),
+    };
+    let mut kinds = vec![format!("seqblock literals {}", NAMES[lit_type])];
+    let mut at = lit_section;
+    let nb_seq = match block.get(at) {
+        None => return kinds,
+        Some(&b) if b < 128 => {
+            at += 1;
+            usize::from(b)
+        }
+        Some(&b) if b < 255 => {
+            at += 2;
+            (usize::from(b - 0x80) << 8) + usize::from(block[at - 1])
+        }
+        Some(_) => {
+            at += 3;
+            usize::from(u16::from_le_bytes([block[at - 2], block[at - 1]])) + 0x7F00
+        }
+    };
+    if nb_seq >= 0x7F00 {
+        kinds.push("seqblock nbSeq >= LONGNBSEQ".into());
+    }
+    if nb_seq > 0 {
+        let head = block[at];
+        for (name, shift) in [("ll", 6), ("of", 4), ("ml", 2)] {
+            kinds.push(format!(
+                "seqblock {name} {}",
+                NAMES[usize::from((head >> shift) & 3)]
+            ));
+        }
+    }
+    kinds
+}
+
 #[test]
 fn port_matches_libzstd_compression() {
     let Some(mut oracle) = Oracle::spawn() else {
@@ -741,6 +1091,11 @@ fn port_matches_libzstd_compression() {
         }
         let command = request.split(' ').next().unwrap_or_default();
         let words: Vec<&str> = want.split(' ').collect();
+        if command == "seqblock" && words[0] == "ok" && words[1] != "0" {
+            for kind in seq_block_kinds(&unhex(words[2])) {
+                *outcomes.entry(kind).or_default() += 1;
+            }
+        }
         let outcome = match (command, words[0]) {
             ("hufcompress", "ok") if words[1] == "0" || words[1] == "1" => {
                 format!("hufcompress ok {}", words[1])
@@ -789,19 +1144,35 @@ fn record_compress_answers() {
          # crates/zstd/src/oracle_compress.rs.\n\
          # Regenerate with: cargo test -p hivepack-zstd record_compress_answers -- --ignored\n",
     );
+    // Runs of blocks are kept whole or left out whole, since each block
+    // depends on the ones before.
+    let mut runs: Vec<Vec<String>> = Vec::new();
     for request in requests(&mut oracle, &mut rng, 200) {
+        if request == "seqreset" || !request.starts_with("seqblock") {
+            runs.push(Vec::new());
+        }
+        if let Some(run) = runs.last_mut() {
+            run.push(request);
+        }
+    }
+    for run in runs {
         // Keep the file small: the large inputs are for the live comparison.
         // Huffman requests carry a table, of up to 4 KB of hex.
-        let limit = if request.starts_with("hufcompress") {
-            8000
-        } else {
-            3000
-        };
-        if request.len() > limit {
+        let fits = run.iter().all(|request| {
+            let limit = if request.starts_with("hufcompress") || request.starts_with("seqblock") {
+                8000
+            } else {
+                3000
+            };
+            request.len() <= limit
+        });
+        if !fits {
             continue;
         }
-        let reply = oracle.ask(&request);
-        let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
+        for request in run {
+            let reply = oracle.ask(&request);
+            let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
+        }
     }
     std::fs::write(recorded_path(), text).expect("written");
 }

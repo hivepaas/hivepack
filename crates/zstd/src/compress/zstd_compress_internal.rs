@@ -668,71 +668,75 @@ fn zstd_hash_n<const N: u32>(u: u64, prime: u64, h_bits: u32) -> usize {
 /// `ZSTD_count`: how many bytes from `p_in` equal those from `p_match`,
 /// stopping at `p_in_limit`. `p_match` is before `p_in`.
 #[inline(always)]
-pub(crate) fn zstd_count(
-    src: &[u8],
-    mut p_in: usize,
-    mut p_match: usize,
-    p_in_limit: usize,
-) -> usize {
-    let p_start = p_in;
-    if p_in_limit >= 7 {
-        let p_in_loop_limit = p_in_limit - 7;
-        while p_in < p_in_loop_limit {
-            let diff = mem_read64(src, p_match) ^ mem_read64(src, p_in);
-            if diff != 0 {
-                return p_in + nb_common_bytes(diff) as usize - p_start;
-            }
-            p_in += 8;
-            p_match += 8;
-        }
-    }
-    if p_in + 3 < p_in_limit && mem_read32(src, p_match) == mem_read32(src, p_in) {
-        p_in += 4;
-        p_match += 4;
-    }
-    if p_in + 1 < p_in_limit && mem_read16(src, p_match) == mem_read16(src, p_in) {
-        p_in += 2;
-        p_match += 2;
-    }
-    if p_in < p_in_limit && src[p_match] == src[p_in] {
-        p_in += 1;
-    }
-    p_in - p_start
+pub(crate) fn zstd_count(src: &[u8], p_in: usize, p_match: usize, p_in_limit: usize) -> usize {
+    zstd_count_from(src, p_in, src, p_match, p_in_limit)
 }
 
 /// `ZSTD_count`, with the match in another buffer, `mbuf`.
+///
+/// Differs from libzstd: the first 8 bytes, where most counts end, are read
+/// at the two positions, as in C; past them, the two runs are cut out of
+/// their buffers once and compared 8 bytes at a time, then 4, 2 and 1, with
+/// no bounds check for each read. `p_in_limit` is never past the end of
+/// `src`, so taking the smaller of the two changes nothing, and lets the
+/// test of the limit stand for the bounds check on `src`.
 #[inline(always)]
 fn zstd_count_from(
     src: &[u8],
-    mut p_in: usize,
+    p_in: usize,
     mbuf: &[u8],
-    mut p_match: usize,
+    p_match: usize,
     p_in_limit: usize,
 ) -> usize {
-    let p_start = p_in;
-    if p_in_limit >= 7 {
-        let p_in_loop_limit = p_in_limit - 7;
-        while p_in < p_in_loop_limit {
-            let diff = mem_read64(mbuf, p_match) ^ mem_read64(src, p_in);
-            if diff != 0 {
-                return p_in + nb_common_bytes(diff) as usize - p_start;
-            }
-            p_in += 8;
-            p_match += 8;
+    let p_in_limit = p_in_limit.min(src.len());
+    // Masked, so that `p_in + 8` does not overflow; see `idx`.
+    let p_in = idx(p_in);
+    if p_in + 8 <= p_in_limit {
+        let diff = mem_read64(mbuf, p_match) ^ mem_read64(src, p_in);
+        if diff != 0 {
+            return nb_common_bytes(diff) as usize;
         }
+        // The rest of the two runs, as long as each other.
+        let input = &src[p_in + 8..p_in_limit];
+        let matched = &mbuf[p_match + 8..][..input.len()];
+        let (in_words, in_rest) = input.as_chunks::<8>();
+        let (m_words, m_rest) = matched.as_chunks::<8>();
+        for (i, (a, b)) in in_words.iter().zip(m_words).enumerate() {
+            let diff = u64::from_le_bytes(*b) ^ u64::from_le_bytes(*a);
+            if diff != 0 {
+                return 8 + 8 * i + nb_common_bytes(diff) as usize;
+            }
+        }
+        return 8 + 8 * in_words.len() + zstd_count_end(in_rest, m_rest);
     }
-    if p_in + 3 < p_in_limit && mem_read32(mbuf, p_match) == mem_read32(src, p_in) {
-        p_in += 4;
-        p_match += 4;
+    // Under 8 bytes before the limit.
+    if p_in >= p_in_limit {
+        return 0;
     }
-    if p_in + 1 < p_in_limit && mem_read16(mbuf, p_match) == mem_read16(src, p_in) {
-        p_in += 2;
-        p_match += 2;
+    let input = &src[p_in..p_in_limit];
+    zstd_count_end(input, &mbuf[p_match..][..input.len()])
+}
+
+/// The end of `ZSTD_count`, its tests of 4, 2 and 1 bytes: how many leading
+/// bytes of `input`, under 8, equal those of `matched`, which is as long.
+#[inline(always)]
+fn zstd_count_end(mut input: &[u8], mut matched: &[u8]) -> usize {
+    debug_assert!(input.len() < 8 && matched.len() == input.len());
+    let mut length = 0;
+    if input.len() >= 4 && input[..4] == matched[..4] {
+        length += 4;
+        input = &input[4..];
+        matched = &matched[4..];
     }
-    if p_in < p_in_limit && mbuf[p_match] == src[p_in] {
-        p_in += 1;
+    if input.len() >= 2 && input[..2] == matched[..2] {
+        length += 2;
+        input = &input[2..];
+        matched = &matched[2..];
     }
-    p_in - p_start
+    if !input.is_empty() && input[0] == matched[0] {
+        length += 1;
+    }
+    length
 }
 
 /// `ZSTD_count_2segments`: the length of a match at `ip` (of `src`, up to

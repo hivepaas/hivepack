@@ -143,6 +143,20 @@ impl<R: ReadAt> Source<R> {
 }
 
 impl<R: ReadAt + ?Sized> Source<R> {
+    /// The same source with a position of its own, for one reader of the
+    /// archive's data. libzip's readers share the archive's source and
+    /// seek it before each read; a view does the same without sharing.
+    /// Differs from libzip: a failed read fails only that view's later
+    /// reads.
+    pub(crate) fn view(&self) -> Source<&R> {
+        Source {
+            size: self.size,
+            offset: 0,
+            read_error: self.read_error,
+            inner: &self.inner,
+        }
+    }
+
     /// `st.size` of `zip_source_stat`.
     pub(crate) fn size(&self) -> u64 {
         self.size

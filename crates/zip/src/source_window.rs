@@ -1,0 +1,208 @@
+//! A part of another source, the entry's data in the archive: port of
+//! `zip_source_window.c`, for reading.
+
+use crate::error::{Detail, Error, ErrorCode, Result};
+use crate::file_get_offset::file_get_offset;
+use crate::source::{ReadAt, Source, Whence};
+use crate::zip::{Stat, stat, stat_merge};
+
+/// What a window reads from: the archive, or the empty buffer libzip makes
+/// for an entry with no data.
+pub(crate) enum Lower<'a, R: ?Sized> {
+    Archive(Source<&'a R>),
+    Empty,
+}
+
+impl<R: ReadAt + ?Sized> Lower<'_, R> {
+    /// The length the lower source's `zip_source_stat` gives.
+    pub(crate) fn size(&self) -> u64 {
+        match self {
+            Lower::Archive(src) => src.size(),
+            Lower::Empty => 0,
+        }
+    }
+
+    /// `zip_source_stat` of the lower source: its length, for the window to
+    /// merge its own over. The buffer source tells more, but nothing the
+    /// window does not replace.
+    pub(crate) fn stat(&self) -> Stat<'static> {
+        Stat {
+            valid: stat::SIZE,
+            size: self.size(),
+            ..Stat::default()
+        }
+    }
+
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        match self {
+            Lower::Archive(src) => src.seek(offset as i64, Whence::Set),
+            Lower::Empty if offset == 0 => Ok(()),
+            Lower::Empty => Err(Error::new(ErrorCode::Inval, 0)),
+        }
+    }
+
+    fn read(&mut self, data: &mut [u8]) -> Result<usize> {
+        match self {
+            Lower::Archive(src) => src.read(data),
+            Lower::Empty => Ok(0),
+        }
+    }
+}
+
+/// `struct window`: where the data starts and ends, the entry it belongs
+/// to until it is opened, and the stat it adds.
+pub(crate) struct Window {
+    /// where in file we start reading
+    start: u64,
+    /// where in file we stop reading
+    end: u64,
+    /// whether end is set, otherwise read until EOF
+    end_valid: bool,
+    /// if set, read file data for the entry whose local header is here
+    source_archive: Option<u64>,
+    /// offset in src for next read
+    offset: u64,
+    stat: Stat<'static>,
+    stat_invalid: u64,
+    pub(crate) error: Error,
+}
+
+impl Window {
+    /// A window on `lower` from `start`, `length` bytes long (or to the end
+    /// if -1), with `st` as its stat but for `st_invalid`. With
+    /// `source_archive`, the local header at that offset is skipped when the
+    /// window opens. Port of `_zip_source_window_new`.
+    pub(crate) fn new<R: ReadAt + ?Sized>(
+        lower: &Lower<'_, R>,
+        start: u64,
+        length: i64,
+        st: &Stat<'_>,
+        st_invalid: u64,
+        source_archive: Option<u64>,
+    ) -> Result<Window> {
+        if length < -1 {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+        if length > 0 && start.checked_add(length as u64).is_none() {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        let lower_size = lower.size();
+        if start > lower_size || (length > 0 && start + length as u64 > lower_size) {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        let mut stat = Stat::default();
+        stat_merge(&mut stat, st);
+        Ok(Window {
+            start,
+            end: if length == -1 {
+                0
+            } else {
+                start + length as u64
+            },
+            end_valid: length != -1,
+            source_archive,
+            offset: 0,
+            stat,
+            stat_invalid: st_invalid,
+            error: Error::OK,
+        })
+    }
+
+    /// `ZIP_SOURCE_OPEN`: past the local header, for an entry's data.
+    pub(crate) fn open<R: ReadAt + ?Sized>(
+        &mut self,
+        lower: &mut Lower<'_, R>,
+        index: u64,
+    ) -> Result<()> {
+        if let Some(header) = self.source_archive {
+            let Lower::Archive(src) = lower else {
+                self.error = Error::new(ErrorCode::Internal, 0);
+                return Err(self.error);
+            };
+            let offset = match file_get_offset(src, header) {
+                Ok(offset) => offset,
+                Err(e) => {
+                    self.error = e;
+                    return Err(e);
+                }
+            };
+            if self.end_valid {
+                let Some(end) = self.end.checked_add(offset) else {
+                    // zip archive data claims end of data past zip64 limits
+                    self.error = Error::incons_at(Detail::CdirEntryInvalid, index);
+                    return Err(self.error);
+                };
+                self.end = end;
+            }
+            self.start += offset;
+            self.source_archive = None;
+        }
+        // Both lower sources can seek, so nothing is skipped by reading.
+        self.offset = self.start;
+        Ok(())
+    }
+
+    /// `ZIP_SOURCE_READ`.
+    pub(crate) fn read<R: ReadAt + ?Sized>(
+        &mut self,
+        lower: &mut Lower<'_, R>,
+        data: &mut [u8],
+    ) -> Result<usize> {
+        let mut len = data.len() as u64;
+        if self.end_valid && len > self.end - self.offset {
+            len = self.end - self.offset;
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+
+        if let Err(e) = lower.seek(self.offset) {
+            // We validated ctx->offset in ZIP_SEEK.
+            self.error = if e.code() == ErrorCode::Inval {
+                Error::new(ErrorCode::Eof, 0)
+            } else {
+                e
+            };
+            return Err(self.error);
+        }
+
+        let ret = match lower.read(&mut data[..len as usize]) {
+            Ok(ret) => ret,
+            Err(e) => {
+                self.error = e;
+                return Err(e);
+            }
+        };
+        if ret == 0 && self.end_valid && self.offset < self.end {
+            self.error = Error::new(ErrorCode::Eof, 0);
+            return Err(self.error);
+        }
+        self.offset += ret as u64;
+        Ok(ret)
+    }
+
+    /// `ZIP_SOURCE_STAT`, on the lower source's stat.
+    pub(crate) fn stat(&self, st: &mut Stat<'_>) {
+        stat_merge(st, &self.stat);
+        if self.stat.valid & stat::SIZE == 0 {
+            if self.end_valid {
+                st.valid |= stat::SIZE;
+                st.size = self.end - self.start;
+            } else if st.valid & stat::SIZE != 0 {
+                if st.size < self.start {
+                    st.valid &= !stat::SIZE;
+                } else {
+                    st.size -= self.start;
+                }
+            }
+        }
+        st.valid &= !self.stat_invalid;
+    }
+
+    /// `ZIP_SOURCE_AT_EOF`, which a window with an end answers itself.
+    pub(crate) fn at_eof(&self) -> Option<bool> {
+        self.end_valid.then_some(self.offset == self.end)
+    }
+}

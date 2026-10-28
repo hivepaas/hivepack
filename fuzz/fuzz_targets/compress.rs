@@ -1,9 +1,9 @@
 //! Compresses the input with the port and with libzstd, in one call, at a
 //! level the first byte picks, and checks that the frames are the same,
-//! byte for byte, and that the port decodes its frame back; a strategy the
-//! port does not have yet it refuses. With a bit of the first byte set, the
-//! blocks are split after their sequences (`ZSTD_c_splitAfterSequences`),
-//! through `compress2`. A panic or a difference is a bug.
+//! byte for byte, and that the port decodes its frame back. With a bit of
+//! the first byte set, the blocks are split after their sequences
+//! (`ZSTD_c_splitAfterSequences`), through `compress2`. A panic or a
+//! difference is a bug.
 
 #![no_main]
 
@@ -15,7 +15,7 @@ fuzz_target!(|input: &[u8]| {
     let Some((&pick, src)) = input.split_first() else {
         return;
     };
-    let level = [-100, -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][usize::from(pick) % 16];
+    let level = [-100, -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 10, 13, 16, 19, 22][usize::from(pick) % 16];
     let split = pick & 0x10 != 0;
     let capacity = hivepack_zstd::compress_bound(src.len()).unwrap_or(0);
     let mut c_out = vec![0u8; capacity];
@@ -43,8 +43,6 @@ fuzz_target!(|input: &[u8]| {
         )
     };
     match (got, want) {
-        // A strategy the port does not have yet.
-        (Err(error), Ok(_)) if error.code() == hivepack_zstd::ErrorCode::ParameterUnsupported => {}
         (Ok(got), Ok(want)) => {
             assert!(
                 got == want,

@@ -710,13 +710,14 @@ pub(crate) fn zstd_ldm_block_compress(
     let src = block_compressor.src;
     let mut ip = istart;
 
-    // With the optimal parser (btopt and up), libzstd takes the sequences
-    // as candidates only: it points ms->ldmSeqStore at them, runs the block
-    // compressor on the whole block, then moves past its bytes in them
-    // (ZSTD_ldm_skipRawSeqStoreBytes). The port does not have that yet; the
-    // context refuses those frames (zstd_frame_ported).
+    // With the optimal parser (btopt and up), the sequences are candidates
+    // only: libzstd points ms->ldmSeqStore at them, runs the block
+    // compressor on the whole block, then moves past its bytes in them.
     if ms.c_params.strategy >= Strategy::Btopt {
-        return error!(ParameterUnsupported);
+        let last_ll_size =
+            block_compressor.compress_opt(ms, seq_store, rep, istart, iend, Some(raw_seq_store));
+        zstd_ldm_skip_raw_seq_store_bytes(raw_seq_store, iend - istart);
+        return Ok(last_ll_size);
     }
 
     debug_assert!(raw_seq_store.pos <= raw_seq_store.size());

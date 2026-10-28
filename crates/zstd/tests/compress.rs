@@ -3,9 +3,8 @@
 //! one context used again for every frame, and compares the frames byte
 //! for byte; then decodes the port's frame back with the port.
 //!
-//! At every level; those whose strategy the port does not have yet, it
-//! refuses with `ParameterUnsupported`, and they are skipped, by libzstd's
-//! context too: both contexts compress the same frames in the same order.
+//! At every level, both contexts compressing the same frames in the same
+//! order.
 //! Then again through `compress2`, with the blocks split after their
 //! sequences (`ZSTD_c_splitAfterSequences`).
 //! Then every file twice over with long distance matching, through
@@ -15,11 +14,13 @@
 
 mod support;
 
-use hivepack_zstd::{CCtx, CParameter as P, ErrorCode, ParamSwitch};
+use hivepack_zstd::{CCtx, CParameter as P, ParamSwitch};
 use support::{Kind, Problems, Set};
 use zstd::zstd_safe::{self, CParameter as C};
 
-const LEVELS: [i32; 14] = [-5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13];
+const LEVELS: [i32; 18] = [
+    -5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 18, 19, 22,
+];
 
 fn sets() -> Vec<Set> {
     support::manifest()
@@ -114,8 +115,6 @@ fn compare(
     let mut got = vec![0u8; bound];
     let size = match cctx.port_compress(&mut got, data, level) {
         Ok(size) => size,
-        // A strategy the port does not have yet.
-        Err(error) if error.code() == ErrorCode::ParameterUnsupported => return false,
         Err(error) => {
             problems.add(format!("{name} at level {level}: {error}"));
             return false;
@@ -254,8 +253,6 @@ fn every_test_file_twice_compresses_with_long_distance_matching_as_libzstd() {
             let mut got = vec![0u8; bound];
             let size = match cctx.port.compress2(&mut got, &data) {
                 Ok(size) => size,
-                // A strategy the port does not have yet.
-                Err(error) if error.code() == ErrorCode::ParameterUnsupported => continue,
                 Err(error) => {
                     problems.add(format!("{name} at level {level}: {error}"));
                     continue;
@@ -349,7 +346,6 @@ fn compression_fails_as_libzstd_fails() {
             .map(|n| got[..n].to_vec());
         match (got, want) {
             (Ok(got), Ok(want)) => assert_eq!(got, want, "level {level}"),
-            (Err(error), _) if error.code() == ErrorCode::ParameterUnsupported => {}
             (got, want) => panic!("level {level}: port {got:?}, libzstd {want:?}"),
         }
     }

@@ -1017,7 +1017,7 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         requests.extend(seq_chain(rng, chain));
     }
 
-    // Whole frames, at the levels whose strategy the port has.
+    // Whole frames, at the levels the port has for their size.
     for i in 0..per_command / 4 {
         requests.push(frame_request(rng, i));
     }
@@ -1071,8 +1071,8 @@ fn frame_data(rng: &mut Rng, len: usize) -> Vec<u8> {
     out
 }
 
-/// A `compress` request, at a level whose strategy the port has for its
-/// size, with room enough, barely enough, or too little.
+/// A `compress` request, at a level the port has for its size, with room
+/// enough, barely enough, or too little.
 fn frame_request(rng: &mut Rng, i: usize) -> String {
     // Sizes on both sides of where the tables of levels change, and powers
     // of 2, where the window just holds the input.
@@ -1129,26 +1129,25 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
     let mut steps: Vec<i64> = Vec::new();
     let small = len < 50_000;
 
-    // The parameters: the levels whose strategy the port has (up to 10,
-    // the lazy strategies and btlazy2 for every size; up to 15 with the
-    // strategy set, below), small windows and blocks for the input buffer
-    // to wrap around.
+    // The parameters: every level, small windows and blocks for the input
+    // buffer to wrap around.
     let stable_in = rng.range(0, 3) == 0;
     let stable_out = rng.range(0, 3) == 0;
-    let level: i64 = match rng.range(0, 10) {
+    let level: i64 = match rng.range(0, 11) {
         0 => -(rng.range(1, 10) as i64),
         1 => 1,
         2 => 2,
         3 | 4 => 3,
         5..=7 => rng.range(4, 8) as i64,
-        _ => rng.range(9, 15) as i64,
+        8 => rng.range(9, 15) as i64,
+        _ => rng.range(16, 22) as i64,
     };
     steps.extend([7, 100, level]);
     // The lazy strategies with the row match finder or the hash chain: on,
     // off, or as the window decides.
     steps.extend([7, 1011, rng.range(0, 2) as i64]);
     // The block splitter after the sequences: on, off, or as the strategy
-    // decides (off below btopt).
+    // decides (on for btopt and up with windows of 128 KB or more).
     steps.extend([7, 1010, rng.range(0, 2) as i64]);
     if rng.range(0, 1) == 0 {
         let window_log = if small {
@@ -1168,7 +1167,7 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         (104, 0, 8),
         (105, 2, 8),
         (106, 0, 300),
-        (107, 0, 6),
+        (107, 0, 9),
         (200, 0, 1),
         (201, 0, 1),
         (202, 0, 1),
@@ -1182,10 +1181,11 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         }
     }
     if rng.range(0, 2) == 0 {
-        // Long distance matching, on, off or auto (off below btopt), with
-        // small parameters so that it finds matches in these inputs, some
-        // out of bounds; and a small window, which it would otherwise set
-        // to 2^27 bytes, with up to 2^26 entries in its hash table.
+        // Long distance matching, on, off or auto (on for btopt and up with
+        // windows of 128 MB or more), with small parameters so that it
+        // finds matches in these inputs, some out of bounds; and a small
+        // window, which it would otherwise set to 2^27 bytes, with up to
+        // 2^26 entries in its hash table.
         steps.extend([7, 160, rng.range(0, 2) as i64]);
         for (number, low, high) in [(161, 5, 18), (162, 3, 80), (163, 0, 9), (164, 0, 4)] {
             if rng.range(0, 1) == 0 {
@@ -1199,15 +1199,14 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         };
         steps.extend([7, 101, window_log as i64]);
     }
-    if level > 10 {
-        // Levels 11 to 15 are btopt for some sizes, which the port does not
-        // have: a strategy it has, btlazy2 the most often.
-        let strategy = if rng.range(0, 1) == 0 {
-            6
-        } else {
-            rng.range(1, 6)
-        };
-        steps.extend([7, 107, strategy as i64]);
+    if rng.range(0, 2) == 0 {
+        // The optimal parser's strategies, at any level.
+        steps.extend([7, 107, rng.range(7, 9) as i64]);
+    }
+    if rng.range(0, 1) == 0 {
+        // A shortest match of 3 bytes, for the optimal parser's 3-byte
+        // hash table.
+        steps.extend([7, 105, 3]);
     }
     steps.extend([7, 1006, i64::from(stable_in)]);
     steps.extend([7, 1007, i64::from(stable_out)]);

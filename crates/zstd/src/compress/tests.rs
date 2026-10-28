@@ -14,8 +14,8 @@ use crate::decompress::zstd_decompress::{InBuffer, OutBuffer};
 use crate::oracle::Rng;
 use zstd::zstd_safe;
 
-/// Whether `level` compresses `len` bytes with a strategy the port has,
-/// and libzstd gives the frames it gives on little-endian machines. On
+/// Whether the port has what `level` needs to compress `len` bytes, and
+/// libzstd gives the frames it gives on little-endian machines. On
 /// big-endian ones its block splitter, which the strategies from `greedy`
 /// up use on full blocks, hashes pairs of bytes in the machine's order and
 /// splits elsewhere (the port gives the same frames everywhere).
@@ -91,8 +91,9 @@ fn frames_match_libzstd_at_the_levels_ported() {
             }
         };
         let level = [
-            -1, -3, -20, -1000, -131_072, 1, 1, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 19,
-        ][rng.range(0, 21) as usize];
+            -1, -3, -20, -1000, -131_072, 1, 1, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22,
+        ][rng.range(0, 28) as usize];
         if !is_ported(level, len) {
             continue;
         }
@@ -332,31 +333,46 @@ type Lowered = (Vec<u8>, u32, u32);
 /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, which its fuzzers are built
 /// with), the frames come out the same: in one call, and streaming with
 /// small windows, where matches reach into the window's older segment. A
-/// quarter of the frames are btlazy2, whose tree keeps its unsorted
-/// positions through the lowering; half are at a lazy level with the row
-/// match finder, whose tags stay as they are when the indices are lowered
-/// (its chain log, small, only sets how soon they are). Half of each have
-/// long distance matching, whose window lowers its own indices.
+/// fifth of the frames are btlazy2, whose tree keeps its unsorted positions
+/// through the lowering; a fifth are the optimal parser's, with a shortest
+/// match of 3 bytes for its 3-byte hash table; two fifths are at a lazy
+/// level with the row match finder, whose tags stay as they are when the
+/// indices are lowered (the chain log, small, only sets how soon they
+/// are). Half of each have long distance matching, whose window lowers its
+/// own indices.
 #[test]
 fn lowering_the_indices_changes_no_frame() {
     let mut rng = Rng::new(0x5EED_0202);
     let mut corrections = 0;
     let mut row_corrections = 0;
+    let mut opt_corrections = 0;
     let mut ldm_corrections = 0;
     let mut problems = Vec::new();
-    for i in 0..32 {
-        let len = rng.range(100_000, 1_200_000) as usize;
-        let data = rng.lz_data(len);
-        // 0: the fast levels, 1 and 3: the row match finder, 2: btlazy2;
-        // each in one call and streaming.
-        let kind = i % 4;
-        let one_call = (i + i / 4) % 2 == 0;
+    for i in 0..40 {
+        // 0: the fast levels, 1 and 3: the row match finder, 2: btlazy2,
+        // 4: the optimal parser; each in one call and streaming.
+        let kind = i % 5;
+        let one_call = (i + i / 5) % 2 == 0;
         let row = kind == 1 || kind == 3;
+        let opt = kind == 4;
+        // The optimal parser is slow without optimizations.
+        let len = if opt && cfg!(debug_assertions) {
+            rng.range(100_000, 300_000)
+        } else {
+            rng.range(100_000, 1_200_000)
+        } as usize;
+        let data = rng.lz_data(len);
         let (level, chain_log, row_mode) = if row {
             (
                 rng.range(5, 8) as i32,
                 rng.range(6, 16) as u32,
                 ParamSwitch::Enable,
+            )
+        } else if opt {
+            (
+                rng.range(1, 19) as i32,
+                rng.range(6, 16) as u32,
+                ParamSwitch::Auto,
             )
         } else {
             (
@@ -365,7 +381,16 @@ fn lowering_the_indices_changes_no_frame() {
                 ParamSwitch::Auto,
             )
         };
-        let strategy = (kind == 2).then_some(Strategy::Btlazy2);
+        let strategy = match kind {
+            2 => Some(Strategy::Btlazy2),
+            4 => Some([Strategy::Btopt, Strategy::Btultra, Strategy::Btultra2][i / 5 % 3]),
+            _ => None,
+        };
+        let (min_match, search_log) = if opt {
+            (3, rng.range(1, 4) as u32)
+        } else {
+            (0, 0)
+        };
         let window_log = if i % 3 == 0 {
             0
         } else {
@@ -375,7 +400,7 @@ fn lowering_the_indices_changes_no_frame() {
         // Long distance matching for each kind, in one call and streaming,
         // with small parameters; and a hash table of its own size, which
         // the window, up to 2^27 bytes without one set, would make large.
-        let ldm = (i / 4 + i / 8) % 2 == 1;
+        let ldm = (i / 5 + i / 10) % 2 == 1 && !opt;
         let ldm_mode = if ldm {
             ParamSwitch::Enable
         } else {
@@ -395,6 +420,8 @@ fn lowering_the_indices_changes_no_frame() {
                     .and_then(|()| cctx.set_parameter(CParameter::ChainLog(chain_log)))
                     .and_then(|()| cctx.set_parameter(CParameter::UseRowMatchFinder(row_mode)))
                     .and_then(|()| cctx.set_parameter(CParameter::Strategy(strategy)))
+                    .and_then(|()| cctx.set_parameter(CParameter::MinMatch(min_match)))
+                    .and_then(|()| cctx.set_parameter(CParameter::SearchLog(search_log)))
                     .and_then(|()| {
                         cctx.set_parameter(CParameter::EnableLongDistanceMatching(ldm_mode))
                     })
@@ -431,6 +458,9 @@ fn lowering_the_indices_changes_no_frame() {
                 if row {
                     row_corrections += lowered;
                 }
+                if opt {
+                    opt_corrections += lowered;
+                }
                 if want != got {
                     problems.push(format!(
                         "{len} bytes at level {level}, strategy {strategy:?}, window log \
@@ -450,7 +480,7 @@ fn lowering_the_indices_changes_no_frame() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     eprintln!(
         "{corrections} corrections, {row_corrections} with the row match finder, \
-         {ldm_corrections} of long distance matching"
+         {opt_corrections} with the optimal parser, {ldm_corrections} of long distance matching"
     );
     assert!(corrections > 100, "only {corrections} corrections");
     assert!(
@@ -460,6 +490,10 @@ fn lowering_the_indices_changes_no_frame() {
     assert!(
         row_corrections > 50,
         "only {row_corrections} corrections with the row match finder"
+    );
+    assert!(
+        opt_corrections > 20,
+        "only {opt_corrections} corrections with the optimal parser"
     );
 }
 

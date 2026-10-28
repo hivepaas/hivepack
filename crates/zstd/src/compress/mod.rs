@@ -15,4 +15,5 @@ pub(crate) mod zstd_fast;
 pub(crate) mod zstd_lazy;
 pub(crate) mod zstd_ldm;
 pub(crate) mod zstd_ldm_geartab;
+pub(crate) mod zstd_opt;
 pub(crate) mod zstd_pre_split;

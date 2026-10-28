@@ -7,9 +7,6 @@
 //!
 //! The data has repeats near and far, and the windows are small: the input
 //! buffer wraps around, and matches reach into the window's older segment.
-//! When the port refuses a frame with `ParameterUnsupported`, a strategy it
-//! does not have yet, that context is left, whatever libzstd answers: the
-//! port refuses when the frame starts, before libzstd can fail.
 //!
 //! The `zstd` crate does not let the input buffer be stable, nor set the
 //! block splitter level; the oracle tests those (`src/oracle_compress.rs`).
@@ -19,7 +16,7 @@
 mod support;
 
 use hivepack_zstd::{
-    CCtx, CParameter as P, EndDirective, ErrorCode, Format, ParamSwitch, ResetDirective, Strategy,
+    CCtx, CParameter as P, EndDirective, Format, ParamSwitch, ResetDirective, Strategy,
 };
 use support::{Problems, Rng};
 use zstd::zstd_safe::{self, CParameter as C, FrameFormat, zstd_sys::ZSTD_EndDirective};
@@ -72,8 +69,9 @@ fn piece(rng: &mut Rng) -> usize {
 /// Random parameters, the same for both; some out of bounds.
 fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
     let mut list = Vec::new();
-    let level =
-        [-7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][rng.range(0, 16) as usize];
+    let level = [
+        -7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 15, 16, 17, 18, 19, 20, 22,
+    ][rng.range(0, 21) as usize];
     list.push((P::CompressionLevel(level), C::CompressionLevel(level)));
     if rng.chance(2) {
         let value = rng.range(9, 20) as u32;
@@ -92,7 +90,12 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         list.push((P::SearchLog(value), C::SearchLog(value)));
     }
     if rng.chance(3) {
-        let value = rng.range(2, 8) as u32;
+        // Often 3, for the optimal parser's 3-byte hash table.
+        let value = if rng.chance(2) {
+            3
+        } else {
+            rng.range(2, 8) as u32
+        };
         list.push((P::MinMatch(value), C::MinMatch(value)));
     }
     if rng.chance(4) {
@@ -108,8 +111,22 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
             (Strategy::Lazy, S::ZSTD_lazy),
             (Strategy::Lazy2, S::ZSTD_lazy2),
             (Strategy::Btlazy2, S::ZSTD_btlazy2),
-        ][rng.range(0, 5) as usize];
+            (Strategy::Btopt, S::ZSTD_btopt),
+            (Strategy::Btultra, S::ZSTD_btultra),
+            (Strategy::Btultra2, S::ZSTD_btultra2),
+        ][rng.range(0, 8) as usize];
         list.push((P::Strategy(Some(p)), C::Strategy(c)));
+    }
+    // The block splitter after the sequences, which the optimal parser's
+    // strategies use with windows of 128 KB or more: the port refuses it
+    // for now, so mostly off.
+    if !rng.chance(8) {
+        let (p, c) = if rng.chance(8) {
+            (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto)
+        } else {
+            (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable)
+        };
+        list.push((P::SplitAfterSequences(p), C::UseBlockSplitter(c)));
     }
     if rng.chance(2) {
         let (p, c) = match rng.range(0, 2) {
@@ -241,8 +258,6 @@ enum Ended {
     Frame(Vec<u8>),
     /// Both failed the same way.
     Failed,
-    /// The port refused the strategy.
-    Unsupported,
 }
 
 /// One frame of `data` through both contexts, in the same calls.
@@ -343,11 +358,6 @@ fn stream_frame(
             };
             (result, input.pos, output.pos)
         };
-        if let Err(error) = &got
-            && error.code() == ErrorCode::ParameterUnsupported
-        {
-            return Ok(Ended::Unsupported);
-        }
         let got = got.map_err(message);
 
         if (&want, ci, co) != (&got, pi, po) {
@@ -382,11 +392,11 @@ fn stream_frame(
 }
 
 /// Contexts used for several frames, compared call by call.
-fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
+fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
     let mut rng = Rng(seed);
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();
-    let (mut frames, mut unsupported) = (0, 0);
+    let mut frames = 0;
     for round in 0..rng.range(1, 4) {
         let tag = format!("seed {seed}, frame {round}");
         if rng.chance(4) {
@@ -405,13 +415,13 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             let got = p.reset(reset.0).map_err(message);
             if want != got {
                 problems.add(format!("{tag}: resetting: libzstd {want:?}, port {got:?}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
         for parameter in parameters(&mut rng) {
             if let Err(problem) = set_both(&mut c, &mut p, parameter) {
                 problems.add(format!("{tag}: {problem}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
         let stable_out = rng.chance(4);
@@ -424,7 +434,7 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             ),
         ) {
             problems.add(format!("{tag}: {problem}"));
-            return (frames, unsupported);
+            return frames;
         }
 
         let len = match rng.range(0, 5) {
@@ -445,7 +455,7 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             let got = p.set_pledged_src_size(size).map_err(message);
             if want != got {
                 problems.add(format!("{tag}: pledging: libzstd {want:?}, port {got:?}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
 
@@ -454,11 +464,7 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
                 problems.add(format!(
                     "{tag} ({len} bytes, stable output {stable_out}): {problem}"
                 ));
-                return (frames, unsupported);
-            }
-            Ok(Ended::Unsupported) => {
-                unsupported += 1;
-                return (frames, unsupported);
+                return frames;
             }
             Ok(Ended::Failed) => {
                 // libzstd's context waits for a reset after an error.
@@ -489,23 +495,21 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             };
             if let Err(problem) = set_both(&mut c, &mut p, parameter) {
                 problems.add(format!("{tag}: after the frame, {problem}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
     }
-    (frames, unsupported)
+    frames
 }
 
 #[test]
 fn streaming_compresses_as_libzstd_does() {
     let mut problems = Problems::default();
-    let (mut frames, mut unsupported) = (0, 0);
+    let mut frames = 0;
     for seed in 0..150 {
-        let (f, u) = compare_contexts(&mut problems, seed);
-        frames += f;
-        unsupported += u;
+        frames += compare_contexts(&mut problems, seed);
     }
-    println!("{frames} frames compared, {unsupported} contexts left at an unsupported strategy");
+    println!("{frames} frames compared");
     assert!(frames > 150, "too few frames compared: {frames}");
     problems.check();
 }
@@ -588,13 +592,7 @@ fn compress2_compresses_as_libzstd_does() {
             let mut c_out = vec![0u8; room];
             let mut p_out = vec![0u8; room];
             let want = c.compress2(&mut c_out[..], &content).map_err(name);
-            let got = p.compress2(&mut p_out, &content);
-            if let Err(error) = &got
-                && error.code() == ErrorCode::ParameterUnsupported
-            {
-                break;
-            }
-            let got = got.map_err(message);
+            let got = p.compress2(&mut p_out, &content).map_err(message);
             if want != got {
                 problems.add(format!(
                     "seed {seed}, {len} bytes into {room}: libzstd {want:?}, port {got:?}"

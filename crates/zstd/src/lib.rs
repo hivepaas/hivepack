@@ -4,12 +4,14 @@
 //! Work in progress: decompression works, of whole frames in one call
 //! ([`decompress`], [`DCtx::decompress`]) or streaming
 //! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`].
-//! Compression works with every strategy up to `btlazy2` (the levels up to
-//! 15 for large inputs, up to 12 or 10 for small ones), in one call
-//! ([`compress`], [`CCtx::compress`], [`CCtx::compress2`]) or streaming
-//! ([`CCtx::compress_stream2`]), with libzstd's parameters
-//! ([`CCtx::set_parameter`]), giving the frames libzstd gives; the optimal
-//! parser (the strongest levels) and dictionaries come next. The plan, and the rules the port
+//! Compression works with every strategy, the optimal parser included, in
+//! one call ([`compress`], [`CCtx::compress`], [`CCtx::compress2`]) or
+//! streaming ([`CCtx::compress_stream2`]), with libzstd's parameters
+//! ([`CCtx::set_parameter`]), giving the frames libzstd gives: every level
+//! for inputs up to 64 KB. Over 64 KB the strongest levels also split blocks
+//! after finding their sequences, which comes next, with long distance
+//! matching and dictionaries: until then the levels up to 15 work for large
+//! inputs, up to 12 for those up to 256 KB. The plan, and the rules the port
 //! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
 //!
 //! ```

@@ -19,8 +19,9 @@ use crate::compress::huf_compress::HufRepeat;
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, EntropyCTables, FrameParameters,
     FseCTables, FseRepeat, LongLengthType, MatchState, ParamSwitch, SeqStore, Strategy, Window,
-    WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX, zstd_literals_compression_is_disabled,
-    zstd_ll_code, zstd_min_gain, zstd_ml_code, zstd_no_compress_block, zstd_reduce_table,
+    WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX,
+    zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain, zstd_ml_code,
+    zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
 };
 use crate::compress::zstd_compress_literals::zstd_compress_literals;
 use crate::compress::zstd_compress_sequences::{
@@ -30,6 +31,10 @@ use crate::compress::zstd_double_fast::{
     zstd_compress_block_double_fast, zstd_compress_block_double_fast_ext_dict,
 };
 use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_fast_ext_dict};
+use crate::compress::zstd_lazy::{
+    ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc,
+    zstd_compress_block_lazy_row,
+};
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
@@ -409,8 +414,6 @@ const ZSTD_BLOCKSIZE_MAX_MIN: u32 = 1 << 10;
 pub(crate) const ZSTD_CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 /// `ZSTD_FRAMEHEADERSIZE_MAX`
 const ZSTD_FRAMEHEADERSIZE_MAX: usize = 18;
-/// `ZSTD_ROW_HASH_TAG_BITS`
-const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
 /// `ZSTD_MAX_INPUT_SIZE` on 64-bit machines.
 const ZSTD_MAX_INPUT_SIZE: u64 = 0xFF00_FF00_FF00_FF00;
 
@@ -478,10 +481,67 @@ fn zstd_row_match_finder_used(strategy: Strategy, mode: ParamSwitch) -> bool {
     zstd_row_match_finder_supported(strategy) && mode == ParamSwitch::Enable
 }
 
+/// `ZSTD_resolveRowMatchFinderMode`: whether a frame with `c_params` uses
+/// the row match finder, for `Auto` from the strategy and the window.
+pub(crate) fn zstd_resolve_row_match_finder_mode(
+    mode: ParamSwitch,
+    c_params: &CompressionParameters,
+) -> ParamSwitch {
+    if mode != ParamSwitch::Auto {
+        return mode;
+    }
+    if zstd_row_match_finder_supported(c_params.strategy) && c_params.window_log > 14 {
+        ParamSwitch::Enable
+    } else {
+        ParamSwitch::Disable
+    }
+}
+
+/// Whether the port has the match finder a frame with `c_params` needs,
+/// the use of the row match finder resolved: the strategies up to `lazy2`,
+/// with the hash chain or the row match finder. The context refuses the
+/// others with `ParameterUnsupported`.
+pub(crate) fn zstd_strategy_ported(
+    c_params: &CompressionParameters,
+    _use_row_match_finder: ParamSwitch,
+) -> bool {
+    c_params.strategy <= Strategy::Btlazy2
+}
+
+/// Whether the port has the match finder `ZSTD_compressCCtx` takes at
+/// `level` for `src_size` bytes.
+#[cfg(test)]
+pub(crate) fn zstd_level_ported(level: i32, src_size: u64) -> bool {
+    let c_params = zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict);
+    let row = zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params);
+    zstd_strategy_ported(&c_params, row)
+}
+
+/// The strategy `ZSTD_compressCCtx` takes at `level` for `src_size` bytes.
+#[cfg(test)]
+pub(crate) fn zstd_level_strategy(level: i32, src_size: u64) -> Strategy {
+    zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict).strategy
+}
+
 /// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for
 /// `dfast`, its short hash table).
 fn zstd_allocate_chain_table(strategy: Strategy, use_row_match_finder: ParamSwitch) -> bool {
     strategy != Strategy::Fast && !zstd_row_match_finder_used(strategy, use_row_match_finder)
+}
+
+/// `ZSTD_bitmix`: the bits of `val` mixed, after `XXH3_rrmxmx`.
+fn zstd_bitmix(mut val: u64, len: u64) -> u64 {
+    val ^= val.rotate_right(49) ^ val.rotate_right(24);
+    val = val.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    val ^= (val >> 35).wrapping_add(len);
+    val = val.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    val ^ (val >> 28)
+}
+
+/// `ZSTD_advanceHashSalt`: the row match finder's next salt, from the last
+/// one and the hashes searched since.
+fn zstd_advance_hash_salt(ms: &mut MatchState) {
+    ms.hash_salt = zstd_bitmix(ms.hash_salt, 8) ^ zstd_bitmix(u64::from(ms.hash_salt_entropy), 4);
 }
 
 /// `ZSTD_cycleLog`
@@ -733,6 +793,9 @@ pub(crate) struct CCtxParams {
     pub(crate) max_block_size: usize,
     /// 0 for the strategy's level of block splitting, 1 for none, 2 to 6.
     pub(crate) pre_block_splitter_level: i32,
+    /// Whether the lazy strategies use the row match finder: `Auto` until
+    /// a frame resolves it.
+    pub(crate) use_row_match_finder: ParamSwitch,
 }
 
 impl CCtxParams {
@@ -753,6 +816,7 @@ impl CCtxParams {
             out_buffer_mode: BufferMode::Buffered,
             max_block_size: 0,
             pre_block_splitter_level: 0,
+            use_row_match_finder: zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params),
         }
     }
 
@@ -766,10 +830,9 @@ impl CCtxParams {
             0,
             CParamMode::Unknown,
         );
-        (
-            CCtxParams::new(c_params, f_params, ZSTD_CLEVEL_DEFAULT),
-            CParamOverrides::default(),
-        )
+        let mut params = CCtxParams::new(c_params, f_params, ZSTD_CLEVEL_DEFAULT);
+        params.use_row_match_finder = ParamSwitch::Auto;
+        (params, CParamOverrides::default())
     }
 }
 
@@ -792,7 +855,13 @@ fn zstd_get_cparams_from_cctx_params(
     // have it.
     zstd_override_cparams(&mut c_params, overrides);
     // A size hint of 0 means 0.
-    zstd_adjust_cparams_internal(c_params, src_size_hint, dict_size, mode, ParamSwitch::Auto)
+    zstd_adjust_cparams_internal(
+        c_params,
+        src_size_hint,
+        dict_size,
+        mode,
+        params.use_row_match_finder,
+    )
 }
 
 /// `ZSTD_resolveMaxBlockSize`
@@ -837,10 +906,15 @@ fn zstd_overflow_correct_if_needed(
         .need_overflow_correction(cycle_log, max_dist, ms.loaded_dict_end, src, src_end)
     {
         let correction = ms.window.correct_overflow(cycle_log, max_dist, src);
-        // ZSTD_reduceIndex
+        // ZSTD_reduceIndex. The row match finder's tags stay as they are
+        // (see reset_cctx_internal).
         zstd_reduce_table(&mut ms.hash_table, correction);
-        if zstd_allocate_chain_table(c_params.strategy, ParamSwitch::Disable) {
-            zstd_reduce_table(&mut ms.chain_table, correction);
+        if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
+            if c_params.strategy == Strategy::Btlazy2 {
+                zstd_reduce_table_btlazy2(&mut ms.chain_table, correction);
+            } else {
+                zstd_reduce_table(&mut ms.chain_table, correction);
+            }
         }
         ms.next_to_update = ms.next_to_update.saturating_sub(correction);
         // Dictionaries are invalid after a correction.
@@ -983,6 +1057,10 @@ pub enum CParameter {
     BlockSplitterLevel(u32),
     /// The largest block: 1024 to 131072; 0 for 131072.
     MaxBlockSize(u32),
+    /// Whether `greedy`, `lazy` and `lazy2` search with the row match
+    /// finder or the hash chain; `Auto` takes the row match finder for
+    /// windows over 16 KB.
+    UseRowMatchFinder(ParamSwitch),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -1006,6 +1084,7 @@ pub enum CParameterKind {
     StableOutBuffer,
     BlockSplitterLevel,
     MaxBlockSize,
+    UseRowMatchFinder,
 }
 
 impl CParameter {
@@ -1030,6 +1109,7 @@ impl CParameter {
             CParameter::StableOutBuffer(_) => CParameterKind::StableOutBuffer,
             CParameter::BlockSplitterLevel(_) => CParameterKind::BlockSplitterLevel,
             CParameter::MaxBlockSize(_) => CParameterKind::MaxBlockSize,
+            CParameter::UseRowMatchFinder(_) => CParameterKind::UseRowMatchFinder,
         }
     }
 }
@@ -1135,7 +1215,14 @@ impl CCtx {
                 chain_table: Vec::new(),
                 next_to_update: 0,
                 loaded_dict_end: 0,
+                lazy_skipping: false,
                 c_params,
+                row_hash_log: 0,
+                tag_table: Vec::new(),
+                hash_cache: [0; ZSTD_ROW_HASH_CACHE_SIZE],
+                // A new context's salt, before the first frame advances it.
+                hash_salt: 0,
+                hash_salt_entropy: 0,
             },
             seq_store: SeqStore::with_capacity(0, 0),
             block_size_max: 0,
@@ -1173,7 +1260,7 @@ impl CCtx {
         pledged_src_size: u64,
         buffered: bool,
     ) -> Result<()> {
-        if params.c_params.strategy > Strategy::Dfast {
+        if !zstd_strategy_ported(&params.c_params, params.use_row_match_finder) {
             return error!(ParameterUnsupported);
         }
         self.is_first_block = true;
@@ -1220,17 +1307,49 @@ impl CCtx {
         ms.window = Window::new();
         ms.next_to_update = ms.window.dict_limit;
         ms.loaded_dict_end = 0;
+        ms.lazy_skipping = false;
         ms.hash_table.clear();
         ms.hash_table.resize(1 << c_params.hash_log, 0);
         // ZSTD_allocateChainTable: none for fast, nor for the row match
-        // finder, which the port does not have yet.
-        let chain_size = if zstd_allocate_chain_table(c_params.strategy, ParamSwitch::Disable) {
-            1 << c_params.chain_log
-        } else {
-            0
-        };
+        // finder.
+        let chain_size =
+            if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
+                1 << c_params.chain_log
+            } else {
+                0
+            };
         ms.chain_table.clear();
         ms.chain_table.resize(chain_size, 0);
+        if zstd_row_match_finder_used(c_params.strategy, params.use_row_match_finder) {
+            // The row match finder's table of tags, and a new salt. Unlike
+            // the window, the salt goes on from frame to frame, as libzstd's
+            // does. It changes no output: XORed into the hashes before
+            // their shift, it changes which row and which tag a position
+            // gets, never which positions share them.
+            //
+            // Differs from libzstd: the tags are zeroed at every frame, where
+            // libzstd zeroes them only the first time its workspace holds
+            // them (ZSTD_cwksp_reserve_aligned_init_once): later frames find
+            // the tags and heads of earlier ones, or other bytes. They
+            // change nothing. A search goes through a row from its head,
+            // newest entry first, so the entries written in this frame come
+            // first, wherever the head is. Every other entry holds an index
+            // below the window: an earlier frame's in libzstd, whose
+            // indices go on from frame to frame, or 0. A search stops at
+            // the first entry below the window that has its tag, after
+            // taking those with its tag before it; so it takes the same
+            // candidates in the same order, whatever the other entries'
+            // tags and the head. Lowering the indices (ZSTD_reduceIndex)
+            // leaves the tags too: the entries it sets to 0 held indices
+            // below the window already, the oldest of their rows.
+            ms.tag_table.clear();
+            ms.tag_table.resize(1 << c_params.hash_log, 0);
+            zstd_advance_hash_salt(ms);
+            // Rows of 16 entries, 32 from a search log of 5, 64 from 6.
+            let row_log = c_params.search_log.clamp(4, 6);
+            debug_assert!(c_params.hash_log >= row_log);
+            ms.row_hash_log = c_params.hash_log - row_log;
+        }
         ms.c_params = c_params;
 
         self.seq_store = SeqStore::with_capacity(block_size, max_nb_seq);
@@ -1296,6 +1415,21 @@ impl CCtx {
             (Strategy::Dfast, true) => zstd_compress_block_double_fast_ext_dict(
                 ms, seq_store, rep, src, dict, istart, iend,
             ),
+            (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2, _) => {
+                let params = &self.applied_params;
+                let depth = params.c_params.strategy as u32 - Strategy::Greedy as u32;
+                let dict = ext_dict.then_some(dict);
+                if zstd_row_match_finder_used(params.c_params.strategy, params.use_row_match_finder)
+                {
+                    zstd_compress_block_lazy_row(depth, ms, seq_store, rep, src, dict, istart, iend)
+                } else {
+                    zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
+                }
+            }
+            (Strategy::Btlazy2, _) => {
+                let dict = ext_dict.then_some(dict);
+                zstd_compress_block_btlazy2(ms, seq_store, rep, src, dict, istart, iend)
+            }
             // The other strategies are not ported yet; the context does not
             // take them.
             _ => return error!(ParameterUnsupported),
@@ -1736,9 +1870,10 @@ impl CCtx {
     /// with [`CCtx::set_parameter`] do not apply; [`CCtx::compress2`] takes
     /// them.
     ///
-    /// Work in progress: the port has libzstd's `fast` and `dfast`
-    /// strategies so far, which are every level up to 3, and level 4 for
-    /// inputs over 256 KB. Other levels fail with
+    /// Work in progress: the port has libzstd's strategies up to `btlazy2`
+    /// so far, which are every level up to 15 for inputs over 256 KB (or of
+    /// unknown size), up to 12 for inputs over 16 KB, and up to 10 for
+    /// smaller ones. Other levels fail with
     /// [`ErrorCode::ParameterUnsupported`](crate::ErrorCode::ParameterUnsupported).
     pub fn compress(
         &mut self,
@@ -1857,6 +1992,7 @@ impl CCtx {
                 }
                 params.max_block_size = value as usize;
             }
+            CParameter::UseRowMatchFinder(mode) => params.use_row_match_finder = mode,
         }
         Ok(())
     }
@@ -1891,6 +2027,7 @@ impl CCtx {
             CParameterKind::StableOutBuffer => buffer_mode(params.out_buffer_mode),
             CParameterKind::BlockSplitterLevel => params.pre_block_splitter_level,
             CParameterKind::MaxBlockSize => params.max_block_size as i32,
+            CParameterKind::UseRowMatchFinder => params.use_row_match_finder as i32,
         }
     }
 
@@ -2137,6 +2274,8 @@ impl CCtx {
             0,
             CParamMode::NoAttachDict,
         );
+        params.use_row_match_finder =
+            zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
 
         self.compress_begin_internal(&params, pledged_src_size, true)?;

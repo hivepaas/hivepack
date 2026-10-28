@@ -7,9 +7,9 @@
 //!
 //! The data has repeats near and far, and the windows are small: the input
 //! buffer wraps around, and matches reach into the window's older segment.
-//! The strategies are those the port has: when the port refuses a frame
-//! with `ParameterUnsupported` (level 4 for inputs of 256 KB or less is
-//! `greedy`), that context is left.
+//! When the port refuses a frame with `ParameterUnsupported`, a strategy it
+//! does not have yet, that context is left, whatever libzstd answers: the
+//! port refuses when the frame starts, before libzstd can fail.
 //!
 //! The `zstd` crate does not let the input buffer be stable, nor set the
 //! block splitter level; the oracle tests those (`src/oracle_compress.rs`).
@@ -72,7 +72,8 @@ fn piece(rng: &mut Rng) -> usize {
 /// Random parameters, the same for both; some out of bounds.
 fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
     let mut list = Vec::new();
-    let level = [-7, -3, -1, 0, 1, 2, 3, 4][rng.range(0, 7) as usize];
+    let level =
+        [-7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][rng.range(0, 16) as usize];
     list.push((P::CompressionLevel(level), C::CompressionLevel(level)));
     if rng.chance(2) {
         let value = rng.range(9, 20) as u32;
@@ -99,12 +100,24 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         list.push((P::TargetLength(value), C::TargetLength(value)));
     }
     if rng.chance(3) {
-        let (p, c) = if rng.chance(2) {
-            (Strategy::Fast, zstd_safe::Strategy::ZSTD_fast)
-        } else {
-            (Strategy::Dfast, zstd_safe::Strategy::ZSTD_dfast)
-        };
+        use zstd_safe::Strategy as S;
+        let (p, c) = [
+            (Strategy::Fast, S::ZSTD_fast),
+            (Strategy::Dfast, S::ZSTD_dfast),
+            (Strategy::Greedy, S::ZSTD_greedy),
+            (Strategy::Lazy, S::ZSTD_lazy),
+            (Strategy::Lazy2, S::ZSTD_lazy2),
+            (Strategy::Btlazy2, S::ZSTD_btlazy2),
+        ][rng.range(0, 5) as usize];
         list.push((P::Strategy(Some(p)), C::Strategy(c)));
+    }
+    if rng.chance(2) {
+        let (p, c) = match rng.range(0, 2) {
+            0 => (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
+            1 => (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
+            _ => (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
+        };
+        list.push((P::UseRowMatchFinder(p), C::UseRowMatchFinder(c)));
     }
     if rng.chance(2) {
         let flag = rng.chance(2);
@@ -141,6 +154,18 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
     if rng.chance(4) {
         let value = [0, 1000, 1024, 5000, 65_536, 131_072, 131_073][rng.range(0, 6) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
+    }
+    // On big-endian machines libzstd's block splitter, which the strategies
+    // from `greedy` up use on full blocks, hashes pairs of bytes in the
+    // machine's order and splits elsewhere; the port gives the same frames
+    // everywhere. There `fast` or `dfast` instead.
+    if cfg!(target_endian = "big") {
+        let (p, c) = if rng.chance(2) {
+            (Strategy::Fast, zstd_safe::Strategy::ZSTD_fast)
+        } else {
+            (Strategy::Dfast, zstd_safe::Strategy::ZSTD_dfast)
+        };
+        list.push((P::Strategy(Some(p)), C::Strategy(c)));
     }
     list
 }
@@ -273,7 +298,6 @@ fn stream_frame(
         };
         if let Err(error) = &got
             && error.code() == ErrorCode::ParameterUnsupported
-            && want.is_ok()
         {
             return Ok(Ended::Unsupported);
         }
@@ -520,7 +544,6 @@ fn compress2_compresses_as_libzstd_does() {
             let got = p.compress2(&mut p_out, &content);
             if let Err(error) = &got
                 && error.code() == ErrorCode::ParameterUnsupported
-                && want.is_ok()
             {
                 break;
             }

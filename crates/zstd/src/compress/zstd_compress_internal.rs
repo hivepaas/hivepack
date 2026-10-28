@@ -10,7 +10,7 @@ use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_L
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
 
 /// `ZSTD_strategy`: how hard the match finder searches, from `Fast` (1) to
-/// `Btultra2` (9). The port has `Fast` and `Dfast` so far.
+/// `Btultra2` (9). The port has those up to `Btlazy2` so far.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Strategy {
     /// One hash table, one candidate per position.
@@ -263,6 +263,11 @@ pub(crate) const ZSTD_HASHLOG_MIN: u32 = 6;
 /// `ZSTD_WINDOW_START_INDEX`: the index of the first byte a fresh context
 /// sees, above 0 so that every position is valid.
 pub(crate) const ZSTD_WINDOW_START_INDEX: u32 = 2;
+/// `ZSTD_DUBT_UNSORTED_MARK`: in the binary tree of `btlazy2`, the second
+/// entry of a position inserted but not sorted yet. No index is 1: they
+/// start at `ZSTD_WINDOW_START_INDEX`.
+pub(crate) const ZSTD_DUBT_UNSORTED_MARK: u32 = 1;
+const _: () = assert!(ZSTD_DUBT_UNSORTED_MARK < ZSTD_WINDOW_START_INDEX);
 /// `HASH_READ_SIZE`: the bytes the hashes read at a position.
 pub(crate) const HASH_READ_SIZE: usize = 8;
 /// `kSearchStrength`: how quickly the search speeds up over data without
@@ -540,13 +545,17 @@ fn overflow_correct_frequently() -> bool {
     false
 }
 
-/// `ZSTD_reduceTable`: lowers every index of a table by `reducer_value`;
-/// those it would take below `ZSTD_WINDOW_START_INDEX` become 0.
-pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
+/// `ZSTD_reduceTable_internal`: lowers every index of a table by
+/// `reducer_value`; those it would take below `ZSTD_WINDOW_START_INDEX`
+/// become 0. With `PRESERVE_MARK`, `ZSTD_DUBT_UNSORTED_MARK` stays.
+#[inline(always)]
+fn zstd_reduce_table_internal<const PRESERVE_MARK: bool>(table: &mut [u32], reducer_value: u32) {
     // Indices below ZSTD_WINDOW_START_INDEX are special.
     let reducer_threshold = reducer_value + ZSTD_WINDOW_START_INDEX;
     for cell in table {
-        *cell = if *cell < reducer_threshold {
+        *cell = if PRESERVE_MARK && *cell == ZSTD_DUBT_UNSORTED_MARK {
+            ZSTD_DUBT_UNSORTED_MARK
+        } else if *cell < reducer_threshold {
             0
         } else {
             *cell - reducer_value
@@ -554,17 +563,53 @@ pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
     }
 }
 
+/// `ZSTD_reduceTable`
+pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
+    zstd_reduce_table_internal::<false>(table, reducer_value);
+}
+
+/// `ZSTD_reduceTable_btlazy2`: for the binary tree of `btlazy2`, whose
+/// unsorted positions stay unsorted.
+pub(crate) fn zstd_reduce_table_btlazy2(table: &mut [u32], reducer_value: u32) {
+    zstd_reduce_table_internal::<true>(table, reducer_value);
+}
+
+/// `ZSTD_ROW_HASH_CACHE_SIZE`: how many positions ahead the row match
+/// finder hashes.
+pub(crate) const ZSTD_ROW_HASH_CACHE_SIZE: usize = 8;
+
 /// `ZSTD_MatchState_t`: what the match finders keep from block to block.
 pub(crate) struct MatchState {
     pub(crate) window: Window,
+    /// The hash table; for the row match finder, its rows one after
+    /// another.
     pub(crate) hash_table: Vec<u32>,
     /// The chain table, or for `dfast` the short hash table; empty for
-    /// `fast`.
+    /// `fast` and the row match finder.
     pub(crate) chain_table: Vec<u32>,
     pub(crate) next_to_update: u32,
     /// The index after a loaded dictionary, or 0.
     pub(crate) loaded_dict_end: u32,
+    /// `lazySkipping`: the lazy strategies, over input without matches,
+    /// insert only the positions they search.
+    pub(crate) lazy_skipping: bool,
     pub(crate) c_params: CompressionParameters,
+
+    // The row match finder.
+    /// `rowHashLog`: the log of the number of rows.
+    pub(crate) row_hash_log: u32,
+    /// `tagTable`: a byte for each entry of the hash table. The first of
+    /// each row is the row's head; the others are the tags of the row's
+    /// entries, the low 8 bits of their hashes.
+    pub(crate) tag_table: Vec<u8>,
+    /// `hashCache`: the hashes of the next positions to insert, each at
+    /// its index modulo the size.
+    pub(crate) hash_cache: [u32; ZSTD_ROW_HASH_CACHE_SIZE],
+    /// `hashSalt`: mixed into the hashes, new at every frame.
+    pub(crate) hash_salt: u64,
+    /// `hashSaltEntropy`: the sum of the hashes searched, for the next
+    /// salt.
+    pub(crate) hash_salt_entropy: u32,
 }
 
 impl MatchState {
@@ -705,6 +750,22 @@ fn zstd_hash_top_u64(u: u64, mls: u32) -> u64 {
 #[inline(always)]
 fn zstd_hash_n<const N: u32>(u: u64, prime: u64) -> u64 {
     (u << (64 - 8 * N)).wrapping_mul(prime)
+}
+
+/// `ZSTD_hashPtrSalted`: [`zstd_hash_ptr`] with `salt` mixed in before the
+/// shift, as a `U32`; the 4-byte hash takes the salt's low 32 bits.
+///
+/// The 4-byte hash is in the top half of [`zstd_hash_top`]'s `u64`, so its
+/// salt goes there too: the top 32 bits are then libzstd's `U32`.
+#[inline(always)]
+pub(crate) fn zstd_hash_ptr_salted(src: &[u8], at: usize, h_bits: u32, mls: u32, salt: u64) -> u32 {
+    debug_assert!(h_bits <= 32);
+    let salt = match mls {
+        5..=8 => salt,
+        // 4, and anything else
+        _ => u64::from(salt as u32) << 32,
+    };
+    ((zstd_hash_top(src, at, mls) ^ salt) >> (64 - h_bits)) as u32
 }
 
 /// A match finder's hash table of `1 << h_bits` entries, and its hashes.

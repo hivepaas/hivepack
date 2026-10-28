@@ -11,30 +11,51 @@ The port follows zlib **1.3.2** (tag `v1.3.2`, commit `da607da739fa6047df13e66a2
 The rules of [porting.md](porting.md):
 
 - **The same layout.** Each file of zlib becomes a module of the same name: `inflate.c` becomes `crates/deflate/src/inflate.rs`, `inffixed.h` becomes `inffixed.rs`.
-- **The same names**, in snake case, with the C name in every doc comment. The stream and its state are one type, `Inflate`, whose methods drop the `inflate` prefix: `inflateSetDictionary` becomes `Inflate::set_dictionary`.
-- **The same algorithms, constants and tables.** The fixed-code tables of `inffixed.h` are copied as they are. The CRC tables of `crc32.h` are computed while compiling, by the functions zlib uses to write that file, and a test compares them with it.
+- **The same names**, in snake case, with the C name in every doc comment. A stream and its state are one type, `Inflate` or `Deflate`, whose methods drop the prefix: `inflateSetDictionary` becomes `Inflate::set_dictionary`, `deflateParams` becomes `Deflate::params`.
+- **The same algorithms, constants and tables.** The fixed-code tables of `inffixed.h` are copied as they are. The CRC tables of `crc32.h` and the static trees of `trees.h` are computed while compiling, by the functions zlib uses to write those files, and tests compare them with the files. The compressor's configuration table is zlib's. That is what makes the output identical.
 - **The same results.** A call returns zlib's code, as `Result<Status, Error>`, and an error carries the message zlib leaves in `strm->msg`, such as `"invalid distance too far back"`.
 - **Differences are marked** with a comment starting `Differs from zlib:`.
 
-The main difference is the stream itself. zlib's `z_stream` holds pointers to the caller's input and output; the port takes them for each call as an `InBuffer` and an `OutBuffer`, a slice and a position, as `hivepack-zstd` does. Positions in the window, the code tables and the buffers are indices. A stream cannot be used before it is initialised or after it ends, so the checks zlib makes for that (`inflateStateCheck`) have nothing to check.
+The main difference is the stream itself. zlib's `z_stream` holds pointers to the caller's input and output; the port takes them for each call as an `InBuffer` and an `OutBuffer`, a slice and a position, as `hivepack-zstd` does. Positions in the window, the code tables and the buffers are indices. A stream cannot be used before it is initialised or after it ends, so the checks zlib makes for that (`inflateStateCheck`, `deflateStateCheck`) have nothing to check.
+
+The compressor keeps zlib's memory layout where the output depends on it: the symbol buffer overlays the pending output in one buffer (`pending_buf`), and the window's bytes past the input are those zlib leaves there. The few other differences:
+
+- A gzip header's name and comment end at their first zero byte, or at their end; zlib needs the zero and would read past a buffer without one. An extra field shorter than `extra_len` is written with zeros after it.
+- The operating system written in a gzip header is the one zlib's build would write: 3 (Unix), 10 on Windows, 19 on Apple systems.
+- `deflateParams`, which calls `deflate()` with the stream's current buffers, takes them as arguments: `Deflate::params(output, input, level, strategy)`.
 
 ## How it is shown
 
 The reference is zlib 1.3.2 itself, reached two ways: built from the sources bundled in `libz-sys` 1.1.30 (its `static` feature, so that a system zlib of another version is never used) and called through `flate2`, both development dependencies only; and `tools/zlib-oracle`, a small C program built from the zlib 1.3.2 release by `scripts/testdata.py`, as `tools/zstd-oracle` is for libzstd.
 
+- **`tests/deflate.rs`** compresses the same inputs with the port and with zlib, in the same random pieces of input and output, with the same flushes (none, sync, full, partial, finish). Every call must return the same result and read and write the same number of bytes, and the bytes must be the same: at every level from −1 to 9, raw, zlib and gzip, with windows of 512 bytes to 32 KiB, on text, random bytes, runs, long-distance matches, `testdata`'s files and, where it is fetched, 400 KB of five Silesia files.
 - **`tests/zlib.rs`** decompresses streams that zlib's own compressor wrote, with the port and with zlib, in the same pieces of input and output, chosen at random from one byte up. Every call must return the same result and message and read and write the same number of bytes, and the output must be the same. The streams are raw, zlib and gzip; at levels 0, 1, 6 and 9; with windows of 512 bytes to 32 KiB; with sync, full and partial flushes in between; with preset dictionaries, right and wrong; decompressed with a smaller window than they need; with a gzip header that has every field; and 2,880 of them damaged, with bytes changed, bits flipped and cut short. The inputs are text, random bytes, runs, matches from up to 40 KiB back, and the uncompressed files in `testdata/zstd/golden-compression`.
 - **`tests/oracle.rs`** reaches what `flate2` cannot: `Flush::Block` and `Flush::Trees`, `data_type`, `inflateMark`, `inflatePrime`, `inflateSync`, `inflateValidate`, dictionaries set at any point, and the gzip header fields, on streams from every level, window, memory level, strategy and flush (`Z_BLOCK` included) of zlib's compressor, some of them damaged. Each request is a stream and a list of calls; the port must answer each call as zlib does: the result, bytes read and written, `data_type`, `inflateMark` and `msg`, then the totals, the check value, a hash of the output and the header. About 1,800 requests are compared with zlib where the oracle is built (Linux and macOS in CI), and `testdata/oracle/inflate.txt` replays 1,173 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
+
+  The compressor is compared the same way, through the oracle's `deflate2` requests, for what `flate2` cannot set: every memory level and strategy (`Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`), parameters out of range, gzip headers with every field, dictionaries before and between blocks, `deflateParams` and `deflateTune` between calls, `deflatePrime`, `deflateBound`, `Z_BLOCK`, and output space from none up. Each call is answered with the result, bytes read and written, `data_type`, `deflatePending`, `deflateUsed` and `msg`, then the totals, the check value and a hash of the output. About 800 requests are compared live, and `testdata/oracle/deflate.txt` replays 586.
 - **`tests/infcover.rs`** is zlib's own coverage test of inflate, `test/infcover.c`, ported with the same inputs and expected results, including the messages of every data error.
-- **Unit tests** compare the CRC tables with `crc32.h`, build `inffixed.h`'s tables with the ported `inflate_table` as zlib's `makefixed()` does, and check CRC-32 and Adler-32, combined or not, against their definitions.
-- **`fuzz/fuzz_targets/inflate.rs`** does what `tests/zlib.rs` does with the fuzzer's input as the stream (see [fuzz/README.md](../fuzz/README.md)).
+- **Unit tests** compare the CRC tables with `crc32.h` and the static trees with `trees.h`, build `inffixed.h`'s tables with the ported `inflate_table` as zlib's `makefixed()` does, and check CRC-32 and Adler-32, combined or not, against their definitions.
+- **`fuzz/fuzz_targets/inflate.rs`** and **`deflate.rs`** do what `tests/zlib.rs` and `tests/deflate.rs` do, with the fuzzer's input as the stream or the data (see [fuzz/README.md](../fuzz/README.md)).
 
 ## The speed target
 
-At least 0.95× zlib's speed, as for zstd, measured with `tools/deflate-bench` on the Silesia corpus:
+At least 0.95× zlib's speed, as for zstd, measured with `tools/deflate-bench` on the Silesia corpus (`python3 scripts/testdata.py fetch --group bench` fetches it):
 
 ```sh
-cargo run --release -p deflate-bench -- [--levels 1,6,9] [--stream] PATH...
+cargo run --release -p deflate-bench -- [--levels 1,6,9] [--stream | --compress] target/testdata/silesia
 ```
+
+With `--compress`, the tool also checks that the port's streams are zlib's, byte for byte.
+
+### Where compression stands
+
+The port as it is, with no speed work: AMD Ryzen 9 9950X (x86-64, Linux), October 2026, Silesia at levels 1, 6 and 9, one call each, best of three rounds taken in turn:
+
+| | Mean | Range | At 0.95× or more |
+|---|---|---|---|
+| Compression | 0.99× zlib | 0.95–1.03× | 36 of 36 |
+
+Every stream was zlib's, byte for byte.
 
 ### Where decompression stands
 
@@ -68,16 +89,17 @@ The slowest inputs are text at level 1, mostly literals. arm64 is not measured y
 | `inftrees.{h,c}`, `inffixed.h` | `inftrees.rs`, `inffixed.rs` | done | `inffixed.h` rebuilt; `infcover.c`'s `cover_trees`; every dynamic block in `tests/zlib.rs` |
 | `inffast.{h,c}` | `inffast.rs` | done | `tests/zlib.rs`; `tests/oracle.rs`; `infcover.c`'s `cover_fast` |
 | `inflate.{h,c}` | `inflate.rs` | done | `tests/zlib.rs`; `tests/oracle.rs`, for every function and flush; `infcover.c`'s `cover_support`, `cover_wrap` and `cover_inflate` |
-| `deflate.{h,c}`, `trees.{h,c}`, `compress.c` | | next | the output, byte for byte, at every level, strategy and flush |
-| `uncompr.c` | | later | |
-| Deflate64 (not in zlib itself) | | after the encoder | zlib's `contrib/infback9`, which decodes it; ZIP archives from Windows and 7-Zip |
+| `trees.{h,c}` | `trees.rs` | done | `trees.h`'s tables; every block of `tests/deflate.rs` and `tests/oracle.rs` |
+| `deflate.{h,c}` | `deflate.rs` | done | `tests/deflate.rs`, byte for byte, call by call; `tests/oracle.rs`, for every function, strategy, memory level and flush |
+| `compress.c`, `uncompr.c` | | later | |
+| Deflate64 (not in zlib itself) | | next | zlib's `contrib/infback9`, which decodes it; ZIP archives from Windows and 7-Zip |
 
 ## Not ported, for now
 
 - `infback.c`: `inflateBack`, a callback interface to the same decoder.
 - `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`: reading and writing gzip files. The gzip format itself is in `inflate.c` and is ported.
-- Parts that exist only because zlib is in C: custom allocators (`zalloc`, `zfree`), `inflateInit_`'s version check, the checks of a null or uninitialised stream, and building the CRC tables on first use (`DYNAMIC_CRC_TABLE`).
-- Build options that zlib leaves off by default: `INFLATE_STRICT`, `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR` (so `inflateUndermine` always fails, as in a default build), `PKZIP_BUG_WORKAROUND`, `BUILDFIXED`, and the ARMv8 CRC instructions.
+- Parts that exist only because zlib is in C: custom allocators (`zalloc`, `zfree`), the version checks of `inflateInit_` and `deflateInit_`, the `method` argument of `deflateInit2` (always `Z_DEFLATED`), the checks of a null or uninitialised stream, and building the CRC tables on first use (`DYNAMIC_CRC_TABLE`).
+- Build options that zlib leaves off by default: `INFLATE_STRICT`, `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR` (so `inflateUndermine` always fails, as in a default build), `PKZIP_BUG_WORKAROUND`, `BUILDFIXED`, the ARMv8 CRC instructions, and in the compressor `FASTEST`, `LIT_MEM`, `UNALIGNED_OK`, `FORCE_STATIC`, `FORCE_STORED`, `GEN_TREES_H` and `ZLIB_DEBUG`.
 - `contrib/`, except `infback9`, for Deflate64, later.
 
 ## Following new releases

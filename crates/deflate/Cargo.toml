@@ -1,12 +1,12 @@
 [package]
 name = "hivepack-deflate"
 version = "0.0.0"
-description = "Deflate, zlib and gzip decompression in safe Rust, ported from the official library, zlib"
+description = "Deflate, zlib and gzip compression and decompression in safe Rust, ported from the official library, zlib"
 license = "Zlib"
 readme = "README.md"
 keywords = ["deflate", "zlib", "gzip", "inflate", "compression"]
 categories = ["compression"]
-# Nothing to publish until the decoder is checked against zlib.
+# Nothing to publish yet.
 publish = false
 edition.workspace = true
 rust-version.workspace = true

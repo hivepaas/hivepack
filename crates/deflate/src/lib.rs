@@ -1,11 +1,12 @@
-//! Deflate, zlib and gzip decompression in safe Rust, ported from the
-//! official library, [zlib](https://zlib.net).
+//! Deflate, zlib and gzip compression and decompression in safe Rust,
+//! ported from the official library, [zlib](https://zlib.net).
 //!
-//! Work in progress: decompression works ([`Inflate`]), with the zlib and
-//! gzip wrappers, dictionaries and gzip headers, and so do the checksums
-//! ([`crc32`], [`adler32`]); compression comes next. The plan, and the rules
-//! the port follows, are in the repository: `docs/deflate.md` and
-//! `docs/safety.md`.
+//! Compression ([`Deflate`]) gives zlib's output, byte for byte, at every
+//! level, strategy and flush, and decompression ([`Inflate`]) zlib's
+//! results and messages, both with the zlib and gzip wrappers, dictionaries
+//! and gzip headers; so do the checksums ([`crc32`], [`adler32`]). The
+//! rules the port follows, and how it is checked, are in the repository:
+//! `docs/deflate.md` and `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_deflate::Error> {
@@ -40,14 +41,20 @@
 
 mod adler32;
 mod crc32;
+mod deflate;
 mod inffast;
 mod inffixed;
 mod inflate;
 mod inftrees;
+mod trees;
 mod zutil;
 
 pub use adler32::{ADLER32_INIT, adler32, adler32_combine};
 pub use crc32::{crc32, crc32_combine, crc32_combine_gen, crc32_combine_op, get_crc_table};
+pub use deflate::{
+    DEF_MEM_LEVEL, Deflate, MAX_MEM_LEVEL, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_FILTERED,
+    Z_FIXED, Z_HUFFMAN_ONLY, Z_RLE,
+};
 pub use inflate::{GzHeader, InBuffer, Inflate, OutBuffer};
 pub use zutil::{Error, ErrorCode, Flush, MAX_WBITS, Result, Status};
 

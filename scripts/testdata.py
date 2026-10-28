@@ -175,14 +175,17 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path) -> N
     which the port does not have either); the `included` files are left
     out, as the oracle includes them itself to reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
-    (gz*.c), which it does not use."""
+    (gz*.c), which it does not use, and with contrib/infback9 for
+    Deflate64."""
     files = [str(ROOT / s) for s in sources]
     compiler = os.environ.get("CC", "cc")
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:
+        infback9 = zlib / "contrib" / "infback9"
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
-        subprocess.run([compiler, "-O2", f"-I{zlib}", *files, "-o", str(folder / "oracle")],
-                       check=True)
+        files += [str(infback9 / "infback9.c"), str(infback9 / "inftree9.c")]
+        subprocess.run([compiler, "-O2", f"-I{zlib}", f"-I{infback9}", *files,
+                        "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))
     for part in ("common", "compress", "decompress"):

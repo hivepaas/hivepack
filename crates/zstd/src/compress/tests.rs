@@ -138,6 +138,10 @@ fn stream(cctx: &mut CCtx, data: &[u8], seed: u64) -> Result<Vec<u8>, String> {
     Err("no end".into())
 }
 
+/// A frame, and how many times the indices of the match state, and those
+/// of long distance matching, were lowered in it.
+type Lowered = (Vec<u8>, u32, u32);
+
 /// With the indices lowered as soon as they can be (libzstd's
 /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, which its fuzzers are built
 /// with), the frames come out the same: in one call, and streaming with
@@ -145,12 +149,14 @@ fn stream(cctx: &mut CCtx, data: &[u8], seed: u64) -> Result<Vec<u8>, String> {
 /// quarter of the frames are btlazy2, whose tree keeps its unsorted
 /// positions through the lowering; half are at a lazy level with the row
 /// match finder, whose tags stay as they are when the indices are lowered
-/// (its chain log, small, only sets how soon they are).
+/// (its chain log, small, only sets how soon they are). Half of each have
+/// long distance matching, whose window lowers its own indices.
 #[test]
 fn lowering_the_indices_changes_no_frame() {
     let mut rng = Rng::new(0x5EED_0202);
     let mut corrections = 0;
     let mut row_corrections = 0;
+    let mut ldm_corrections = 0;
     let mut problems = Vec::new();
     for i in 0..32 {
         let len = rng.range(100_000, 1_200_000) as usize;
@@ -180,7 +186,19 @@ fn lowering_the_indices_changes_no_frame() {
             rng.range(10, 17) as u32
         };
         let seed = rng.next();
-        let frames: Vec<Result<(Vec<u8>, u32), String>> = [false, true]
+        // Long distance matching for each kind, in one call and streaming,
+        // with small parameters; and a hash table of its own size, which
+        // the window, up to 2^27 bytes without one set, would make large.
+        let ldm = (i / 4 + i / 8) % 2 == 1;
+        let ldm_mode = if ldm {
+            ParamSwitch::Enable
+        } else {
+            ParamSwitch::Disable
+        };
+        let ldm_min_match = 4 + (seed % 61) as u32;
+        let ldm_hash_rate_log = 1 + (seed >> 8) as u32 % 5;
+        let ldm_hash_log = 10 + (seed >> 16) as u32 % 9;
+        let frames: Vec<Result<Lowered, String>> = [false, true]
             .into_iter()
             .map(|frequently| {
                 OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(frequently));
@@ -190,7 +208,15 @@ fn lowering_the_indices_changes_no_frame() {
                     .and_then(|()| cctx.set_parameter(CParameter::WindowLog(window_log)))
                     .and_then(|()| cctx.set_parameter(CParameter::ChainLog(chain_log)))
                     .and_then(|()| cctx.set_parameter(CParameter::UseRowMatchFinder(row_mode)))
-                    .and_then(|()| cctx.set_parameter(CParameter::Strategy(strategy)));
+                    .and_then(|()| cctx.set_parameter(CParameter::Strategy(strategy)))
+                    .and_then(|()| {
+                        cctx.set_parameter(CParameter::EnableLongDistanceMatching(ldm_mode))
+                    })
+                    .and_then(|()| cctx.set_parameter(CParameter::LdmMinMatch(ldm_min_match)))
+                    .and_then(|()| {
+                        cctx.set_parameter(CParameter::LdmHashRateLog(ldm_hash_rate_log))
+                    })
+                    .and_then(|()| cctx.set_parameter(CParameter::LdmHashLog(ldm_hash_log)));
                 if let Err(error) = set {
                     return Err(format!("{error:?}"));
                 }
@@ -204,20 +230,26 @@ fn lowering_the_indices_changes_no_frame() {
                 } else {
                     stream(&mut cctx, &data, seed)?
                 };
-                Ok((frame, cctx.nb_overflow_corrections()))
+                Ok((
+                    frame,
+                    cctx.nb_overflow_corrections(),
+                    cctx.nb_ldm_overflow_corrections(),
+                ))
             })
             .collect();
         OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(false));
         match (&frames[0], &frames[1]) {
-            (Ok((want, 0)), Ok((got, lowered))) => {
+            (Ok((want, 0, 0)), Ok((got, lowered, ldm_lowered))) => {
                 corrections += lowered;
+                ldm_corrections += ldm_lowered;
                 if row {
                     row_corrections += lowered;
                 }
                 if want != got {
                     problems.push(format!(
                         "{len} bytes at level {level}, strategy {strategy:?}, window log \
-                         {window_log}, {}: the frames differ after {lowered} corrections",
+                         {window_log}, long distance matching {ldm}, {}: the frames differ after \
+                         {lowered} corrections, {ldm_lowered} of long distance matching",
                         if one_call { "one call" } else { "streaming" }
                     ));
                 }
@@ -230,8 +262,15 @@ fn lowering_the_indices_changes_no_frame() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
-    eprintln!("{corrections} corrections, {row_corrections} with the row match finder");
+    eprintln!(
+        "{corrections} corrections, {row_corrections} with the row match finder, \
+         {ldm_corrections} of long distance matching"
+    );
     assert!(corrections > 100, "only {corrections} corrections");
+    assert!(
+        ldm_corrections > 50,
+        "only {ldm_corrections} corrections of long distance matching"
+    );
     assert!(
         row_corrections > 50,
         "only {row_corrections} corrections with the row match finder"
@@ -307,4 +346,166 @@ fn the_row_match_finders_salt_changes_no_frame() {
             ),
         }
     }
+}
+
+/// Data with repeats far back: pieces of LZ-like and random bytes, and
+/// copies of earlier stretches from anywhere before, a few bytes changed.
+/// The copies of random bytes only long distance matching finds, past the
+/// reach of the strategy's tables.
+fn far_repeats(rng: &mut Rng, len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len + 70_000);
+    while data.len() < len {
+        if data.len() > 4096 && rng.range(0, 2) != 0 {
+            let size = (rng.range(16, 65_536) as usize).min(data.len() / 2);
+            let at = rng.range(0, (data.len() - size) as u64) as usize;
+            let start = data.len();
+            data.extend_from_within(at..at + size);
+            for _ in 0..rng.range(0, 4) {
+                let i = start + rng.range(0, size as u64 - 1) as usize;
+                data[i] = rng.next() as u8;
+            }
+        } else {
+            let n = rng.range(1, 20_000) as usize;
+            let piece = if rng.range(0, 1) == 0 {
+                rng.lz_data(n)
+            } else {
+                rng.bytes(n)
+            };
+            data.extend(piece);
+        }
+    }
+    data.truncate(len);
+    data
+}
+
+/// The parameters of long distance matching, for both: small, so that it
+/// finds matches in inputs of a few MB; with the strategy, the row match
+/// finder for the lazy ones, and the window.
+fn ldm_parameters(rng: &mut Rng, strategy: Strategy) -> Vec<(CParameter, zstd_safe::CParameter)> {
+    use zstd_safe::CParameter as C;
+    let mut list = vec![(
+        CParameter::EnableLongDistanceMatching(ParamSwitch::Enable),
+        C::EnableLongDistanceMatching(true),
+    )];
+    let level = rng.range(1, 15) as i32;
+    list.push((
+        CParameter::CompressionLevel(level),
+        C::CompressionLevel(level),
+    ));
+    let c_strategy = match strategy {
+        Strategy::Fast => zstd_safe::Strategy::ZSTD_fast,
+        Strategy::Dfast => zstd_safe::Strategy::ZSTD_dfast,
+        Strategy::Greedy => zstd_safe::Strategy::ZSTD_greedy,
+        Strategy::Lazy => zstd_safe::Strategy::ZSTD_lazy,
+        Strategy::Lazy2 => zstd_safe::Strategy::ZSTD_lazy2,
+        _ => zstd_safe::Strategy::ZSTD_btlazy2,
+    };
+    list.push((
+        CParameter::Strategy(Some(strategy)),
+        C::Strategy(c_strategy),
+    ));
+    let (p_row, c_row) = [
+        (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
+        (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
+        (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
+    ][rng.range(0, 2) as usize];
+    list.push((
+        CParameter::UseRowMatchFinder(p_row),
+        C::UseRowMatchFinder(c_row),
+    ));
+    if rng.range(0, 3) != 0 {
+        let value = rng.range(10, 23) as u32;
+        list.push((CParameter::WindowLog(value), C::WindowLog(value)));
+    }
+    if rng.range(0, 2) != 0 {
+        // Small tables for the strategy, which then misses what is far.
+        let value = rng.range(8, 16) as u32;
+        list.push((CParameter::HashLog(value), C::HashLog(value)));
+        let value = rng.range(8, 16) as u32;
+        list.push((CParameter::ChainLog(value), C::ChainLog(value)));
+    }
+    if rng.range(0, 3) != 0 {
+        let value = rng.range(4, 80) as u32;
+        list.push((CParameter::LdmMinMatch(value), C::LdmMinMatch(value)));
+    }
+    if rng.range(0, 3) != 0 {
+        // Not past the smallest window log less 6: libzstd then takes a
+        // hash table of 2^30 entries.
+        let value = rng.range(0, 4) as u32;
+        list.push((CParameter::LdmHashRateLog(value), C::LdmHashRateLog(value)));
+    }
+    if rng.range(0, 3) == 0 {
+        let value = rng.range(6, 20) as u32;
+        list.push((CParameter::LdmHashLog(value), C::LdmHashLog(value)));
+    }
+    if rng.range(0, 3) == 0 {
+        let value = rng.range(1, 8) as u32;
+        list.push((
+            CParameter::LdmBucketSizeLog(value),
+            C::LdmBucketSizeLog(value),
+        ));
+    }
+    list
+}
+
+/// Long distance matching with every strategy the port has, in one call
+/// (`compress2`), against libzstd, over data with repeats far back; and
+/// decoded back.
+#[test]
+fn long_distance_matching_matches_libzstd() {
+    let mut rng = Rng::new(0x5EED_0205);
+    let mut problems = Vec::new();
+    let strategies = [
+        Strategy::Fast,
+        Strategy::Dfast,
+        Strategy::Greedy,
+        Strategy::Lazy,
+        Strategy::Lazy2,
+        Strategy::Btlazy2,
+    ];
+    let mut cctx = CCtx::new();
+    let mut c_cctx = zstd_safe::CCtx::create();
+    for i in 0..60 {
+        let strategy = strategies[i % strategies.len()];
+        let len = match i % 4 {
+            0 => rng.range(0, 5000),
+            1 => rng.range(100_000, 400_000),
+            _ => rng.range(400_000, 2_500_000),
+        } as usize;
+        let data = far_repeats(&mut rng, len);
+        cctx.reset(crate::decompress::zstd_decompress::ResetDirective::Parameters)
+            .expect("between frames");
+        c_cctx
+            .reset(zstd_safe::ResetDirective::Parameters)
+            .expect("between frames");
+        let parameters = ldm_parameters(&mut rng, strategy);
+        for &(p, c) in &parameters {
+            cctx.set_parameter(p).expect("the port takes it");
+            c_cctx.set_parameter(c).expect("libzstd takes it");
+        }
+        let bound = zstd_compress_bound(len).expect("a bound");
+        let mut want = vec![0u8; bound];
+        let want_size = c_cctx
+            .compress2(&mut want[..], &data)
+            .expect("libzstd compresses");
+        want.truncate(want_size);
+        let mut got = vec![0u8; bound];
+        match cctx.compress2(&mut got, &data) {
+            Ok(size) if got[..size] == want[..] => {
+                let mut back = vec![0u8; len];
+                if decompress(&mut back, &want).ok() != Some(len) || back != data {
+                    problems.push(format!("{len} bytes: does not decode back"));
+                }
+            }
+            Ok(size) => {
+                let at = got[..size].iter().zip(&want).position(|(a, b)| a != b);
+                problems.push(format!(
+                    "{len} bytes, {parameters:?}: {size} bytes, libzstd {want_size}, first \
+                     difference at {at:?}"
+                ));
+            }
+            Err(error) => problems.push(format!("{len} bytes, {parameters:?}: {error:?}")),
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

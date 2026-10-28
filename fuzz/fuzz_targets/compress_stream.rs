@@ -52,6 +52,7 @@ fuzz_target!(|input: &[u8]| {
     let stable_out = head[2] & 1 != 0;
     let checksum = head[2] & 2 != 0;
     let max_block = [0, 1024, 4096, 65_536][usize::from(head[2] >> 2) % 4];
+    let ldm = head[2] & 16 != 0;
     let mut rng = Rng(u64::from(u32::from_le_bytes([head[3], head[4], head[5], head[6]])) | 1);
 
     let mut parameters = vec![
@@ -63,8 +64,32 @@ fuzz_target!(|input: &[u8]| {
         ),
         (P::MaxBlockSize(max_block), C::MaxBlockSize(max_block)),
     ];
-    if head[7] & 1 != 0 {
+    // Long distance matching needs a window set: it would take 2^27 bytes.
+    if head[7] & 1 != 0 || ldm {
         parameters.push((P::WindowLog(window_log), C::WindowLog(window_log)));
+    }
+    if ldm {
+        // Small parameters, so that it finds matches in small inputs; some
+        // left to the library.
+        parameters.push((
+            P::EnableLongDistanceMatching(ParamSwitch::Enable),
+            C::EnableLongDistanceMatching(true),
+        ));
+        let pick = head[2] >> 5;
+        if pick & 1 != 0 {
+            let value = 4 + (rng.next() % 61) as u32;
+            parameters.push((P::LdmMinMatch(value), C::LdmMinMatch(value)));
+        }
+        if pick & 2 != 0 {
+            let value = (rng.next() % 5) as u32;
+            parameters.push((P::LdmHashRateLog(value), C::LdmHashRateLog(value)));
+        }
+        if pick & 4 != 0 {
+            let value = 6 + (rng.next() % 15) as u32;
+            parameters.push((P::LdmHashLog(value), C::LdmHashLog(value)));
+            let value = 1 + (rng.next() % 8) as u32;
+            parameters.push((P::LdmBucketSizeLog(value), C::LdmBucketSizeLog(value)));
+        }
     }
     {
         use zstd_safe::Strategy as S;

@@ -66,10 +66,13 @@
 #![allow(clippy::needless_range_loop)]
 
 mod common;
+mod compress;
 mod decompress;
 
 #[cfg(test)]
 mod oracle;
+#[cfg(test)]
+mod oracle_compress;
 
 pub use common::error_private::{Error, ErrorCode, Result};
 pub use decompress::zstd_ddict::{DDict, DictContentType};

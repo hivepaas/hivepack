@@ -41,3 +41,22 @@ pub(crate) fn read_le64(src: &[u8], at: usize) -> u64 {
 pub(crate) fn read_le24(src: &[u8], at: usize) -> u32 {
     u32::from(read_le16(src, at)) + (u32::from(src[at + 2]) << 16)
 }
+
+/// `MEM_writeLE16`
+#[inline(always)]
+pub(crate) fn write_le16(dst: &mut [u8], at: usize, value: u16) {
+    dst[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+/// `MEM_writeLE32`
+#[inline(always)]
+pub(crate) fn write_le32(dst: &mut [u8], at: usize, value: u32) {
+    dst[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// `MEM_writeLE64`, which is also `MEM_writeLEST` on 64-bit machines.
+#[inline(always)]
+pub(crate) fn write_le64(dst: &mut [u8], at: usize, value: u64) {
+    let at = idx(at);
+    dst[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}

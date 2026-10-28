@@ -64,6 +64,48 @@
  *                                     compressed with it (HUF_compress{1,4}X_usingCTable),
  *                                     or "none" when that is not possible
  *
+ * The encoder's entropy coding. Tables are answered whole, with the cells a
+ * function leaves alone still holding the filler they started with
+ * (0xdeadbeef words, 0x7777 counts, 0xaaaaaaaa histogram counts), so that
+ * the port must write exactly the same cells:
+ *   hist <mode> <maxSV> <hex>         HIST_count_simple ("simple"), HIST_countFast_wksp
+ *                                     ("fast"), or HIST_count_wksp ("wksp"), answered
+ *                                     "ok <largest> <maxSV> <256 counts>"
+ *   fseoptlog <maxTableLog> <srcSize> <maxSV> <minus>
+ *                                     FSE_optimalTableLog_internal
+ *   fsenorm <tableLog> <useLowProbCount> <counts>
+ *                                     FSE_normalizeCount, of counts summing to at least 2
+ *   fsencount <bufferSize> <maxSV> <tableLog> <normalized>
+ *                                     FSE_writeNCount
+ *   fsectable <maxSV> <tableLog> <normalized>
+ *                                     FSE_buildCTable_wksp, of a valid distribution: the
+ *                                     table's words, then FSE_bitCost (accuracy 8) and
+ *                                     FSE_getMaxNbBits of each symbol
+ *   fsectablerle <symbol>             FSE_buildCTable_rle
+ *   fsecompress <maxTableLog> <useLowProbCount> <dstCapacity> <hex>
+ *                                     HIST_count_simple, FSE_optimalTableLog,
+ *                                     FSE_normalizeCount and FSE_buildCTable_wksp, then
+ *                                     FSE_compress_usingCTable; "none" for a single symbol
+ *   bitc <dstCapacity> <ops>          BIT_initCStream, then for each triple of <ops>
+ *                                     (value, nbBits, how) BIT_addBits (how 0), BIT_addBits
+ *                                     and BIT_flushBits (1) or BIT_addBitsFast and
+ *                                     BIT_flushBits (2), then BIT_closeCStream
+ *   hufctable <maxNbBits> <counts>    HUF_buildCTable_wksp: the table as little-endian
+ *                                     words, then HUF_writeCTable_wksp
+ *   hufoptlog <maxTableLog> <flags> <counts>
+ *                                     HUF_optimalTableLog
+ *   hufcompress <streams> <maxSV> <huffLog> <flags> <dstCapacity> <repeat> <table> <hex>
+ *                                     HUF_compress{1,4}X_repeat, with the previous table
+ *                                     given as little-endian words, the ones left out
+ *                                     being filler ("-": none, and no repeat mode
+ *                                     either), answered "ok <result> <repeat> <output>
+ *                                     <table>". The table is answered up to its largest
+ *                                     symbol: libzstd copies a new table whole from its
+ *                                     workspace, past that symbol too, but never reads
+ *                                     those cells.
+ *   hufreadctable <maxSV> <hex>       HUF_readCTable, answered "ok <size> <maxSV>
+ *                                     <hasZeroWeights> <table>"
+ *
  * Copyright (c) 2026 HivePaaS. MIT license.
  */
 
@@ -427,6 +469,352 @@ static void line_append_hex(const unsigned char* bytes, size_t n)
     }
 }
 
+/* ---- The encoder's entropy coding ---- */
+
+#define FILLER_WORD 0xdeadbeefu
+#define FILLER_NORM ((short)0x7777)
+#define FILLER_COUNT 0xaaaaaaaau
+
+/* The workspace every entropy function below gets: as much as libzstd's
+ * Huffman functions take, and for FSE tables enough for the largest. */
+static U64 entropy_wksp[HUF_WORKSPACE_SIZE_U64];
+static unsigned fse_wksp[FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32(FSE_MAX_SYMBOL_VALUE, FSE_MAX_TABLELOG)];
+
+static int parse_counts(const char* text, unsigned* counts, long max, long* n)
+{
+    static long long values[256];
+    long s;
+    *n = parse_list(text, values, max);
+    if (*n < 1) return 0;
+    for (s = 0; s < *n; s++) {
+        if (values[s] < 0 || values[s] > 0xffffffffLL) return 0;
+        counts[s] = (unsigned)values[s];
+    }
+    return 1;
+}
+
+static void hist(char** args, int nargs)
+{
+    unsigned count[256];
+    unsigned maxSV, s;
+    long n, i;
+    size_t r;
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    maxSV = (unsigned)strtoul(args[1], NULL, 10);
+    if (maxSV > 255) { puts("bad"); return; }
+    for (s = 0; s < 256; s++) count[s] = FILLER_COUNT;
+    if (!strcmp(args[0], "wksp")) {
+        r = HIST_count_wksp(count, &maxSV, input, (size_t)n, entropy_wksp, sizeof(entropy_wksp));
+    } else {
+        /* These two trust the input to stay within maxSV. */
+        for (i = 0; i < n; i++) if (input[i] > maxSV) { puts("bad"); return; }
+        r = !strcmp(args[0], "simple")
+            ? HIST_count_simple(count, &maxSV, input, (size_t)n)
+            : HIST_countFast_wksp(count, &maxSV, input, (size_t)n, entropy_wksp, sizeof(entropy_wksp));
+    }
+    if (HIST_isError(r)) { answer_error(r); return; }
+    printf("ok %u %u ", (unsigned)r, maxSV);
+    for (s = 0; s < 256; s++) printf(s ? ",%u" : "%u", count[s]);
+    puts("");
+}
+
+static void fseoptlog(char** args, int nargs)
+{
+    size_t srcSize;
+    if (nargs != 4) { puts("bad"); return; }
+    srcSize = strtoul(args[1], NULL, 10);
+    if (srcSize < 2) { puts("bad"); return; }
+    printf("ok %u\n", FSE_optimalTableLog_internal((unsigned)strtoul(args[0], NULL, 10), srcSize,
+        (unsigned)strtoul(args[2], NULL, 10), (unsigned)strtoul(args[3], NULL, 10)));
+}
+
+static void fsenorm(char** args, int nargs)
+{
+    unsigned counts[256];
+    short norm[256];
+    size_t total = 0, r;
+    long n, s;
+    if (nargs != 3 || !parse_counts(args[2], counts, 256, &n)) { puts("bad"); return; }
+    for (s = 0; s < n; s++) total += counts[s];
+    if (total < 2) { puts("bad"); return; }
+    for (s = 0; s < 256; s++) norm[s] = FILLER_NORM;
+    r = FSE_normalizeCount(norm, (unsigned)strtoul(args[0], NULL, 10), counts, total,
+                           (unsigned)n - 1, (unsigned)atoi(args[1]));
+    if (FSE_isError(r)) { answer_error(r); return; }
+    printf("ok %u ", (unsigned)r);
+    for (s = 0; s < n; s++) printf(s ? ",%d" : "%d", norm[s]);
+    puts("");
+}
+
+static int parse_norm(const char* text, short* norm, long* n)
+{
+    static long long values[256];
+    long s;
+    *n = parse_list(text, values, 256);
+    if (*n < 1) return 0;
+    for (s = 0; s < *n; s++) {
+        if (values[s] < -32768 || values[s] > 32767) return 0;
+        norm[s] = (short)values[s];
+    }
+    return 1;
+}
+
+static void fsencount(char** args, int nargs)
+{
+    short norm[256];
+    size_t bufferSize, r;
+    long n;
+    if (nargs != 4 || !parse_norm(args[3], norm, &n)) { puts("bad"); return; }
+    bufferSize = strtoul(args[0], NULL, 10);
+    if (bufferSize > MAX_BYTES || n != (long)strtoul(args[1], NULL, 10) + 1) { puts("bad"); return; }
+    r = FSE_writeNCount(output, bufferSize, norm, (unsigned)n - 1, (unsigned)strtoul(args[2], NULL, 10));
+    if (FSE_isError(r)) { answer_error(r); return; }
+    printf("ok ");
+    print_hex(output, r);
+    puts("");
+}
+
+static void fsectable(char** args, int nargs)
+{
+    FSE_CTable ct[FSE_CTABLE_SIZE_U32(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE)];
+    short norm[256];
+    unsigned maxSV, tableLog, words, s;
+    long n;
+    size_t r;
+    if (nargs != 3 || !parse_norm(args[2], norm, &n)) { puts("bad"); return; }
+    maxSV = (unsigned)strtoul(args[0], NULL, 10);
+    tableLog = (unsigned)strtoul(args[1], NULL, 10);
+    if (n != (long)maxSV + 1 || tableLog < FSE_MIN_TABLELOG || tableLog > FSE_MAX_TABLELOG) { puts("bad"); return; }
+    {   /* Only valid distributions: libzstd builds tables from FSE_normalizeCount. */
+        long total = 0;
+        for (s = 0; s <= maxSV; s++) {
+            if (norm[s] < -1) { puts("bad"); return; }
+            total += norm[s] < 0 ? 1 : norm[s];
+        }
+        if (total != (1L << tableLog)) { puts("bad"); return; }
+    }
+    words = FSE_CTABLE_SIZE_U32(tableLog, maxSV);
+    for (s = 0; s < words; s++) ct[s] = FILLER_WORD;
+    r = FSE_buildCTable_wksp(ct, norm, maxSV, tableLog, fse_wksp, sizeof(fse_wksp));
+    if (FSE_isError(r)) { answer_error(r); return; }
+    printf("ok ");
+    for (s = 0; s < words; s++) printf(s ? ",%u" : "%u", ct[s]);
+    {   FSE_CState_t cstate;
+        FSE_initCState(&cstate, ct);
+        putchar(' ');
+        for (s = 0; s <= maxSV; s++) printf(s ? ",%u" : "%u", FSE_bitCost(cstate.symbolTT, tableLog, s, 8));
+        putchar(' ');
+        for (s = 0; s <= maxSV; s++) printf(s ? ",%u" : "%u", FSE_getMaxNbBits(cstate.symbolTT, s));
+    }
+    puts("");
+}
+
+static void fsectablerle(char** args, int nargs)
+{
+    FSE_CTable ct[2 + 2 * 256];
+    unsigned symbol, s;
+    if (nargs != 1) { puts("bad"); return; }
+    symbol = (unsigned)strtoul(args[0], NULL, 10);
+    if (symbol > 255) { puts("bad"); return; }
+    for (s = 0; s < 2 + 2 * (symbol + 1); s++) ct[s] = FILLER_WORD;
+    FSE_buildCTable_rle(ct, (BYTE)symbol);
+    printf("ok ");
+    for (s = 0; s < 2 + 2 * (symbol + 1); s++) printf(s ? ",%u" : "%u", ct[s]);
+    puts("");
+}
+
+static void fsecompress(char** args, int nargs)
+{
+    FSE_CTable ct[FSE_CTABLE_SIZE_U32(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE)];
+    unsigned counts[256];
+    short norm[256];
+    unsigned maxSV = 255, tableLog, largest;
+    size_t dstCapacity, r;
+    long n;
+    if (nargs != 4 || (n = parse_hex(args[3])) < 0) { puts("bad"); return; }
+    dstCapacity = strtoul(args[2], NULL, 10);
+    if (dstCapacity > MAX_BYTES) { puts("bad"); return; }
+    largest = HIST_count_simple(counts, &maxSV, input, (size_t)n);
+    if (n < 2 || largest == (unsigned)n) { puts("none"); return; }
+    tableLog = FSE_optimalTableLog((unsigned)strtoul(args[0], NULL, 10), (size_t)n, maxSV);
+    r = FSE_normalizeCount(norm, tableLog, counts, (size_t)n, maxSV, (unsigned)atoi(args[1]));
+    if (FSE_isError(r)) { answer_error(r); return; }
+    r = FSE_buildCTable_wksp(ct, norm, maxSV, tableLog, fse_wksp, sizeof(fse_wksp));
+    if (FSE_isError(r)) { answer_error(r); return; }
+    r = FSE_compress_usingCTable(output, dstCapacity, input, (size_t)n, ct);
+    if (FSE_isError(r)) { answer_error(r); return; }
+    printf("ok %u %u ", tableLog, (unsigned)r);
+    print_hex(output, r);
+    puts("");
+}
+
+static void bitc(char** args, int nargs)
+{
+    static long long ops[3 * 4096];
+    BIT_CStream_t bitC;
+    size_t dstCapacity, r;
+    long nops, i;
+    if (nargs != 2) { puts("bad"); return; }
+    dstCapacity = strtoul(args[0], NULL, 10);
+    nops = parse_list(args[1], ops, 3 * 4096);
+    if (dstCapacity > MAX_BYTES || nops < 0 || nops % 3) { puts("bad"); return; }
+    r = BIT_initCStream(&bitC, output, dstCapacity);
+    if (ERR_isError(r)) { answer_error(r); return; }
+    for (i = 0; i < nops; i += 3) {
+        unsigned const nbBits = (unsigned)ops[i + 1];
+        /* The register must not overflow: the requests flush in time. */
+        if (ops[i] < 0 || nbBits > 31 || bitC.bitPos + nbBits >= 64) { puts("bad"); return; }
+        if (ops[i + 2] == 2) {
+            if (nbBits < 63 && ((unsigned long long)ops[i] >> nbBits) != 0) { puts("bad"); return; }
+            BIT_addBitsFast(&bitC, (size_t)ops[i], nbBits);
+        } else {
+            BIT_addBits(&bitC, (size_t)ops[i], nbBits);
+        }
+        if (ops[i + 2]) BIT_flushBits(&bitC);
+    }
+    if (bitC.bitPos >= 63) { puts("bad"); return; }
+    r = BIT_closeCStream(&bitC);
+    printf("ok %u ", (unsigned)r);
+    print_hex(output, r);
+    puts("");
+}
+
+static void print_words_le(const HUF_CElt* table, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char bytes[8];
+        unsigned long long const v = table[i];
+        int b;
+        for (b = 0; b < 8; b++) bytes[b] = (unsigned char)(v >> (8 * b));
+        print_hex(bytes, 8);
+    }
+}
+
+static void line_append_words_le(const HUF_CElt* table, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char bytes[8];
+        unsigned long long const v = table[i];
+        int b;
+        for (b = 0; b < 8; b++) bytes[b] = (unsigned char)(v >> (8 * b));
+        line_append_hex(bytes, 8);
+    }
+}
+
+/* Reads up to `n` little-endian words from hex, the rest being filler;
+ * returns 1, or 0 when the length is wrong. */
+static int parse_words_le(const char* text, HUF_CElt* table, size_t n)
+{
+    size_t i, len = strlen(text);
+    if (len % 16 || len > 16 * n) return 0;
+    for (i = len / 16; i < n; i++) table[i] = ((HUF_CElt)FILLER_WORD << 32) | FILLER_WORD;
+    for (i = 0; i < len / 16; i++) {
+        unsigned long long v = 0;
+        int b;
+        for (b = 7; b >= 0; b--) {
+            int const hi = hex_value(text[16 * i + 2 * b]), lo = hex_value(text[16 * i + 2 * b + 1]);
+            if (hi < 0 || lo < 0) return 0;
+            v = (v << 8) | (unsigned)(hi * 16 + lo);
+        }
+        table[i] = (HUF_CElt)v;
+    }
+    return 1;
+}
+
+/* Counts libzstd's Huffman builders accept: two symbols or more, and room for them. */
+static int huf_counts_ok(const unsigned* counts, unsigned maxSV, unsigned maxNbBits)
+{
+    unsigned const cardinality = HUF_cardinality(counts, maxSV);
+    return cardinality >= 2 && maxNbBits >= HUF_minTableLog(cardinality) && maxNbBits <= HUF_TABLELOG_MAX;
+}
+
+static void hufctable(char** args, int nargs)
+{
+    HUF_CElt table[HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+    unsigned counts[256];
+    unsigned maxNbBits, s;
+    long n;
+    size_t maxBits, w;
+    if (nargs != 2 || !parse_counts(args[1], counts, 256, &n)) { puts("bad"); return; }
+    maxNbBits = (unsigned)strtoul(args[0], NULL, 10);
+    if (!huf_counts_ok(counts, (unsigned)n - 1, maxNbBits)) { puts("bad"); return; }
+    for (s = 0; s < HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX); s++) table[s] = ((HUF_CElt)FILLER_WORD << 32) | FILLER_WORD;
+    maxBits = HUF_buildCTable_wksp(table, counts, (unsigned)n - 1, maxNbBits, entropy_wksp, sizeof(entropy_wksp));
+    if (HUF_isError(maxBits)) { answer_error(maxBits); return; }
+    printf("ok %u ", (unsigned)maxBits);
+    print_words_le(table, HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX));
+    w = HUF_writeCTable_wksp(output, MAX_BYTES, table, (unsigned)n - 1, (unsigned)maxBits, entropy_wksp, sizeof(entropy_wksp));
+    if (HUF_isError(w)) { printf(" err %d\n", (int)ERR_getErrorCode(w)); return; }
+    putchar(' ');
+    print_hex(output, w);
+    puts("");
+}
+
+static void hufoptlog(char** args, int nargs)
+{
+    HUF_CElt table[HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+    unsigned counts[256];
+    size_t total = 0;
+    long n, s;
+    if (nargs != 3 || !parse_counts(args[2], counts, 256, &n)) { puts("bad"); return; }
+    for (s = 0; s < n; s++) total += counts[s];
+    if (total < 2 || !huf_counts_ok(counts, (unsigned)n - 1, HUF_TABLELOG_MAX)) { puts("bad"); return; }
+    printf("ok %u\n", HUF_optimalTableLog((unsigned)strtoul(args[0], NULL, 10), total, (unsigned)n - 1,
+        entropy_wksp, sizeof(entropy_wksp), table, counts, atoi(args[1])));
+}
+
+static void hufcompress(char** args, int nargs)
+{
+    static HUF_CElt table[HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+    HUF_repeat repeat;
+    int const hasTable = nargs == 8 && strcmp(args[6], "-") != 0;
+    size_t dstCapacity, r;
+    long n;
+    if (nargs != 8 || (n = parse_hex(args[7])) < 0) { puts("bad"); return; }
+    if (hasTable && !parse_words_le(args[6], table, HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX))) { puts("bad"); return; }
+    dstCapacity = strtoul(args[4], NULL, 10);
+    repeat = (HUF_repeat)atoi(args[5]);
+    if (dstCapacity > MAX_BYTES || repeat > HUF_repeat_valid) { puts("bad"); return; }
+    r = atoi(args[0]) == 1
+        ? HUF_compress1X_repeat(output, dstCapacity, input, (size_t)n, (unsigned)strtoul(args[1], NULL, 10),
+              (unsigned)strtoul(args[2], NULL, 10), entropy_wksp, sizeof(entropy_wksp),
+              hasTable ? table : NULL, hasTable ? &repeat : NULL, atoi(args[3]))
+        : HUF_compress4X_repeat(output, dstCapacity, input, (size_t)n, (unsigned)strtoul(args[1], NULL, 10),
+              (unsigned)strtoul(args[2], NULL, 10), entropy_wksp, sizeof(entropy_wksp),
+              hasTable ? table : NULL, hasTable ? &repeat : NULL, atoi(args[3]));
+    if (HUF_isError(r)) { answer_error(r); return; }
+    line_reset();
+    {   char head[64];
+        int const k = snprintf(head, sizeof(head), "ok %u %d ", (unsigned)r, hasTable ? (int)repeat : -1);
+        line_append(head, (size_t)k);
+    }
+    if (r == 0) line_append("-", 1);
+    line_append_hex(output, r);
+    line_append(" ", 1);
+    if (hasTable) line_append_words_le(table, HUF_CTABLE_SIZE_ST(HUF_readCTableHeader(table).maxSymbolValue));
+    else line_append("-", 1);
+    puts(line_out);
+}
+
+static void hufreadctable(char** args, int nargs)
+{
+    HUF_CElt table[HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+    unsigned maxSV, hasZeroWeights = 0, s;
+    long n;
+    size_t r;
+    if (nargs != 2 || (n = parse_hex(args[1])) < 0) { puts("bad"); return; }
+    maxSV = (unsigned)strtoul(args[0], NULL, 10);
+    if (maxSV > 255) { puts("bad"); return; }
+    for (s = 0; s < HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX); s++) table[s] = ((HUF_CElt)FILLER_WORD << 32) | FILLER_WORD;
+    r = HUF_readCTable(table, &maxSV, input, (size_t)n, &hasZeroWeights);
+    if (HUF_isError(r)) { answer_error(r); return; }
+    printf("ok %u %u %u ", (unsigned)r, maxSV, hasZeroWeights);
+    print_words_le(table, HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX));
+    puts("");
+}
+
 static void mkblocks(char** args, int nargs)
 {
     static ZSTD_CCtx* cctx;
@@ -613,6 +1001,18 @@ int main(void)
         else if (!strcmp(command, "mkframe")) mkframe(args, nargs);
         else if (!strcmp(command, "frames")) frames(args, nargs);
         else if (!strcmp(command, "stream")) stream(args, nargs);
+        else if (!strcmp(command, "hist")) hist(args, nargs);
+        else if (!strcmp(command, "fseoptlog")) fseoptlog(args, nargs);
+        else if (!strcmp(command, "fsenorm")) fsenorm(args, nargs);
+        else if (!strcmp(command, "fsencount")) fsencount(args, nargs);
+        else if (!strcmp(command, "fsectable")) fsectable(args, nargs);
+        else if (!strcmp(command, "fsectablerle")) fsectablerle(args, nargs);
+        else if (!strcmp(command, "fsecompress")) fsecompress(args, nargs);
+        else if (!strcmp(command, "bitc")) bitc(args, nargs);
+        else if (!strcmp(command, "hufctable")) hufctable(args, nargs);
+        else if (!strcmp(command, "hufoptlog")) hufoptlog(args, nargs);
+        else if (!strcmp(command, "hufcompress")) hufcompress(args, nargs);
+        else if (!strcmp(command, "hufreadctable")) hufreadctable(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

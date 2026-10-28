@@ -2,7 +2,7 @@
 
 Zstandard (zstd) compression and decompression in safe Rust, ported from the official library, [libzstd](https://github.com/facebook/zstd) 1.5.7.
 
-> **Status:** decompression works, in one call or streaming, with dictionaries, and gives the same output and errors as libzstd on all the test data. It runs at about 0.9× libzstd's speed on Apple M1, and about 0.95× with the `unsafe-fast` feature (x86-64 is not measured yet). Compression works at every level up to 3, in one call (`hivepack_zstd::compress`, `CCtx::compress2`) or streaming (`CCtx::compress_stream2`), with libzstd's parameters, and gives the frames libzstd gives, byte for byte, at about 0.88× libzstd's speed so far; the stronger levels and dictionaries come next. This crate is not on crates.io.
+> **Status:** decompression works, in one call or streaming, with dictionaries, and gives the same output and errors as libzstd on all the test data. It runs at about 0.9× libzstd's speed on Apple M1, and about 0.95× with the `unsafe-fast` feature (x86-64 is not measured yet). Compression works with every strategy up to `btlazy2` (the levels up to 15 for inputs over 256 KB, up to 12 or 10 for smaller ones), in one call (`hivepack_zstd::compress`, `CCtx::compress2`) or streaming (`CCtx::compress_stream2`), with libzstd's parameters, and gives the frames libzstd gives, byte for byte, at about 0.88× libzstd's speed at levels 1 to 3 so far; the strongest levels and dictionaries come next. This crate is not on crates.io.
 
 ```rust
 let frame = [

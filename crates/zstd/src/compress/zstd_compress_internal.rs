@@ -10,7 +10,7 @@ use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_L
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
 
 /// `ZSTD_strategy`: how hard the match finder searches, from `Fast` (1) to
-/// `Btultra2` (9). The port has `Fast` and `Dfast` so far.
+/// `Btultra2` (9). The port has those up to `Btlazy2` so far.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Strategy {
     /// One hash table, one candidate per position.

@@ -1864,10 +1864,10 @@ impl CCtx {
     /// with [`CCtx::set_parameter`] do not apply; [`CCtx::compress2`] takes
     /// them.
     ///
-    /// Work in progress: the port has libzstd's strategies up to `lazy2` so
-    /// far, which are every level up to 12 for inputs over 256 KB, up to 10
-    /// for inputs over 16 KB, and up to 8 for smaller ones. Other levels
-    /// fail with
+    /// Work in progress: the port has libzstd's strategies up to `btlazy2`
+    /// so far, which are every level up to 15 for inputs over 256 KB (or of
+    /// unknown size), up to 12 for inputs over 16 KB, and up to 10 for
+    /// smaller ones. Other levels fail with
     /// [`ErrorCode::ParameterUnsupported`](crate::ErrorCode::ParameterUnsupported).
     pub fn compress(
         &mut self,

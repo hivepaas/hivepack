@@ -173,8 +173,8 @@ jobs:
 
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
   # feature, the compressor's frames and streaming calls against libzstd's,
-  # and inflate against zlib, under AddressSanitizer. A few minutes per
-  # target; longer runs are done by hand (see fuzz/README.md).
+  # and inflate and deflate against zlib, under AddressSanitizer. A few
+  # minutes per target; longer runs are done by hand (see fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
@@ -209,3 +209,4 @@ jobs:
         run: cp -r fuzz/corpus/compress fuzz/corpus/compress_stream
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=180
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=180
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=180

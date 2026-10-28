@@ -82,7 +82,7 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 
 1. **CRC-32 and inflate.** The decompressor and checksums of `hivepack-deflate`, ported from zlib 1.3.2 (`crc32.c`; `inflate.c`, `inftrees.c`, `inffast.c`). Nothing compressed can be read before them. Done: see [deflate.md](deflate.md).
 2. **Reading.** Errors, buffers, extra fields, headers, file names, `open.rs`; stored and deflated entries; `tools/zip-oracle`, and `tools/ziptool`'s reading commands. Deflate64.
-3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's.
+3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md).
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto`.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.
 6. **More methods.** bzip2, LZMA, XZ and PPMd, as their crates arrive; zstd once `hivepack-zstd` compresses.

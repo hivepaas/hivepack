@@ -39,6 +39,29 @@
  *       piece's bytes with that flush (0 to 5), deflate() called until it
  *       leaves output space unused. After the pieces, Z_FINISH until
  *       Z_STREAM_END. Answered "ok <stream>".
+ *
+ *   deflate2 <level> <windowBits> <memLevel> <strategy> <head> <steps> <hex>
+ *       deflateInit2, then each step on the input <hex>, given to the steps
+ *       in order. The steps are comma-separated:
+ *         i<in>/<out>/<flush>  deflate() with the next <in> bytes of input,
+ *                              <out> bytes of output space, that flush
+ *         p<level>/<strategy>/<in>/<out>
+ *                              deflateParams, with that input and space
+ *         t<good>/<lazy>/<nice>/<chain>
+ *                              deflateTune
+ *         b<bits>/<value>      deflatePrime
+ *         d<hex>               deflateSetDictionary with those bytes
+ *         n<len>               deflateBound(len)
+ *       <head> is "-", or "<text>/<time>/<os>/<hcrc>/<extra>/<name>/
+ *       <comment>" for deflateSetHeader first, the last three in
+ *       hexadecimal, or "null"; name and comment get a terminating zero.
+ *       Answered "ok", then a token per step:
+ *         i: <ret>/<read>/<written>/<data_type>/<pending>/<bits>/<used>/<msg>
+ *         p: <ret>/<read>/<written>
+ *         t, b, d: <ret>
+ *         n: <bound>
+ *       then "<total_in>/<total_out>/<adler>", the FNV-1a hash of all the
+ *       output, and the ret of deflateSetHeader with <head>.
  */
 
 #include <stdio.h>
@@ -282,6 +305,147 @@ done:
     free(dict);
 }
 
+/* The bytes of a hexadecimal field, or Z_NULL for "null". With zero set,
+   a terminating zero is added. */
+static unsigned char *field(const char *text, size_t *len, int zero) {
+    unsigned char *bytes;
+    if (strcmp(text, "null") == 0) {
+        *len = 0;
+        return Z_NULL;
+    }
+    bytes = unhex(text, len);
+    if (zero) {
+        bytes = realloc(bytes, *len + 1);
+        bytes[*len] = 0;
+    }
+    return bytes;
+}
+
+static void do_deflate2(int level, int window_bits, int mem_level, int strategy,
+                        char *head_spec, const char *steps, const char *data_hex) {
+    z_stream strm;
+    gz_header head;
+    unsigned char *data, *out, *extra = Z_NULL, *name = Z_NULL, *comment = Z_NULL;
+    size_t len, space = 0, consumed = 0, written = 0;
+    int ret, head_ret = 0, want_head = strcmp(head_spec, "-") != 0;
+    const char *p;
+
+    memset(&strm, 0, sizeof(strm));
+    ret = deflateInit2(&strm, level, Z_DEFLATED, window_bits, mem_level, strategy);
+    if (ret != Z_OK) {
+        printf("err %d\n", ret);
+        return;
+    }
+    data = unhex(data_hex, &len);
+    for (p = steps; *p; ) {
+        unsigned long a, b, c, d;
+        if (*p == 'i' && sscanf(p, "i%lu/%lu/%lu", &a, &b, &c) == 3)
+            space += b;
+        else if (*p == 'p' && sscanf(p, "p%lu/%lu/%lu/%lu", &a, &b, &c, &d) == 4)
+            space += d;
+        p = strchr(p, ',');
+        if (!p)
+            break;
+        p++;
+    }
+    out = malloc(space + 1);
+    if (want_head) {
+        char *fields[7];
+        int n = 0;
+        char *word;
+        size_t extra_len, name_len, comm_len;
+        for (word = strtok(head_spec, "/"); word && n < 7; word = strtok(NULL, "/"))
+            fields[n++] = word;
+        memset(&head, 0, sizeof(head));
+        head.text = atoi(fields[0]);
+        head.time = strtoul(fields[1], NULL, 10);
+        head.os = atoi(fields[2]);
+        head.hcrc = atoi(fields[3]);
+        extra = field(fields[4], &extra_len, 0);
+        name = field(fields[5], &name_len, 1);
+        comment = field(fields[6], &comm_len, 1);
+        head.extra = extra;
+        head.extra_len = (uInt)extra_len;
+        head.name = name;
+        head.comment = comment;
+        head_ret = deflateSetHeader(&strm, &head);
+    }
+
+    fputs("ok", stdout);
+    p = steps;
+    while (*p) {
+        unsigned long in, room;
+        int flush, lvl, strat, good, lazy, nice, chain, bits, value;
+        size_t avail;
+        if (*p == 'i' && sscanf(p, "i%lu/%lu/%d", &in, &room, &flush) == 3) {
+            unsigned pending;
+            int pbits, used;
+            avail = in < len - consumed ? in : len - consumed;
+            strm.next_in = data + consumed;
+            strm.avail_in = (uInt)avail;
+            strm.next_out = out + written;
+            strm.avail_out = (uInt)room;
+            ret = deflate(&strm, flush);
+            consumed += avail - strm.avail_in;
+            written += room - strm.avail_out;
+            deflatePending(&strm, &pending, &pbits);
+            deflateUsed(&strm, &used);
+            printf(" %d/%lu/%lu/%d/%u/%d/%d/", ret, (unsigned long)(avail - strm.avail_in),
+                   (unsigned long)(room - strm.avail_out), strm.data_type, pending, pbits, used);
+            if (strm.msg)
+                put_hex((const unsigned char *)strm.msg, strlen(strm.msg));
+            else
+                fputs("-", stdout);
+        } else if (*p == 'p' && sscanf(p, "p%d/%d/%lu/%lu", &lvl, &strat, &in, &room) == 4) {
+            avail = in < len - consumed ? in : len - consumed;
+            strm.next_in = data + consumed;
+            strm.avail_in = (uInt)avail;
+            strm.next_out = out + written;
+            strm.avail_out = (uInt)room;
+            ret = deflateParams(&strm, lvl, strat);
+            consumed += avail - strm.avail_in;
+            written += room - strm.avail_out;
+            printf(" %d/%lu/%lu", ret, (unsigned long)(avail - strm.avail_in),
+                   (unsigned long)(room - strm.avail_out));
+        } else if (*p == 't' && sscanf(p, "t%d/%d/%d/%d", &good, &lazy, &nice, &chain) == 4) {
+            printf(" %d", deflateTune(&strm, good, lazy, nice, chain));
+        } else if (*p == 'b' && sscanf(p, "b%d/%d", &bits, &value) == 2) {
+            printf(" %d", deflatePrime(&strm, bits, value));
+        } else if (*p == 'd') {
+            const char *end = strchr(p, ',');
+            size_t n = end ? (size_t)(end - p - 1) : strlen(p + 1), dict_len;
+            char *hexbuf = malloc(n + 1);
+            unsigned char *dict;
+            memcpy(hexbuf, p + 1, n);
+            hexbuf[n] = '\0';
+            dict = unhex(hexbuf, &dict_len);
+            printf(" %d", deflateSetDictionary(&strm, dict, (uInt)dict_len));
+            free(dict);
+            free(hexbuf);
+        } else if (*p == 'n' && sscanf(p, "n%lu", &in) == 1) {
+            printf(" %lu", deflateBound(&strm, in));
+        } else {
+            printf(" bad\n");
+            goto done;
+        }
+        p = strchr(p, ',');
+        if (!p)
+            break;
+        p++;
+    }
+    printf(" %lu/%lu/%lu %016llx", strm.total_in, strm.total_out, strm.adler, fnv64(out, written));
+    if (want_head)
+        printf(" h%d", head_ret);
+    putchar('\n');
+done:
+    deflateEnd(&strm);
+    free(data);
+    free(out);
+    free(extra);
+    free(name);
+    free(comment);
+}
+
 int main(void) {
     size_t cap = 1 << 20;
     char *line = malloc(cap);
@@ -306,6 +470,9 @@ int main(void) {
         else if (count == 8 && strcmp(words[0], "deflate") == 0)
             do_deflate(atoi(words[1]), atoi(words[2]), atoi(words[3]), atoi(words[4]), words[5],
                        words[6], words[7]);
+        else if (count == 8 && strcmp(words[0], "deflate2") == 0)
+            do_deflate2(atoi(words[1]), atoi(words[2]), atoi(words[3]), atoi(words[4]), words[5],
+                        words[6], words[7]);
         else
             puts("bad");
         fflush(stdout);

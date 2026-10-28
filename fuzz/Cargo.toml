@@ -51,6 +51,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "deflate"
+path = "fuzz_targets/deflate.rs"
+test = false
+doc = false
+bench = false
+
 # Not in the main workspace: cargo-fuzz builds it with nightly and its own
 # flags.
 [workspace]

@@ -1,12 +1,15 @@
-//! Times hivepack-deflate's decompression against zlib's on the same
-//! inputs: raw deflate streams that zlib wrote at each level, as in a ZIP
-//! archive.
+//! Times hivepack-deflate against zlib on the same inputs: decompressing
+//! raw deflate streams that zlib wrote at each level, as in a ZIP archive,
+//! or, with `--compress`, compressing at each level. The compressed streams
+//! must be the same, byte for byte.
 //!
 //! ```text
-//! cargo run --release -p deflate-bench -- [--levels 1,6,9] [--rounds 3] [--seconds 0.5] [--stream] PATH...
+//! cargo run --release -p deflate-bench -- [--levels 1,6,9] [--rounds 3] [--seconds 0.5] [--stream | --compress] PATH...
 //! ```
 //!
-//! Without `--stream`, each decompression is one call, with all the input
+//! Compression is one call, with all the input and room for all the
+//! output, on a stream made for the level and reset between runs. Without
+//! `--stream`, each decompression is one call, with all the input
 //! and an output buffer of the right size. With it, the input and output go
 //! in pieces of 16 KiB, as zlib's `zpipe.c` example does, each piece of
 //! output then appended to the result.
@@ -21,7 +24,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
-use hivepack_deflate::{Flush, InBuffer, Inflate, OutBuffer, Status};
+use hivepack_deflate::{Deflate, Flush, InBuffer, Inflate, OutBuffer, Status};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -35,6 +38,14 @@ trait Codec {
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
     /// The same in pieces of `CHUNK`.
     fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
+    /// Compresses `input` at `level` as raw deflate, in one call.
+    fn compress(&mut self, level: u32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
+}
+
+/// Room for the compressed form of `len` bytes: deflateBound for the
+/// default window and memory level.
+fn bound(len: usize) -> usize {
+    len + (len >> 12) + (len >> 14) + (len >> 25) + 13 - 6
 }
 
 /// zlib 1.3.2 through flate2, reusing one stream as zpipe would for many
@@ -42,6 +53,7 @@ trait Codec {
 struct Zlib {
     stream: Decompress,
     piece: Vec<u8>,
+    compressor: Option<(u32, Compress)>,
 }
 
 impl Codec for Zlib {
@@ -81,12 +93,35 @@ impl Codec for Zlib {
             }
         }
     }
+
+    fn compress(&mut self, level: u32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        let c = match &mut self.compressor {
+            Some((l, c)) if *l == level => {
+                c.reset();
+                c
+            }
+            slot => {
+                let c = Compress::new_with_window_bits(Compression::new(level), false, 15);
+                &mut slot.insert((level, c)).1
+            }
+        };
+        output.clear();
+        output.resize(bound(input.len()), 0);
+        match c.compress(input, output, FlushCompress::Finish) {
+            Ok(flate2::Status::StreamEnd) => {
+                output.truncate(c.total_out() as usize);
+                Ok(())
+            }
+            other => Err(format!("zlib: {other:?}")),
+        }
+    }
 }
 
 /// The port, used the same way.
 struct Port {
     stream: Inflate,
     piece: Vec<u8>,
+    compressor: Option<(u32, Deflate)>,
 }
 
 impl Codec for Port {
@@ -131,6 +166,30 @@ impl Codec for Port {
             }
         }
     }
+
+    fn compress(&mut self, level: u32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        let c = match &mut self.compressor {
+            Some((l, c)) if *l == level => {
+                c.reset();
+                c
+            }
+            slot => {
+                let c = Deflate::new(level as i32, -15, 8, 0).map_err(|e| e.to_string())?;
+                &mut slot.insert((level, c)).1
+            }
+        };
+        output.clear();
+        output.resize(bound(input.len()), 0);
+        let mut out = OutBuffer::new(output);
+        match c.deflate(&mut out, &mut InBuffer::new(input), Flush::Finish) {
+            Ok(Status::StreamEnd) => {
+                let written = out.pos;
+                output.truncate(written);
+                Ok(())
+            }
+            other => Err(format!("hivepack-deflate: {other:?}")),
+        }
+    }
 }
 
 /// `data` as a raw deflate stream from zlib at `level`.
@@ -152,6 +211,7 @@ struct Options {
     rounds: usize,
     budget: Duration,
     stream: bool,
+    compress: bool,
     paths: Vec<PathBuf>,
 }
 
@@ -161,6 +221,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
         rounds: 3,
         budget: Duration::from_millis(500),
         stream: false,
+        compress: false,
         paths: Vec::new(),
     };
     let mut args = args.peekable();
@@ -174,6 +235,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
                     .collect::<Result<_>>()?;
             }
             "--stream" => options.stream = true,
+            "--compress" => options.compress = true,
             "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
             "--seconds" => {
                 let seconds: f64 = value()?.parse().map_err(|_| "bad --seconds")?;
@@ -182,7 +244,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: deflate-bench [--levels 1,6,9] [--rounds N] [--seconds S] [--stream] PATH..."
+                    "usage: deflate-bench [--levels 1,6,9] [--rounds N] [--seconds S] [--stream | --compress] PATH..."
                         .into(),
                 );
             }
@@ -267,8 +329,23 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
         let compressed = compress(level, &data)?;
         let ratio = data.len() as f64 / compressed.len().max(1) as f64;
         let mut speeds: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
+        let mut streams: Vec<Vec<u8>> = codecs.iter().map(|_| Vec::new()).collect();
         for _ in 0..options.rounds {
             for (i, codec) in codecs.iter_mut().enumerate() {
+                if options.compress {
+                    let seconds = time(options.budget, || {
+                        codec.compress(level, &data, &mut scratch)
+                    })?;
+                    streams[i] = scratch.clone();
+                    if streams[i] != compressed {
+                        return Err(format!(
+                            "{}: {name} level {level} is not zlib's stream",
+                            codec.name()
+                        ));
+                    }
+                    speeds[i] = Range::add(speeds[i].take(), megabytes / seconds);
+                    continue;
+                }
                 let seconds = time(options.budget, || {
                     if options.stream {
                         codec.decompress_stream(&compressed, &mut scratch)
@@ -309,19 +386,23 @@ fn run() -> Result<()> {
         Box::new(Zlib {
             stream: Decompress::new(false),
             piece: vec![0; CHUNK],
+            compressor: None,
         }),
         Box::new(Port {
             stream: Inflate::new(-15).map_err(|e| e.to_string())?,
             piece: vec![0; CHUNK],
+            compressor: None,
         }),
     ];
     let header: Vec<String> = codecs.iter().map(|c| c.name()).collect();
-    let mode = if options.stream {
-        "streaming"
+    let mode = if options.compress {
+        "Compression, one call"
+    } else if options.stream {
+        "Decompression, streaming"
     } else {
-        "one call"
+        "Decompression, one call"
     };
-    println!("Decompression, {mode}, MB/s:\n");
+    println!("{mode}, MB/s:\n");
     println!(
         "| input | MB | level | ratio | {} | port/zlib |",
         header.join(" | ")

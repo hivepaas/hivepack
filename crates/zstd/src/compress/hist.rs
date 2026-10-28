@@ -9,7 +9,7 @@ pub(crate) const HIST_WKSP_SIZE_U32: usize = 1024;
 
 /// `HIST_add`: adds the bytes of `src` to `count`, which has room for every
 /// byte value.
-pub(crate) fn hist_add(count: &mut [u32; 256], src: &[u8]) {
+pub(crate) fn hist_add(count: &mut [u32], src: &[u8]) {
     for &byte in src {
         count[usize::from(byte)] += 1;
     }

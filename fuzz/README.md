@@ -6,6 +6,7 @@ nightly toolchain and `cargo install cargo-fuzz`.
 | Target | What it checks |
 |---|---|
 | `decompress` | Decoding the input in one call: the same output as libzstd, or the same error |
+| `compress` | Compressing the input in one call, at a level its first byte picks: the same frame as libzstd, which decodes back |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:
@@ -18,4 +19,4 @@ cargo fuzz run --features unsafe-fast decompress -- -max_total_time=3600
 
 `cargo fuzz` builds with AddressSanitizer, so with the feature an access out
 of bounds in its unchecked copies stops the run as a crash, as a difference
-from libzstd does. CI runs each target for five minutes.
+from libzstd does. CI runs each target for a few minutes.

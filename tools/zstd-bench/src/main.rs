@@ -27,8 +27,8 @@ type Result<T> = std::result::Result<T, String>;
 
 trait Codec {
     fn name(&self) -> String;
-    /// Whether [`Codec::compress`] works yet.
-    fn compresses(&self) -> bool {
+    /// Whether [`Codec::compress`] works at `level` yet.
+    fn compresses(&self, _level: i32) -> bool {
         true
     }
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
@@ -109,8 +109,10 @@ impl Codec for Libzstd {
     }
 }
 
-/// The port: decompression only, for now.
+/// The port: compression at the levels it has so far (up to 3), and
+/// decompression.
 struct Hivepack {
+    cctx: hivepack_zstd::CCtx,
     dctx: hivepack_zstd::DCtx,
     /// A piece of streamed output.
     piece: Vec<u8>,
@@ -125,12 +127,18 @@ impl Codec for Hivepack {
         }
     }
 
-    fn compresses(&self) -> bool {
-        false
+    fn compresses(&self, level: i32) -> bool {
+        level <= 3
     }
 
-    fn compress(&mut self, _level: i32, _input: &[u8], _output: &mut Vec<u8>) -> Result<()> {
-        Err("hivepack-zstd does not compress yet".into())
+    fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        output.resize(hivepack_zstd::compress_bound(input.len()).unwrap_or(0), 0);
+        let size = self
+            .cctx
+            .compress(output, input, level)
+            .map_err(|e| e.to_string())?;
+        output.truncate(size);
+        Ok(())
     }
 
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
@@ -295,7 +303,7 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
         let mut decompress: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
         for _ in 0..options.rounds {
             for (i, codec) in codecs.iter_mut().enumerate() {
-                if codec.compresses() {
+                if codec.compresses(level) {
                     let seconds = time(options.budget, || {
                         codec.compress(level, &data, &mut scratch)
                     })?;
@@ -346,6 +354,7 @@ fn run() -> Result<()> {
             piece: vec![0; DCtx::out_size()],
         }),
         Box::new(Hivepack {
+            cctx: hivepack_zstd::CCtx::new(),
             dctx: hivepack_zstd::DCtx::new(),
             piece: vec![0; hivepack_zstd::dstream_out_size()],
         }),

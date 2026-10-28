@@ -433,15 +433,12 @@ pub(crate) fn answer(request: &str) -> String {
         ["compress", level, dst_capacity, src] => {
             let src = unhex(src);
             let mut dst = vec![0u8; number(dst_capacity)];
-            CCTX.with(|cctx| {
-                match cctx
-                    .borrow_mut()
-                    .compress_cctx(&mut dst, &src, number(level))
-                {
+            CCTX.with(
+                |cctx| match cctx.borrow_mut().compress(&mut dst, &src, number(level)) {
                     Ok(size) => format!("ok {}", hex(&dst[..size])),
                     Err(error) => failed(error),
-                }
-            })
+                },
+            )
         }
         ["seqreset"] => {
             SEQ_ENTROPY.with(|state| {
@@ -868,7 +865,7 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         requests.extend(seq_chain(rng, chain));
     }
 
-    // Whole frames, at the levels whose strategy is fast.
+    // Whole frames, at the levels whose strategy the port has.
     for i in 0..per_command / 4 {
         requests.push(frame_request(rng, i));
     }
@@ -917,8 +914,8 @@ fn frame_data(rng: &mut Rng, len: usize) -> Vec<u8> {
     out
 }
 
-/// A `compress` request, at a level whose strategy is fast for its size,
-/// with room enough, barely enough, or too little.
+/// A `compress` request, at a level whose strategy the port has for its
+/// size, with room enough, barely enough, or too little.
 fn frame_request(rng: &mut Rng, i: usize) -> String {
     // Sizes on both sides of where the tables of levels change, and powers
     // of 2, where the window just holds the input.
@@ -936,12 +933,13 @@ fn frame_request(rng: &mut Rng, i: usize) -> String {
         _ => rng.range(0, 6000),
     } as usize;
     let src = frame_data(rng, len);
-    // Level 2 is dfast for inputs from 128 to 256 KB.
-    let dfast_at_2 = (128 << 10) < len && len <= 256 << 10;
-    let level: i64 = match rng.range(0, 5) {
+    // Level 4 is greedy up to 256 KB, which the port does not have yet.
+    let level: i64 = match rng.range(0, 7) {
         0 => -(rng.range(1, 10) as i64),
         1 => -(rng.range(1, 200_000) as i64),
-        2 if !dfast_at_2 => 2,
+        2 => 2,
+        3 | 4 => 3,
+        5 if len > 256 << 10 => 4,
         _ => 1,
     };
     let bound = zstd_compress_bound(len).unwrap_or(0) as u64;

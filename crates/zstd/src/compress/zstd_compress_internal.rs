@@ -317,6 +317,9 @@ impl Window {
 pub(crate) struct MatchState {
     pub(crate) window: Window,
     pub(crate) hash_table: Vec<u32>,
+    /// The chain table, or for `dfast` the short hash table; empty for
+    /// `fast`.
+    pub(crate) chain_table: Vec<u32>,
     pub(crate) next_to_update: u32,
     /// The index after a loaded dictionary, or 0.
     pub(crate) loaded_dict_end: u32,

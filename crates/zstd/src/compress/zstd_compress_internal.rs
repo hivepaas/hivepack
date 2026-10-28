@@ -10,17 +10,26 @@ use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_L
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
 
 /// `ZSTD_strategy`: how hard the match finder searches, from `Fast` (1) to
-/// `Btultra2` (9).
+/// `Btultra2` (9). The port has `Fast` and `Dfast` so far.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum Strategy {
+pub enum Strategy {
+    /// One hash table, one candidate per position.
     Fast = 1,
+    /// Two hash tables, of short and long matches.
     Dfast = 2,
+    /// The first match of a hash chain or row.
     Greedy = 3,
+    /// A match, or a better one at the next position.
     Lazy = 4,
+    /// The same, up to two positions on.
     Lazy2 = 5,
+    /// `Lazy2` over a binary tree.
     Btlazy2 = 6,
+    /// The optimal parser.
     Btopt = 7,
+    /// The optimal parser, counting costs more precisely.
     Btultra = 8,
+    /// `Btultra`, with a first pass to gather statistics.
     Btultra2 = 9,
 }
 
@@ -42,9 +51,10 @@ impl Strategy {
     }
 }
 
-/// `ZSTD_ParamSwitch_e`: a feature on, off, or left to libzstd.
+/// `ZSTD_ParamSwitch_e`: a feature on, off, or left to the library.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ParamSwitch {
+pub enum ParamSwitch {
+    /// The library's choice.
     Auto = 0,
     Enable = 1,
     Disable = 2,
@@ -268,34 +278,137 @@ pub(crate) fn offset_to_offbase(offset: u32) -> u32 {
 // ---------------------------------------------------------------------------
 // The window and the match state
 
-/// `ZSTD_window_t`, for input in one buffer: index `i` is byte `i - base`
-/// of the buffer the window is over. Below `low_limit` no index is valid;
-/// from `dict_limit` on, the prefix starts.
+/// Which buffer a window's segment lies in: the caller's input, or the
+/// context's own input buffer when streaming with one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WindowBuffer {
+    /// None yet: the window is new.
+    None,
+    Input,
+    InBuff,
+}
+
+/// The buffers a window's segments can lie in, for one call.
+#[derive(Clone, Copy)]
+pub(crate) struct Buffers<'a> {
+    /// The caller's input.
+    pub(crate) input: &'a [u8],
+    /// The context's input buffer.
+    pub(crate) in_buff: &'a [u8],
+}
+
+impl<'a> Buffers<'a> {
+    /// The buffer `which` names.
+    #[inline(always)]
+    pub(crate) fn get(&self, which: WindowBuffer) -> &'a [u8] {
+        match which {
+            WindowBuffer::None => &[],
+            WindowBuffer::Input => self.input,
+            WindowBuffer::InBuff => self.in_buff,
+        }
+    }
+}
+
+/// `ZSTD_window_t`: the input seen so far, in two segments. Index `i` of
+/// the prefix, from `dict_limit` on, is byte `i - base` of its buffer;
+/// index `i` of the older segment (the `extDict`), from `low_limit` to
+/// `dict_limit`, is byte `i - dict_base` of its buffer. Below `low_limit`
+/// no index is valid.
 ///
-/// Differs from libzstd: positions are indices into the buffer instead of
-/// pointers, so the window covers one buffer, without an older segment
-/// (an `extDict`) yet.
+/// Differs from libzstd: positions are indices into buffers instead of
+/// pointers. `base` and `dict_base` are the indices of the buffers' first
+/// bytes, as libzstd's pointers are the addresses of index 0; they can be
+/// negative, as libzstd's can point before the buffer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Window {
-    /// The index of the buffer's first byte.
-    pub(crate) base: u32,
-    /// The index after the last byte seen.
-    pub(crate) next_src: u32,
+    pub(crate) base: i64,
+    pub(crate) dict_base: i64,
+    /// The buffers the prefix and the older segment lie in.
+    pub(crate) buffer: WindowBuffer,
+    pub(crate) dict_buffer: WindowBuffer,
+    /// The index after the last byte seen; libzstd keeps a pointer, which
+    /// can be more than 4 GiB past `base`.
+    pub(crate) next_src: i64,
     pub(crate) dict_limit: u32,
     pub(crate) low_limit: u32,
+    pub(crate) nb_overflow_corrections: u32,
 }
 
 impl Window {
-    /// `ZSTD_window_init`, then `ZSTD_window_update` with a buffer that does
-    /// not follow anything: its first byte gets index
-    /// `ZSTD_WINDOW_START_INDEX`.
-    pub(crate) fn new(src_size: usize) -> Self {
+    /// `ZSTD_window_init`: empty, starting at `ZSTD_WINDOW_START_INDEX` so
+    /// that every position is valid.
+    pub(crate) fn new() -> Self {
         Window {
-            base: ZSTD_WINDOW_START_INDEX,
-            next_src: ZSTD_WINDOW_START_INDEX + src_size as u32,
+            base: 0,
+            dict_base: 0,
+            buffer: WindowBuffer::None,
+            dict_buffer: WindowBuffer::None,
+            next_src: i64::from(ZSTD_WINDOW_START_INDEX),
             dict_limit: ZSTD_WINDOW_START_INDEX,
             low_limit: ZSTD_WINDOW_START_INDEX,
+            nb_overflow_corrections: 0,
         }
+    }
+
+    /// The index of byte `position` of the prefix's buffer.
+    #[inline(always)]
+    pub(crate) fn index(&self, position: usize) -> u32 {
+        (position as i64 + self.base) as u32
+    }
+
+    /// `ZSTD_window_hasExtDict`
+    pub(crate) fn has_ext_dict(&self) -> bool {
+        self.low_limit < self.dict_limit
+    }
+
+    /// `ZSTD_window_update`: the window after `size` bytes at `position` of
+    /// `buffer`. Returns whether they follow the bytes before. When they do
+    /// not, the prefix becomes the older segment.
+    pub(crate) fn update(
+        &mut self,
+        buffer: WindowBuffer,
+        position: usize,
+        size: usize,
+        force_non_contiguous: bool,
+    ) -> bool {
+        let mut contiguous = true;
+        if size == 0 {
+            return contiguous;
+        }
+        // Do the bytes follow the ones before?
+        let next_src_position = self.next_src - self.base;
+        if buffer != self.buffer || position as i64 != next_src_position || force_non_contiguous {
+            // Not contiguous.
+            let distance_from_base = self.next_src;
+            debug_assert!(distance_from_base == i64::from(distance_from_base as u32));
+            self.low_limit = self.dict_limit;
+            self.dict_limit = distance_from_base as u32;
+            self.dict_base = self.base;
+            self.dict_buffer = self.buffer;
+            self.base = distance_from_base - position as i64;
+            self.buffer = buffer;
+            if self.dict_limit - self.low_limit < HASH_READ_SIZE as u32 {
+                // An older segment too small to use.
+                self.low_limit = self.dict_limit;
+            }
+            contiguous = false;
+        }
+        self.next_src = (position + size) as i64 + self.base;
+        // Input over the older segment overwrites it: shrink the segment.
+        if self.dict_buffer == buffer {
+            let input_start = position as i64 + self.dict_base;
+            let input_end = (position + size) as i64 + self.dict_base;
+            if input_end > i64::from(self.low_limit) && input_start < i64::from(self.dict_limit) {
+                let high_input_idx = input_end;
+                let low_limit_max = if high_input_idx > i64::from(self.dict_limit) {
+                    self.dict_limit
+                } else {
+                    high_input_idx as u32
+                };
+                self.low_limit = low_limit_max;
+            }
+        }
+        contiguous
     }
 
     /// `ZSTD_window_enforceMaxDist`, without a dictionary: makes indices
@@ -310,6 +423,130 @@ impl Window {
                 self.dict_limit = self.low_limit;
             }
         }
+    }
+
+    /// `ZSTD_window_canOverflowCorrect`: whether the indices are large
+    /// enough to lower them without losing matches.
+    fn can_overflow_correct(
+        &self,
+        cycle_log: u32,
+        max_dist: u32,
+        loaded_dict_end: u32,
+        curr: u32,
+    ) -> bool {
+        let cycle_size = 1u32 << cycle_log;
+        let min_index_to_overflow_correct =
+            cycle_size + max_dist.max(cycle_size) + ZSTD_WINDOW_START_INDEX;
+        // Back off, so as not to spend too long correcting. If this
+        // overflows, it only has to be at least the minimum.
+        let adjustment = self.nb_overflow_corrections + 1;
+        let adjusted_index = min_index_to_overflow_correct
+            .wrapping_mul(adjustment)
+            .max(min_index_to_overflow_correct);
+        let index_large_enough = curr > adjusted_index;
+        // Only early when the dictionary is out of the window already, not
+        // to hurt the compression ratio.
+        let dictionary_invalidated = curr > max_dist.wrapping_add(loaded_dict_end);
+        index_large_enough && dictionary_invalidated
+    }
+
+    /// `ZSTD_window_needOverflowCorrection`: whether the indices from
+    /// `src` to `src_end` (indices of the prefix) are getting too large.
+    pub(crate) fn need_overflow_correction(
+        &self,
+        cycle_log: u32,
+        max_dist: u32,
+        loaded_dict_end: u32,
+        src: u32,
+        src_end: u32,
+    ) -> bool {
+        if overflow_correct_frequently()
+            && self.can_overflow_correct(cycle_log, max_dist, loaded_dict_end, src)
+        {
+            return true;
+        }
+        src_end > ZSTD_CURRENT_MAX
+    }
+
+    /// `ZSTD_window_correctOverflow`: lowers the indices, keeping their low
+    /// `cycle_log` bits and the last `max_dist` of history. Returns the
+    /// correction, to subtract from every index stored.
+    pub(crate) fn correct_overflow(&mut self, cycle_log: u32, max_dist: u32, src: u32) -> u32 {
+        let cycle_size = 1u32 << cycle_log;
+        let cycle_mask = cycle_size - 1;
+        let curr = src;
+        let current_cycle = curr & cycle_mask;
+        // Keep newCurrent - maxDist >= ZSTD_WINDOW_START_INDEX.
+        let current_cycle_correction = if current_cycle < ZSTD_WINDOW_START_INDEX {
+            cycle_size.max(ZSTD_WINDOW_START_INDEX)
+        } else {
+            0
+        };
+        let new_current = current_cycle + current_cycle_correction + max_dist.max(cycle_size);
+        let correction = curr - new_current;
+        debug_assert!(max_dist & (max_dist - 1) == 0);
+        debug_assert!(curr & cycle_mask == new_current & cycle_mask);
+        debug_assert!(curr > new_current);
+
+        self.base -= i64::from(correction);
+        self.dict_base -= i64::from(correction);
+        self.next_src -= i64::from(correction);
+        if self.low_limit < correction + ZSTD_WINDOW_START_INDEX {
+            self.low_limit = ZSTD_WINDOW_START_INDEX;
+        } else {
+            self.low_limit -= correction;
+        }
+        if self.dict_limit < correction + ZSTD_WINDOW_START_INDEX {
+            self.dict_limit = ZSTD_WINDOW_START_INDEX;
+        } else {
+            self.dict_limit -= correction;
+        }
+
+        // The whole window can still be reached.
+        debug_assert!(new_current >= max_dist);
+        debug_assert!(new_current - max_dist >= ZSTD_WINDOW_START_INDEX);
+        debug_assert!(self.low_limit <= new_current && self.dict_limit <= new_current);
+
+        self.nb_overflow_corrections += 1;
+        correction
+    }
+}
+
+/// `ZSTD_CURRENT_MAX` on 64-bit machines: the largest index before the
+/// indices are lowered.
+pub(crate) const ZSTD_CURRENT_MAX: u32 = 3500 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, which libzstd sets when
+    /// built for fuzzing: lower the indices as soon as possible, for the
+    /// tests to reach that code.
+    pub(crate) static OVERFLOW_CORRECT_FREQUENTLY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn overflow_correct_frequently() -> bool {
+    OVERFLOW_CORRECT_FREQUENTLY.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn overflow_correct_frequently() -> bool {
+    false
+}
+
+/// `ZSTD_reduceTable`: lowers every index of a table by `reducer_value`;
+/// those it would take below `ZSTD_WINDOW_START_INDEX` become 0.
+pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
+    // Indices below ZSTD_WINDOW_START_INDEX are special.
+    let reducer_threshold = reducer_value + ZSTD_WINDOW_START_INDEX;
+    for cell in table {
+        *cell = if *cell < reducer_threshold {
+            0
+        } else {
+            *cell - reducer_value
+        };
     }
 }
 
@@ -327,6 +564,25 @@ pub(crate) struct MatchState {
 }
 
 impl MatchState {
+    /// `ZSTD_getLowestMatchIndex`: the lowest index a match at `curr` may
+    /// reach, in either segment, at most `1 << window_log` back.
+    #[inline(always)]
+    pub(crate) fn lowest_match_index(&self, curr: u32, window_log: u32) -> u32 {
+        let max_distance = 1u32 << window_log;
+        let lowest_valid = self.window.low_limit;
+        let within_window = if curr.wrapping_sub(lowest_valid) > max_distance {
+            curr - max_distance
+        } else {
+            lowest_valid
+        };
+        let is_dictionary = self.loaded_dict_end != 0;
+        if is_dictionary {
+            lowest_valid
+        } else {
+            within_window
+        }
+    }
+
     /// `ZSTD_getLowestPrefixIndex`: the lowest index a match at `curr` may
     /// reach, at most `1 << window_log` back.
     #[inline(always)]
@@ -418,6 +674,72 @@ pub(crate) fn zstd_count(
         p_in += 1;
     }
     p_in - p_start
+}
+
+/// `ZSTD_count`, with the match in another buffer, `mbuf`.
+#[inline(always)]
+fn zstd_count_from(
+    src: &[u8],
+    mut p_in: usize,
+    mbuf: &[u8],
+    mut p_match: usize,
+    p_in_limit: usize,
+) -> usize {
+    let p_start = p_in;
+    if p_in_limit >= 7 {
+        let p_in_loop_limit = p_in_limit - 7;
+        while p_in < p_in_loop_limit {
+            let diff = read_le64(mbuf, p_match) ^ read_le64(src, p_in);
+            if diff != 0 {
+                return p_in + nb_common_bytes(diff) as usize - p_start;
+            }
+            p_in += 8;
+            p_match += 8;
+        }
+    }
+    if p_in + 3 < p_in_limit && read_le32(mbuf, p_match) == read_le32(src, p_in) {
+        p_in += 4;
+        p_match += 4;
+    }
+    if p_in + 1 < p_in_limit && read_le16(mbuf, p_match) == read_le16(src, p_in) {
+        p_in += 2;
+        p_match += 2;
+    }
+    if p_in < p_in_limit && mbuf[p_match] == src[p_in] {
+        p_in += 1;
+    }
+    p_in - p_start
+}
+
+/// `ZSTD_count_2segments`: the length of a match at `ip` (of `src`, up to
+/// `i_end`) with `match_pos` of `mbuf`, which ends at `m_end`, and goes on
+/// at `i_start` of `src`: a match in the older segment may run into the
+/// prefix.
+#[inline(always)]
+pub(crate) fn zstd_count_2segments(
+    src: &[u8],
+    ip: usize,
+    mbuf: &[u8],
+    match_pos: usize,
+    i_end: usize,
+    m_end: usize,
+    i_start: usize,
+) -> usize {
+    // libzstd's `ip + (mEnd - match)` goes before `ip` for a match past the
+    // segment's end, which counts nothing; so does 0.
+    let v_end = (ip + m_end.saturating_sub(match_pos)).min(i_end);
+    let match_length = zstd_count_from(src, ip, mbuf, match_pos, v_end);
+    if match_pos + match_length != m_end {
+        return match_length;
+    }
+    match_length + zstd_count(src, ip + match_length, i_start, i_end)
+}
+
+/// `ZSTD_index_overlap_check`: whether 4 bytes at `rep_index` lie in one
+/// segment, before or from `prefix_lowest_index`.
+#[inline(always)]
+pub(crate) fn zstd_index_overlap_check(prefix_lowest_index: u32, rep_index: u32) -> bool {
+    (prefix_lowest_index.wrapping_sub(1)).wrapping_sub(rep_index) >= 3
 }
 
 // ---------------------------------------------------------------------------

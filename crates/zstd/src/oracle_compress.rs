@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use crate::common::bitstream::BitCStream;
+use crate::common::error_private::ErrorCode;
 use crate::common::fse::{
     FseCState, fse_bit_cost, fse_blockbound, fse_ctable_size_u32, fse_get_max_nb_bits,
 };
@@ -35,11 +36,15 @@ use crate::compress::huf_compress::{
     huf_compress1x_repeat, huf_compress4x_repeat, huf_optimal_table_log, huf_read_ctable,
     huf_read_ctable_header, huf_write_ctable_wksp,
 };
-use crate::compress::zstd_compress::{CCtx, zstd_compress_bound, zstd_entropy_compress_seq_store};
+use crate::compress::zstd_compress::{
+    CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_entropy_compress_seq_store,
+};
 use crate::compress::zstd_compress_internal::{
     EntropyCTables, FseRepeat, LongLengthType, ParamSwitch, SeqDef, SeqStore, Strategy,
     zstd_literals_compression_is_disabled,
 };
+use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
+use crate::decompress::zstd_decompress_internal::Format;
 use crate::oracle::{
     Oracle, Rng, failed, fnv64, hex, list, mutate, recorded_form, repository, unhex, unlist,
 };
@@ -440,6 +445,7 @@ pub(crate) fn answer(request: &str) -> String {
                 },
             )
         }
+        ["cstream", capacity, steps, src] => cstream(capacity, steps, src),
         ["seqreset"] => {
             SEQ_ENTROPY.with(|state| {
                 *state.borrow_mut() = (
@@ -470,6 +476,147 @@ pub(crate) fn answer(request: &str) -> String {
         ),
         _ => panic!("unknown request {request:.200}"),
     }
+}
+
+/// The parameter of libzstd's number `number` (a `ZSTD_cParameter`), with
+/// `value`, as `ZSTD_CCtx_setParameter` takes it. The requests only have
+/// values the port's parameters can hold.
+fn c_parameter(number: i64, value: i64) -> CParameter {
+    let flag = value != 0;
+    let unsigned = || u32::try_from(value).expect("a value the parameter holds");
+    let stable = || match value {
+        0 => false,
+        1 => true,
+        _ => panic!("buffer mode {value}"),
+    };
+    match number {
+        100 => CParameter::CompressionLevel(value as i32),
+        101 => CParameter::WindowLog(unsigned()),
+        102 => CParameter::HashLog(unsigned()),
+        103 => CParameter::ChainLog(unsigned()),
+        104 => CParameter::SearchLog(unsigned()),
+        105 => CParameter::MinMatch(unsigned()),
+        106 => CParameter::TargetLength(unsigned()),
+        107 => CParameter::Strategy(match value {
+            0 => None,
+            _ => Some(Strategy::from_number(unsigned()).expect("a strategy")),
+        }),
+        200 => CParameter::ContentSizeFlag(flag),
+        201 => CParameter::ChecksumFlag(flag),
+        202 => CParameter::DictIdFlag(flag),
+        // ZSTD_c_format
+        10 => CParameter::Format(match value {
+            0 => Format::Zstd1,
+            1 => Format::Zstd1Magicless,
+            _ => panic!("format {value}"),
+        }),
+        // ZSTD_c_literalCompressionMode
+        1002 => CParameter::LiteralCompressionMode(match value {
+            0 => ParamSwitch::Auto,
+            1 => ParamSwitch::Enable,
+            2 => ParamSwitch::Disable,
+            _ => panic!("switch {value}"),
+        }),
+        // ZSTD_c_srcSizeHint
+        1004 => CParameter::SrcSizeHint(unsigned()),
+        // ZSTD_c_stableInBuffer, ZSTD_c_stableOutBuffer
+        1006 => CParameter::StableInBuffer(stable()),
+        1007 => CParameter::StableOutBuffer(stable()),
+        // ZSTD_c_maxBlockSize
+        1015 => CParameter::MaxBlockSize(unsigned()),
+        // ZSTD_c_blockSplitterLevel
+        1017 => CParameter::BlockSplitterLevel(unsigned()),
+        _ => panic!("parameter {number}"),
+    }
+}
+
+/// `cstream`: a new context through the steps, as the oracle takes it
+/// through them; reset after a failed call, but for buffers not as stable
+/// as promised, which is found before anything changes.
+fn cstream(capacity: &str, steps: &str, src: &str) -> String {
+    let capacity: usize = number(capacity);
+    let steps = unlist(steps);
+    let src = unhex(src);
+    let mut cctx = CCtx::new();
+    let mut out = vec![0u8; capacity];
+    let (mut in_pos, mut out_pos) = (0usize, 0usize);
+    let mut text = String::from("ok");
+    for step in steps.chunks(3) {
+        let (op, a, b) = (step[0], step[1], step[2]);
+        let in_end = (in_pos + a.max(0) as usize).min(src.len());
+        let out_end = if op == 10 {
+            capacity
+        } else {
+            (out_pos + b.max(0) as usize).min(capacity)
+        };
+        let mut input = InBuffer {
+            src: &src[..in_end],
+            pos: if op == 10 {
+                (in_pos + b as usize).min(in_end)
+            } else {
+                in_pos
+            },
+        };
+        let mut output = OutBuffer {
+            dst: &mut out[..out_end],
+            pos: out_pos,
+        };
+        let result = match op {
+            0..=2 => {
+                let directive = [
+                    EndDirective::Continue,
+                    EndDirective::Flush,
+                    EndDirective::End,
+                ][op as usize];
+                cctx.compress_stream2(&mut output, &mut input, directive)
+                    .map(Some)
+            }
+            3 => cctx.compress_stream(&mut output, &mut input).map(Some),
+            4 => cctx.flush_stream(&mut output).map(Some),
+            5 => cctx.end_stream(&mut output).map(Some),
+            6 => {
+                let result = cctx.compress2(&mut output.dst[out_pos..], &input.src[in_pos..]);
+                if let Ok(size) = result {
+                    input.pos = in_end;
+                    output.pos = out_pos + size;
+                }
+                result.map(Some)
+            }
+            7 => cctx.set_parameter(c_parameter(a, b)).map(|()| None),
+            10 => cctx
+                .compress_stream2(&mut output, &mut input, EndDirective::Continue)
+                .map(Some),
+            8 => cctx
+                .reset(match a {
+                    1 => ResetDirective::SessionOnly,
+                    2 => ResetDirective::Parameters,
+                    _ => ResetDirective::SessionAndParameters,
+                })
+                .map(|()| None),
+            _ => cctx
+                .set_pledged_src_size(if a < 0 { u64::MAX } else { a as u64 })
+                .map(|()| None),
+        };
+        in_pos = input.pos;
+        out_pos = output.pos;
+        let unstable = result
+            .as_ref()
+            .is_err_and(|error| error.code() == ErrorCode::StabilityConditionNotRespected);
+        if result.is_err() && !unstable && (op <= 6 || op == 10) {
+            // A context must be reset after an error, before it is used
+            // again: libzstd's then reads what the input buffers of earlier
+            // calls held, and the port refuses to.
+            let _ = cctx.reset(ResetDirective::SessionOnly);
+        }
+        let _ = match result {
+            Err(error) => write!(text, " e{}/{in_pos}/{out_pos}", error.code().number()),
+            Ok(None) => write!(text, " s"),
+            // libzstd prints the result as an unsigned int.
+            Ok(Some(r)) => write!(text, " {}/{in_pos}/{out_pos}", r as u32),
+        };
+    }
+    let _ = write!(text, " {:016x}", fnv64(&out[..out_pos]));
+    text
 }
 
 /// Bytes for the entropy coders: text-like, skewed, random, one symbol, or
@@ -870,6 +1017,11 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         requests.push(frame_request(rng, i));
     }
 
+    // Streaming scripts.
+    for i in 0..per_command / 4 {
+        requests.push(cstream_request(rng, i));
+    }
+
     // Valid tables, as a dictionary gives them: used without a look when
     // the flags prefer them, otherwise when they cost less.
     for _ in 0..per_command / 10 {
@@ -948,7 +1100,164 @@ fn frame_request(rng: &mut Rng, i: usize) -> String {
         1 => rng.range(len as u64 / 3, bound),
         _ => bound,
     };
+    // The oracle's output holds 1 MiB.
+    let capacity = capacity.min(1 << 20);
     format!("compress {level} {capacity} {}", hex(&src))
+}
+
+/// A `cstream` request: parameters, maybe a pledged size, then streaming
+/// calls over the data, cut at random, with parameters set in between;
+/// sometimes several frames, and `compress2`.
+fn cstream_request(rng: &mut Rng, i: usize) -> String {
+    let len = match i % 8 {
+        0 => rng.range(0, 64),
+        1 => rng.range(100_000, 400_000),
+        2 => rng.range(4000, 40_000),
+        _ => rng.range(0, 3900),
+    } as usize;
+    let src = frame_data(rng, len);
+    let mut steps: Vec<i64> = Vec::new();
+    let small = len < 50_000;
+
+    // The parameters: the levels whose strategy the port has, small windows
+    // and blocks for the input buffer to wrap around.
+    let stable_in = rng.range(0, 3) == 0;
+    let stable_out = rng.range(0, 3) == 0;
+    // Not level 4, which is greedy for the empty frames a script may end
+    // with.
+    let level: i64 = match rng.range(0, 6) {
+        0 => -(rng.range(1, 10) as i64),
+        1 => 1,
+        2 => 2,
+        _ => 3,
+    };
+    steps.extend([7, 100, level]);
+    if rng.range(0, 1) == 0 {
+        let window_log = if small {
+            rng.range(9, 13)
+        } else {
+            rng.range(10, 18)
+        };
+        steps.extend([7, 101, window_log as i64]);
+    }
+    if rng.range(0, 2) == 0 {
+        let max_block = [0, 1000, 1024, 1500, 4096, 131_072][rng.range(0, 5) as usize];
+        steps.extend([7, 1015, max_block]);
+    }
+    for (number, low, high) in [
+        (102, 5, 18),
+        (103, 5, 18),
+        (104, 0, 8),
+        (105, 2, 8),
+        (106, 0, 300),
+        (107, 0, 2),
+        (200, 0, 1),
+        (201, 0, 1),
+        (202, 0, 1),
+        (10, 0, 1),
+        (1002, 0, 2),
+        (1004, 0, 300_000),
+        (1017, 0, 7),
+    ] {
+        if rng.range(0, 4) == 0 {
+            steps.extend([7, number, rng.range(low, high) as i64]);
+        }
+    }
+    steps.extend([7, 1006, i64::from(stable_in)]);
+    steps.extend([7, 1007, i64::from(stable_out)]);
+    if rng.range(0, 3) == 0 {
+        // Not a size just short with a stable input buffer: the hint of
+        // the next frame's ZSTD_compressStream then wraps around to what
+        // reads as an error in libzstd, a number for the port.
+        let pledged = match rng.range(0, 4) {
+            0 => -1,
+            1 if !stable_in => len as i64 + 1,
+            2 if !stable_in => (len as i64 - 1).max(0),
+            _ => len as i64,
+        };
+        steps.extend([9, pledged, 0]);
+    }
+
+    // The calls. The output is all of it with a stable output buffer, so
+    // that its room stays the same; otherwise pieces of it.
+    // Sizes on both sides of a full block, and of the most input a stable
+    // buffer waits for before a frame starts.
+    let piece = |rng: &mut Rng| -> i64 {
+        (match rng.range(0, 7) {
+            0 | 1 => rng.range(0, 16),
+            2 => rng.range(1, 2000),
+            3 => rng.range(1, 40_000),
+            4 => [1000, 1023, 1024, 1025, 1500, 4095, 4096, 4097][rng.range(0, 7) as usize],
+            5 => rng.range(131_070, 131_074),
+            _ => rng.range(1, 300_000),
+        }) as i64
+    };
+    let calls = rng.range(1, if small { 40 } else { 200 });
+    let mut given = 0i64;
+    for _ in 0..calls {
+        // With a stable input buffer, the port differs from libzstd in
+        // ZSTD_flushStream, ZSTD_endStream, and after a reset while input
+        // waits (see CCtx::flush_stream and CCtx::reset): none of them.
+        let op = match rng.range(0, 20) {
+            15 | 16 | 18 | 19 if stable_in => 0,
+            20 => 10,
+            0..=10 => 0,
+            11 | 12 => 1,
+            13 => 2,
+            14 => 3,
+            15 => 4,
+            16 => 5,
+            17 => 7,
+            _ => 8,
+        };
+        match op {
+            7 => {
+                // While streaming: allowed for the level, not the window.
+                let (number, value) = if rng.range(0, 1) == 0 {
+                    (100, rng.range(1, 3) as i64)
+                } else {
+                    (101, rng.range(10, 14) as i64)
+                };
+                steps.extend([7, number, value]);
+            }
+            8 => {
+                if rng.range(0, 3) == 0 {
+                    steps.extend([8, rng.range(1, 3) as i64, 0]);
+                } else {
+                    steps.extend([0, piece(rng), piece(rng)]);
+                }
+            }
+            10 => {
+                // The input moved on: a stable buffer must not be.
+                let a = piece(rng);
+                given += a;
+                steps.extend([10, a, rng.range(0, 2) as i64]);
+            }
+            _ => {
+                let a = piece(rng);
+                given += a;
+                let b = if stable_out { 1 << 30 } else { piece(rng) };
+                steps.extend([op, a, b]);
+            }
+        }
+    }
+    // The end of the frame, and more after it, sometimes.
+    for _ in 0..rng.range(1, 6) {
+        let b = if stable_out { 1 << 30 } else { piece(rng) * 8 };
+        steps.extend([2, len as i64 - given.min(len as i64) + 1, b]);
+    }
+    if !stable_in && rng.range(0, 5) == 0 {
+        steps.extend([6, rng.range(0, 5000) as i64, rng.range(0, 1 << 20) as i64]);
+        steps.extend([0, piece(rng), piece(rng), 2, 1 << 30, 1 << 30]);
+    }
+
+    let bound = zstd_compress_bound(len).unwrap_or(0) as u64;
+    let capacity = match rng.range(0, 7) {
+        0 => rng.range(0, 40),
+        1 => rng.range(len as u64 / 3, bound + 30),
+        _ => 2 * bound + 64,
+    };
+    format!("cstream {capacity} {} {}", list(steps), hex(&src))
 }
 
 /// How a run of blocks draws its sequences.
@@ -1188,6 +1497,15 @@ fn port_matches_libzstd_compression() {
                 *outcomes.entry(kind).or_default() += 1;
             }
         }
+        if command == "cstream" && words[0] == "ok" {
+            for word in &words[1..words.len() - 1] {
+                let outcome = match word.split_once('/') {
+                    Some((code, _)) if code.starts_with('e') => format!("cstream step {code}"),
+                    _ => "cstream step ok".to_string(),
+                };
+                *outcomes.entry(outcome).or_default() += 1;
+            }
+        }
         if command == "seqblock" && words[0] == "ok" && words[1] != "0" {
             for kind in seq_block_kinds(&unhex(words[2])) {
                 *outcomes.entry(kind).or_default() += 1;
@@ -1259,6 +1577,7 @@ fn record_compress_answers() {
             let limit = if request.starts_with("hufcompress")
                 || request.starts_with("seqblock")
                 || request.starts_with("compress")
+                || request.starts_with("cstream")
             {
                 8000
             } else {

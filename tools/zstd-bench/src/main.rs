@@ -5,17 +5,19 @@
 //! cargo run --release -p zstd-bench -- [--levels 1,3,19] [--rounds 3] [--seconds 0.5] [--stream] PATH...
 //! ```
 //!
-//! With `--stream`, decompression goes through `ZSTD_decompressStream`, in
-//! pieces of `ZSTD_DStreamInSize` and `ZSTD_DStreamOutSize` as the zstd
-//! command line reads and writes, each piece of output then appended to the
-//! result.
+//! With `--stream`, compression goes through `ZSTD_compressStream2`, in
+//! pieces of `ZSTD_CStreamInSize` and `ZSTD_CStreamOutSize`, the size not
+//! pledged, and decompression through `ZSTD_decompressStream`, in pieces of
+//! `ZSTD_DStreamInSize` and `ZSTD_DStreamOutSize`, as the zstd command line
+//! reads and writes, each piece of output then appended to the result.
 //!
 //! Each PATH is a file, or a folder whose files are each an input. Rounds take
 //! turns between implementations, so a noisy machine slows them all alike.
 //! Speeds are the range over rounds in MB/s of uncompressed data (10^6 bytes
 //! per second), and the output is a Markdown table.
 //!
-//! hivepack-zstd only decompresses so far; its compression column is empty.
+//! hivepack-zstd compresses at the levels up to 3 so far; its compression
+//! column is empty for the others.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,6 +34,8 @@ trait Codec {
         true
     }
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
+    /// The same by streaming, one piece at a time.
+    fn compress_stream(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
     /// Decompresses `input`, whose content is `size` bytes long.
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
     /// The same by streaming, one piece at a time.
@@ -43,8 +47,9 @@ trait Codec {
 struct Libzstd {
     compressor: CCtx<'static>,
     decompressor: DCtx<'static>,
-    /// A piece of streamed output.
+    /// A piece of streamed output, decompressed and compressed.
     piece: Vec<u8>,
+    compressed_piece: Vec<u8>,
 }
 
 fn error_name(code: usize) -> String {
@@ -70,6 +75,41 @@ impl Codec for Libzstd {
             .compress(output, input, level)
             .map(drop)
             .map_err(error_name)
+    }
+
+    fn compress_stream(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        use zstd_safe::zstd_sys::ZSTD_EndDirective;
+        output.clear();
+        self.compressor
+            .reset(zstd_safe::ResetDirective::SessionOnly)
+            .map_err(error_name)?;
+        self.compressor
+            .set_parameter(zstd_safe::CParameter::CompressionLevel(level))
+            .map_err(error_name)?;
+        let mut in_pos = 0;
+        loop {
+            let in_end = input.len().min(in_pos + CCtx::in_size());
+            let directive = if in_end == input.len() {
+                ZSTD_EndDirective::ZSTD_e_end
+            } else {
+                ZSTD_EndDirective::ZSTD_e_continue
+            };
+            let (remaining, written) = {
+                let mut src = zstd_safe::InBuffer::around(&input[..in_end]);
+                src.set_pos(in_pos);
+                let mut dst = zstd_safe::OutBuffer::around(&mut self.compressed_piece[..]);
+                let remaining = self
+                    .compressor
+                    .compress_stream2(&mut dst, &mut src, directive)
+                    .map_err(error_name)?;
+                in_pos = src.pos();
+                (remaining, dst.pos())
+            };
+            output.extend_from_slice(&self.compressed_piece[..written]);
+            if directive == ZSTD_EndDirective::ZSTD_e_end && remaining == 0 {
+                return Ok(());
+            }
+        }
     }
 
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
@@ -114,8 +154,9 @@ impl Codec for Libzstd {
 struct Hivepack {
     cctx: hivepack_zstd::CCtx,
     dctx: hivepack_zstd::DCtx,
-    /// A piece of streamed output.
+    /// A piece of streamed output, decompressed and compressed.
     piece: Vec<u8>,
+    compressed_piece: Vec<u8>,
 }
 
 impl Codec for Hivepack {
@@ -139,6 +180,42 @@ impl Codec for Hivepack {
             .map_err(|e| e.to_string())?;
         output.truncate(size);
         Ok(())
+    }
+
+    fn compress_stream(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        use hivepack_zstd::{CParameter, EndDirective, ResetDirective};
+        output.clear();
+        let error = |e: hivepack_zstd::Error| e.to_string();
+        self.cctx
+            .reset(ResetDirective::SessionOnly)
+            .map_err(error)?;
+        self.cctx
+            .set_parameter(CParameter::CompressionLevel(level))
+            .map_err(error)?;
+        let mut in_pos = 0;
+        loop {
+            let in_end = input.len().min(in_pos + hivepack_zstd::cstream_in_size());
+            let directive = if in_end == input.len() {
+                EndDirective::End
+            } else {
+                EndDirective::Continue
+            };
+            let mut written = 0;
+            let remaining = self
+                .cctx
+                .compress_stream2_simple_args(
+                    &mut self.compressed_piece,
+                    &mut written,
+                    &input[..in_end],
+                    &mut in_pos,
+                    directive,
+                )
+                .map_err(error)?;
+            output.extend_from_slice(&self.compressed_piece[..written]);
+            if directive == EndDirective::End && remaining == 0 {
+                return Ok(());
+            }
+        }
     }
 
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
@@ -305,7 +382,11 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
             for (i, codec) in codecs.iter_mut().enumerate() {
                 if codec.compresses(level) {
                     let seconds = time(options.budget, || {
-                        codec.compress(level, &data, &mut scratch)
+                        if options.stream {
+                            codec.compress_stream(level, &data, &mut scratch)
+                        } else {
+                            codec.compress(level, &data, &mut scratch)
+                        }
                     })?;
                     compress[i] = Range::add(compress[i].take(), megabytes / seconds);
                 }
@@ -352,21 +433,19 @@ fn run() -> Result<()> {
             compressor: CCtx::create(),
             decompressor: DCtx::create(),
             piece: vec![0; DCtx::out_size()],
+            compressed_piece: vec![0; CCtx::out_size()],
         }),
         Box::new(Hivepack {
             cctx: hivepack_zstd::CCtx::new(),
             dctx: hivepack_zstd::DCtx::new(),
             piece: vec![0; hivepack_zstd::dstream_out_size()],
+            compressed_piece: vec![0; hivepack_zstd::cstream_out_size()],
         }),
     ];
-    let how = if options.stream {
-        "decompress (stream)"
-    } else {
-        "decompress"
-    };
+    let how = if options.stream { " (stream)" } else { "" };
     let header: Vec<String> = codecs
         .iter()
-        .map(|c| format!("{0} compress | {0} {how}", c.name()))
+        .map(|c| format!("{0} compress{how} | {0} decompress{how}", c.name()))
         .collect();
     println!("| input | MB | level | ratio | {} |", header.join(" | "));
     println!("|---|---|---|---|{}", "---|".repeat(2 * codecs.len()));

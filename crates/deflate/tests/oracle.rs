@@ -17,6 +17,13 @@
 //!   the emulated i686 and s390x jobs), `testdata/oracle/inflate.txt`
 //!   replays answers zlib gave earlier. `cargo test -p hivepack-deflate
 //!   --test oracle record_oracle_answers -- --ignored` rewrites that file.
+//!
+//! The compressor is compared the same way, through the oracle's
+//! `deflate2` requests: every level, window, memory level and strategy
+//! (some out of range), gzip headers, dictionaries, `deflateParams`,
+//! `deflateTune`, `deflatePrime`, `deflateBound`, every flush, and output
+//! space from none up. `testdata/oracle/deflate.txt` replays its answers,
+//! and `record_deflate_answers` rewrites it.
 
 // Helpers outside #[test] functions unwrap too: a failure there is a test
 // failure.
@@ -27,7 +34,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use hivepack_deflate::{ErrorCode, Flush, GzHeader, InBuffer, Inflate, OutBuffer, Result, Status};
+use hivepack_deflate::{
+    Deflate, ErrorCode, Flush, GzHeader, InBuffer, Inflate, OutBuffer, Result, Status,
+};
 
 fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -35,6 +44,10 @@ fn repository() -> PathBuf {
 
 fn recorded_path() -> PathBuf {
     repository().join("testdata/oracle/inflate.txt")
+}
+
+fn recorded_deflate_path() -> PathBuf {
+    repository().join("testdata/oracle/deflate.txt")
 }
 
 /// The oracle program, running.
@@ -639,4 +652,326 @@ fn answers_a_known_request() {
     assert!(answer.starts_with("ok 0/4/1/"), "{answer}");
     assert!(answer.contains(" 13/5/103547413 "), "{answer}");
     let _ = ErrorCode::Data;
+}
+
+/// The port's answer to a `deflate2` request, in the oracle's format.
+fn answer_deflate(request: &str) -> String {
+    let words: Vec<&str> = request.split(' ').collect();
+    let [
+        "deflate2",
+        level,
+        window_bits,
+        mem_level,
+        strategy,
+        head,
+        steps,
+        data,
+    ] = words[..]
+    else {
+        panic!("not a deflate2 request: {request:.100}");
+    };
+    let mut strm = match Deflate::new(
+        level.parse().unwrap(),
+        window_bits.parse().unwrap(),
+        mem_level.parse().unwrap(),
+        strategy.parse().unwrap(),
+    ) {
+        Ok(strm) => strm,
+        Err(e) => return format!("err {}", e.code().number()),
+    };
+    let data = unhex(data);
+    let head_ret = (head != "-").then(|| {
+        let f: Vec<&str> = head.split('/').collect();
+        let field = |text: &str| (text != "null").then(|| unhex(text));
+        let extra = field(f[4]);
+        let header = GzHeader {
+            text: f[0].parse().unwrap(),
+            time: f[1].parse().unwrap(),
+            os: f[2].parse().unwrap(),
+            hcrc: f[3].parse().unwrap(),
+            extra_len: extra.as_ref().map_or(0, |e| e.len() as u32),
+            extra,
+            name: field(f[5]),
+            comment: field(f[6]),
+            ..GzHeader::default()
+        };
+        unit_code(strm.set_header(header))
+    });
+    let numbers =
+        |args: &str| -> Vec<i64> { args.split('/').map(|a| a.parse().unwrap()).collect() };
+    let space: usize = steps
+        .split(',')
+        .map(|step| match step.split_at(1) {
+            ("i", args) => numbers(args)[1] as usize,
+            ("p", args) => numbers(args)[3] as usize,
+            _ => 0,
+        })
+        .sum();
+    let mut out = vec![0u8; space];
+    let (mut consumed, mut written) = (0, 0);
+    let mut text = String::from("ok");
+    for step in steps.split(',') {
+        let (kind, args) = step.split_at(1);
+        match kind {
+            "i" | "p" => {
+                let args = numbers(args);
+                let (input_len, room) = if kind == "i" {
+                    (args[0], args[1])
+                } else {
+                    (args[2], args[3])
+                };
+                let avail = (input_len as usize).min(data.len() - consumed);
+                let mut input = InBuffer {
+                    src: &data[..consumed + avail],
+                    pos: consumed,
+                };
+                let mut output = OutBuffer::new(&mut out[written..written + room as usize]);
+                let ret = if kind == "i" {
+                    code(strm.deflate(&mut output, &mut input, flush(args[2] as u32)))
+                } else {
+                    unit_code(strm.params(&mut output, &mut input, args[0] as i32, args[1] as i32))
+                };
+                let read = input.pos - consumed;
+                let made = output.pos;
+                consumed += read;
+                written += made;
+                if kind == "i" {
+                    let (pending, bits) = strm.pending();
+                    let msg = strm
+                        .msg()
+                        .map_or_else(|| "-".to_string(), |m| hex(m.as_bytes()));
+                    let _ = write!(
+                        text,
+                        " {ret}/{read}/{made}/{}/{pending}/{bits}/{}/{msg}",
+                        strm.data_type(),
+                        strm.used()
+                    );
+                } else {
+                    let _ = write!(text, " {ret}/{read}/{made}");
+                }
+            }
+            "t" => {
+                let a = numbers(args);
+                strm.tune(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as i32);
+                text.push_str(" 0");
+            }
+            "b" => {
+                let a = numbers(args);
+                let _ = write!(text, " {}", unit_code(strm.prime(a[0] as i32, a[1] as i32)));
+            }
+            "d" => {
+                let _ = write!(text, " {}", unit_code(strm.set_dictionary(&unhex(args))));
+            }
+            "n" => {
+                let _ = write!(text, " {}", strm.bound(args.parse().unwrap()));
+            }
+            _ => panic!("unknown step {step}"),
+        }
+    }
+    let _ = write!(
+        text,
+        " {}/{}/{} {:016x}",
+        strm.total_in(),
+        strm.total_out(),
+        strm.adler(),
+        fnv64(&out[..written])
+    );
+    if let Some(head_ret) = head_ret {
+        let _ = write!(text, " h{head_ret}");
+    }
+    text
+}
+
+/// `deflate2` requests: `count` inputs, each compressed with random
+/// parameters (some out of range), steps and flushes.
+fn deflate_requests(rng: &mut Rng, count: usize) -> Vec<String> {
+    let mut requests = Vec::new();
+    for _ in 0..count {
+        let len = match rng.below(6) {
+            0 => rng.below(16) as usize,
+            1..=3 => rng.below(3000) as usize,
+            4 => rng.below(10_000) as usize,
+            _ => rng.below(80_000) as usize,
+        };
+        let data = make_data(rng, len);
+        let level = if rng.below(30) == 0 {
+            rng.pick(&[-2, 10])
+        } else {
+            rng.below(11) as i32 - 1
+        };
+        let wbits = 8 + rng.below(8) as i32;
+        let wrap = rng.pick(&[Wrap::Raw, Wrap::Zlib, Wrap::Gzip]);
+        let window_bits = match wrap {
+            Wrap::Raw => -wbits,
+            Wrap::Zlib => wbits,
+            Wrap::Gzip => wbits + 16,
+        };
+        let window_bits = if rng.below(40) == 0 {
+            rng.pick(&[7, -16, 32])
+        } else {
+            window_bits
+        };
+        let mem_level = if rng.below(30) == 0 {
+            rng.pick(&[0, 10])
+        } else {
+            1 + rng.below(9) as i32
+        };
+        let strategy = if rng.below(30) == 0 {
+            5
+        } else {
+            rng.below(5) as i32
+        };
+        let head = if wrap == Wrap::Gzip && rng.below(2) == 0 {
+            let bytes = |rng: &mut Rng, max: u64| -> String {
+                if rng.below(3) == 0 {
+                    "null".to_string()
+                } else {
+                    let n = rng.below(max) as usize;
+                    hex(&(0..n)
+                        .map(|_| 1 + (rng.next() % 255) as u8)
+                        .collect::<Vec<_>>())
+                }
+            };
+            let extra = bytes(rng, 40);
+            let name = bytes(rng, 30);
+            let comment = bytes(rng, 30);
+            format!(
+                "{}/{}/{}/{}/{extra}/{name}/{comment}",
+                rng.below(2),
+                rng.next() as u32,
+                rng.below(256),
+                rng.below(2)
+            )
+        } else {
+            "-".to_string()
+        };
+
+        let mut steps = Vec::new();
+        if wrap != Wrap::Gzip && rng.below(5) == 0 {
+            let long = rng.below(4) == 0;
+            let dict_len = rng.below(if long { 40_000 } else { 3000 }) as usize;
+            steps.push(format!("d{}", hex(&make_data(rng, dict_len))));
+        }
+        if rng.below(10) == 0 {
+            steps.push(format!(
+                "b{}/{}",
+                rng.below(18) as i64 - 1,
+                rng.below(1 << 17)
+            ));
+        }
+        if rng.below(10) == 0 {
+            let lazy = rng.pick(&[0, 3, 16, 258]);
+            steps.push(format!(
+                "t{}/{lazy}/{}/{}",
+                rng.below(40),
+                3 + rng.below(256),
+                rng.pick(&[1, 4, 64, 4096])
+            ));
+        }
+        if rng.below(5) == 0 {
+            steps.push(format!("n{}", rng.below(1 << 20)));
+        }
+        let mut given = 0;
+        while given < len + 8 && steps.len() < 120 {
+            if rng.below(30) == 0 {
+                let room = rng.pick(&[0, 1, 50, 70_000]);
+                let level = rng.below(11) as i64 - 1;
+                steps.push(format!(
+                    "p{level}/{}/{}/{room}",
+                    rng.below(5),
+                    rng.below(500)
+                ));
+            }
+            if wrap == Wrap::Raw && rng.below(40) == 0 {
+                let dict_len = rng.below(500) as usize;
+                steps.push(format!("d{}", hex(&make_data(rng, dict_len))));
+            }
+            let input = match rng.below(5) {
+                0 => 1 + rng.below(16),
+                1 => 1 + rng.below(600),
+                2 => len as u64,
+                _ => rng.below(5000),
+            };
+            let output = match rng.below(6) {
+                0 => 0,
+                1 => 1 + rng.below(8),
+                2 => 1 + rng.below(300),
+                3 => 1 + rng.below(3000),
+                _ => 1 + rng.below(70_000),
+            };
+            let flush = match rng.below(14) {
+                0 => 1,
+                1 => 2,
+                2 => 3,
+                3 => 5,
+                4 => 4,
+                _ => 0,
+            };
+            given += input as usize;
+            steps.push(format!("i{input}/{output}/{flush}"));
+        }
+        // Room to finish.
+        for _ in 0..3 {
+            steps.push(format!("i{len}/{}/4", rng.pick(&[70_000, 300, 5])));
+        }
+        steps.push("i0/200000/4".to_string());
+        requests.push(format!(
+            "deflate2 {level} {window_bits} {mem_level} {strategy} {head} {} {}",
+            steps.join(","),
+            hex(&data)
+        ));
+    }
+    requests
+}
+
+#[test]
+fn deflate_matches_zlib() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x5eed_0101);
+    for request in deflate_requests(&mut rng, 800) {
+        let want = oracle.ask(&request);
+        assert_eq!(answer_deflate(&request), want, "{request:.300}");
+    }
+}
+
+#[test]
+fn deflate_matches_recorded_answers() {
+    let text =
+        std::fs::read_to_string(recorded_deflate_path()).expect("testdata/oracle/deflate.txt");
+    let mut checked = 0;
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        assert_eq!(
+            recorded_form(&answer_deflate(request)),
+            want,
+            "{request:.300}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 500, "only {checked} recorded answers");
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/deflate.txt from the oracle"]
+fn record_deflate_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut rng = Rng(0x5eed_0102);
+    let mut text = String::from(
+        "# Answers from zlib 1.3.2 (tools/zlib-oracle), replayed by crates/deflate/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-deflate --test oracle record_deflate_answers -- --ignored\n",
+    );
+    for request in deflate_requests(&mut rng, 900) {
+        // Keep the file small: the large inputs are for the live comparison.
+        if request.len() > 6_000 {
+            continue;
+        }
+        let reply = oracle.ask(&request);
+        let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
+    }
+    std::fs::write(recorded_deflate_path(), text).expect("written");
 }

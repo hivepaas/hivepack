@@ -10,7 +10,7 @@ use crate::common::zstd_internal::{
     BlockType, DEFAULT_MAX_OFF, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, LL_FSE_LOG, LONGNBSEQ,
     MAX_LL, MAX_ML, MAX_OFF, MAX_SEQ, MIN_CBLOCK_SIZE, ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG,
     ML_FSE_LOG, OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG, OFF_FSE_LOG, REP_START_VALUE,
-    SymbolEncodingType, ZSTD_BLOCKHEADERSIZE, ZSTD_BLOCKSIZE_MAX, ZSTD_MAGICNUMBER,
+    SymbolEncodingType, ZSTD_BLOCKHEADERSIZE, ZSTD_BLOCKSIZE_MAX, ZSTD_MAGICNUMBER, ZSTD_REP_NUM,
     ZSTD_WINDOWLOG_ABSOLUTEMIN,
 };
 use crate::compress::clevels::{ZSTD_DEFAULT_CPARAMETERS, ZSTD_MAX_CLEVEL};
@@ -18,10 +18,11 @@ use crate::compress::hist::{HIST_WKSP_SIZE_U32, hist_count_fast_wksp};
 use crate::compress::huf_compress::HufRepeat;
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, EntropyCTables, FrameParameters,
-    FseCTables, FseRepeat, LongLengthType, MatchState, ParamSwitch, SeqStore, Strategy, Window,
-    WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX,
-    zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain, zstd_ml_code,
-    zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
+    FseCTables, FseRepeat, LdmEntry, LdmParams, LdmState, LongLengthType, MatchState, ParamSwitch,
+    RawSeqStore, SeqStore, Strategy, Window, WindowBuffer, ZSTD_HASHLOG_MIN,
+    ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX, zstd_literals_compression_is_disabled,
+    zstd_ll_code, zstd_min_gain, zstd_ml_code, zstd_no_compress_block, zstd_reduce_table,
+    zstd_reduce_table_btlazy2,
 };
 use crate::compress::zstd_compress_literals::zstd_compress_literals;
 use crate::compress::zstd_compress_sequences::{
@@ -34,6 +35,10 @@ use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_f
 use crate::compress::zstd_lazy::{
     ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc,
     zstd_compress_block_lazy_row,
+};
+use crate::compress::zstd_ldm::{
+    ZSTD_LDM_BUCKETSIZELOG_MAX, ZSTD_LDM_DEFAULT_WINDOW_LOG, zstd_ldm_adjust_parameters,
+    zstd_ldm_block_compress, zstd_ldm_generate_sequences, zstd_ldm_get_max_nb_seq,
 };
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
@@ -410,6 +415,20 @@ const ZSTD_SRCSIZEHINT_MAX: u32 = i32::MAX as u32;
 const ZSTD_BLOCKSPLITTER_LEVEL_MAX: u32 = 6;
 /// `ZSTD_BLOCKSIZE_MAX_MIN`: the smallest largest block.
 const ZSTD_BLOCKSIZE_MAX_MIN: u32 = 1 << 10;
+/// `ZSTD_LDM_HASHLOG_MIN`
+const ZSTD_LDM_HASHLOG_MIN: u32 = ZSTD_HASHLOG_MIN;
+/// `ZSTD_LDM_HASHLOG_MAX`
+const ZSTD_LDM_HASHLOG_MAX: u32 = ZSTD_HASHLOG_MAX;
+/// `ZSTD_LDM_MINMATCH_MIN`
+const ZSTD_LDM_MINMATCH_MIN: u32 = 4;
+/// `ZSTD_LDM_MINMATCH_MAX`
+const ZSTD_LDM_MINMATCH_MAX: u32 = 4096;
+/// `ZSTD_LDM_BUCKETSIZELOG_MIN`
+const ZSTD_LDM_BUCKETSIZELOG_MIN: u32 = 1;
+/// `ZSTD_LDM_HASHRATELOG_MIN`
+const ZSTD_LDM_HASHRATELOG_MIN: u32 = 0;
+/// `ZSTD_LDM_HASHRATELOG_MAX`
+const ZSTD_LDM_HASHRATELOG_MAX: u32 = ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN;
 /// `ZSTD_CONTENTSIZE_UNKNOWN`
 pub(crate) const ZSTD_CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 /// `ZSTD_FRAMEHEADERSIZE_MAX`
@@ -506,8 +525,9 @@ pub(crate) fn zstd_frame_ported(params: &CCtxParams) -> bool {
     params.c_params.strategy <= Strategy::Btlazy2
         // The block splitter after the sequences (ZSTD_compressBlock_splitBlock).
         && params.post_block_splitter != ParamSwitch::Enable
-        // Long distance matching (zstd_ldm.c).
-        && params.ldm_enable != ParamSwitch::Enable
+        // Long distance matching with the optimal parser (ZSTD_optLdm_* in
+        // zstd_opt.c); below btopt, zstd_ldm.c is ported.
+        && (params.ldm_enable != ParamSwitch::Enable || params.c_params.strategy < Strategy::Btopt)
 }
 
 /// Whether the port has what `ZSTD_compressCCtx` takes at `level` for
@@ -840,6 +860,10 @@ pub(crate) struct CCtxParams {
     /// (`ZSTD_c_enableLongDistanceMatching`); `Auto` until a frame resolves
     /// it.
     pub(crate) ldm_enable: ParamSwitch,
+    /// `ldmParams`, but `enableLdm`: the parameters of long distance
+    /// matching, 0 for those left to `ZSTD_ldm_adjustParameters`, which a
+    /// frame with it applies.
+    pub(crate) ldm: LdmParams,
 }
 
 impl CCtxParams {
@@ -863,6 +887,7 @@ impl CCtxParams {
             use_row_match_finder: zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params),
             post_block_splitter: zstd_resolve_block_splitter_mode(ParamSwitch::Auto, &c_params),
             ldm_enable: zstd_resolve_enable_ldm(ParamSwitch::Auto, &c_params),
+            ldm: LdmParams::default(),
         }
     }
 
@@ -899,8 +924,11 @@ fn zstd_get_cparams_from_cctx_params(
     }
     let mut c_params =
         zstd_get_cparams_internal(params.compression_level, src_size_hint, dict_size, mode);
-    // Long distance matching would set the window log; the port does not
-    // have it.
+    // Long distance matching, when set (not left to the library), has its
+    // own window log, under those set.
+    if params.ldm_enable == ParamSwitch::Enable {
+        c_params.window_log = ZSTD_LDM_DEFAULT_WINDOW_LOG;
+    }
     zstd_override_cparams(&mut c_params, overrides);
     // A size hint of 0 means 0.
     zstd_adjust_cparams_internal(
@@ -984,6 +1012,66 @@ fn zstd_window_in_buffers(window: &Window, bufs: &Buffers<'_>) -> bool {
             && i64::from(window.dict_limit) - window.dict_base <= dict.len() as i64
     };
     prefix_fits && dict_fits
+}
+
+/// `ZSTD_selectBlockCompressor`'s choice: the block compressor of the
+/// strategy, without a dictionary or with the window's older segment
+/// (`ZSTD_noDict`, `ZSTD_extDict`), over the buffers of a block: `src`, the
+/// prefix's, and `dict`, the older segment's when it has one.
+///
+/// Differs from libzstd: what picks the function, kept as a value, instead
+/// of a pointer to it; [`BlockCompressor::compress`] calls the same one.
+/// Long distance matching calls it on parts of a block.
+pub(crate) struct BlockCompressor<'a> {
+    pub(crate) strategy: Strategy,
+    pub(crate) use_row_match_finder: ParamSwitch,
+    pub(crate) src: &'a [u8],
+    pub(crate) dict: Option<&'a [u8]>,
+}
+
+impl BlockCompressor<'_> {
+    /// `ZSTD_BlockCompressor_f`: the sequences of `src[istart..iend]` into
+    /// `seq_store`. Returns the size of the literals left after the last
+    /// sequence. Fails for the strategies the port does not have yet; the
+    /// context does not take them.
+    pub(crate) fn compress(
+        &self,
+        ms: &mut MatchState,
+        seq_store: &mut SeqStore,
+        rep: &mut [u32; ZSTD_REP_NUM],
+        istart: usize,
+        iend: usize,
+    ) -> Result<usize> {
+        let src = self.src;
+        Ok(match (self.strategy, self.dict) {
+            (Strategy::Fast, None) => {
+                zstd_compress_block_fast(ms, seq_store, rep, src, istart, iend)
+            }
+            (Strategy::Fast, Some(dict)) => {
+                zstd_compress_block_fast_ext_dict(ms, seq_store, rep, src, dict, istart, iend)
+            }
+            (Strategy::Dfast, None) => {
+                zstd_compress_block_double_fast(ms, seq_store, rep, src, istart, iend)
+            }
+            (Strategy::Dfast, Some(dict)) => zstd_compress_block_double_fast_ext_dict(
+                ms, seq_store, rep, src, dict, istart, iend,
+            ),
+            (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2, dict) => {
+                let depth = self.strategy as u32 - Strategy::Greedy as u32;
+                if zstd_row_match_finder_used(self.strategy, self.use_row_match_finder) {
+                    zstd_compress_block_lazy_row(depth, ms, seq_store, rep, src, dict, istart, iend)
+                } else {
+                    zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
+                }
+            }
+            (Strategy::Btlazy2, dict) => {
+                zstd_compress_block_btlazy2(ms, seq_store, rep, src, dict, istart, iend)
+            }
+            // The other strategies are not ported yet; the context does not
+            // take them.
+            _ => return error!(ParameterUnsupported),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,8 +1203,26 @@ pub enum CParameter {
     SplitAfterSequences(ParamSwitch),
     /// Long distance matching (`ZSTD_c_enableLongDistanceMatching`):
     /// matches far back, found ahead of the strategy's own; `Auto` uses it
-    /// for `btopt` and up with windows of 128 MB or more.
+    /// for `btopt` and up with windows of 128 MB or more. On, it takes a
+    /// window of 128 MB (a window log of 27) when none is set, smaller for
+    /// a smaller input of known size.
     EnableLongDistanceMatching(ParamSwitch),
+    /// The size of the hash table of long distance matching, as a power of
+    /// 2 (`ZSTD_c_ldmHashLog`): 6 to 30; 0 for the window log less the
+    /// hash rate log.
+    LdmHashLog(u32),
+    /// The shortest match of long distance matching (`ZSTD_c_ldmMinMatch`):
+    /// 4 to 4096; 0 for 64 (32 from `btultra` up).
+    LdmMinMatch(u32),
+    /// The size of a bucket of long distance matching's hash table, as a
+    /// power of 2 (`ZSTD_c_ldmBucketSizeLog`): 1 to 8, and at most the hash
+    /// log; 0 for the strategy's number, 4 at least.
+    LdmBucketSizeLog(u32),
+    /// How often long distance matching puts a position in its table, about
+    /// one in `1 << value` (`ZSTD_c_ldmHashRateLog`): 0 to 25; 0 for the
+    /// window log less the hash log when that is set, otherwise from 7 for
+    /// `fast` to 4 for `btultra2`.
+    LdmHashRateLog(u32),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -1143,6 +1249,10 @@ pub enum CParameterKind {
     UseRowMatchFinder,
     SplitAfterSequences,
     EnableLongDistanceMatching,
+    LdmHashLog,
+    LdmMinMatch,
+    LdmBucketSizeLog,
+    LdmHashRateLog,
 }
 
 impl CParameter {
@@ -1170,6 +1280,10 @@ impl CParameter {
             CParameter::UseRowMatchFinder(_) => CParameterKind::UseRowMatchFinder,
             CParameter::SplitAfterSequences(_) => CParameterKind::SplitAfterSequences,
             CParameter::EnableLongDistanceMatching(_) => CParameterKind::EnableLongDistanceMatching,
+            CParameter::LdmHashLog(_) => CParameterKind::LdmHashLog,
+            CParameter::LdmMinMatch(_) => CParameterKind::LdmMinMatch,
+            CParameter::LdmBucketSizeLog(_) => CParameterKind::LdmBucketSizeLog,
+            CParameter::LdmHashRateLog(_) => CParameterKind::LdmHashRateLog,
         }
     }
 }
@@ -1219,6 +1333,10 @@ pub struct CCtx {
     next_cblock: CompressedBlockState,
     match_state: MatchState,
     seq_store: SeqStore,
+    /// Long distance matching: its window and tables (`ldmState`), and the
+    /// store of a block's sequences (`ldmSequences`, `maxNbLdmSequences`).
+    ldm_state: LdmState,
+    ldm_sequences: RawSeqStore,
     block_size_max: usize,
     is_first_block: bool,
     pledged_src_size_plus_one: u64,
@@ -1285,6 +1403,8 @@ impl CCtx {
                 hash_salt_entropy: 0,
             },
             seq_store: SeqStore::with_capacity(0, 0),
+            ldm_state: LdmState::new(),
+            ldm_sequences: RawSeqStore::default(),
             block_size_max: 0,
             is_first_block: true,
             pledged_src_size_plus_one: 0,
@@ -1326,12 +1446,22 @@ impl CCtx {
         self.is_first_block = true;
         self.applied_params = *params;
         self.applied_params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
+        debug_assert!(params.ldm_enable != ParamSwitch::Auto);
+        if params.ldm_enable == ParamSwitch::Enable {
+            // The parameters of long distance matching, for the frame.
+            zstd_ldm_adjust_parameters(&mut self.applied_params.ldm, &params.c_params);
+            debug_assert!(
+                self.applied_params.ldm.hash_log >= self.applied_params.ldm.bucket_size_log
+            );
+            debug_assert!(self.applied_params.ldm.hash_rate_log < 32);
+        }
         let params = self.applied_params;
         let c_params = params.c_params;
 
         let window_size = (1u64 << c_params.window_log).min(pledged_src_size).max(1) as usize;
         let block_size = params.max_block_size.min(window_size);
         let max_nb_seq = zstd_max_nb_seq(block_size, c_params.min_match);
+        let max_nb_ldm_seq = zstd_ldm_get_max_nb_seq(params.ldm_enable, &params.ldm, block_size);
         let buff_out_size = if buffered && params.out_buffer_mode == BufferMode::Buffered {
             zstd_compress_bound(block_size)? + 1
         } else {
@@ -1414,6 +1544,31 @@ impl CCtx {
 
         self.seq_store = SeqStore::with_capacity(block_size, max_nb_seq);
 
+        // The tables of long distance matching, cleared, and its window,
+        // new: unlike the match state's, libzstd starts its indices again
+        // at every frame.
+        //
+        // Differs from libzstd: without long distance matching, libzstd
+        // leaves them as they were, unused; the port lets them go. A frame
+        // with it sets them up again either way.
+        let ldm = &mut self.ldm_state;
+        if params.ldm_enable == ParamSwitch::Enable {
+            let ldm_h_size = 1usize << params.ldm.hash_log;
+            ldm.hash_table.clear();
+            ldm.hash_table.resize(ldm_h_size, LdmEntry::default());
+            self.ldm_sequences.reset();
+            self.ldm_sequences.capacity = max_nb_ldm_seq;
+            self.ldm_sequences.seq.reserve(max_nb_ldm_seq);
+            ldm.window = Window::new();
+            ldm.loaded_dict_end = 0;
+            let num_buckets = 1usize << (params.ldm.hash_log - params.ldm.bucket_size_log);
+            ldm.bucket_offsets.clear();
+            ldm.bucket_offsets.resize(num_buckets, 0);
+        } else {
+            *ldm = LdmState::new();
+            self.ldm_sequences = RawSeqStore::default();
+        }
+
         // The buffers. What they hold is not used again: the window starts
         // over.
         self.in_buff.resize(buff_in_size, 0);
@@ -1462,37 +1617,44 @@ impl CCtx {
         self.next_cblock.rep = self.prev_cblock.rep;
         let rep = &mut self.next_cblock.rep;
         let seq_store = &mut self.seq_store;
-        let last_ll_size = match (self.applied_params.c_params.strategy, ext_dict) {
-            (Strategy::Fast, false) => {
-                zstd_compress_block_fast(ms, seq_store, rep, src, istart, iend)
-            }
-            (Strategy::Fast, true) => {
-                zstd_compress_block_fast_ext_dict(ms, seq_store, rep, src, dict, istart, iend)
-            }
-            (Strategy::Dfast, false) => {
-                zstd_compress_block_double_fast(ms, seq_store, rep, src, istart, iend)
-            }
-            (Strategy::Dfast, true) => zstd_compress_block_double_fast_ext_dict(
-                ms, seq_store, rep, src, dict, istart, iend,
-            ),
-            (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2, _) => {
-                let params = &self.applied_params;
-                let depth = params.c_params.strategy as u32 - Strategy::Greedy as u32;
-                let dict = ext_dict.then_some(dict);
-                if zstd_row_match_finder_used(params.c_params.strategy, params.use_row_match_finder)
-                {
-                    zstd_compress_block_lazy_row(depth, ms, seq_store, rep, src, dict, istart, iend)
-                } else {
-                    zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
-                }
-            }
-            (Strategy::Btlazy2, _) => {
-                let dict = ext_dict.then_some(dict);
-                zstd_compress_block_btlazy2(ms, seq_store, rep, src, dict, istart, iend)
-            }
-            // The other strategies are not ported yet; the context does not
-            // take them.
-            _ => return error!(ParameterUnsupported),
+        let params = &self.applied_params;
+        let block_compressor = BlockCompressor {
+            strategy: params.c_params.strategy,
+            use_row_match_finder: params.use_row_match_finder,
+            src,
+            dict: ext_dict.then_some(dict),
+        };
+        let last_ll_size = if params.ldm_enable == ParamSwitch::Enable {
+            // Long distance matching: its sequences of the block, from its
+            // own window, over the same buffers; then the block compressor
+            // between them.
+            let ldm_seq_store = &mut self.ldm_sequences;
+            ldm_seq_store.reset();
+            let ldm_window = &self.ldm_state.window;
+            let ldm_src = bufs.get(ldm_window.buffer);
+            let ldm_dict = bufs.get(ldm_window.dict_buffer);
+            zstd_ldm_generate_sequences(
+                &mut self.ldm_state,
+                ldm_seq_store,
+                &params.ldm,
+                ldm_src,
+                ldm_dict,
+                istart,
+                iend,
+            )?;
+            let last_ll_size = zstd_ldm_block_compress(
+                ldm_seq_store,
+                ms,
+                seq_store,
+                rep,
+                &block_compressor,
+                istart,
+                iend,
+            )?;
+            debug_assert!(ldm_seq_store.pos == ldm_seq_store.size());
+            last_ll_size
+        } else {
+            block_compressor.compress(ms, seq_store, rep, istart, iend)?
         };
         self.seq_store
             .store_last_literals(src, iend - last_ll_size, last_ll_size);
@@ -1816,6 +1978,13 @@ impl CCtx {
         if !zstd_window_in_buffers(&ms.window, &bufs) {
             return error!(SrcBufferWrong);
         }
+        if self.applied_params.ldm_enable == ParamSwitch::Enable {
+            let window = &mut self.ldm_state.window;
+            window.update(which, start, end - start, false);
+            if !zstd_window_in_buffers(window, &bufs) {
+                return error!(SrcBufferWrong);
+            }
+        }
 
         let c_size =
             self.compress_frame_chunk(&mut dst[fh_size..], bufs, start, end, last_frame_chunk)?;
@@ -2055,6 +2224,33 @@ impl CCtx {
             CParameter::UseRowMatchFinder(mode) => params.use_row_match_finder = mode,
             CParameter::SplitAfterSequences(mode) => params.post_block_splitter = mode,
             CParameter::EnableLongDistanceMatching(mode) => params.ldm_enable = mode,
+            CParameter::LdmHashLog(value) => {
+                if value != 0 {
+                    bound_check(value, ZSTD_LDM_HASHLOG_MIN..=ZSTD_LDM_HASHLOG_MAX)?;
+                }
+                params.ldm.hash_log = value;
+            }
+            CParameter::LdmMinMatch(value) => {
+                if value != 0 {
+                    bound_check(value, ZSTD_LDM_MINMATCH_MIN..=ZSTD_LDM_MINMATCH_MAX)?;
+                }
+                params.ldm.min_match_length = value;
+            }
+            CParameter::LdmBucketSizeLog(value) => {
+                if value != 0 {
+                    bound_check(
+                        value,
+                        ZSTD_LDM_BUCKETSIZELOG_MIN..=ZSTD_LDM_BUCKETSIZELOG_MAX,
+                    )?;
+                }
+                params.ldm.bucket_size_log = value;
+            }
+            CParameter::LdmHashRateLog(value) => {
+                if value != 0 {
+                    bound_check(value, ZSTD_LDM_HASHRATELOG_MIN..=ZSTD_LDM_HASHRATELOG_MAX)?;
+                }
+                params.ldm.hash_rate_log = value;
+            }
         }
         Ok(())
     }
@@ -2092,6 +2288,10 @@ impl CCtx {
             CParameterKind::UseRowMatchFinder => params.use_row_match_finder as i32,
             CParameterKind::SplitAfterSequences => params.post_block_splitter as i32,
             CParameterKind::EnableLongDistanceMatching => params.ldm_enable as i32,
+            CParameterKind::LdmHashLog => params.ldm.hash_log as i32,
+            CParameterKind::LdmMinMatch => params.ldm.min_match_length as i32,
+            CParameterKind::LdmBucketSizeLog => params.ldm.bucket_size_log as i32,
+            CParameterKind::LdmHashRateLog => params.ldm.hash_rate_log as i32,
         }
     }
 
@@ -2672,6 +2872,12 @@ impl CCtx {
     /// How many times the indices were lowered in the last frame.
     pub(crate) fn nb_overflow_corrections(&self) -> u32 {
         self.match_state.window.nb_overflow_corrections
+    }
+
+    /// How many times the indices of long distance matching were lowered
+    /// in the last frame.
+    pub(crate) fn nb_ldm_overflow_corrections(&self) -> u32 {
+        self.ldm_state.window.nb_overflow_corrections
     }
 }
 

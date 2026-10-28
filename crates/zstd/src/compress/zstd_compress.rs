@@ -19,9 +19,9 @@ use crate::compress::huf_compress::HufRepeat;
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, EntropyCTables, FrameParameters,
     FseCTables, FseRepeat, LongLengthType, MatchState, ParamSwitch, SeqStore, Strategy, Window,
-    WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX, zstd_literals_compression_is_disabled,
-    zstd_ll_code, zstd_min_gain, zstd_ml_code, zstd_no_compress_block, zstd_reduce_table,
-    zstd_reduce_table_btlazy2,
+    WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX,
+    zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain, zstd_ml_code,
+    zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
 };
 use crate::compress::zstd_compress_literals::zstd_compress_literals;
 use crate::compress::zstd_compress_sequences::{
@@ -31,7 +31,10 @@ use crate::compress::zstd_double_fast::{
     zstd_compress_block_double_fast, zstd_compress_block_double_fast_ext_dict,
 };
 use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_fast_ext_dict};
-use crate::compress::zstd_lazy::{zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc};
+use crate::compress::zstd_lazy::{
+    ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc,
+    zstd_compress_block_lazy_row,
+};
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
@@ -411,8 +414,6 @@ const ZSTD_BLOCKSIZE_MAX_MIN: u32 = 1 << 10;
 pub(crate) const ZSTD_CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 /// `ZSTD_FRAMEHEADERSIZE_MAX`
 const ZSTD_FRAMEHEADERSIZE_MAX: usize = 18;
-/// `ZSTD_ROW_HASH_TAG_BITS`
-const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
 /// `ZSTD_MAX_INPUT_SIZE` on 64-bit machines.
 const ZSTD_MAX_INPUT_SIZE: u64 = 0xFF00_FF00_FF00_FF00;
 
@@ -497,14 +498,14 @@ pub(crate) fn zstd_resolve_row_match_finder_mode(
 }
 
 /// Whether the port has the match finder a frame with `c_params` needs,
-/// the use of the row match finder resolved. The context refuses the
+/// the use of the row match finder resolved: the strategies up to `lazy2`,
+/// with the hash chain or the row match finder. The context refuses the
 /// others with `ParameterUnsupported`.
 pub(crate) fn zstd_strategy_ported(
     c_params: &CompressionParameters,
-    use_row_match_finder: ParamSwitch,
+    _use_row_match_finder: ParamSwitch,
 ) -> bool {
     c_params.strategy <= Strategy::Btlazy2
-        && !zstd_row_match_finder_used(c_params.strategy, use_row_match_finder)
 }
 
 /// Whether the port has the match finder `ZSTD_compressCCtx` takes at
@@ -520,6 +521,21 @@ pub(crate) fn zstd_level_ported(level: i32, src_size: u64) -> bool {
 /// `dfast`, its short hash table).
 fn zstd_allocate_chain_table(strategy: Strategy, use_row_match_finder: ParamSwitch) -> bool {
     strategy != Strategy::Fast && !zstd_row_match_finder_used(strategy, use_row_match_finder)
+}
+
+/// `ZSTD_bitmix`: the bits of `val` mixed, after `XXH3_rrmxmx`.
+fn zstd_bitmix(mut val: u64, len: u64) -> u64 {
+    val ^= val.rotate_right(49) ^ val.rotate_right(24);
+    val = val.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    val ^= (val >> 35).wrapping_add(len);
+    val = val.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    val ^ (val >> 28)
+}
+
+/// `ZSTD_advanceHashSalt`: the row match finder's next salt, from the last
+/// one and the hashes searched since.
+fn zstd_advance_hash_salt(ms: &mut MatchState) {
+    ms.hash_salt = zstd_bitmix(ms.hash_salt, 8) ^ zstd_bitmix(u64::from(ms.hash_salt_entropy), 4);
 }
 
 /// `ZSTD_cycleLog`
@@ -884,7 +900,8 @@ fn zstd_overflow_correct_if_needed(
         .need_overflow_correction(cycle_log, max_dist, ms.loaded_dict_end, src, src_end)
     {
         let correction = ms.window.correct_overflow(cycle_log, max_dist, src);
-        // ZSTD_reduceIndex
+        // ZSTD_reduceIndex. The row match finder's tags stay as they are
+        // (see reset_cctx_internal).
         zstd_reduce_table(&mut ms.hash_table, correction);
         if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
             if c_params.strategy == Strategy::Btlazy2 {
@@ -1194,6 +1211,12 @@ impl CCtx {
                 loaded_dict_end: 0,
                 lazy_skipping: false,
                 c_params,
+                row_hash_log: 0,
+                tag_table: Vec::new(),
+                hash_cache: [0; ZSTD_ROW_HASH_CACHE_SIZE],
+                // A new context's salt, before the first frame advances it.
+                hash_salt: 0,
+                hash_salt_entropy: 0,
             },
             seq_store: SeqStore::with_capacity(0, 0),
             block_size_max: 0,
@@ -1291,6 +1314,36 @@ impl CCtx {
             };
         ms.chain_table.clear();
         ms.chain_table.resize(chain_size, 0);
+        if zstd_row_match_finder_used(c_params.strategy, params.use_row_match_finder) {
+            // The row match finder's table of tags, and a new salt. Unlike
+            // the window, the salt goes on from frame to frame, as libzstd's
+            // does. It changes no output: XORed into the hashes before
+            // their shift, it changes which row and which tag a position
+            // gets, never which positions share them.
+            //
+            // Differs from libzstd: the tags are zeroed at every frame, where
+            // libzstd zeroes them only the first time its workspace holds
+            // them (ZSTD_cwksp_reserve_aligned_init_once): later frames find
+            // the tags and heads of earlier ones, or other bytes. They
+            // change nothing. A search goes through a row from its head,
+            // newest entry first, so the entries written in this frame come
+            // first, wherever the head is. Every other entry holds an index
+            // below the window: an earlier frame's in libzstd, whose
+            // indices go on from frame to frame, or 0. A search stops at
+            // the first entry below the window that has its tag, after
+            // taking those with its tag before it; so it takes the same
+            // candidates in the same order, whatever the other entries'
+            // tags and the head. Lowering the indices (ZSTD_reduceIndex)
+            // leaves the tags too: the entries it sets to 0 held indices
+            // below the window already, the oldest of their rows.
+            ms.tag_table.clear();
+            ms.tag_table.resize(1 << c_params.hash_log, 0);
+            zstd_advance_hash_salt(ms);
+            // Rows of 16 entries, 32 from a search log of 5, 64 from 6.
+            let row_log = c_params.search_log.clamp(4, 6);
+            debug_assert!(c_params.hash_log >= row_log);
+            ms.row_hash_log = c_params.hash_log - row_log;
+        }
         ms.c_params = c_params;
 
         self.seq_store = SeqStore::with_capacity(block_size, max_nb_seq);
@@ -1357,9 +1410,15 @@ impl CCtx {
                 ms, seq_store, rep, src, dict, istart, iend,
             ),
             (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2, _) => {
-                let depth = self.applied_params.c_params.strategy as u32 - Strategy::Greedy as u32;
+                let params = &self.applied_params;
+                let depth = params.c_params.strategy as u32 - Strategy::Greedy as u32;
                 let dict = ext_dict.then_some(dict);
-                zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
+                if zstd_row_match_finder_used(params.c_params.strategy, params.use_row_match_finder)
+                {
+                    zstd_compress_block_lazy_row(depth, ms, seq_store, rep, src, dict, istart, iend)
+                } else {
+                    zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
+                }
             }
             (Strategy::Btlazy2, _) => {
                 let dict = ext_dict.then_some(dict);
@@ -1805,9 +1864,10 @@ impl CCtx {
     /// with [`CCtx::set_parameter`] do not apply; [`CCtx::compress2`] takes
     /// them.
     ///
-    /// Work in progress: the port has libzstd's `fast` and `dfast`
-    /// strategies so far, which are every level up to 3, and level 4 for
-    /// inputs over 256 KB. Other levels fail with
+    /// Work in progress: the port has libzstd's strategies up to `lazy2` so
+    /// far, which are every level up to 12 for inputs over 256 KB, up to 10
+    /// for inputs over 16 KB, and up to 8 for smaller ones. Other levels
+    /// fail with
     /// [`ErrorCode::ParameterUnsupported`](crate::ErrorCode::ParameterUnsupported).
     pub fn compress(
         &mut self,

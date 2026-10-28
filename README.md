@@ -7,7 +7,8 @@ Read and write archives and compressed files in Rust: one library for many forma
 ## 🎯 Plans
 
 - **zstd**: a Rust port of the official [Zstandard](https://github.com/facebook/zstd) library, for both compressing and decompressing.
-- **ZIP**: reading and writing, including split archives (`.z01`, `.z02`, …, `.zip`).
+- **Deflate**: a Rust port of [zlib](https://zlib.net), for both too, with the zlib and gzip formats.
+- **ZIP**: reading and writing, including split archives (`.z01`, `.z02`, …, `.zip`), its rules ported from [libzip](https://libzip.org) (see [docs/zip.md](docs/zip.md)).
 - **RAR**: reading through [rars](https://github.com/bitplane/rars).
 - **tar**, and tar inside zstd (`.tar.zst`).
 - **Safe extraction by default**: no writing outside the destination, through links, or past size limits set for archive bombs.
@@ -16,9 +17,10 @@ Read and write archives and compressed files in Rust: one library for many forma
 
 | Crate | What it is | Status |
 |---|---|---|
+| [`hivepack-deflate`](crates/deflate) | Deflate, zlib and gzip in safe Rust, ported from zlib 1.3.2: the same output, at the same speed | Decompresses, with the same results and messages as zlib, at about 0.8× its speed before any speed work. Compression comes next |
 | [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | Decompresses, in one call or streaming, with the same output and errors as libzstd, at about 0.9× its speed. Compresses at the levels up to 3, in one call or streaming, with libzstd's frames; the rest of the encoder comes next |
 
-Every crate forbids `unsafe` code; the one exception, `hivepack-zstd`'s `unsafe-fast` feature, is off by default (see [docs/unsafe.md](docs/unsafe.md)). The rules are in [docs/safety.md](docs/safety.md), and how the zstd port follows the official library is in [docs/porting.md](docs/porting.md).
+Every crate forbids `unsafe` code; the one exception, `hivepack-zstd`'s `unsafe-fast` feature, is off by default (see [docs/unsafe.md](docs/unsafe.md)). The rules are in [docs/safety.md](docs/safety.md), and how the ports follow the official libraries is in [docs/porting.md](docs/porting.md) (zstd) and [docs/deflate.md](docs/deflate.md) (zlib).
 
 ## 🧪 Tests
 
@@ -41,4 +43,4 @@ hivepack is built and maintained by HivePaaS, who also make:
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 HivePaaS.
 
-The exception is `hivepack-zstd`, which is under BSD-3-Clause, the license of the Zstandard code it is ported from (see [crates/zstd/LICENSE](crates/zstd/LICENSE)). The test files in `testdata/` keep their own licenses, listed in [testdata/README.md](testdata/README.md).
+The exceptions are the ports, under the licenses of the code they are ported from: `hivepack-zstd` under BSD-3-Clause (see [crates/zstd/LICENSE](crates/zstd/LICENSE)), and `hivepack-deflate` under the zlib license (see [crates/deflate/LICENSE](crates/deflate/LICENSE)). The test files in `testdata/` keep their own licenses, listed in [testdata/README.md](testdata/README.md).

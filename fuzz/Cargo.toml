@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-fuzz"
 version = "0.0.0"
-description = "Fuzzers that compare hivepack-zstd with libzstd"
+description = "Fuzzers that compare hivepack-zstd with libzstd, and hivepack-deflate with zlib"
 publish = false
 license = "MIT"
 edition = "2024"
@@ -18,6 +18,10 @@ libfuzzer-sys = "0.4"
 hivepack-zstd = { path = "../crates/zstd" }
 # libzstd 1.5.7, without the x86-64 Huffman assembly, as the tests build it.
 zstd = { version = "0.14.3", default-features = false, features = ["experimental", "no_asm"] }
+hivepack-deflate = { path = "../crates/deflate" }
+# zlib 1.3.2, built from libz-sys's bundled sources, as the tests build it.
+libz-sys = { version = "=1.1.30", features = ["static"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 
 [[bin]]
 name = "decompress"
@@ -36,6 +40,13 @@ bench = false
 [[bin]]
 name = "compress_stream"
 path = "fuzz_targets/compress_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
 test = false
 doc = false
 bench = false

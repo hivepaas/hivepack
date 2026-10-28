@@ -49,6 +49,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast
 
@@ -159,9 +160,9 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
 
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
-  # feature, and the compressor's frames and streaming calls against
-  # libzstd's, under AddressSanitizer. A few minutes per target; longer runs are done by hand
-  # (see fuzz/README.md).
+  # feature, the compressor's frames and streaming calls against libzstd's,
+  # and inflate against zlib, under AddressSanitizer. A few minutes per
+  # target; longer runs are done by hand (see fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
@@ -192,3 +193,4 @@ jobs:
       - name: Seed the streaming compressor's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/compress_stream
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=180
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=180

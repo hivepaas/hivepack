@@ -43,4 +43,4 @@ Library code returns errors and never panics, whatever the input:
 
 ## No C in the libraries
 
-libzstd is a development dependency only: it is the reference in tests and benchmarks, and it never ends up in a library. `cargo deny` (see `deny.toml`) keeps every dependency under a permissive license, from crates.io, and free of open security advisories.
+libzstd and zlib are development dependencies only: they are the references in tests and benchmarks, and they never end up in a library. `cargo deny` (see `deny.toml`) keeps every dependency under a permissive license, from crates.io, and free of open security advisories.

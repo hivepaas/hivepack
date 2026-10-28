@@ -1,0 +1,16 @@
+[package]
+name = "deflate-bench"
+version = "0.0.0"
+description = "Times hivepack-deflate against zlib on the same inputs"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hivepack-deflate.workspace = true
+libz-sys.workspace = true
+flate2.workspace = true

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/zstd", "tools/zstd-bench"]
+members = ["crates/deflate", "crates/zstd", "tools/deflate-bench", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -11,11 +11,19 @@ repository = "https://github.com/hivepaas/hivepack-rs"
 homepage = "https://github.com/hivepaas/hivepack-rs"
 
 [workspace.dependencies]
+hivepack-deflate = { path = "crates/deflate" }
 hivepack-zstd = { path = "crates/zstd" }
-# The official library, used only as the reference in tests and benchmarks.
-# zstd 0.14.3 builds libzstd 1.5.7, the release hivepack-zstd ports. The
-# legacy formats (v0.1 to v0.7) are left out, as the port does not read them.
+# The official libraries, used only as the reference in tests and
+# benchmarks. zstd 0.14.3 builds libzstd 1.5.7, the release hivepack-zstd
+# ports. The legacy formats (v0.1 to v0.7) are left out, as the port does not
+# read them.
 zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "experimental"] }
+# libz-sys 1.1.30 bundles zlib 1.3.2, the release hivepack-deflate ports, and
+# its `static` feature builds that rather than linking the system's zlib,
+# which may be another version. flate2, with its zlib backend, is the safe
+# interface to it.
+libz-sys = { version = "=1.1.30", features = ["static"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -31,9 +39,12 @@ todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
 
-# Tests compare against large inputs; an unoptimised libzstd makes them slow
-# for no benefit.
+# Tests compare against large inputs; an unoptimised libzstd or zlib makes
+# them slow for no benefit.
 [profile.dev.package.zstd-sys]
+opt-level = 3
+
+[profile.dev.package.libz-sys]
 opt-level = 3
 
 [profile.release]

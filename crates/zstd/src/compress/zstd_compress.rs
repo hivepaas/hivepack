@@ -497,30 +497,66 @@ pub(crate) fn zstd_resolve_row_match_finder_mode(
     }
 }
 
-/// Whether the port has the match finder a frame with `c_params` needs,
-/// the use of the row match finder resolved: the strategies up to `lazy2`,
-/// with the hash chain or the row match finder. The context refuses the
-/// others with `ParameterUnsupported`.
-pub(crate) fn zstd_strategy_ported(
-    c_params: &CompressionParameters,
-    _use_row_match_finder: ParamSwitch,
-) -> bool {
-    c_params.strategy <= Strategy::Btlazy2
+/// Whether the port has what a frame with `params` needs, their modes
+/// resolved: its strategy (every one up to `btlazy2`), the block splitter
+/// after the sequences, and long distance matching. The context refuses
+/// the others with `ParameterUnsupported`.
+pub(crate) fn zstd_frame_ported(params: &CCtxParams) -> bool {
+    // The strategies.
+    params.c_params.strategy <= Strategy::Btlazy2
+        // The block splitter after the sequences (ZSTD_compressBlock_splitBlock).
+        && params.post_block_splitter != ParamSwitch::Enable
+        // Long distance matching (zstd_ldm.c).
+        && params.ldm_enable != ParamSwitch::Enable
 }
 
-/// Whether the port has the match finder `ZSTD_compressCCtx` takes at
-/// `level` for `src_size` bytes.
+/// Whether the port has what `ZSTD_compressCCtx` takes at `level` for
+/// `src_size` bytes.
 #[cfg(test)]
 pub(crate) fn zstd_level_ported(level: i32, src_size: u64) -> bool {
-    let c_params = zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict);
-    let row = zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params);
-    zstd_strategy_ported(&c_params, row)
+    let (c_params, f_params) =
+        zstd_get_params_internal(level, src_size, 0, CParamMode::NoAttachDict);
+    zstd_frame_ported(&CCtxParams::new(c_params, f_params, level))
 }
 
 /// The strategy `ZSTD_compressCCtx` takes at `level` for `src_size` bytes.
 #[cfg(test)]
 pub(crate) fn zstd_level_strategy(level: i32, src_size: u64) -> Strategy {
     zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict).strategy
+}
+
+/// `ZSTD_resolveBlockSplitterMode`: whether a frame with `c_params` splits
+/// its blocks after finding their sequences; for `Auto`, the optimal
+/// parser's strategies with windows of 128 KB or more.
+pub(crate) fn zstd_resolve_block_splitter_mode(
+    mode: ParamSwitch,
+    c_params: &CompressionParameters,
+) -> ParamSwitch {
+    if mode != ParamSwitch::Auto {
+        return mode;
+    }
+    if c_params.strategy >= Strategy::Btopt && c_params.window_log >= 17 {
+        ParamSwitch::Enable
+    } else {
+        ParamSwitch::Disable
+    }
+}
+
+/// `ZSTD_resolveEnableLdm`: whether a frame with `c_params` uses long
+/// distance matching; for `Auto`, the optimal parser's strategies with
+/// windows of 128 MB or more.
+pub(crate) fn zstd_resolve_enable_ldm(
+    mode: ParamSwitch,
+    c_params: &CompressionParameters,
+) -> ParamSwitch {
+    if mode != ParamSwitch::Auto {
+        return mode;
+    }
+    if c_params.strategy >= Strategy::Btopt && c_params.window_log >= 27 {
+        ParamSwitch::Enable
+    } else {
+        ParamSwitch::Disable
+    }
 }
 
 /// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for
@@ -796,6 +832,14 @@ pub(crate) struct CCtxParams {
     /// Whether the lazy strategies use the row match finder: `Auto` until
     /// a frame resolves it.
     pub(crate) use_row_match_finder: ParamSwitch,
+    /// `postBlockSplitter`: whether blocks are split after their sequences
+    /// are found (`ZSTD_c_splitAfterSequences`); `Auto` until a frame
+    /// resolves it.
+    pub(crate) post_block_splitter: ParamSwitch,
+    /// `ldmParams.enableLdm`: long distance matching
+    /// (`ZSTD_c_enableLongDistanceMatching`); `Auto` until a frame resolves
+    /// it.
+    pub(crate) ldm_enable: ParamSwitch,
 }
 
 impl CCtxParams {
@@ -817,6 +861,8 @@ impl CCtxParams {
             max_block_size: 0,
             pre_block_splitter_level: 0,
             use_row_match_finder: zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params),
+            post_block_splitter: zstd_resolve_block_splitter_mode(ParamSwitch::Auto, &c_params),
+            ldm_enable: zstd_resolve_enable_ldm(ParamSwitch::Auto, &c_params),
         }
     }
 
@@ -832,6 +878,8 @@ impl CCtxParams {
         );
         let mut params = CCtxParams::new(c_params, f_params, ZSTD_CLEVEL_DEFAULT);
         params.use_row_match_finder = ParamSwitch::Auto;
+        params.post_block_splitter = ParamSwitch::Auto;
+        params.ldm_enable = ParamSwitch::Auto;
         (params, CParamOverrides::default())
     }
 }
@@ -1061,6 +1109,14 @@ pub enum CParameter {
     /// finder or the hash chain; `Auto` takes the row match finder for
     /// windows over 16 KB.
     UseRowMatchFinder(ParamSwitch),
+    /// Whether to split blocks after finding their sequences, where the
+    /// statistics change (`ZSTD_c_splitAfterSequences`); `Auto` does for
+    /// `btopt` and up with windows of 128 KB or more.
+    SplitAfterSequences(ParamSwitch),
+    /// Long distance matching (`ZSTD_c_enableLongDistanceMatching`):
+    /// matches far back, found ahead of the strategy's own; `Auto` uses it
+    /// for `btopt` and up with windows of 128 MB or more.
+    EnableLongDistanceMatching(ParamSwitch),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -1085,6 +1141,8 @@ pub enum CParameterKind {
     BlockSplitterLevel,
     MaxBlockSize,
     UseRowMatchFinder,
+    SplitAfterSequences,
+    EnableLongDistanceMatching,
 }
 
 impl CParameter {
@@ -1110,6 +1168,8 @@ impl CParameter {
             CParameter::BlockSplitterLevel(_) => CParameterKind::BlockSplitterLevel,
             CParameter::MaxBlockSize(_) => CParameterKind::MaxBlockSize,
             CParameter::UseRowMatchFinder(_) => CParameterKind::UseRowMatchFinder,
+            CParameter::SplitAfterSequences(_) => CParameterKind::SplitAfterSequences,
+            CParameter::EnableLongDistanceMatching(_) => CParameterKind::EnableLongDistanceMatching,
         }
     }
 }
@@ -1260,7 +1320,7 @@ impl CCtx {
         pledged_src_size: u64,
         buffered: bool,
     ) -> Result<()> {
-        if !zstd_strategy_ported(&params.c_params, params.use_row_match_finder) {
+        if !zstd_frame_ported(params) {
             return error!(ParameterUnsupported);
         }
         self.is_first_block = true;
@@ -1993,6 +2053,8 @@ impl CCtx {
                 params.max_block_size = value as usize;
             }
             CParameter::UseRowMatchFinder(mode) => params.use_row_match_finder = mode,
+            CParameter::SplitAfterSequences(mode) => params.post_block_splitter = mode,
+            CParameter::EnableLongDistanceMatching(mode) => params.ldm_enable = mode,
         }
         Ok(())
     }
@@ -2028,6 +2090,8 @@ impl CCtx {
             CParameterKind::BlockSplitterLevel => params.pre_block_splitter_level,
             CParameterKind::MaxBlockSize => params.max_block_size as i32,
             CParameterKind::UseRowMatchFinder => params.use_row_match_finder as i32,
+            CParameterKind::SplitAfterSequences => params.post_block_splitter as i32,
+            CParameterKind::EnableLongDistanceMatching => params.ldm_enable as i32,
         }
     }
 
@@ -2274,6 +2338,10 @@ impl CCtx {
             0,
             CParamMode::NoAttachDict,
         );
+        // ZSTD_CCtx_init_compressStream2, in libzstd's order.
+        params.post_block_splitter =
+            zstd_resolve_block_splitter_mode(params.post_block_splitter, &params.c_params);
+        params.ldm_enable = zstd_resolve_enable_ldm(params.ldm_enable, &params.c_params);
         params.use_row_match_finder =
             zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);

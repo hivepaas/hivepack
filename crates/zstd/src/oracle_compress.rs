@@ -477,6 +477,12 @@ pub(crate) fn answer(request: &str) -> String {
 fn c_parameter(number: i64, value: i64) -> CParameter {
     let flag = value != 0;
     let unsigned = || u32::try_from(value).expect("a value the parameter holds");
+    let switch = || match value {
+        0 => ParamSwitch::Auto,
+        1 => ParamSwitch::Enable,
+        2 => ParamSwitch::Disable,
+        _ => panic!("switch {value}"),
+    };
     let stable = || match value {
         0 => false,
         1 => true,
@@ -504,12 +510,7 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
             _ => panic!("format {value}"),
         }),
         // ZSTD_c_literalCompressionMode
-        1002 => CParameter::LiteralCompressionMode(match value {
-            0 => ParamSwitch::Auto,
-            1 => ParamSwitch::Enable,
-            2 => ParamSwitch::Disable,
-            _ => panic!("switch {value}"),
-        }),
+        1002 => CParameter::LiteralCompressionMode(switch()),
         // ZSTD_c_srcSizeHint
         1004 => CParameter::SrcSizeHint(unsigned()),
         // ZSTD_c_stableInBuffer, ZSTD_c_stableOutBuffer
@@ -519,13 +520,12 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         1015 => CParameter::MaxBlockSize(unsigned()),
         // ZSTD_c_blockSplitterLevel
         1017 => CParameter::BlockSplitterLevel(unsigned()),
+        // ZSTD_c_splitAfterSequences
+        1010 => CParameter::SplitAfterSequences(switch()),
+        // ZSTD_c_enableLongDistanceMatching
+        160 => CParameter::EnableLongDistanceMatching(switch()),
         // ZSTD_c_useRowMatchFinder
-        1011 => CParameter::UseRowMatchFinder(match value {
-            0 => ParamSwitch::Auto,
-            1 => ParamSwitch::Enable,
-            2 => ParamSwitch::Disable,
-            _ => panic!("switch {value}"),
-        }),
+        1011 => CParameter::UseRowMatchFinder(switch()),
         _ => panic!("parameter {number}"),
     }
 }

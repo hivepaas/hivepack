@@ -59,6 +59,7 @@ jobs:
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
       - run: cargo check -p hivepack-deflate --lib --locked
+      - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast
 
@@ -211,3 +212,14 @@ jobs:
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=180
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=180
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=120
+      - name: Seed the ZIP corpus with the recorded archives
+        run: |
+          mkdir -p fuzz/corpus/zip_open
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/zip-open.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              data = line.split("\t")[0].split(" ")[3]
+              pathlib.Path(f"fuzz/corpus/zip_open/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_open -- -max_total_time=120

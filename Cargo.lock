@@ -74,6 +74,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-zip"
+version = "0.0.0"
+dependencies = [
+ "hivepack-deflate",
+]
+
+[[package]]
 name = "hivepack-zstd"
 version = "0.0.0"
 dependencies = [

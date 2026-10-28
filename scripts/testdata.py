@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -168,7 +169,37 @@ def build_tool(source: Path, tool: str) -> Path:
     return binary
 
 
-def build_oracle(source: Path, sources: list, included: list, folder: Path) -> None:
+def libzip_sources(lib: Path) -> list:
+    """The library's C files, as lib/CMakeLists.txt lists them in ZIP_SOURCES,
+    with the Unix ones it adds; zip_err_str.c is generated apart."""
+    text = (lib / "CMakeLists.txt").read_text()
+    listed = text.split("set(ZIP_SOURCES", 1)[1].split(")", 1)[0].split()
+    names = [n for n in listed if n.endswith(".c") and not n.startswith("$")]
+    return names + ["zip_source_file_stdio_named.c", "zip_random_unix.c"]
+
+
+def zip_err_str(lib: Path) -> str:
+    """zip_err_str.c, as libzip's cmake/GenerateZipErrorStrings.cmake writes
+    it from the comments in zip.h and zipint.h."""
+    pattern = r"#define ZIP_ER_{}([A-Z0-9_]+) ([0-9]+)[ \t]+/([-*0-9a-zA-Z, ']*)/"
+    errors = re.findall(pattern.format(""), (lib / "zip.h").read_text())
+    details = re.findall(pattern.format("DETAIL_"), (lib / "zipint.h").read_text())
+    out = ['#include "zipint.h"', "#define L ZIP_ET_LIBZIP", "#define N ZIP_ET_NONE",
+           "#define S ZIP_ET_SYS", "#define Z ZIP_ET_ZLIB", "#define E ZIP_DETAIL_ET_ENTRY",
+           "#define G ZIP_DETAIL_ET_GLOBAL", "const struct _zip_err_info _zip_err_str[] = {"]
+    for _, _, text in errors:
+        kind, description = re.search(r"([LNSZ]+) ([-0-9a-zA-Z, ']*)", text).groups()
+        out.append(f'    {{ {kind}, "{description.strip()}" }},')
+    out += ["};", "const int _zip_err_str_count = sizeof(_zip_err_str)/sizeof(_zip_err_str[0]);",
+            "const struct _zip_err_info _zip_err_details[] = {"]
+    for _, _, text in details:
+        kind, description = re.search(r"([EG]+) ([-0-9a-zA-Z, ']*)", text).groups()
+        out.append(f'    {{ {kind}, "{description.strip()}" }},')
+    out += ["};", "const int _zip_err_details_count = sizeof(_zip_err_details)/sizeof(_zip_err_details[0]);"]
+    return "\n".join(out) + "\n"
+
+
+def build_oracle(source: Path, sources: list, included: list, folder: Path, extra: list) -> None:
     """An oracle program, compiled with the library's own sources.
 
     tools/zstd-oracle is built with libzstd's (without the assembly loop,
@@ -176,9 +207,24 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path) -> N
     out, as the oracle includes them itself to reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
-    Deflate64."""
-    files = [str(ROOT / s) for s in sources]
+    Deflate64. tools/zip-oracle is built with libzip's, its own config.h and
+    zipconf.h in place of those libzip's CMake build writes, and zlib's
+    (the `extra` set)."""
+    files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
+    libzip = next(source.glob("libzip-*"), None)
+    if libzip is not None:
+        lib = libzip / "lib"
+        zlib = next(extra[0].glob("zlib-*"))
+        generated = folder / "generated"
+        generated.mkdir()
+        (generated / "zip_err_str.c").write_text(zip_err_str(lib))
+        files += [str(lib / name) for name in libzip_sources(lib)] + [str(generated / "zip_err_str.c")]
+        files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+        config = ROOT / Path(sources[0]).parent
+        subprocess.run([compiler, "-O2", "-w", f"-I{config}", f"-I{lib}", f"-I{zlib}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:
         infback9 = zlib / "contrib" / "infback9"
@@ -204,11 +250,15 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
         return
     origin = sets[generate["from"]]
     fetch_set(origin, cache)
+    extra = [sets[name] for name in generate.get("with", [])]
+    for entry_with in extra:
+        fetch_set(entry_with, cache)
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
     if generate["tool"] == "oracle":
-        build_oracle(cache / origin["name"], generate["sources"], generate.get("included", []), folder)
+        build_oracle(cache / origin["name"], generate["sources"], generate.get("included", []), folder,
+                     [cache / e["name"] for e in extra])
     else:
         binary = build_tool(cache / origin["name"], generate["tool"])
         # Each frame goes to z<number>.zst with its original at z<number>.

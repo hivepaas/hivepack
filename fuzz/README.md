@@ -7,6 +7,7 @@ nightly toolchain and `cargo install cargo-fuzz`.
 |---|---|
 | `decompress` | Decoding the input in one call: the same output as libzstd, or the same error |
 | `compress` | Compressing the input in one call, at a level its first byte picks: the same frame as libzstd, which decodes back |
+| `compress_stream` | Streaming the input, with parameters, pieces, directives and room for output its first 8 bytes pick: every call the same as libzstd's, and a frame that decodes back |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:

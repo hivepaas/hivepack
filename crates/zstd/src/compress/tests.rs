@@ -4,10 +4,11 @@
 //! data is compressed in `tests/compress.rs`.
 
 use crate::compress::zstd_compress::{
-    CCtx, CParamMode, zstd_compress_bound, zstd_get_cparams_internal,
+    CCtx, CParamMode, CParameter, EndDirective, zstd_compress_bound, zstd_get_cparams_internal,
 };
-use crate::compress::zstd_compress_internal::Strategy;
+use crate::compress::zstd_compress_internal::{OVERFLOW_CORRECT_FREQUENTLY, Strategy};
 use crate::decompress::zstd_decompress::decompress;
+use crate::decompress::zstd_decompress::{InBuffer, OutBuffer};
 use crate::oracle::Rng;
 
 /// Whether `level` compresses `len` bytes with a strategy the port has.
@@ -80,4 +81,103 @@ fn frames_match_libzstd_at_fast_levels() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// `data` streamed through `cctx` in pieces drawn from `seed`, as one
+/// frame.
+fn stream(cctx: &mut CCtx, data: &[u8], seed: u64) -> Result<Vec<u8>, String> {
+    let mut rng = Rng::new(seed);
+    let mut frame = Vec::new();
+    let mut piece = vec![0u8; 1 << 17];
+    let mut taken = 0;
+    for _ in 0..1_000_000 {
+        let end = (taken + rng.range(1, 70_000) as usize).min(data.len());
+        let directive = if end == data.len() {
+            EndDirective::End
+        } else if rng.range(0, 9) == 0 {
+            EndDirective::Flush
+        } else {
+            EndDirective::Continue
+        };
+        let room = rng.range(1, piece.len() as u64) as usize;
+        let mut output = OutBuffer::new(&mut piece[..room]);
+        let mut input = InBuffer::new(&data[taken..end]);
+        let remaining = cctx
+            .compress_stream2(&mut output, &mut input, directive)
+            .map_err(|error| format!("{error:?}"))?;
+        taken += input.pos;
+        let written = output.pos;
+        frame.extend_from_slice(&piece[..written]);
+        if directive == EndDirective::End && remaining == 0 {
+            return Ok(frame);
+        }
+    }
+    Err("no end".into())
+}
+
+/// With the indices lowered as soon as they can be (libzstd's
+/// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, which its fuzzers are built
+/// with), the frames come out the same: in one call, and streaming with
+/// small windows, where matches reach into the window's older segment.
+#[test]
+fn lowering_the_indices_changes_no_frame() {
+    let mut rng = Rng::new(0x5EED_0202);
+    let mut corrections = 0;
+    let mut problems = Vec::new();
+    for i in 0..24 {
+        let len = rng.range(100_000, 1_200_000) as usize;
+        let data = rng.lz_data(len);
+        let level = [-5, -1, 1, 2, 3][rng.range(0, 4) as usize];
+        let window_log = if i % 3 == 0 {
+            0
+        } else {
+            rng.range(10, 17) as u32
+        };
+        let seed = rng.next();
+        let frames: Vec<Result<(Vec<u8>, u32), String>> = [false, true]
+            .into_iter()
+            .map(|frequently| {
+                OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(frequently));
+                let mut cctx = CCtx::new();
+                let set = cctx
+                    .set_parameter(CParameter::CompressionLevel(level))
+                    .and_then(|()| cctx.set_parameter(CParameter::WindowLog(window_log)));
+                if let Err(error) = set {
+                    return Err(format!("{error:?}"));
+                }
+                let frame = if i % 2 == 0 {
+                    let mut dst = vec![0u8; zstd_compress_bound(len).unwrap_or(0)];
+                    let size = cctx
+                        .compress2(&mut dst, &data)
+                        .map_err(|error| format!("{error:?}"))?;
+                    dst.truncate(size);
+                    dst
+                } else {
+                    stream(&mut cctx, &data, seed)?
+                };
+                Ok((frame, cctx.nb_overflow_corrections()))
+            })
+            .collect();
+        OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(false));
+        match (&frames[0], &frames[1]) {
+            (Ok((want, 0)), Ok((got, lowered))) => {
+                corrections += lowered;
+                if want != got {
+                    problems.push(format!(
+                        "{len} bytes at level {level}, window log {window_log}, {}: \
+                         the frames differ after {lowered} corrections",
+                        if i % 2 == 0 { "one call" } else { "streaming" }
+                    ));
+                }
+                let mut back = vec![0u8; len];
+                if decompress(&mut back, got).ok() != Some(len) || back != data {
+                    problems.push(format!("{len} bytes: does not decode back"));
+                }
+            }
+            other => problems.push(format!("{len} bytes at level {level}: {other:?}")),
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    eprintln!("{corrections} corrections");
+    assert!(corrections > 100, "only {corrections} corrections");
 }

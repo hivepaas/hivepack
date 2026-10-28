@@ -856,6 +856,96 @@ static void compress(char** args, int nargs)
     puts(line_out);
 }
 
+static unsigned long long fnv64(const unsigned char* bytes, size_t n);
+
+/* A new compression context through steps of three numbers, op a b, over
+ * `input` and `output` (of capacity `cap`), from where the last step left
+ * them:
+ *   0, 1, 2: ZSTD_compressStream2 with ZSTD_e_continue, _flush, _end, the
+ *            input up to a more bytes, the output up to b more;
+ *   3: ZSTD_compressStream, 4: ZSTD_flushStream, 5: ZSTD_endStream;
+ *   6: ZSTD_compress2 of the next a bytes into the next b;
+ *   7: ZSTD_CCtx_setParameter(a, b); 8: ZSTD_CCtx_reset(a);
+ *   9: ZSTD_CCtx_setPledgedSrcSize(a, or unknown if a < 0);
+ *   10: ZSTD_compressStream2 with ZSTD_e_continue, the input up to a more
+ *       bytes, its position moved b further, and all the room left.
+ * Answers each step's result (s for success of 7 to 9) with the positions,
+ * then a hash of the output. After an error of a compression call, the
+ * session is reset, as a context must be before it is used again; but for
+ * buffers not as stable as promised, which is found before anything
+ * changes. */
+static void cstream(char** args, int nargs)
+{
+    static long long steps[3 * 4096];
+    ZSTD_CCtx* cctx;
+    size_t cap, r, inPos = 0, outPos = 0;
+    long n, nsteps, i;
+    char text[80];
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    cap = strtoul(args[0], NULL, 10);
+    nsteps = parse_list(args[1], steps, 3 * 4096);
+    if (cap > MAX_BYTES || nsteps < 0 || nsteps % 3) { puts("bad"); return; }
+    cctx = ZSTD_createCCtx();
+    line_reset();
+    line_append("ok", 2);
+    for (i = 0; i < nsteps; i += 3) {
+        long long const op = steps[i], a = steps[i + 1], b = steps[i + 2];
+        size_t const inEnd = inPos + (size_t)(a < 0 ? 0 : a);
+        size_t const outEnd = outPos + (size_t)(b < 0 ? 0 : b);
+        ZSTD_inBuffer in;
+        ZSTD_outBuffer out;
+        in.src = input;
+        in.size = inEnd < (size_t)n ? inEnd : (size_t)n;
+        in.pos = inPos;
+        out.dst = output;
+        out.size = outEnd < cap ? outEnd : cap;
+        out.pos = outPos;
+        switch (op) {
+        case 0: case 1: case 2:
+            r = ZSTD_compressStream2(cctx, &out, &in, (ZSTD_EndDirective)op);
+            break;
+        case 3: r = ZSTD_compressStream(cctx, &out, &in); break;
+        case 4: r = ZSTD_flushStream(cctx, &out); break;
+        case 5: r = ZSTD_endStream(cctx, &out); break;
+        case 6:
+            r = ZSTD_compress2(cctx, output + outPos, out.size - outPos, input + inPos,
+                               in.size - inPos);
+            if (!ZSTD_isError(r)) { in.pos = in.size; out.pos = outPos + r; }
+            break;
+        case 10:
+            in.pos = inPos + (size_t)b < in.size ? inPos + (size_t)b : in.size;
+            out.size = cap;
+            r = ZSTD_compressStream2(cctx, &out, &in, ZSTD_e_continue);
+            break;
+        case 7: r = ZSTD_CCtx_setParameter(cctx, (ZSTD_cParameter)a, (int)b); break;
+        case 8: r = ZSTD_CCtx_reset(cctx, (ZSTD_ResetDirective)a); break;
+        case 9:
+            r = ZSTD_CCtx_setPledgedSrcSize(cctx, a < 0 ? ZSTD_CONTENTSIZE_UNKNOWN
+                                                        : (unsigned long long)a);
+            break;
+        default: ZSTD_freeCCtx(cctx); puts("bad"); return;
+        }
+        inPos = in.pos;
+        outPos = out.pos;
+        if (ZSTD_isError(r) && (op <= 6 || op == 10)
+            && ERR_getErrorCode(r) != ZSTD_error_stabilityCondition_notRespected)
+            ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
+        if (ZSTD_isError(r))
+            snprintf(text, sizeof(text), " e%d/%u/%u", (int)ERR_getErrorCode(r),
+                     (unsigned)inPos, (unsigned)outPos);
+        else if (op >= 7 && op <= 9)
+            snprintf(text, sizeof(text), " s");
+        else
+            snprintf(text, sizeof(text), " %u/%u/%u", (unsigned)r, (unsigned)inPos,
+                     (unsigned)outPos);
+        line_append(text, strlen(text));
+    }
+    ZSTD_freeCCtx(cctx);
+    snprintf(text, sizeof(text), " %016llx", fnv64(output, outPos));
+    line_append(text, strlen(text));
+    puts(line_out);
+}
+
 /* ---- A block's entropy coding ---- */
 
 static ZSTD_entropyCTables_t seq_entropy[2];
@@ -1190,6 +1280,7 @@ int main(void)
         else if (!strcmp(command, "hufreadctable")) hufreadctable(args, nargs);
         else if (!strcmp(command, "seqreset")) seqreset(nargs);
         else if (!strcmp(command, "compress")) compress(args, nargs);
+        else if (!strcmp(command, "cstream")) cstream(args, nargs);
         else if (!strcmp(command, "seqblock")) seqblock(args, nargs);
         else puts("bad");
         fflush(stdout);

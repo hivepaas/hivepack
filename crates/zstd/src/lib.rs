@@ -4,9 +4,11 @@
 //! Work in progress: decompression works, of whole frames in one call
 //! ([`decompress`], [`DCtx::decompress`]) or streaming
 //! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`].
-//! Compression works in one call ([`compress`], [`CCtx::compress`]) at the
-//! levels up to 3, giving the frames libzstd gives; the other levels,
-//! dictionaries and streaming come next. The plan, and the rules the port
+//! Compression works at the levels up to 3, in one call ([`compress`],
+//! [`CCtx::compress`], [`CCtx::compress2`]) or streaming
+//! ([`CCtx::compress_stream2`]), with libzstd's parameters
+//! ([`CCtx::set_parameter`]), giving the frames libzstd gives; the other
+//! levels and dictionaries come next. The plan, and the rules the port
 //! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
 //!
 //! ```
@@ -17,6 +19,43 @@
 //! let mut out = vec![0; data.len()];
 //! assert_eq!(hivepack_zstd::decompress(&mut out, &frame[..size])?, data.len());
 //! assert_eq!(&out, data);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Compressing as a stream, with a checksum:
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_zstd::Error> {
+//! use hivepack_zstd::{CCtx, CParameter, EndDirective, InBuffer, OutBuffer};
+//!
+//! let mut cctx = CCtx::new();
+//! cctx.set_parameter(CParameter::CompressionLevel(1))?;
+//! cctx.set_parameter(CParameter::ChecksumFlag(true))?;
+//! let mut frame = Vec::new();
+//! let mut piece = vec![0; hivepack_zstd::cstream_out_size()];
+//! for chunk in [&b"hello, "[..], b"hello, ", b"hello"] {
+//!     let mut input = InBuffer::new(chunk);
+//!     while input.pos < chunk.len() {
+//!         let mut output = OutBuffer::new(&mut piece);
+//!         cctx.compress_stream2(&mut output, &mut input, EndDirective::Continue)?;
+//!         let written = output.pos;
+//!         frame.extend_from_slice(&piece[..written]);
+//!     }
+//! }
+//! // End the frame: until nothing is left to write out.
+//! loop {
+//!     let mut output = OutBuffer::new(&mut piece);
+//!     let remaining = cctx.end_stream(&mut output)?;
+//!     let written = output.pos;
+//!     frame.extend_from_slice(&piece[..written]);
+//!     if remaining == 0 {
+//!         break;
+//!     }
+//! }
+//! let mut out = vec![0; 19];
+//! assert_eq!(hivepack_zstd::decompress(&mut out, &frame)?, 19);
+//! assert_eq!(&out, b"hello, hello, hello");
 //! # Ok(())
 //! # }
 //! ```
@@ -92,8 +131,10 @@ mod oracle_compress;
 
 pub use common::error_private::{Error, ErrorCode, Result};
 pub use compress::zstd_compress::{
-    CCtx, compress, compress_bound, default_c_level, max_c_level, min_c_level,
+    CCtx, CParameter, CParameterKind, EndDirective, compress, compress_bound, cstream_in_size,
+    cstream_out_size, default_c_level, max_c_level, min_c_level,
 };
+pub use compress::zstd_compress_internal::{ParamSwitch, Strategy};
 pub use decompress::zstd_ddict::{DDict, DictContentType};
 pub use decompress::zstd_decompress::{
     BLOCKSIZE_MAX_MIN, ContentSize, DParameter, DParameterKind, FRAMEHEADER_SIZE_MAX,

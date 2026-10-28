@@ -4,17 +4,16 @@
 //! data is compressed in `tests/compress.rs`.
 
 use crate::compress::zstd_compress::{
-    CCtx, CParamMode, CParameter, EndDirective, zstd_compress_bound, zstd_get_cparams_internal,
+    CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_level_ported,
 };
-use crate::compress::zstd_compress_internal::{OVERFLOW_CORRECT_FREQUENTLY, Strategy};
+use crate::compress::zstd_compress_internal::OVERFLOW_CORRECT_FREQUENTLY;
 use crate::decompress::zstd_decompress::decompress;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer};
 use crate::oracle::Rng;
 
 /// Whether `level` compresses `len` bytes with a strategy the port has.
-fn is_fast(level: i32, len: usize) -> bool {
-    zstd_get_cparams_internal(level, len as u64, 0, CParamMode::NoAttachDict).strategy
-        <= Strategy::Dfast
+fn is_ported(level: i32, len: usize) -> bool {
+    zstd_level_ported(level, len as u64)
 }
 
 /// Compresses `data` with the port and libzstd, and checks they agree and
@@ -45,7 +44,7 @@ fn check(cctx: &mut CCtx, data: &[u8], level: i32) -> Option<String> {
 }
 
 #[test]
-fn frames_match_libzstd_at_fast_levels() {
+fn frames_match_libzstd_at_the_levels_ported() {
     let mut rng = Rng::new(0x5EED_0201);
     let mut cctx = CCtx::new();
     let mut problems = Vec::new();
@@ -69,8 +68,10 @@ fn frames_match_libzstd_at_fast_levels() {
                 data
             }
         };
-        let level = [-1, -3, -20, -1000, -131_072, 1, 1, 2, 3, 3, 4][rng.range(0, 10) as usize];
-        if !is_fast(level, len) {
+        let level = [
+            -1, -3, -20, -1000, -131_072, 1, 1, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 19,
+        ][rng.range(0, 21) as usize];
+        if !is_ported(level, len) {
             continue;
         }
         if let Some(problem) = check(&mut cctx, &data, level) {

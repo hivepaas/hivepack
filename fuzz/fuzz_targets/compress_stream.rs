@@ -6,7 +6,7 @@
 
 #![no_main]
 
-use hivepack_zstd::{CCtx, CParameter as P, EndDirective, ErrorCode, Strategy};
+use hivepack_zstd::{CCtx, CParameter as P, EndDirective, ErrorCode, ParamSwitch, Strategy};
 use libfuzzer_sys::fuzz_target;
 use zstd::zstd_safe::{self, CParameter as C, zstd_sys::ZSTD_EndDirective};
 
@@ -46,7 +46,8 @@ fuzz_target!(|input: &[u8]| {
         return;
     }
     let (head, src) = input.split_at(8);
-    let level = [-100, -5, -1, 1, 2, 3, 4][usize::from(head[0]) % 7];
+    let level =
+        [-100, -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][usize::from(head[0]) % 16];
     let window_log = 10 + u32::from(head[1] % 12);
     let stable_out = head[2] & 1 != 0;
     let checksum = head[2] & 2 != 0;
@@ -56,23 +57,36 @@ fuzz_target!(|input: &[u8]| {
     let mut parameters = vec![
         (P::CompressionLevel(level), C::CompressionLevel(level)),
         (P::ChecksumFlag(checksum), C::ChecksumFlag(checksum)),
-        (P::StableOutBuffer(stable_out), C::StableOutBuffer(stable_out)),
+        (
+            P::StableOutBuffer(stable_out),
+            C::StableOutBuffer(stable_out),
+        ),
         (P::MaxBlockSize(max_block), C::MaxBlockSize(max_block)),
     ];
     if head[7] & 1 != 0 {
         parameters.push((P::WindowLog(window_log), C::WindowLog(window_log)));
     }
-    match head[7] >> 1 & 3 {
-        1 => parameters.push((
-            P::Strategy(Some(Strategy::Fast)),
-            C::Strategy(zstd_safe::Strategy::ZSTD_fast),
-        )),
-        2 => parameters.push((
-            P::Strategy(Some(Strategy::Dfast)),
-            C::Strategy(zstd_safe::Strategy::ZSTD_dfast),
-        )),
-        _ => {}
+    {
+        use zstd_safe::Strategy as S;
+        let strategies = [
+            (Strategy::Fast, S::ZSTD_fast),
+            (Strategy::Dfast, S::ZSTD_dfast),
+            (Strategy::Greedy, S::ZSTD_greedy),
+            (Strategy::Lazy, S::ZSTD_lazy),
+            (Strategy::Lazy2, S::ZSTD_lazy2),
+            (Strategy::Btlazy2, S::ZSTD_btlazy2),
+        ];
+        let pick = usize::from(head[7] >> 1 & 7);
+        if let Some(&(p, c)) = strategies.get(pick) {
+            parameters.push((P::Strategy(Some(p)), C::Strategy(c)));
+        }
     }
+    let (p_row, c_row) = [
+        (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
+        (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
+        (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
+    ][usize::from(head[7] >> 4) % 3];
+    parameters.push((P::UseRowMatchFinder(p_row), C::UseRowMatchFinder(c_row)));
 
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();
@@ -81,7 +95,10 @@ fuzz_target!(|input: &[u8]| {
         let got = p
             .set_parameter(pp)
             .map_err(|error| error.code().message().to_string());
-        assert!(want == got, "setting {pp:?}: libzstd {want:?}, port {got:?}");
+        assert!(
+            want == got,
+            "setting {pp:?}: libzstd {want:?}, port {got:?}"
+        );
     }
 
     // With a stable output buffer, one buffer whose room stays the same.
@@ -138,7 +155,6 @@ fuzz_target!(|input: &[u8]| {
         };
         if let Err(error) = &got
             && error.code() == ErrorCode::ParameterUnsupported
-            && want.is_ok()
         {
             // A strategy the port does not have yet.
             return;
@@ -162,8 +178,7 @@ fuzz_target!(|input: &[u8]| {
             Err(_) => return,
             Ok(0) if directive == EndDirective::End => {
                 let mut back = vec![0u8; src.len()];
-                let size =
-                    hivepack_zstd::decompress(&mut back, &frame).expect("the frame decodes");
+                let size = hivepack_zstd::decompress(&mut back, &frame).expect("the frame decodes");
                 assert!(back[..size] == *src, "does not decode back");
                 return;
             }

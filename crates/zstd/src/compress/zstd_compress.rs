@@ -495,6 +495,26 @@ pub(crate) fn zstd_resolve_row_match_finder_mode(
     }
 }
 
+/// Whether the port has the match finder a frame with `c_params` needs,
+/// the use of the row match finder resolved. The context refuses the
+/// others with `ParameterUnsupported`.
+pub(crate) fn zstd_strategy_ported(
+    c_params: &CompressionParameters,
+    use_row_match_finder: ParamSwitch,
+) -> bool {
+    c_params.strategy <= Strategy::Lazy2
+        && !zstd_row_match_finder_used(c_params.strategy, use_row_match_finder)
+}
+
+/// Whether the port has the match finder `ZSTD_compressCCtx` takes at
+/// `level` for `src_size` bytes.
+#[cfg(test)]
+pub(crate) fn zstd_level_ported(level: i32, src_size: u64) -> bool {
+    let c_params = zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict);
+    let row = zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params);
+    zstd_strategy_ported(&c_params, row)
+}
+
 /// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for
 /// `dfast`, its short hash table).
 fn zstd_allocate_chain_table(strategy: Strategy, use_row_match_finder: ParamSwitch) -> bool {
@@ -1206,9 +1226,7 @@ impl CCtx {
         pledged_src_size: u64,
         buffered: bool,
     ) -> Result<()> {
-        if params.c_params.strategy >= Strategy::Btlazy2
-            || zstd_row_match_finder_used(params.c_params.strategy, params.use_row_match_finder)
-        {
+        if !zstd_strategy_ported(&params.c_params, params.use_row_match_finder) {
             return error!(ParameterUnsupported);
         }
         self.is_first_block = true;

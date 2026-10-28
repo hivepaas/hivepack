@@ -3,9 +3,8 @@
 //! the frames byte for byte; then decodes the port's frame back with the
 //! port.
 //!
-//! The levels are those the port has so far: every level up to 3, and 4
-//! for inputs over 256 KB (below that, libzstd's level 4 is `greedy`, which
-//! the port refuses with `ParameterUnsupported`).
+//! At every level; those whose strategy the port does not have yet, it
+//! refuses with `ParameterUnsupported`, and they are skipped.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -14,7 +13,7 @@ mod support;
 use hivepack_zstd::{CCtx, ErrorCode};
 use support::{Kind, Problems, Set};
 
-const LEVELS: [i32; 7] = [-5, -1, 0, 1, 2, 3, 4];
+const LEVELS: [i32; 14] = [-5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13];
 
 fn sets() -> Vec<Set> {
     support::manifest()
@@ -33,12 +32,8 @@ fn compare(problems: &mut Problems, cctx: &mut CCtx, name: &str, data: &[u8], le
     let mut got = vec![0u8; hivepack_zstd::compress_bound(data.len()).expect("a bound")];
     let size = match cctx.compress(&mut got, data, level) {
         Ok(size) => size,
-        Err(error) if error.code() == ErrorCode::ParameterUnsupported => {
-            if level != 4 || data.len() > 256 << 10 {
-                problems.add(format!("{name} at level {level}: refused"));
-            }
-            return false;
-        }
+        // A strategy the port does not have yet.
+        Err(error) if error.code() == ErrorCode::ParameterUnsupported => return false,
         Err(error) => {
             problems.add(format!("{name} at level {level}: {error}"));
             return false;

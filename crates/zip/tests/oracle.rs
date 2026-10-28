@@ -27,12 +27,18 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hivepack_deflate::crc32;
+use hivepack_deflate::{
+    Deflate, Flush as DeflateFlush, InBuffer, OutBuffer, Status as DeflateStatus, crc32,
+};
 use hivepack_zip::{Archive, ArchiveFlags, Error, Flags, OpenFlags, ReadAt};
 use support::{Oracle, Rng, damage, hex, recorded_form, repository, unhex};
 
 fn recorded_path() -> PathBuf {
     repository().join("testdata/oracle/zip-open.txt")
+}
+
+fn recorded_read_path() -> PathBuf {
+    repository().join("testdata/oracle/zip-read.txt")
 }
 
 fn error_text(e: Error) -> String {
@@ -149,11 +155,101 @@ fn describe<R: ReadAt>(result: hivepack_zip::Result<Archive<R>>) -> String {
     text
 }
 
-/// The port's answer to an `open` request, in the oracle's format.
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// The oracle's answer to a `read` request: every entry read in pieces of
+/// `chunks`, up to `limit` bytes, then closed.
+fn read_entries<R: ReadAt>(
+    result: hivepack_zip::Result<Archive<R>>,
+    fflags: u32,
+    chunks: &str,
+    limit: i64,
+) -> String {
+    let za = match result {
+        Ok(za) => za,
+        Err(e) => return error_text(e),
+    };
+    let chunks: Vec<i64> = chunks.split(',').map(|c| c.parse().unwrap()).collect();
+    let n = za.get_num_entries(Flags::NONE);
+    let mut text = format!("ok {n}");
+    let mut buffer = vec![0u8; 1 << 20];
+    for i in 0..n {
+        text.push_str(" |");
+        let mut zf = match za.fopen_index(i, Flags(fflags)) {
+            Ok(zf) => zf,
+            Err(e) => {
+                text.push_str(&error_text(e));
+                continue;
+            }
+        };
+        let (mut data_hash, mut returns_hash) = (0xcbf2_9ce4_8422_2325, 0xcbf2_9ce4_8422_2325);
+        let (mut total, mut reads, mut next) = (0i64, 0, 0);
+        let mut end = "eof".to_string();
+        loop {
+            let mut want = chunks[next];
+            next = (next + 1) % chunks.len();
+            if limit >= 0 && want > limit - total {
+                want = limit - total;
+            }
+            if limit >= 0 && want == 0 {
+                end = "limit".into();
+                break;
+            }
+            reads += 1;
+            match zf.fread(&mut buffer[..want as usize]) {
+                Err(e) => {
+                    returns_hash = fnv(returns_hash, b"-1,");
+                    end = error_text(e);
+                    break;
+                }
+                Ok(got) => {
+                    returns_hash = fnv(returns_hash, format!("{got},").as_bytes());
+                    if got == 0 {
+                        break;
+                    }
+                    data_hash = fnv(data_hash, &buffer[..got]);
+                    total += got as i64;
+                }
+            }
+        }
+        let close = match zf.fclose() {
+            Ok(()) => 0,
+            Err(e) => e.code().number(),
+        };
+        let _ = write!(
+            text,
+            "{total}/{data_hash:016x}/{reads}/{returns_hash:016x}/{end}/{close}"
+        );
+    }
+    text
+}
+
+/// The port's answer to a request, in the oracle's format.
+fn respond<R: ReadAt>(words: &[&str], result: hivepack_zip::Result<Archive<R>>) -> String {
+    match words[0] {
+        "open" => describe(result),
+        _ => read_entries(
+            result,
+            words[3].parse().unwrap(),
+            words[4],
+            words[5].parse().unwrap(),
+        ),
+    }
+}
+
+/// The port's answer to an `open` or `read` request, in the oracle's
+/// format.
 fn answer(request: &str) -> String {
     let words: Vec<&str> = request.split(' ').collect();
-    let [_, flags, kind, data] = words[..] else {
-        panic!("{request:.100}")
+    let (flags, kind, data) = match words[..] {
+        ["open", flags, kind, data] => (flags, kind, data),
+        ["read", flags, kind, _, _, _, data] => (flags, kind, data),
+        _ => panic!("{request:.100}"),
     };
     let flags = OpenFlags(flags.parse().unwrap());
     let data = unhex(data);
@@ -166,11 +262,11 @@ fn answer(request: &str) -> String {
         ));
         std::fs::write(&path, &data).unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let text = describe(Archive::open(file, flags));
+        let text = respond(&words, Archive::open(file, flags));
         let _ = std::fs::remove_file(&path);
         text
     } else {
-        describe(Archive::open(data.as_slice(), flags))
+        respond(&words, Archive::open(data.as_slice(), flags))
     }
 }
 
@@ -322,10 +418,56 @@ fn other_fields(rng: &mut Rng) -> Vec<u8> {
     out
 }
 
+/// The uncompressed data of an entry: text, runs or random bytes.
+fn plain(rng: &mut Rng) -> Vec<u8> {
+    let len = rng.pick(&[0usize, 1, 5, 12, 40, 300, 3000, 20_000]);
+    match rng.below(3) {
+        0 => (0..len).map(|_| rng.next() as u8).collect(),
+        1 => text(rng, len),
+        _ => {
+            let byte = rng.next() as u8;
+            vec![byte; len]
+        }
+    }
+}
+
+/// `plain` as a raw deflate stream, from the port's compressor, which
+/// writes zlib's streams.
+fn deflated(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
+    let level = rng.below(10) as i32;
+    let mut stream = Deflate::new(level, -15, 8, 0).unwrap();
+    let mut out = vec![0; stream.bound(plain.len() as u64) as usize];
+    let mut output = OutBuffer::new(&mut out);
+    let ret = stream.deflate(&mut output, &mut InBuffer::new(plain), DeflateFlush::Finish);
+    assert_eq!(ret, Ok(DeflateStatus::StreamEnd));
+    let written = output.pos;
+    out.truncate(written);
+    out
+}
+
 fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
     let name = name(rng, earlier);
-    let data_len = rng.pick(&[0usize, 1, 5, 12, 40]);
-    let data: Vec<u8> = (0..data_len).map(|_| rng.next() as u8).collect();
+    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 99, 14, 93]);
+    let plain = plain(rng);
+    let data = match method {
+        0 => plain.clone(),
+        8 => {
+            let mut data = deflated(rng, &plain);
+            match rng.below(12) {
+                // Cut short, garbage after it, or a byte changed.
+                0 => data.truncate(rng.below(data.len() as u64 + 1) as usize),
+                1 => data.extend((0..1 + rng.below(4)).map(|_| rng.next() as u8)),
+                2 if !data.is_empty() => {
+                    let at = rng.below(data.len() as u64) as usize;
+                    data[at] ^= 1 << rng.below(8);
+                }
+                _ => {}
+            }
+            data
+        }
+        _ => (0..plain.len().min(40)).map(|_| rng.next() as u8).collect(),
+    };
+    let data_len = data.len();
     let mut gpbf = 0u16;
     if rng.below(3) == 0 {
         gpbf |= 0x0800;
@@ -339,17 +481,17 @@ fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
             gpbf |= 0x0040;
         }
     }
-    let method = rng.pick(&[0u16, 0, 0, 8, 8, 9, 12, 99, 14, 93]);
     let encrypted_header = if gpbf & 1 != 0 { 12 } else { 0 };
-    let usize = match rng.below(5) {
+    let usize = match rng.below(10) {
         0 => rng.next() as u32 % 100,
+        1 => plain.len() as u32 + 1,
         _ if method == 0 => (data_len as u32).saturating_sub(encrypted_header),
-        _ => data_len as u32 * 3,
+        _ => plain.len() as u32,
     };
-    let crc = if rng.below(4) == 0 {
+    let crc = if rng.below(8) == 0 {
         rng.next() as u32
     } else {
-        crc32(0, &data)
+        crc32(0, &plain)
     };
     let time = rng.next() as u16;
     let date = rng.next() as u16;
@@ -734,6 +876,36 @@ fn requests(rng: &mut Rng, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// `count` read requests on generated archives, some damaged: in pieces of
+/// every size, with each flag that changes what is read, sometimes stopping
+/// early.
+fn read_requests(rng: &mut Rng, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            let mut zip = archive(rng);
+            if rng.below(6) == 0 {
+                zip = damage(rng, &zip);
+            }
+            format!("read {} {}", read_parameters(rng), hex(&zip))
+        })
+        .collect()
+}
+
+/// The flags, source, file flags, pieces and limit of a read request.
+fn read_parameters(rng: &mut Rng) -> String {
+    let flags = rng.pick(&[0, 4]);
+    let kind = if rng.below(10) == 0 { "f" } else { "b" };
+    // 0, ZIP_FL_COMPRESSED, ZIP_FL_ENCRYPTED, ZIP_FL_UNCHANGED
+    let fflags = rng.pick(&[0, 0, 0, 4, 32, 8]);
+    let chunks = rng.pick(&["8192", "1", "7,100", "65536", "3,5000,1", "20000"]);
+    let limit = match rng.below(5) {
+        0 => rng.below(100) as i64,
+        1 => rng.pick(&[5, 12, 40, 300, 3000, 20_000]),
+        _ => -1,
+    };
+    format!("{flags} {kind} {fflags} {chunks} {limit}")
+}
+
 /// libzip's test archives, where the libzip sources are fetched.
 fn regress_archives() -> Vec<(String, Vec<u8>)> {
     let cache = std::env::var_os("HIVEPACK_TESTDATA")
@@ -790,6 +962,45 @@ fn regress_archives_match_libzip() {
 }
 
 #[test]
+fn regress_archives_read_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x2400_0001);
+    for (name, data) in &regress_archives() {
+        if data.len() > 1 << 20 {
+            continue;
+        }
+        for parameters in [
+            "0 b 0 8192 -1",
+            "4 b 0 8192 -1",
+            "0 f 4 100 -1",
+            "0 b 0 1 -1",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([read_parameters(&mut rng)])
+        {
+            let request = format!("read {parameters} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_eq!(answer(&request), want, "{name}: read {parameters}");
+        }
+    }
+}
+
+#[test]
+fn generated_archives_read_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x2400_0002);
+    for request in read_requests(&mut rng, 800) {
+        let want = oracle.ask(&request);
+        assert_eq!(answer(&request), want, "{request:.400}");
+    }
+}
+
+#[test]
 fn generated_archives_match_libzip() {
     let Some(mut oracle) = Oracle::spawn() else {
         return;
@@ -799,6 +1010,73 @@ fn generated_archives_match_libzip() {
         let want = oracle.ask(&request);
         assert_eq!(answer(&request), want, "{request:.400}");
     }
+}
+
+/// Replays the answers recorded in `path`.
+fn replay(path: &PathBuf, at_least: usize) {
+    let text = std::fs::read_to_string(path).expect("the recorded answers");
+    let mut checked = 0;
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        assert_eq!(recorded_form(&answer(request)), want, "{request:.300}");
+        checked += 1;
+    }
+    assert!(checked > at_least, "only {checked} recorded answers");
+}
+
+/// Writes libzip's answers to `requests` into `path`, but for the long
+/// ones (past `max_len`), and, with `errors_kept` n, only every nth archive
+/// libzip refuses or finds empty.
+fn record(
+    path: &PathBuf,
+    what: &str,
+    test: &str,
+    requests: Vec<String>,
+    max_len: usize,
+    errors_kept: usize,
+) {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = format!(
+        "# {what} from libzip 1.12.1 (tools/zip-oracle), replayed by crates/zip/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-zip --test oracle {test} -- --ignored\n"
+    );
+    let mut refused = 0;
+    for request in requests {
+        if request.len() > max_len {
+            continue;
+        }
+        let reply = oracle.ask(&request);
+        if !reply.contains(" |") {
+            refused += 1;
+            if refused % errors_kept != 0 {
+                continue;
+            }
+        }
+        let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
+    }
+    std::fs::write(path, text).expect("written");
+}
+
+#[test]
+fn port_reads_as_recorded() {
+    replay(&recorded_read_path(), 300);
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/zip-read.txt from the oracle"]
+fn record_read_answers() {
+    let mut rng = Rng(0x2400_0003);
+    record(
+        &recorded_read_path(),
+        "Reads",
+        "record_read_answers",
+        read_requests(&mut rng, 2500),
+        5_000,
+        5,
+    );
 }
 
 #[test]

@@ -32,6 +32,18 @@
  *                                                of its last part with
  *                                                ZIP_FL_NODIR, and of the raw
  *                                                name with ZIP_FL_ENC_RAW
+ *
+ *   read <flags> <source> <fflags> <chunks> <limit> <hex>
+ *       Opens the archive as open does, then reads every entry: zip_fopen_index
+ *       with <fflags>, zip_fread in pieces of the comma-separated <chunks>
+ *       sizes, taken in turn, until it returns 0 or fails, or <limit> bytes
+ *       are read (unless <limit> is -1), then zip_fclose. Answered with the
+ *       error of opening the archive, or "ok <entries>", then for each entry
+ *       " |" and the error of zip_fopen_index, or
+ *       "<bytes>/<hash of the data>/<reads>/<hash of what each returned>/
+ *       <end>/<zip_fclose>": <end> is "eof", "limit" or the error, and the
+ *       hashes are FNV-1a, the second of the returns written in decimal, each
+ *       followed by a comma.
  */
 
 #include <stdio.h>
@@ -68,6 +80,15 @@ static void put_hex(const unsigned char *bytes, size_t len) {
     }
     for (i = 0; i < len; i++)
         printf("%02x", bytes[i]);
+}
+
+static unsigned long long fnv64(unsigned long long hash, const unsigned char *bytes, size_t len) {
+    size_t i;
+    for (i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= 0x00000100000001b3ULL;
+    }
+    return hash;
 }
 
 static void put_error(const zip_error_t *error) {
@@ -120,6 +141,116 @@ static void put_locate(zip_t *za, const char *name, zip_flags_t flags) {
         printf("%lld", (long long)index);
     else
         put_error(zip_get_error(za));
+}
+
+/* Opens <hex> as an archive with <flags> | ZIP_RDONLY, from a buffer or a
+ * temporary file; NULL with the error printed if libzip refuses it. */
+static zip_t *open_archive(int flags, const char *kind, unsigned char *data, size_t len, char *path,
+                           int *made_file) {
+    zip_error_t error;
+    zip_source_t *src;
+    zip_t *za;
+
+    zip_error_init(&error);
+    if (strcmp(kind, "f") == 0) {
+        int fd = mkstemp(path);
+        if (fd < 0 || write(fd, data, len) != (ssize_t)len) {
+            puts("bad");
+            return NULL;
+        }
+        close(fd);
+        *made_file = 1;
+        src = zip_source_file_create(path, 0, -1, &error);
+    }
+    else {
+        src = zip_source_buffer_create(data, len, 0, &error);
+    }
+    if (src == NULL) {
+        put_error(&error);
+        putchar('\n');
+        zip_error_fini(&error);
+        return NULL;
+    }
+    za = zip_open_from_source(src, flags | ZIP_RDONLY, &error);
+    if (za == NULL) {
+        zip_source_free(src);
+        put_error(&error);
+        putchar('\n');
+    }
+    zip_error_fini(&error);
+    return za;
+}
+
+static void do_read(int flags, const char *kind, int fflags, const char *chunks, long long limit,
+                    const char *data_hex) {
+    size_t len;
+    unsigned char *data = unhex(data_hex, &len);
+    char path[] = "/tmp/zip-oracle-XXXXXX";
+    int made_file = 0;
+    zip_t *za = open_archive(flags, kind, data, len, path, &made_file);
+    zip_uint64_t i, n;
+    unsigned char *buffer = malloc(1 << 20);
+
+    if (za == NULL)
+        goto done;
+    n = (zip_uint64_t)zip_get_num_entries(za, 0);
+    printf("ok %llu", (unsigned long long)n);
+    for (i = 0; i < n; i++) {
+        zip_file_t *zf = zip_fopen_index(za, i, (zip_flags_t)fflags);
+        unsigned long long data_hash = 0xcbf29ce484222325ULL, returns_hash = 0xcbf29ce484222325ULL;
+        long long total = 0, reads = 0;
+        const char *chunk = chunks;
+        const char *end = "eof";
+        zip_error_t read_error;
+        int failed = 0;
+
+        printf(" |");
+        if (zf == NULL) {
+            put_error(zip_get_error(za));
+            continue;
+        }
+        for (;;) {
+            char text[32];
+            zip_int64_t got;
+            long long want = strtoll(chunk, NULL, 10);
+            chunk = strchr(chunk, ',') ? strchr(chunk, ',') + 1 : chunks;
+            if (limit >= 0 && want > limit - total)
+                want = limit - total;
+            if (limit >= 0 && want == 0) {
+                end = "limit";
+                break;
+            }
+            got = zip_fread(zf, buffer, (zip_uint64_t)want);
+            reads++;
+            snprintf(text, sizeof(text), "%lld,", (long long)got);
+            returns_hash = fnv64(returns_hash, (const unsigned char *)text, strlen(text));
+            if (got < 0) {
+                zip_error_init(&read_error);
+                zip_error_set(&read_error, zip_error_code_zip(zip_file_get_error(zf)),
+                              zip_error_code_system(zip_file_get_error(zf)));
+                failed = 1;
+                break;
+            }
+            if (got == 0)
+                break;
+            data_hash = fnv64(data_hash, buffer, (size_t)got);
+            total += got;
+        }
+        printf("%lld/%016llx/%lld/%016llx/", total, data_hash, reads, returns_hash);
+        if (failed)
+            put_error(&read_error);
+        else
+            fputs(end, stdout);
+        printf("/%d", zip_fclose(zf));
+    }
+    putchar('\n');
+    zip_discard(za);
+
+done:
+    if (made_file)
+        unlink(path);
+    free(buffer);
+    free(data);
 }
 
 static void do_open(int flags, const char *kind, const char *data_hex) {
@@ -247,7 +378,7 @@ int main(void) {
 
     while (fgets(line, (int)cap, stdin)) {
         size_t n = strlen(line);
-        char *words[4];
+        char *words[7];
         int count = 0;
         char *word;
         while (n == cap - 1 && line[n - 1] != '\n') {
@@ -259,10 +390,12 @@ int main(void) {
         }
         if (n && line[n - 1] == '\n')
             line[--n] = '\0';
-        for (word = strtok(line, " "); word && count < 4; word = strtok(NULL, " "))
+        for (word = strtok(line, " "); word && count < 7; word = strtok(NULL, " "))
             words[count++] = word;
         if (count == 4 && strcmp(words[0], "open") == 0)
             do_open(atoi(words[1]), words[2], words[3]);
+        else if (count == 7 && strcmp(words[0], "read") == 0)
+            do_read(atoi(words[1]), words[2], atoi(words[3]), words[4], atoll(words[5]), words[6]);
         else
             puts("bad");
         fflush(stdout);

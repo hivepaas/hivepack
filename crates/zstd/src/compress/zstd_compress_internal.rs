@@ -649,20 +649,76 @@ const PRIME8BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
 #[inline(always)]
 pub(crate) fn zstd_hash_ptr(src: &[u8], at: usize, h_bits: u32, mls: u32) -> usize {
     debug_assert!(h_bits <= 32);
+    (zstd_hash_top(src, at, mls) >> (64 - h_bits)) as usize
+}
+
+/// The hash of the `mls` bytes at `at` before its shift: the hash `h_bits`
+/// long is the top `h_bits` of it.
+///
+/// Differs from libzstd: `ZSTD_hash4` multiplies on 32 bits and shifts by
+/// `32 - h_bits`. Here the 4 bytes are in the top half of a `u64`, where the
+/// product has the same 32 bits, so that the hashes of every length shift by
+/// `64 - h_bits`, which [`HashTable`] depends on.
+#[inline(always)]
+fn zstd_hash_top(src: &[u8], at: usize, mls: u32) -> u64 {
     match mls {
-        5 => zstd_hash_n::<5>(mem_read64(src, at), PRIME5BYTES, h_bits),
-        6 => zstd_hash_n::<6>(mem_read64(src, at), PRIME6BYTES, h_bits),
-        7 => zstd_hash_n::<7>(mem_read64(src, at), PRIME7BYTES, h_bits),
-        8 => (mem_read64(src, at).wrapping_mul(PRIME8BYTES) >> (64 - h_bits)) as usize,
+        5 => zstd_hash_n::<5>(mem_read64(src, at), PRIME5BYTES),
+        6 => zstd_hash_n::<6>(mem_read64(src, at), PRIME6BYTES),
+        7 => zstd_hash_n::<7>(mem_read64(src, at), PRIME7BYTES),
+        8 => mem_read64(src, at).wrapping_mul(PRIME8BYTES),
         // 4, and anything else
-        _ => (mem_read32(src, at).wrapping_mul(PRIME4BYTES) >> (32 - h_bits)) as usize,
+        _ => (u64::from(mem_read32(src, at)) << 32).wrapping_mul(u64::from(PRIME4BYTES)),
     }
 }
 
-/// `ZSTD_hash5` to `ZSTD_hash7`: the low `N` bytes of `u`.
+/// `ZSTD_hash5` to `ZSTD_hash7`, before the shift: the low `N` bytes of `u`.
 #[inline(always)]
-fn zstd_hash_n<const N: u32>(u: u64, prime: u64, h_bits: u32) -> usize {
-    ((u << (64 - 8 * N)).wrapping_mul(prime) >> (64 - h_bits)) as usize
+fn zstd_hash_n<const N: u32>(u: u64, prime: u64) -> u64 {
+    (u << (64 - 8 * N)).wrapping_mul(prime)
+}
+
+/// A match finder's hash table of `1 << h_bits` entries, and its hashes.
+///
+/// Differs from libzstd: the table is cut once to the entries a hash can
+/// reach, up to `u64::MAX >> shift`, `shift` being the `64 - h_bits` every
+/// hash shifts by. Where the compiler sees how a hash was made, it can then
+/// tell that the hash masked with `len - 1` is in bounds and that the mask
+/// leaves it as it is, and drops both: indexing costs nothing. A hash kept
+/// from one turn of a loop to the next may cost the mask, one `and`,
+/// instead of the check.
+pub(crate) struct HashTable<'a> {
+    table: &'a mut [u32],
+    shift: u32,
+}
+
+impl<'a> HashTable<'a> {
+    /// The first `1 << h_bits` entries of `table`, which has that many.
+    #[inline(always)]
+    pub(crate) fn new(table: &'a mut [u32], h_bits: u32) -> Self {
+        debug_assert!(h_bits <= 32);
+        let shift = 64 - h_bits;
+        let table = &mut table[..=(u64::MAX >> shift) as usize];
+        HashTable { table, shift }
+    }
+
+    /// `ZSTD_hashPtr`: the hash of the `mls` bytes at `at`.
+    #[inline(always)]
+    pub(crate) fn hash(&self, src: &[u8], at: usize, mls: u32) -> usize {
+        (zstd_hash_top(src, at, mls) >> self.shift) as usize
+    }
+
+    /// The entry of `hash`, one of the table's hashes.
+    #[inline(always)]
+    pub(crate) fn get(&self, hash: usize) -> u32 {
+        self.table[hash & (self.table.len() - 1)]
+    }
+
+    /// Sets the entry of `hash`, one of the table's hashes.
+    #[inline(always)]
+    pub(crate) fn set(&mut self, hash: usize, value: u32) {
+        let mask = self.table.len() - 1;
+        self.table[hash & mask] = value;
+    }
 }
 
 /// `ZSTD_count`: how many bytes from `p_in` equal those from `p_match`,

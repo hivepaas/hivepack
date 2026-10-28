@@ -7,8 +7,9 @@
 
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
-    HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore, mem_read32,
-    offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr, zstd_index_overlap_check,
+    HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
+    mem_read32, offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr,
+    zstd_index_overlap_check,
 };
 
 /// `ZSTD_compressBlock_fast_noDict_generic`: the sequences of the block
@@ -96,7 +97,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
         }
     }
 
-    let hash_table = &mut ms.hash_table;
+    let mut hash_table = HashTable::new(&mut ms.hash_table, hlog);
 
     'start: loop {
         // Needs ip0.
@@ -112,10 +113,10 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
             break 'start;
         }
 
-        hash0 = zstd_hash_ptr(src, ip0, hlog, mls);
-        hash1 = zstd_hash_ptr(src, ip1, hlog, mls);
+        hash0 = hash_table.hash(src, ip0, mls);
+        hash1 = hash_table.hash(src, ip1, mls);
 
-        match_idx = hash_table[hash0];
+        match_idx = hash_table.get(hash0);
 
         'search: loop {
             // The repcode match for ip2.
@@ -123,7 +124,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
 
             // Write back the hash table entry.
             current0 = index(ip0);
-            hash_table[hash0] = current0;
+            hash_table.set(hash0, current0);
 
             // Check the repcode at ip2.
             if (mem_read32(src, ip2) == rval) & (rep_offset1 > 0) {
@@ -137,7 +138,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
 
                 // The next hash table entry, already computed. Safe to
                 // write, since ip1 is before the repcode (ip2).
-                hash_table[hash1] = index(ip1);
+                hash_table.set(hash1, index(ip1));
 
                 break 'search;
             }
@@ -145,7 +146,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
             if match_found(ip0, match_idx) {
                 // The next hash table entry, already computed. Safe since
                 // ip1 == ip0 + 1, and the search resumes after ip1.
-                hash_table[hash1] = index(ip1);
+                hash_table.set(hash1, index(ip1));
                 (offcode, match0, m_length) = offset_match(
                     &mut rep_offset1,
                     &mut rep_offset2,
@@ -161,11 +162,11 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
             }
 
             // Look up ip1.
-            match_idx = hash_table[hash1];
+            match_idx = hash_table.get(hash1);
 
             // Hash ip2.
             hash0 = hash1;
-            hash1 = zstd_hash_ptr(src, ip2, hlog, mls);
+            hash1 = hash_table.hash(src, ip2, mls);
 
             // Advance to the next positions.
             ip0 = ip1;
@@ -174,14 +175,14 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
 
             // Write back the hash table entry.
             current0 = index(ip0);
-            hash_table[hash0] = current0;
+            hash_table.set(hash0, current0);
 
             if match_found(ip0, match_idx) {
                 // The next hash table entry, already computed. Not written
                 // if it is at or past where the search will resume: the
                 // shortest match has 4 bytes, so it resumes at ip0 + 4.
                 if step <= 4 {
-                    hash_table[hash1] = index(ip1);
+                    hash_table.set(hash1, index(ip1));
                 }
                 (offcode, match0, m_length) = offset_match(
                     &mut rep_offset1,
@@ -198,11 +199,11 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
             }
 
             // Look up ip1.
-            match_idx = hash_table[hash1];
+            match_idx = hash_table.get(hash1);
 
             // Hash ip2.
             hash0 = hash1;
-            hash1 = zstd_hash_ptr(src, ip2, hlog, mls);
+            hash1 = hash_table.hash(src, ip2, mls);
 
             // Advance to the next positions.
             ip0 = ip1;
@@ -235,8 +236,8 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
         if ip0 <= ilimit {
             // Here because current + 2 could be past iend - 8.
             let at = (i64::from(current0 + 2) - base) as usize;
-            hash_table[zstd_hash_ptr(src, at, hlog, mls)] = current0 + 2;
-            hash_table[zstd_hash_ptr(src, ip0 - 2, hlog, mls)] = index(ip0 - 2);
+            hash_table.set(hash_table.hash(src, at, mls), current0 + 2);
+            hash_table.set(hash_table.hash(src, ip0 - 2, mls), index(ip0 - 2));
 
             if rep_offset2 > 0 {
                 // rep_offset2 == 0 means it is invalid.
@@ -248,7 +249,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
                         zstd_count(src, ip0 + 4, ip0 + 4 - rep_offset2 as usize, iend) + 4;
                     // Swap rep_offset2 and rep_offset1.
                     std::mem::swap(&mut rep_offset1, &mut rep_offset2);
-                    hash_table[zstd_hash_ptr(src, ip0, hlog, mls)] = index(ip0);
+                    hash_table.set(hash_table.hash(src, ip0, mls), index(ip0));
                     ip0 += r_length;
                     seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, r_length);
                     anchor = ip0;

@@ -58,7 +58,7 @@ These are hivepack's own, and each one has its own oracles.
 | Split archives (`.z01`, `.z02`, …, `.zip`) | `check_eocd` and `_zip_read_eocd64` fail with `ZIP_ER_MULTIDISK` | A volume set that reads the segments as one byte space, and a writer that splits. A single segment on its own still fails with `ZIP_ER_MULTIDISK` | minizip-ng, Commons Compress, 7-Zip, Info-ZIP `zip -s` |
 | `.zip.001` volumes | Not a ZIP feature: 7-Zip splits the bytes | The same volume set, joined end to end | 7-Zip |
 | Legacy code pages | `zip_utf-8.c` knows only CP437 | Tables for CP932, CP936, CP949, CP950, CP866, CP1258 and others, chosen by the caller or guessed | 7-Zip `-mcp`, `unzip -O`, libarchive `hdrcharset`, Python `metadata_encoding` |
-| Deflate64 and PPMd | Not among libzip's methods | Deflate64 as a mode of `hivepack-deflate`'s inflater; PPMd later | .NET and Commons Compress test data, 7-Zip |
+| Deflate64 and PPMd | Not among libzip's methods | Deflate64: `hivepack-deflate`'s `InflateBack9`, ported from zlib's `contrib/infback9` (done); PPMd later | .NET and Commons Compress test data, 7-Zip |
 | Writing to a stream | `add_data` seeks back to rewrite the local header, and forces Zip64 when the size is unknown | A streaming writer with data descriptors | Every oracle reads what it writes |
 | Reading a stream | Needs a seekable source | An opt-in streaming reader that checks what it read against the central directory at the end | libarchive's streaming reader |
 | Parallel work | One thread | Entries decompressed in parallel through `ReaderAt`; compressed in parallel and written in order | The single-threaded output, byte for byte |
@@ -81,7 +81,7 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 ## The order of work
 
 1. **CRC-32 and inflate.** The decompressor and checksums of `hivepack-deflate`, ported from zlib 1.3.2 (`crc32.c`; `inflate.c`, `inftrees.c`, `inffast.c`). Nothing compressed can be read before them. Done: see [deflate.md](deflate.md).
-2. **Reading.** Errors, buffers, extra fields, headers, file names, `open.rs`; stored and deflated entries; `tools/zip-oracle`, and `tools/ziptool`'s reading commands. Deflate64.
+2. **Reading.** Errors, buffers, extra fields, headers, file names, `open.rs`; stored and deflated entries; `tools/zip-oracle`, and `tools/ziptool`'s reading commands. Deflate64 entries, whose decoder is done: see [deflate.md](deflate.md).
 3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md).
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto`.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.

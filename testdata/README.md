@@ -4,7 +4,7 @@
 
 - **Committed sets** are in this folder. Each source keeps its license file next to its data.
 - **Fetched sets** are downloaded by `scripts/testdata.py`, checked against the SHA-256 in the manifest, and unpacked into `target/testdata/<set>`. Setting `HIVEPACK_TESTDATA` puts them somewhere else.
-- **Generated sets** are made in the same place by zstd's own `decodecorpus` tool. The script builds it from the zstd 1.5.7 release with zstd's Makefile and the system C compiler.
+- **Generated sets** are made in the same place by zstd's own `decodecorpus` tool, or are the oracle programs in `tools/`. The script builds them from the zstd 1.5.7 and zlib 1.3.2 releases with the system C compiler (and zstd's Makefile for `decodecorpus`).
 
 ```sh
 python3 scripts/testdata.py fetch                  # the core sets: a 16 MB download
@@ -44,7 +44,9 @@ Each set has a `kind`:
 | `zstd-fuzz-*` | zstd's fuzzing corpora for its decoding targets | BSD-3-Clause | fetched, `fuzz` |
 | `silesia` | the Silesia corpus, for benchmarks | none stated | fetched, `bench` |
 | `zstd-oracle` | `tools/zstd-oracle`, built with the zstd 1.5.7 sources: libzstd's internal functions, for comparing the port with them | MIT and BSD-3-Clause | generated |
+| `zlib-1.3.2-source` | the zlib 1.3.2 release, to build the next set from | Zlib | fetched, `generated` |
+| `zlib-oracle` | `tools/zlib-oracle`, built with the zlib 1.3.2 sources: zlib's inflate and deflate, for comparing hivepack-deflate with them | MIT and Zlib | generated |
 
 zstd's `tests/gzip` is GPLv3, and nothing is taken from it.
 
-`oracle/common.txt` holds answers the oracle gave (requests, then libzstd's answer or its FNV-1a hash when long). The port's tests replay them where the oracle cannot be built; `cargo test -p hivepack-zstd record_oracle_answers -- --ignored` rewrites the file. `oracle/compress.txt` does the same for the encoder's requests, and `cargo test -p hivepack-zstd record_compress_answers -- --ignored` rewrites it.
+`oracle/common.txt` holds answers the oracle gave (requests, then libzstd's answer or its FNV-1a hash when long). The port's tests replay them where the oracle cannot be built; `cargo test -p hivepack-zstd record_oracle_answers -- --ignored` rewrites the file. `oracle/compress.txt` does the same for the encoder's requests, and `cargo test -p hivepack-zstd record_compress_answers -- --ignored` rewrites it. `oracle/inflate.txt` holds zlib's answers for hivepack-deflate, and `cargo test -p hivepack-deflate --test oracle record_oracle_answers -- --ignored` rewrites it.

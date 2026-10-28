@@ -20,14 +20,13 @@ The main difference is the stream itself. zlib's `z_stream` holds pointers to th
 
 ## How it is shown
 
-The reference is zlib 1.3.2 itself, built from the sources bundled in `libz-sys` 1.1.30 (its `static` feature, so that a system zlib of another version is never used), called through `flate2`. They are development dependencies only.
+The reference is zlib 1.3.2 itself, reached two ways: built from the sources bundled in `libz-sys` 1.1.30 (its `static` feature, so that a system zlib of another version is never used) and called through `flate2`, both development dependencies only; and `tools/zlib-oracle`, a small C program built from the zlib 1.3.2 release by `scripts/testdata.py`, as `tools/zstd-oracle` is for libzstd.
 
 - **`tests/zlib.rs`** decompresses streams that zlib's own compressor wrote, with the port and with zlib, in the same pieces of input and output, chosen at random from one byte up. Every call must return the same result and message and read and write the same number of bytes, and the output must be the same. The streams are raw, zlib and gzip; at levels 0, 1, 6 and 9; with windows of 512 bytes to 32 KiB; with sync, full and partial flushes in between; with preset dictionaries, right and wrong; decompressed with a smaller window than they need; with a gzip header that has every field; and 2,880 of them damaged, with bytes changed, bits flipped and cut short. The inputs are text, random bytes, runs, matches from up to 40 KiB back, and the uncompressed files in `testdata/zstd/golden-compression`.
+- **`tests/oracle.rs`** reaches what `flate2` cannot: `Flush::Block` and `Flush::Trees`, `data_type`, `inflateMark`, `inflatePrime`, `inflateSync`, `inflateValidate`, dictionaries set at any point, and the gzip header fields, on streams from every level, window, memory level, strategy and flush (`Z_BLOCK` included) of zlib's compressor, some of them damaged. Each request is a stream and a list of calls; the port must answer each call as zlib does: the result, bytes read and written, `data_type`, `inflateMark` and `msg`, then the totals, the check value, a hash of the output and the header. About 1,800 requests are compared with zlib where the oracle is built (Linux and macOS in CI), and `testdata/oracle/inflate.txt` replays 1,173 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
 - **`tests/infcover.rs`** is zlib's own coverage test of inflate, `test/infcover.c`, ported with the same inputs and expected results, including the messages of every data error.
 - **Unit tests** compare the CRC tables with `crc32.h`, build `inffixed.h`'s tables with the ported `inflate_table` as zlib's `makefixed()` does, and check CRC-32 and Adler-32, combined or not, against their definitions.
 - **`fuzz/fuzz_targets/inflate.rs`** does what `tests/zlib.rs` does with the fuzzer's input as the stream (see [fuzz/README.md](../fuzz/README.md)).
-
-What `flate2` cannot reach is not compared with zlib call by call yet: `Flush::Block` and `Flush::Trees`, `data_type`, `inflateMark`, `inflateSync` and the gzip header fields. `infcover.rs` covers them with zlib's own expectations; a small C oracle, as `tools/zstd-oracle` is for libzstd, is the way to compare them directly.
 
 ## The speed target
 
@@ -43,12 +42,14 @@ AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the Silesia corpus compressed b
 
 | | Mean | Range | At 0.95× or more |
 |---|---|---|---|
-| In one call | 0.99× zlib | 0.89–1.09× | 32 of 36 |
-| Streaming, in pieces of 16 KiB as zlib's `zpipe.c` | 1.05× | 0.95–1.16× | 36 of 36 |
+| In one call | 1.00× zlib | 0.92–1.09× | 34 of 36 |
+| Streaming, in pieces of 16 KiB as zlib's `zpipe.c` | 1.05× | 0.95–1.14× | 36 of 36 |
 
 It was 0.82× in one call (0.71–0.86×) and 0.90× streaming before the speed work, all of it in `inflate_fast`. What made the difference, the largest first, measured at level 6 in one call:
 
 - **Eight bytes of input at once.** zlib pulls two bytes into its bit buffer whenever it has fewer than 15 bits, up to six times per length and distance. The port reads eight bytes once per code, to 56 bits or more, which is enough for a length, a distance and their extra bits (48 at most). The bits past those counted are the input's next bits, so they can be or-ed in again. 0.83× to 0.94×.
+
+  Where the loop stops has to be zlib's too, or an error found by one loop and not the other leaves a different `inflateMark`. zlib's loop stops when fewer than six bytes are left past those it has pulled, which depends on when it pulled them; but it then gives back the bytes it did not use, and inflate() calls it again at once if six or more are left. So zlib decodes a code in its fast loop exactly when six bytes or more are left past the bytes already used, and the port's loop tests that, which costs nothing. The first version of the speed work needed eight bytes to enter the loop, and `tests/oracle.rs` found the difference.
 - **Matches copied eight bytes at a time**, when they start at least eight bytes back, each piece read from bytes already written. zlib copies three bytes per loop; byte by byte, every one was a bounds check. +3%.
 - **Runs of one byte filled**: matches one byte back, the commonest of those that overlap. +2%, and 11% on `mr`.
 - **Tables of a fixed size.** `inflate_fast` takes each code table as an array of 1024 entries (the most a table needs is 852), so an index masked with 1023 needs no bounds check. +1%.
@@ -65,8 +66,8 @@ The slowest inputs are text at level 1, mostly literals. arm64 is not measured y
 | `adler32.c` | `adler32.rs` | done | the definition; the trailers of zlib streams |
 | `crc32.c`, `crc32.h` | `crc32.rs` | done | `crc32.h`'s tables; the definition; the trailers of gzip streams |
 | `inftrees.{h,c}`, `inffixed.h` | `inftrees.rs`, `inffixed.rs` | done | `inffixed.h` rebuilt; `infcover.c`'s `cover_trees`; every dynamic block in `tests/zlib.rs` |
-| `inffast.{h,c}` | `inffast.rs` | done | `tests/zlib.rs`; `infcover.c`'s `cover_fast` |
-| `inflate.{h,c}` | `inflate.rs` | done | `tests/zlib.rs`; `infcover.c`'s `cover_support`, `cover_wrap` and `cover_inflate` |
+| `inffast.{h,c}` | `inffast.rs` | done | `tests/zlib.rs`; `tests/oracle.rs`; `infcover.c`'s `cover_fast` |
+| `inflate.{h,c}` | `inflate.rs` | done | `tests/zlib.rs`; `tests/oracle.rs`, for every function and flush; `infcover.c`'s `cover_support`, `cover_wrap` and `cover_inflate` |
 | `deflate.{h,c}`, `trees.{h,c}`, `compress.c` | | next | the output, byte for byte, at every level, strategy and flush |
 | `uncompr.c` | | later | |
 | Deflate64 (not in zlib itself) | | after the encoder | zlib's `contrib/infback9`, which decodes it; ZIP archives from Windows and 7-Zip |

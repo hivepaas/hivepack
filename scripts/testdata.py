@@ -5,8 +5,8 @@ testdata/manifest.json lists every set:
 - Sets with a "path" are committed under testdata/.
 - Sets with "fetch" are downloaded, checked against their SHA-256 and unpacked
   into <cache>/<name>.
-- Sets with "generate" are made in <cache>/<name> by zstd's own tools, built
-  from the pinned zstd release.
+- Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
+  by the oracles in tools/, built from the pinned zstd and zlib releases.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -169,16 +169,25 @@ def build_tool(source: Path, tool: str) -> Path:
 
 
 def build_oracle(source: Path, sources: list, included: list, folder: Path) -> None:
-    """tools/zstd-oracle, compiled with libzstd's own sources (without the
-    assembly loop, which the port does not have either). The `included`
-    files are left out: the oracle includes them itself, to reach their
-    static functions."""
-    lib = next(source.glob("zstd-*/lib"))
+    """An oracle program, compiled with the library's own sources.
+
+    tools/zstd-oracle is built with libzstd's (without the assembly loop,
+    which the port does not have either); the `included` files are left
+    out, as the oracle includes them itself to reach their static functions.
+    tools/zlib-oracle is built with zlib's, without the gzip file functions
+    (gz*.c), which it does not use."""
     files = [str(ROOT / s) for s in sources]
+    compiler = os.environ.get("CC", "cc")
+    zlib = next(source.glob("zlib-*"), None)
+    if zlib is not None:
+        files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+        subprocess.run([compiler, "-O2", f"-I{zlib}", *files, "-o", str(folder / "oracle")],
+                       check=True)
+        return
+    lib = next(source.glob("zstd-*/lib"))
     for part in ("common", "compress", "decompress"):
         files += sorted(str(f) for f in (lib / part).glob("*.c")
                         if f"{part}/{f.name}" not in included)
-    compiler = os.environ.get("CC", "cc")
     subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", f"-I{lib}", f"-I{lib / 'common'}",
                     *files, "-o", str(folder / "oracle")], check=True)
 

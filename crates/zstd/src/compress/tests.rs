@@ -5,8 +5,7 @@
 //! `tests/compress.rs`.
 
 use crate::compress::zstd_compress::{
-    CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_level_ported,
-    zstd_level_uses_row_match_finder,
+    CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_level_ported, zstd_level_strategy,
 };
 use crate::compress::zstd_compress_internal::{OVERFLOW_CORRECT_FREQUENTLY, ParamSwitch, Strategy};
 use crate::compress::zstd_lazy::row_get_match_mask;
@@ -16,12 +15,15 @@ use crate::oracle::Rng;
 use zstd::zstd_safe;
 
 /// Whether `level` compresses `len` bytes with a strategy the port has,
-/// and libzstd gives the frames it gives on little-endian machines: its
-/// row match finder gives others on big-endian ones, on some inputs (the
-/// port gives the same everywhere).
+/// and libzstd gives the frames it gives on little-endian machines. On
+/// big-endian ones its block splitter, which the strategies from `greedy`
+/// up use on full blocks, hashes pairs of bytes in the machine's order and
+/// splits elsewhere (the port gives the same frames everywhere).
 fn is_ported(level: i32, len: usize) -> bool {
     zstd_level_ported(level, len as u64)
-        && !(cfg!(target_endian = "big") && zstd_level_uses_row_match_finder(level, len as u64))
+        && !(cfg!(target_endian = "big")
+            && len >= 128 << 10
+            && zstd_level_strategy(level, len as u64) >= Strategy::Greedy)
 }
 
 /// Compresses `data` with the port's context and libzstd's, and checks

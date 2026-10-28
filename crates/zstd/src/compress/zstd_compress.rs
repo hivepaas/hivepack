@@ -517,13 +517,10 @@ pub(crate) fn zstd_level_ported(level: i32, src_size: u64) -> bool {
     zstd_strategy_ported(&c_params, row)
 }
 
-/// Whether `ZSTD_compressCCtx` searches with the row match finder at
-/// `level` for `src_size` bytes.
+/// The strategy `ZSTD_compressCCtx` takes at `level` for `src_size` bytes.
 #[cfg(test)]
-pub(crate) fn zstd_level_uses_row_match_finder(level: i32, src_size: u64) -> bool {
-    let c_params = zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict);
-    let row = zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params);
-    zstd_row_match_finder_used(c_params.strategy, row)
+pub(crate) fn zstd_level_strategy(level: i32, src_size: u64) -> Strategy {
+    zstd_get_cparams_internal(level, src_size, 0, CParamMode::NoAttachDict).strategy
 }
 
 /// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for

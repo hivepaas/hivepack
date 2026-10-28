@@ -155,14 +155,17 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         let value = [0, 1000, 1024, 5000, 65_536, 131_072, 131_073][rng.range(0, 6) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
     }
-    // On big-endian machines libzstd's row match finder gives other frames
-    // than on little-endian ones on some inputs; the port gives the same
-    // everywhere. There the hash chain instead.
+    // On big-endian machines libzstd's block splitter, which the strategies
+    // from `greedy` up use on full blocks, hashes pairs of bytes in the
+    // machine's order and splits elsewhere; the port gives the same frames
+    // everywhere. There `fast` or `dfast` instead.
     if cfg!(target_endian = "big") {
-        list.push((
-            P::UseRowMatchFinder(ParamSwitch::Disable),
-            C::UseRowMatchFinder(zstd_safe::ParamSwitch::Disable),
-        ));
+        let (p, c) = if rng.chance(2) {
+            (Strategy::Fast, zstd_safe::Strategy::ZSTD_fast)
+        } else {
+            (Strategy::Dfast, zstd_safe::Strategy::ZSTD_dfast)
+        };
+        list.push((P::Strategy(Some(p)), C::Strategy(c)));
     }
     list
 }

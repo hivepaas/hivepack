@@ -51,10 +51,11 @@ fn compare(
     data: &[u8],
     level: i32,
 ) -> bool {
-    // On big-endian machines libzstd's row match finder, at the levels from
-    // 4 to 12 for some sizes, gives other frames than on little-endian
-    // ones on some inputs; the port gives the same everywhere.
-    if cfg!(target_endian = "big") && (4..=12).contains(&level) {
+    // On big-endian machines libzstd's block splitter, which the strategies
+    // from `greedy` up (from level 4) use on full blocks, hashes pairs of
+    // bytes in the machine's order and splits elsewhere; the port gives
+    // the same frames everywhere.
+    if cfg!(target_endian = "big") && level >= 4 && data.len() >= 128 << 10 {
         return false;
     }
     let bound = hivepack_zstd::compress_bound(data.len()).expect("a bound");
@@ -114,7 +115,8 @@ fn every_test_file_compresses_as_libzstd_compresses_it() {
     }
     eprintln!("compared {count} frames");
     // The committed sets alone have more than 300 files; on big-endian
-    // machines the levels 4 to 12 are left out (see `compare`).
+    // machines the levels from 4 are left out for large files (see
+    // `compare`).
     let least = if cfg!(target_endian = "big") {
         300
     } else {

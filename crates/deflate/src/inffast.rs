@@ -11,7 +11,7 @@ use crate::inflate::{InflateState, Mode, TABLE_SPAN};
 ///
 /// Entry assumptions:
 /// - `state.mode` is `Len`;
-/// - at least 8 bytes of input are left at `*next_in`;
+/// - at least 6 bytes of input are left at `*next_in`;
 /// - at least 258 bytes of output space are left at `*next_out`;
 /// - `start` is the output space inflate() had when it was called, so that
 ///   the output written in this call starts at `*next_out - (start -
@@ -28,14 +28,18 @@ use crate::inflate::{InflateState, Mode, TABLE_SPAN};
 /// - positions are indices into `input`, `output` and the window rather
 ///   than pointers;
 /// - the bit buffer is refilled once per code, with eight bytes read at
-///   once, to 56 bits or more, which is enough for a length, a distance and
-///   their extra bits (at most 48). zlib pulls two bytes at a time, when it
-///   has fewer than 15 bits. The bits are the same: those past `bits` in
-///   `hold` are always either zero or the next bits of the input, so they
-///   can be or-ed again. The loop needs eight bytes of input where zlib's
-///   needs six, and stops as zlib's does after each code; whichever of them
-///   stops first, inflate() goes on with its slower loop to the same
-///   result.
+///   once (fewer at the end of the input), to 56 bits or more, which is
+///   enough for a length, a distance and their extra bits (at most 48).
+///   zlib pulls two bytes at a time, when it has fewer than 15 bits. The
+///   bits are the same: those past `bits` in `hold` are always either zero
+///   or the next bits of the input, so they can be or-ed again, and the
+///   bytes not used are given back at the end, as zlib gives back its own.
+///   zlib's loop stops when fewer than six bytes are left past those it
+///   has pulled, which depends on when it pulled them; but then it gives
+///   back the bytes it did not use, and inflate() calls it again at once if
+///   six or more are left, with nothing else changed. So zlib decodes a
+///   code here exactly when six bytes or more are left past the bytes
+///   already used, and the port's loop goes on under that same test.
 pub(crate) fn inflate_fast(
     state: &mut InflateState,
     input: &[u8],
@@ -47,7 +51,7 @@ pub(crate) fn inflate_fast(
 ) {
     // copy state to local variables
     let mut inp = *next_in; // local strm->next_in
-    let last = input.len() - 8; // have enough input for a refill while in <= last
+    let last = input.len() - 6; // have enough input while the bytes used reach no further
     let mut out = *next_out; // local strm->next_out
     let beg = out - (start - (output.len() - out)); // inflate()'s initial strm->next_out
     let end = out + (output.len() - out - 257); // while out < end, enough space available
@@ -74,9 +78,13 @@ pub(crate) fn inflate_fast(
         // enough input data or output space
         'outer: loop {
             // refill to 56 bits or more
-            hold |= read_word(input, inp) << bits;
-            inp += ((63 - bits) >> 3) as usize;
-            bits |= 56;
+            if inp + 8 <= input.len() {
+                hold |= read_word(input, inp) << bits;
+                inp += ((63 - bits) >> 3) as usize;
+                bits |= 56;
+            } else {
+                refill_end(input, &mut inp, &mut hold, &mut bits);
+            }
             let mut here = lcode[(hold & lmask) as usize & SPAN];
             // dolen:
             loop {
@@ -214,7 +222,8 @@ pub(crate) fn inflate_fast(
                 }
                 break;
             }
-            if !(inp <= last && out < end) {
+            // the bytes used so far end at inp - bits / 8
+            if !(inp - (bits >> 3) as usize <= last && out < end) {
                 break;
             }
         }
@@ -234,6 +243,20 @@ pub(crate) fn inflate_fast(
     if let Some(mode) = mode {
         state.mode = mode;
     }
+}
+
+/// The refill at the end of the input, where fewer than eight bytes are
+/// left: those there are, the rest zeros. zlib's test of the input left
+/// keeps six bytes for each code, so they are enough.
+#[cold]
+fn refill_end(input: &[u8], inp: &mut usize, hold: &mut u64, bits: &mut u32) {
+    let left = input.len() - *inp;
+    let mut word = [0; 8];
+    word[..left].copy_from_slice(&input[*inp..]);
+    *hold |= u64::from_le_bytes(word) << *bits;
+    let take = (((63 - *bits) >> 3) as usize).min(left);
+    *inp += take;
+    *bits += 8 * take as u32;
 }
 
 /// Eight bytes of input from `pos`, the first the lowest.

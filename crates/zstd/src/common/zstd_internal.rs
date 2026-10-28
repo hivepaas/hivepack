@@ -23,6 +23,8 @@ pub(crate) const ZSTD_BLOCKHEADERSIZE: usize = 3;
 /// `ZSTD_FRAMECHECKSUMSIZE`
 pub(crate) const ZSTD_FRAMECHECKSUMSIZE: usize = 4;
 
+/// `ZSTD_OPT_NUM`: how far ahead the optimal parser looks, at most.
+pub(crate) const ZSTD_OPT_NUM: usize = 1 << 12;
 /// `ZSTD_REP_NUM`: the number of repeat offsets.
 pub(crate) const ZSTD_REP_NUM: usize = 3;
 /// `repStartValue`

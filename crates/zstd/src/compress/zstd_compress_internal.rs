@@ -5,12 +5,14 @@ use crate::common::bits::{highbit32, nb_common_bytes};
 use crate::common::error_private::{Result, error};
 use crate::common::fse::fse_ctable_size_u32;
 use crate::common::mem::{idx, read_le16, read_le32, read_le64};
-use crate::common::zstd_internal::ZSTD_BLOCKHEADERSIZE;
-use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG};
+use crate::common::zstd_internal::{
+    LITBITS, LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG, ZSTD_BLOCKHEADERSIZE,
+    ZSTD_OPT_NUM, ZSTD_REP_NUM,
+};
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
 
 /// `ZSTD_strategy`: how hard the match finder searches, from `Fast` (1) to
-/// `Btultra2` (9). The port has those up to `Btlazy2` so far.
+/// `Btultra2` (9).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Strategy {
     /// One hash table, one candidate per position.
@@ -281,7 +283,45 @@ pub(crate) const REPCODE1_TO_OFFBASE: u32 = 1;
 #[inline(always)]
 pub(crate) fn offset_to_offbase(offset: u32) -> u32 {
     debug_assert!(offset > 0);
-    offset + crate::common::zstd_internal::ZSTD_REP_NUM as u32
+    offset + ZSTD_REP_NUM as u32
+}
+
+/// `ZSTD_updateRep`: the repeat offsets `rep` after a sequence of offset
+/// base `off_base`, whose literal length is 0 if `ll0`.
+#[inline(always)]
+pub(crate) fn zstd_update_rep(rep: &mut [u32; ZSTD_REP_NUM], off_base: u32, ll0: bool) {
+    if off_base > ZSTD_REP_NUM as u32 {
+        // A full offset.
+        rep[2] = rep[1];
+        rep[1] = rep[0];
+        rep[0] = off_base - ZSTD_REP_NUM as u32;
+    } else {
+        // A repcode.
+        let rep_code = off_base - 1 + u32::from(ll0);
+        if rep_code > 0 {
+            // With repCode 0, no change.
+            let current_offset = if rep_code == ZSTD_REP_NUM as u32 {
+                rep[0].wrapping_sub(1)
+            } else {
+                rep[rep_code as usize]
+            };
+            rep[2] = if rep_code >= 2 { rep[1] } else { rep[2] };
+            rep[1] = rep[0];
+            rep[0] = current_offset;
+        }
+    }
+}
+
+/// `ZSTD_newRep`: [`zstd_update_rep`] on a copy.
+#[inline(always)]
+pub(crate) fn zstd_new_rep(
+    rep: &[u32; ZSTD_REP_NUM],
+    off_base: u32,
+    ll0: bool,
+) -> [u32; ZSTD_REP_NUM] {
+    let mut new_reps = *rep;
+    zstd_update_rep(&mut new_reps, off_base, ll0);
+    new_reps
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +618,109 @@ pub(crate) fn zstd_reduce_table_btlazy2(table: &mut [u32], reducer_value: u32) {
 /// finder hashes.
 pub(crate) const ZSTD_ROW_HASH_CACHE_SIZE: usize = 8;
 
+// ---------------------------------------------------------------------------
+// The optimal parser's state
+
+/// `ZSTD_OPT_SIZE`: the entries of the optimal parser's tables.
+pub(crate) const ZSTD_OPT_SIZE: usize = ZSTD_OPT_NUM + 3;
+
+/// `ZSTD_match_t`: a match the binary tree found.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct OptMatch {
+    /// The offset base, as `ZSTD_storeSeq` takes it.
+    pub(crate) off: u32,
+    /// The length.
+    pub(crate) len: u32,
+}
+
+/// `ZSTD_optimal_t`: how the optimal parser reaches a position at best so
+/// far: a match, then literals.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct Optimal {
+    /// The price from the start of the series to the position.
+    pub(crate) price: i32,
+    /// The offset base of the match.
+    pub(crate) off: u32,
+    /// The length of the match.
+    pub(crate) mlen: u32,
+    /// The literals after the match.
+    pub(crate) litlen: u32,
+    /// The repeat offsets after the match.
+    pub(crate) rep: [u32; ZSTD_REP_NUM],
+}
+
+/// `ZSTD_OptPrice_e`: how symbols are priced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OptPrice {
+    /// From the statistics gathered.
+    Dynamic,
+    /// From fixed costs, for blocks too small for statistics.
+    Predef,
+}
+
+/// `optState_t`: the optimal parser's statistics, kept from block to block
+/// of a frame, and its tables.
+pub(crate) struct OptState {
+    /// `litFreq`: the frequency of each literal.
+    pub(crate) lit_freq: [u32; 1 << LITBITS],
+    /// `litLengthFreq`: of each literal length code.
+    pub(crate) lit_length_freq: [u32; MAX_LL as usize + 1],
+    /// `matchLengthFreq`: of each match length code.
+    pub(crate) match_length_freq: [u32; MAX_ML as usize + 1],
+    /// `offCodeFreq`: of each offset code.
+    pub(crate) off_code_freq: [u32; MAX_OFF as usize + 1],
+    /// `matchTable`: the matches found at a position.
+    pub(crate) match_table: Vec<OptMatch>,
+    /// `priceTable`: how each position of a series is reached at best.
+    pub(crate) price_table: Vec<Optimal>,
+    /// `litSum`, `litLengthSum`, `matchLengthSum`, `offCodeSum`: the sums
+    /// of the frequencies. A `lit_length_sum` of 0 means no statistics yet:
+    /// the frame's first block.
+    pub(crate) lit_sum: u32,
+    pub(crate) lit_length_sum: u32,
+    pub(crate) match_length_sum: u32,
+    pub(crate) off_code_sum: u32,
+    /// The prices of the sums, which the prices of the symbols are taken
+    /// from.
+    pub(crate) lit_sum_base_price: u32,
+    pub(crate) lit_length_sum_base_price: u32,
+    pub(crate) match_length_sum_base_price: u32,
+    pub(crate) off_code_sum_base_price: u32,
+    /// `priceType`
+    pub(crate) price_type: OptPrice,
+    /// `literalCompressionMode`: how the literals will be compressed, from
+    /// the frame's parameters.
+    pub(crate) literal_compression_mode: ParamSwitch,
+}
+
+impl OptState {
+    /// The state of a new context.
+    ///
+    /// Differs from libzstd: its tables start as whatever its workspace
+    /// held. The parser writes every entry it reads in the same series, and
+    /// the statistics before reading them, so they start as zeros here.
+    pub(crate) fn new() -> Self {
+        OptState {
+            lit_freq: [0; 1 << LITBITS],
+            lit_length_freq: [0; MAX_LL as usize + 1],
+            match_length_freq: [0; MAX_ML as usize + 1],
+            off_code_freq: [0; MAX_OFF as usize + 1],
+            match_table: vec![OptMatch::default(); ZSTD_OPT_SIZE],
+            price_table: vec![Optimal::default(); ZSTD_OPT_SIZE],
+            lit_sum: 0,
+            lit_length_sum: 0,
+            match_length_sum: 0,
+            off_code_sum: 0,
+            lit_sum_base_price: 0,
+            lit_length_sum_base_price: 0,
+            match_length_sum_base_price: 0,
+            off_code_sum_base_price: 0,
+            price_type: OptPrice::Dynamic,
+            literal_compression_mode: ParamSwitch::Auto,
+        }
+    }
+}
+
 /// `ZSTD_MatchState_t`: what the match finders keep from block to block.
 pub(crate) struct MatchState {
     pub(crate) window: Window,
@@ -610,6 +753,19 @@ pub(crate) struct MatchState {
     /// `hashSaltEntropy`: the sum of the hashes searched, for the next
     /// salt.
     pub(crate) hash_salt_entropy: u32,
+
+    // The optimal parser.
+    /// `hashLog3`: the log of the size of `hash_table3`, 0 for none.
+    pub(crate) hash_log3: u32,
+    /// `hashTable3`: with a shortest match of 3 bytes, the last position
+    /// of each hash of 3 bytes, for the optimal parser.
+    pub(crate) hash_table3: Vec<u32>,
+    /// `opt`: the optimal parser's state, for `btopt` and up.
+    ///
+    /// Differs from libzstd: boxed, and taken out while the parser runs, so
+    /// that the parser can change it while the match finder changes the
+    /// rest of the match state.
+    pub(crate) opt: Option<Box<OptState>>,
 }
 
 impl MatchState {
@@ -657,7 +813,7 @@ impl MatchState {
 #[derive(Clone)]
 pub(crate) struct CompressedBlockState {
     pub(crate) entropy: Box<EntropyCTables>,
-    pub(crate) rep: [u32; crate::common::zstd_internal::ZSTD_REP_NUM],
+    pub(crate) rep: [u32; ZSTD_REP_NUM],
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +855,7 @@ pub(crate) fn mem_read64_within(src: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
+const PRIME3BYTES: u32 = 506_832_829;
 const PRIME4BYTES: u32 = 2_654_435_761;
 const PRIME5BYTES: u64 = 889_523_592_379;
 const PRIME6BYTES: u64 = 227_718_039_650_203;
@@ -750,6 +907,14 @@ fn zstd_hash_top_u64(u: u64, mls: u32) -> u64 {
 #[inline(always)]
 fn zstd_hash_n<const N: u32>(u: u64, prime: u64) -> u64 {
     (u << (64 - 8 * N)).wrapping_mul(prime)
+}
+
+/// `ZSTD_hash3Ptr`: the hash of the 3 bytes at `at`, `h` bits long. Reads
+/// 4 bytes.
+#[inline(always)]
+pub(crate) fn zstd_hash3_ptr(src: &[u8], at: usize, h: u32) -> usize {
+    debug_assert!((1..=32).contains(&h));
+    ((mem_read32(src, at) << (32 - 24)).wrapping_mul(PRIME3BYTES) >> (32 - h)) as usize
 }
 
 /// `ZSTD_hashPtrSalted`: [`zstd_hash_ptr`] with `salt` mixed in before the

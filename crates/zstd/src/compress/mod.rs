@@ -13,4 +13,5 @@ pub(crate) mod zstd_compress_sequences;
 pub(crate) mod zstd_double_fast;
 pub(crate) mod zstd_fast;
 pub(crate) mod zstd_lazy;
+pub(crate) mod zstd_opt;
 pub(crate) mod zstd_pre_split;

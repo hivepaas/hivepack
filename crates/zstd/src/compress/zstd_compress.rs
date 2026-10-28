@@ -18,8 +18,8 @@ use crate::compress::hist::{HIST_WKSP_SIZE_U32, hist_count_fast_wksp};
 use crate::compress::huf_compress::HufRepeat;
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, EntropyCTables, FrameParameters,
-    FseCTables, FseRepeat, LongLengthType, MatchState, ParamSwitch, SeqStore, Strategy, Window,
-    WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX,
+    FseCTables, FseRepeat, LongLengthType, MatchState, OptState, ParamSwitch, SeqStore, Strategy,
+    Window, WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX,
     zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain, zstd_ml_code,
     zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
 };
@@ -35,6 +35,7 @@ use crate::compress::zstd_lazy::{
     ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc,
     zstd_compress_block_lazy_row,
 };
+use crate::compress::zstd_opt::zstd_compress_block_opt;
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
@@ -390,6 +391,9 @@ const ZSTD_HASHLOG_MAX: u32 = 30;
 const ZSTD_CHAINLOG_MIN: u32 = ZSTD_HASHLOG_MIN;
 /// `ZSTD_CHAINLOG_MAX` on 64-bit machines.
 const ZSTD_CHAINLOG_MAX: u32 = 30;
+/// `ZSTD_HASHLOG3_MAX`: the largest 3-byte hash table, of the optimal
+/// parser with a shortest match of 3 bytes.
+const ZSTD_HASHLOG3_MAX: u32 = 17;
 /// `ZSTD_SEARCHLOG_MIN`
 const ZSTD_SEARCHLOG_MIN: u32 = 1;
 /// `ZSTD_SEARCHLOG_MAX`
@@ -498,14 +502,13 @@ pub(crate) fn zstd_resolve_row_match_finder_mode(
 }
 
 /// Whether the port has what a frame with `params` needs, their modes
-/// resolved: its strategy (every one up to `btlazy2`), the block splitter
-/// after the sequences, and long distance matching. The context refuses
-/// the others with `ParameterUnsupported`.
+/// resolved: its strategy (every one), the block splitter after the
+/// sequences, and long distance matching. The context refuses the others
+/// with `ParameterUnsupported`.
 pub(crate) fn zstd_frame_ported(params: &CCtxParams) -> bool {
-    // The strategies.
-    params.c_params.strategy <= Strategy::Btlazy2
-        // The block splitter after the sequences (ZSTD_compressBlock_splitBlock).
-        && params.post_block_splitter != ParamSwitch::Enable
+    // The strategies: all of them.
+    // The block splitter after the sequences (ZSTD_compressBlock_splitBlock).
+    params.post_block_splitter != ParamSwitch::Enable
         // Long distance matching (zstd_ldm.c).
         && params.ldm_enable != ParamSwitch::Enable
 }
@@ -964,6 +967,9 @@ fn zstd_overflow_correct_if_needed(
                 zstd_reduce_table(&mut ms.chain_table, correction);
             }
         }
+        if ms.hash_log3 != 0 {
+            zstd_reduce_table(&mut ms.hash_table3, correction);
+        }
         ms.next_to_update = ms.next_to_update.saturating_sub(correction);
         // Dictionaries are invalid after a correction.
         ms.loaded_dict_end = 0;
@@ -1283,6 +1289,9 @@ impl CCtx {
                 // A new context's salt, before the first frame advances it.
                 hash_salt: 0,
                 hash_salt_entropy: 0,
+                hash_log3: 0,
+                hash_table3: Vec::new(),
+                opt: None,
             },
             seq_store: SeqStore::with_capacity(0, 0),
             block_size_max: 0,
@@ -1365,9 +1374,20 @@ impl CCtx {
         // ZSTD_reset_matchState
         let ms = &mut self.match_state;
         ms.window = Window::new();
+        // The 3-byte hash table, for a shortest match of 3 bytes.
+        ms.hash_log3 = if c_params.min_match == 3 {
+            ZSTD_HASHLOG3_MAX.min(c_params.window_log)
+        } else {
+            0
+        };
+        ms.lazy_skipping = false;
+        // ZSTD_invalidateMatchState
         ms.next_to_update = ms.window.dict_limit;
         ms.loaded_dict_end = 0;
-        ms.lazy_skipping = false;
+        if let Some(opt) = &mut ms.opt {
+            // The optimal parser's statistics start again.
+            opt.lit_length_sum = 0;
+        }
         ms.hash_table.clear();
         ms.hash_table.resize(1 << c_params.hash_log, 0);
         // ZSTD_allocateChainTable: none for fast, nor for the row match
@@ -1380,6 +1400,13 @@ impl CCtx {
             };
         ms.chain_table.clear();
         ms.chain_table.resize(chain_size, 0);
+        let h3_size = if ms.hash_log3 != 0 {
+            1 << ms.hash_log3
+        } else {
+            0
+        };
+        ms.hash_table3.clear();
+        ms.hash_table3.resize(h3_size, 0);
         if zstd_row_match_finder_used(c_params.strategy, params.use_row_match_finder) {
             // The row match finder's table of tags, and a new salt. Unlike
             // the window, the salt goes on from frame to frame, as libzstd's
@@ -1409,6 +1436,11 @@ impl CCtx {
             let row_log = c_params.search_log.clamp(4, 6);
             debug_assert!(c_params.hash_log >= row_log);
             ms.row_hash_log = c_params.hash_log - row_log;
+        }
+        // The optimal parser's state. libzstd reserves it in the workspace
+        // at every frame; the port keeps it from frame to frame.
+        if c_params.strategy >= Strategy::Btopt && ms.opt.is_none() {
+            ms.opt = Some(Box::new(OptState::new()));
         }
         ms.c_params = c_params;
 
@@ -1490,9 +1522,24 @@ impl CCtx {
                 let dict = ext_dict.then_some(dict);
                 zstd_compress_block_btlazy2(ms, seq_store, rep, src, dict, istart, iend)
             }
-            // The other strategies are not ported yet; the context does not
-            // take them.
-            _ => return error!(ParameterUnsupported),
+            (strategy @ (Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2), _) => {
+                // The optimal parser reads the statistics of the dictionary
+                // from the tables of the block before (ms->opt.symbolCosts),
+                // and is told how the literals will be compressed.
+                let dict = ext_dict.then_some(dict);
+                zstd_compress_block_opt(
+                    strategy,
+                    ms,
+                    seq_store,
+                    rep,
+                    src,
+                    dict,
+                    istart,
+                    iend,
+                    &self.prev_cblock.entropy,
+                    self.applied_params.literal_compression_mode,
+                )
+            }
         };
         self.seq_store
             .store_last_literals(src, iend - last_ll_size, last_ll_size);
@@ -1930,10 +1977,12 @@ impl CCtx {
     /// with [`CCtx::set_parameter`] do not apply; [`CCtx::compress2`] takes
     /// them.
     ///
-    /// Work in progress: the port has libzstd's strategies up to `btlazy2`
-    /// so far, which are every level up to 15 for inputs over 256 KB (or of
-    /// unknown size), up to 12 for inputs over 16 KB, and up to 10 for
-    /// smaller ones. Other levels fail with
+    /// Work in progress: the port has every strategy of libzstd, but not
+    /// yet the block splitter after the sequences, which the optimal
+    /// parser's levels (`btopt` and up) use for inputs over 64 KB. So every
+    /// level works for inputs up to 64 KB; for larger ones, the levels up to
+    /// 15 over 256 KB (or of unknown size), and up to 12 below. Other levels
+    /// fail with
     /// [`ErrorCode::ParameterUnsupported`](crate::ErrorCode::ParameterUnsupported).
     pub fn compress(
         &mut self,

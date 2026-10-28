@@ -1142,6 +1142,9 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
     // The lazy strategies with the row match finder or the hash chain: on,
     // off, or as the window decides.
     steps.extend([7, 1011, rng.range(0, 2) as i64]);
+    // The block splitter after the sequences: on, off, or as the strategy
+    // decides (off below btopt).
+    steps.extend([7, 1010, rng.range(0, 2) as i64]);
     if rng.range(0, 1) == 0 {
         let window_log = if small {
             rng.range(9, 13)

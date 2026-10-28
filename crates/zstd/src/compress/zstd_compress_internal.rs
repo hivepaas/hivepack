@@ -1036,6 +1036,68 @@ impl SeqStore {
     }
 }
 
+/// A run of a block's sequences and their literals, as positions in its
+/// store: the whole store, or a chunk of it, as `ZSTD_deriveSeqStoreChunk`
+/// derives it (a `SeqStore_t` whose pointers point into the block's).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SeqStoreChunk {
+    /// The sequences: `seq_start..seq_end` of the store's.
+    pub(crate) seq_start: usize,
+    pub(crate) seq_end: usize,
+    /// The literals: `lit_start..lit_end` of the store's.
+    pub(crate) lit_start: usize,
+    pub(crate) lit_end: usize,
+    pub(crate) long_length_type: LongLengthType,
+    /// The sequence with the long length, counted from `seq_start`.
+    pub(crate) long_length_pos: u32,
+}
+
+/// The sequences of a [`SeqStoreChunk`], their literals and their codes:
+/// what the entropy coding reads, and the codes it writes.
+pub(crate) struct SeqStoreView<'a> {
+    pub(crate) sequences: &'a [SeqDef],
+    pub(crate) literals: &'a [u8],
+    pub(crate) ll_code: &'a mut [u8],
+    pub(crate) ml_code: &'a mut [u8],
+    pub(crate) of_code: &'a mut [u8],
+    pub(crate) long_length_type: LongLengthType,
+    pub(crate) long_length_pos: u32,
+}
+
+impl SeqStore {
+    /// The whole store, as a chunk.
+    pub(crate) fn whole(&self) -> SeqStoreChunk {
+        SeqStoreChunk {
+            seq_start: 0,
+            seq_end: self.sequences.len(),
+            lit_start: 0,
+            lit_end: self.lit_len,
+            long_length_type: self.long_length_type,
+            long_length_pos: self.long_length_pos,
+        }
+    }
+
+    /// The sequences, literals and codes of `chunk`. The codes are those
+    /// last written there, or 0: `ZSTD_seqToCodes` writes them before they
+    /// are read.
+    pub(crate) fn view(&mut self, chunk: &SeqStoreChunk) -> SeqStoreView<'_> {
+        let nb_seq = self.sequences.len();
+        self.ll_code.resize(nb_seq, 0);
+        self.ml_code.resize(nb_seq, 0);
+        self.of_code.resize(nb_seq, 0);
+        let seqs = chunk.seq_start..chunk.seq_end;
+        SeqStoreView {
+            sequences: &self.sequences[seqs.clone()],
+            literals: &self.lit_buffer[chunk.lit_start..chunk.lit_end],
+            ll_code: &mut self.ll_code[seqs.clone()],
+            ml_code: &mut self.ml_code[seqs.clone()],
+            of_code: &mut self.of_code[seqs],
+            long_length_type: chunk.long_length_type,
+            long_length_pos: chunk.long_length_pos,
+        }
+    }
+}
+
 /// `WILDCOPY_OVERLENGTH`: how far past their end copies in pieces may
 /// write.
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;

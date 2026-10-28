@@ -81,12 +81,19 @@ fuzz_target!(|input: &[u8]| {
             parameters.push((P::Strategy(Some(p)), C::Strategy(c)));
         }
     }
-    let (p_row, c_row) = [
+    let switches = [
         (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
         (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
         (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
-    ][usize::from(head[7] >> 4) % 3];
+    ];
+    let (p_row, c_row) = switches[usize::from(head[7] >> 4) % 3];
     parameters.push((P::UseRowMatchFinder(p_row), C::UseRowMatchFinder(c_row)));
+    // The block splitter after the sequences.
+    let (p_split, c_split) = switches[usize::from(head[2] >> 4) % 3];
+    parameters.push((
+        P::SplitAfterSequences(p_split),
+        C::UseBlockSplitter(c_split),
+    ));
 
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();

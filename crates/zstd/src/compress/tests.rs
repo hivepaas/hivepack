@@ -106,6 +106,192 @@ fn frames_match_libzstd_at_the_levels_ported() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// Data whose kind changes within blocks, where the block splitter after
+/// the sequences cuts them: text-like pieces with repeats near and far,
+/// skewed bytes, and random bytes with copies of 4 bytes from far back,
+/// some at the offset of the copy before. Those are many sequences that
+/// save too little: cut off, they are stored raw, and a repeat code after
+/// them can stand for another offset in the decoder than in the encoder.
+/// And runs of one byte, for blocks stored RLE.
+fn changing_data(rng: &mut Rng, len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len + 70_000);
+    while data.len() < len {
+        let piece = rng.range(1000, 70_000) as usize;
+        match rng.range(0, 8) {
+            0 | 1 => data.extend(rng.lz_data(piece)),
+            2 => data.extend(rng.huffman_data(piece)),
+            3 => {
+                let byte = rng.next() as u8;
+                data.resize(data.len() + piece, byte);
+            }
+            _ => {
+                let end = data.len() + piece;
+                let spacing = rng.range(30, 80);
+                let mut back = 0;
+                while data.len() < end {
+                    if data.len() > 8000 && rng.range(0, spacing) == 0 {
+                        if back == 0 || rng.range(0, 1) == 0 {
+                            back = rng.range(4, data.len().min(100_000) as u64) as usize;
+                        }
+                        for _ in 0..4 {
+                            let byte = data[data.len() - back];
+                            data.push(byte);
+                        }
+                    } else {
+                        data.push(rng.next() as u8);
+                    }
+                }
+            }
+        }
+    }
+    data.truncate(len);
+    data
+}
+
+/// The raw blocks of a frame.
+fn raw_blocks(frame: &[u8]) -> usize {
+    let descriptor = frame[4];
+    let single_segment = descriptor & 0x20 != 0;
+    let dict_id = [0, 1, 2, 4][usize::from(descriptor & 3)];
+    let fcs = [usize::from(single_segment), 2, 4, 8][usize::from(descriptor >> 6)];
+    let mut at = 5 + usize::from(!single_segment) + dict_id + fcs;
+    let mut raw = 0;
+    loop {
+        let header = u32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], 0]);
+        let (last, kind, size) = (header & 1, (header >> 1) & 3, (header >> 3) as usize);
+        raw += usize::from(kind == 0);
+        at += 3 + if kind == 1 { 1 } else { size };
+        if last != 0 {
+            return raw;
+        }
+    }
+}
+
+/// With the block splitter after the sequences on (libzstd's
+/// `ZSTD_c_splitAfterSequences`, for `btopt` and up by default), at every
+/// strategy the port has, in one call: the frames are libzstd's, and decode
+/// back. Some with smaller blocks or windows, or other shortest matches.
+#[test]
+fn frames_split_after_their_sequences_match_libzstd() {
+    use zstd_safe::{CParameter as C, ParamSwitch as S};
+    const STRATEGIES: [(Strategy, zstd_safe::Strategy); 6] = [
+        (Strategy::Fast, zstd_safe::Strategy::ZSTD_fast),
+        (Strategy::Dfast, zstd_safe::Strategy::ZSTD_dfast),
+        (Strategy::Greedy, zstd_safe::Strategy::ZSTD_greedy),
+        (Strategy::Lazy, zstd_safe::Strategy::ZSTD_lazy),
+        (Strategy::Lazy2, zstd_safe::Strategy::ZSTD_lazy2),
+        (Strategy::Btlazy2, zstd_safe::Strategy::ZSTD_btlazy2),
+    ];
+    let mut rng = Rng::new(0x5EED_0205);
+    let mut problems = Vec::new();
+    let (mut compared, mut split, mut raw) = (0, 0, 0);
+    for i in 0..200 {
+        let len = match i % 4 {
+            0 => rng.range(0, 20_000),
+            1 => rng.range(100_000, 140_000),
+            _ => rng.range(140_000, 450_000),
+        } as usize;
+        let data = if i % 6 == 0 {
+            rng.lz_data(len)
+        } else {
+            changing_data(&mut rng, len)
+        };
+        let level = rng.range(0, 17) as i32 - 2;
+        let mut parameters = vec![
+            (
+                CParameter::CompressionLevel(level),
+                C::CompressionLevel(level),
+            ),
+            (
+                CParameter::SplitAfterSequences(ParamSwitch::Enable),
+                C::UseBlockSplitter(S::Enable),
+            ),
+        ];
+        // A strategy the port has, at random, and where the level's is
+        // btopt or up.
+        let mut strategy = zstd_level_strategy(level, len as u64);
+        if strategy > Strategy::Btlazy2 || rng.range(0, 3) == 0 {
+            let (p, c) = STRATEGIES[rng.range(0, 5) as usize];
+            parameters.push((CParameter::Strategy(Some(p)), C::Strategy(c)));
+            strategy = p;
+        }
+        if rng.range(0, 3) == 0 {
+            let window_log = rng.range(10, 20) as u32;
+            parameters.push((CParameter::WindowLog(window_log), C::WindowLog(window_log)));
+        }
+        // Short matches, for the copies of 4 bytes, most of the time.
+        if rng.range(0, 3) != 0 {
+            let min_match = rng.range(3, 6) as u32;
+            parameters.push((CParameter::MinMatch(min_match), C::MinMatch(min_match)));
+        }
+        if rng.range(0, 4) == 0 {
+            let max_block = [1024, 5000, 65_536][rng.range(0, 2) as usize];
+            parameters.push((
+                CParameter::MaxBlockSize(max_block),
+                C::MaxBlockSize(max_block),
+            ));
+        }
+        // On big-endian machines libzstd splits full blocks elsewhere before
+        // finding their sequences (see is_ported).
+        if cfg!(target_endian = "big") && len >= 128 << 10 && strategy >= Strategy::Greedy {
+            continue;
+        }
+
+        let mut cctx = CCtx::new();
+        let mut c_cctx = zstd_safe::CCtx::create();
+        for &(p, c) in &parameters {
+            cctx.set_parameter(p).expect("the port sets it");
+            c_cctx.set_parameter(c).expect("libzstd sets it");
+        }
+        let bound = zstd_compress_bound(len).expect("a bound");
+        let mut want = vec![0u8; bound];
+        let want_size = c_cctx
+            .compress2(&mut want[..], &data)
+            .expect("libzstd compresses");
+        want.truncate(want_size);
+        let mut got = vec![0u8; bound];
+        let tag = format!("{len} bytes, {parameters:?}");
+        let size = match cctx.compress2(&mut got, &data) {
+            Ok(size) => size,
+            Err(error) => {
+                problems.push(format!("{tag}: the port failed: {error:?}"));
+                continue;
+            }
+        };
+        compared += 1;
+        if got[..size] != want[..] {
+            let at = got[..size].iter().zip(&want).position(|(a, b)| a != b);
+            problems.push(format!(
+                "{tag}: {size} bytes, libzstd {want_size}, first difference at {at:?}"
+            ));
+            continue;
+        }
+        let mut back = vec![0u8; len];
+        if decompress(&mut back, &got[..size]).ok() != Some(len) || back != data {
+            problems.push(format!("{tag}: does not decode back"));
+        }
+        // Whether the splitter cut a block, and stored a piece raw: libzstd's
+        // frame without it.
+        c_cctx
+            .set_parameter(C::UseBlockSplitter(S::Disable))
+            .expect("libzstd sets it");
+        let mut unsplit = vec![0u8; bound];
+        let unsplit_size = c_cctx
+            .compress2(&mut unsplit[..], &data)
+            .expect("libzstd compresses");
+        split += usize::from(unsplit[..unsplit_size] != want[..]);
+        raw += usize::from(raw_blocks(&want) > raw_blocks(&unsplit[..unsplit_size]));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    eprintln!(
+        "{compared} frames compared, {split} with blocks cut after their sequences, {raw} with \
+         more raw blocks"
+    );
+    let least = if cfg!(target_endian = "big") { 15 } else { 40 };
+    assert!(split > least, "only {split} frames with blocks cut");
+    assert!(raw > 0, "no frame with a piece stored raw");
+}
+
 /// `data` streamed through `cctx` in pieces drawn from `seed`, as one
 /// frame.
 fn stream(cctx: &mut CCtx, data: &[u8], seed: u64) -> Result<Vec<u8>, String> {

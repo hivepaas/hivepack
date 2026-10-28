@@ -9,7 +9,7 @@ hivepack-deflate with zlib. They need nightly, where
 | Target | What it checks |
 |---|---|
 | `decompress` | Decoding the input in one call: the same output as libzstd, or the same error |
-| `compress` | Compressing the input in one call, at a level its first byte picks: the same frame as libzstd, which decodes back |
+| `compress` | Compressing the input in one call, at a level its first byte picks, with the blocks split after their sequences when a bit of it is set: the same frame as libzstd, which decodes back |
 | `compress_stream` | Streaming the input, with parameters, pieces, directives and room for output its first 8 bytes pick: every call the same as libzstd's, and a frame that decodes back |
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
 | `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |

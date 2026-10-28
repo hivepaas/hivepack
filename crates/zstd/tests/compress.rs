@@ -6,14 +6,16 @@
 //! At every level; those whose strategy the port does not have yet, it
 //! refuses with `ParameterUnsupported`, and they are skipped, by libzstd's
 //! context too: both contexts compress the same frames in the same order.
+//! Then again through `compress2`, with the blocks split after their
+//! sequences (`ZSTD_c_splitAfterSequences`).
 
 #![allow(clippy::expect_used, clippy::panic)]
 
 mod support;
 
-use hivepack_zstd::{CCtx, ErrorCode};
+use hivepack_zstd::{CCtx, CParameter as P, ErrorCode, ParamSwitch};
 use support::{Kind, Problems, Set};
-use zstd::zstd_safe;
+use zstd::zstd_safe::{self, CParameter as C};
 
 const LEVELS: [i32; 14] = [-5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13];
 
@@ -32,6 +34,9 @@ fn sets() -> Vec<Set> {
 struct Contexts {
     libzstd: zstd_safe::CCtx<'static>,
     port: CCtx,
+    /// Through `compress2`, with the block splitter after the sequences
+    /// on, rather than in one call.
+    split: bool,
 }
 
 impl Contexts {
@@ -39,7 +44,52 @@ impl Contexts {
         Contexts {
             libzstd: zstd_safe::CCtx::create(),
             port: CCtx::new(),
+            split: false,
         }
+    }
+
+    /// Contexts that split blocks after their sequences, through
+    /// `compress2`.
+    fn splitting() -> Self {
+        let mut contexts = Contexts::new();
+        contexts
+            .libzstd
+            .set_parameter(C::UseBlockSplitter(zstd_safe::ParamSwitch::Enable))
+            .expect("libzstd sets it");
+        contexts
+            .port
+            .set_parameter(P::SplitAfterSequences(ParamSwitch::Enable))
+            .expect("the port sets it");
+        contexts.split = true;
+        contexts
+    }
+
+    /// `data` at `level` into `dst`, with the port.
+    fn port_compress(
+        &mut self,
+        dst: &mut [u8],
+        data: &[u8],
+        level: i32,
+    ) -> hivepack_zstd::Result<usize> {
+        if !self.split {
+            return self.port.compress(dst, data, level);
+        }
+        self.port.set_parameter(P::CompressionLevel(level))?;
+        self.port.compress2(dst, data)
+    }
+
+    /// `data` at `level` into `dst`, with libzstd.
+    fn libzstd_compress(
+        &mut self,
+        dst: &mut [u8],
+        data: &[u8],
+        level: i32,
+    ) -> Result<usize, usize> {
+        if !self.split {
+            return self.libzstd.compress(dst, data, level);
+        }
+        self.libzstd.set_parameter(C::CompressionLevel(level))?;
+        self.libzstd.compress2(dst, data)
     }
 }
 
@@ -60,7 +110,7 @@ fn compare(
     }
     let bound = hivepack_zstd::compress_bound(data.len()).expect("a bound");
     let mut got = vec![0u8; bound];
-    let size = match cctx.port.compress(&mut got, data, level) {
+    let size = match cctx.port_compress(&mut got, data, level) {
         Ok(size) => size,
         // A strategy the port does not have yet.
         Err(error) if error.code() == ErrorCode::ParameterUnsupported => return false,
@@ -71,8 +121,7 @@ fn compare(
     };
     let mut want = vec![0u8; bound];
     let want_size = cctx
-        .libzstd
-        .compress(&mut want[..], data, level)
+        .libzstd_compress(&mut want, data, level)
         .expect("libzstd compresses");
     want.truncate(want_size);
     if got[..size] != want[..] {
@@ -126,28 +175,62 @@ fn every_test_file_compresses_as_libzstd_compresses_it() {
     problems.check();
 }
 
+/// The block splitter after the sequences, on for every strategy, through
+/// `compress2`: one level per file, all of them across the files.
+#[test]
+fn every_test_file_splits_its_blocks_as_libzstd_splits_them() {
+    let mut problems = Problems::default();
+    let mut cctx = Contexts::splitting();
+    let mut count = 0;
+    for set in sets() {
+        for (i, file) in set.list().iter().enumerate() {
+            let data = set.read(file);
+            let name = format!("{}/{} (split)", set.name, file.display());
+            let level = LEVELS[(i + 7) % LEVELS.len()];
+            count += usize::from(compare(&mut problems, &mut cctx, &name, &data, level));
+        }
+    }
+    eprintln!("compared {count} frames");
+    let least = if cfg!(target_endian = "big") {
+        150
+    } else {
+        250
+    };
+    assert!(count > least, "only {count} frames compared");
+    problems.check();
+}
+
 #[test]
 fn small_inputs_compress_as_libzstd_compresses_them() {
     // Every size up to 300 bytes, of one byte repeated and of text, where
-    // blocks are raw, RLE, or too small to compress.
+    // blocks are raw, RLE, or too small to compress; in one call, and with
+    // the block splitter after the sequences.
     let mut problems = Problems::default();
-    let mut cctx = Contexts::new();
     let text = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
         tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis \
         nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
         irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla.";
-    for len in 0..=300 {
-        for level in LEVELS {
-            let data = vec![b'a'; len];
-            compare(&mut problems, &mut cctx, &format!("{len} a"), &data, level);
-            let data: Vec<u8> = text.iter().copied().cycle().take(len).collect();
-            compare(
-                &mut problems,
-                &mut cctx,
-                &format!("{len} of text"),
-                &data,
-                level,
-            );
+    for mut cctx in [Contexts::new(), Contexts::splitting()] {
+        let split = if cctx.split { " (split)" } else { "" };
+        for len in 0..=300 {
+            for level in LEVELS {
+                let data = vec![b'a'; len];
+                compare(
+                    &mut problems,
+                    &mut cctx,
+                    &format!("{len} a{split}"),
+                    &data,
+                    level,
+                );
+                let data: Vec<u8> = text.iter().copied().cycle().take(len).collect();
+                compare(
+                    &mut problems,
+                    &mut cctx,
+                    &format!("{len} of text{split}"),
+                    &data,
+                    level,
+                );
+            }
         }
     }
     problems.check();

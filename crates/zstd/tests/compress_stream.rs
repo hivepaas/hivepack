@@ -120,6 +120,16 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         list.push((P::UseRowMatchFinder(p), C::UseRowMatchFinder(c)));
     }
     if rng.chance(2) {
+        // The block splitter after the sequences; `Auto` is off below
+        // btopt.
+        let (p, c) = match rng.range(0, 2) {
+            0 => (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
+            1 => (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
+            _ => (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
+        };
+        list.push((P::SplitAfterSequences(p), C::UseBlockSplitter(c)));
+    }
+    if rng.chance(2) {
         let flag = rng.chance(2);
         list.push((P::ChecksumFlag(flag), C::ChecksumFlag(flag)));
     }

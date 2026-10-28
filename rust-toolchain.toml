@@ -1,0 +1,7 @@
+# The stable Rust that formats, lints, documents and tests here. Users build
+# with their own Rust, down to rust-version in Cargo.toml. Raised by hand, in a
+# pull request of its own: README, "Rust versions".
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

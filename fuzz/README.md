@@ -1,8 +1,10 @@
 # Fuzzing
 
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd, and
-hivepack-deflate with zlib. They need a nightly toolchain and
-`cargo install cargo-fuzz`.
+hivepack-deflate with zlib. They need nightly, where
+`rust-toolchain.toml` pins a stable: the nightly CI uses (`NIGHTLY` in
+`.github/workflows/ci.yml`), chosen for the shell with
+`export RUSTUP_TOOLCHAIN=<that nightly>`, and `cargo install cargo-fuzz`.
 
 | Target | What it checks |
 |---|---|
@@ -10,6 +12,7 @@ hivepack-deflate with zlib. They need a nightly toolchain and
 | `compress` | Compressing the input in one call, at a level its first byte picks: the same frame as libzstd, which decodes back |
 | `compress_stream` | Streaming the input, with parameters, pieces, directives and room for output its first 8 bytes pick: every call the same as libzstd's, and a frame that decodes back |
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
+| `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:
@@ -20,10 +23,11 @@ find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
 cargo fuzz run --features unsafe-fast decompress -- -max_total_time=3600
 ```
 
-The `inflate` target starts from an empty corpus:
+The `inflate` and `deflate` targets start from an empty corpus:
 
 ```sh
 cargo fuzz run inflate -- -max_total_time=3600
+cargo fuzz run deflate -- -max_total_time=3600
 ```
 
 `cargo fuzz` builds with AddressSanitizer, so with the feature an access out

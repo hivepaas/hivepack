@@ -17,7 +17,7 @@ Read and write archives and compressed files in Rust: one library for many forma
 
 | Crate | What it is | Status |
 |---|---|---|
-| [`hivepack-deflate`](crates/deflate) | Deflate, zlib and gzip in safe Rust, ported from zlib 1.3.2: the same output, at the same speed | Decompresses, with the same results and messages as zlib, at about its speed. Compression comes next |
+| [`hivepack-deflate`](crates/deflate) | Deflate, zlib and gzip in safe Rust, ported from zlib 1.3.2: the same output, at the same speed | Compresses with zlib's output, byte for byte, and decompresses with its results and messages, both at about its speed. Deflate64 comes next |
 | [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | Decompresses, in one call or streaming, with the same output and errors as libzstd, at about 0.9× its speed. Compresses at the levels up to 15, in one call or streaming, with libzstd's frames; the optimal parser (the strongest levels) comes next |
 
 Every crate forbids `unsafe` code; the one exception, `hivepack-zstd`'s `unsafe-fast` feature, is off by default (see [docs/unsafe.md](docs/unsafe.md)). The rules are in [docs/safety.md](docs/safety.md), and how the ports follow the official libraries is in [docs/porting.md](docs/porting.md) (zstd) and [docs/deflate.md](docs/deflate.md) (zlib).
@@ -30,6 +30,22 @@ cargo test --workspace
 ```
 
 The test files come from zstd itself and from other zstd implementations (Go, Java, Rust), with their licenses. [testdata/README.md](testdata/README.md) lists them.
+
+## 🦀 Rust versions
+
+- **Oldest supported: 1.88**, `rust-version` in `Cargo.toml`, which CI checks.
+  It is a promise to the crates' users: raised only when the code needs
+  something newer, never to a Rust less than a year old, and, once the crates
+  are published, in a minor release with a line in its notes.
+- **Development:** `rust-toolchain.toml` pins the stable Rust that formats,
+  lints, documents and tests, so a new Rust never turns CI red on its own. It
+  is raised by hand every second Rust release (about every twelve weeks), once
+  that release is two weeks old, in a pull request of its own, together with
+  the nightly that Miri and cargo-fuzz use (`NIGHTLY` in
+  `.github/workflows/ci.yml`).
+- **Newer Rust:** a weekly workflow (`.github/workflows/newer-rust.yml`) lints
+  and tests with the latest stable and beta, which users may build with before
+  the pin is raised. A failure there warns; it blocks nothing.
 
 ## 🐝 Made by HivePaaS
 

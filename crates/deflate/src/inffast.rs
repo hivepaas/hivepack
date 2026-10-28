@@ -1,6 +1,6 @@
 //! The fast decoding loop: port of `inffast.{h,c}`.
 
-use crate::inflate::{InflateState, Mode};
+use crate::inflate::{InflateState, Mode, TABLE_SPAN};
 
 /// Decodes literal, length and distance codes and writes literals and match
 /// bytes until either not enough input or output is available, an
@@ -11,7 +11,7 @@ use crate::inflate::{InflateState, Mode};
 ///
 /// Entry assumptions:
 /// - `state.mode` is `Len`;
-/// - at least 6 bytes of input are left at `*next_in`;
+/// - at least 8 bytes of input are left at `*next_in`;
 /// - at least 258 bytes of output space are left at `*next_out`;
 /// - `start` is the output space inflate() had when it was called, so that
 ///   the output written in this call starts at `*next_out - (start -
@@ -24,8 +24,18 @@ use crate::inflate::{InflateState, Mode};
 ///
 /// Port of `inflate_fast`, `inffast.c` (without `INFLATE_STRICT` and
 /// `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR`, as zlib is built by
-/// default). Differs from zlib: positions are indices into `input`,
-/// `output` and the window rather than pointers.
+/// default). Differs from zlib:
+/// - positions are indices into `input`, `output` and the window rather
+///   than pointers;
+/// - the bit buffer is refilled once per code, with eight bytes read at
+///   once, to 56 bits or more, which is enough for a length, a distance and
+///   their extra bits (at most 48). zlib pulls two bytes at a time, when it
+///   has fewer than 15 bits. The bits are the same: those past `bits` in
+///   `hold` are always either zero or the next bits of the input, so they
+///   can be or-ed again. The loop needs eight bytes of input where zlib's
+///   needs six, and stops as zlib's does after each code; whichever of them
+///   stops first, inflate() goes on with its slower loop to the same
+///   result.
 pub(crate) fn inflate_fast(
     state: &mut InflateState,
     input: &[u8],
@@ -37,7 +47,7 @@ pub(crate) fn inflate_fast(
 ) {
     // copy state to local variables
     let mut inp = *next_in; // local strm->next_in
-    let last = inp + (input.len() - inp - 5); // have enough input while in < last
+    let last = input.len() - 8; // have enough input for a refill while in <= last
     let mut out = *next_out; // local strm->next_out
     let beg = out - (start - (output.len() - out)); // inflate()'s initial strm->next_out
     let end = out + (output.len() - out - 257); // while out < end, enough space available
@@ -53,21 +63,21 @@ pub(crate) fn inflate_fast(
 
     {
         let window = &state.window[..];
-        let lcode = state.table(state.lencode); // local strm->lencode
-        let dcode = state.table(state.distcode); // local strm->distcode
+        // Differs from zlib: every index into these is masked with
+        // `TABLE_SPAN - 1`, which changes none (see `fast_table`), so that
+        // the compiler leaves out the bounds checks.
+        let lcode = state.fast_table(state.lencode); // local strm->lencode
+        let dcode = state.fast_table(state.distcode); // local strm->distcode
+        const SPAN: usize = TABLE_SPAN - 1;
 
         // decode literals and length/distances until end-of-block or not
         // enough input data or output space
         'outer: loop {
-            if bits < 15 {
-                hold += u64::from(input[inp]) << bits;
-                inp += 1;
-                bits += 8;
-                hold += u64::from(input[inp]) << bits;
-                inp += 1;
-                bits += 8;
-            }
-            let mut here = lcode[(hold & lmask) as usize];
+            // refill to 56 bits or more
+            hold |= read_word(input, inp) << bits;
+            inp += ((63 - bits) >> 3) as usize;
+            bits |= 56;
+            let mut here = lcode[(hold & lmask) as usize & SPAN];
             // dolen:
             loop {
                 let op = u32::from(here.bits);
@@ -83,24 +93,11 @@ pub(crate) fn inflate_fast(
                     let mut len = u32::from(here.val);
                     op &= 15; // number of extra bits
                     if op != 0 {
-                        if bits < op {
-                            hold += u64::from(input[inp]) << bits;
-                            inp += 1;
-                            bits += 8;
-                        }
                         len += (hold as u32) & ((1u32 << op) - 1);
                         hold >>= op;
                         bits -= op;
                     }
-                    if bits < 15 {
-                        hold += u64::from(input[inp]) << bits;
-                        inp += 1;
-                        bits += 8;
-                        hold += u64::from(input[inp]) << bits;
-                        inp += 1;
-                        bits += 8;
-                    }
-                    here = dcode[(hold & dmask) as usize];
+                    here = dcode[(hold & dmask) as usize & SPAN];
                     // dodist:
                     loop {
                         let op = u32::from(here.bits);
@@ -111,16 +108,6 @@ pub(crate) fn inflate_fast(
                             // distance base
                             let mut dist = u32::from(here.val);
                             op &= 15; // number of extra bits
-                            if bits < op {
-                                hold += u64::from(input[inp]) << bits;
-                                inp += 1;
-                                bits += 8;
-                                if bits < op {
-                                    hold += u64::from(input[inp]) << bits;
-                                    inp += 1;
-                                    bits += 8;
-                                }
-                            }
                             dist += (hold as u32) & ((1u32 << op) - 1);
                             hold >>= op;
                             bits -= op;
@@ -200,8 +187,9 @@ pub(crate) fn inflate_fast(
                             }
                         } else if op & 64 == 0 {
                             // 2nd level distance code
-                            here =
-                                dcode[usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize];
+                            let index =
+                                usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize;
+                            here = dcode[index & SPAN];
                             continue;
                         } else {
                             *msg = Some("invalid distance code");
@@ -212,7 +200,8 @@ pub(crate) fn inflate_fast(
                     }
                 } else if op & 64 == 0 {
                     // 2nd level length code
-                    here = lcode[usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize];
+                    let index = usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize;
+                    here = lcode[index & SPAN];
                     continue;
                 } else if op & 32 != 0 {
                     // end-of-block
@@ -225,7 +214,7 @@ pub(crate) fn inflate_fast(
                 }
                 break;
             }
-            if !(inp < last && out < end) {
+            if !(inp <= last && out < end) {
                 break;
             }
         }
@@ -247,15 +236,41 @@ pub(crate) fn inflate_fast(
     }
 }
 
+/// Eight bytes of input from `pos`, the first the lowest.
+#[inline(always)]
+fn read_word(input: &[u8], pos: usize) -> u64 {
+    let mut word = [0; 8];
+    word.copy_from_slice(&input[pos..pos + 8]);
+    u64::from_le_bytes(word)
+}
+
 /// Copies `len` bytes (at least three) from `from`, earlier in `output`, to
-/// `*out`, a byte at a time so that the copy repeats when they overlap.
+/// `*out`, so that the copy repeats when they overlap.
 ///
-/// Differs from zlib: zlib copies three bytes per loop, with the same
-/// result.
+/// Differs from zlib: zlib copies three bytes per loop. When the bytes are
+/// at least eight back, the port copies eight at a time, each piece read
+/// before it is written, and a run of one byte (one back) it fills, which
+/// give the same bytes.
 #[inline(always)]
 fn copy_from_output(output: &mut [u8], out: &mut usize, from: usize, len: usize) {
-    for i in 0..len {
-        output[*out + i] = output[from + i];
+    let dst = *out;
+    let mut i = 0;
+    if dst - from == 1 {
+        // A run of one byte.
+        let byte = output[from];
+        output[dst..dst + len].fill(byte);
+        i = len;
+    } else if dst - from >= 8 {
+        while i + 8 <= len {
+            let mut piece = [0; 8];
+            piece.copy_from_slice(&output[from + i..from + i + 8]);
+            output[dst + i..dst + i + 8].copy_from_slice(&piece);
+            i += 8;
+        }
+    }
+    while i < len {
+        output[dst + i] = output[from + i];
+        i += 1;
     }
     *out += len;
 }

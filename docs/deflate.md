@@ -39,14 +39,23 @@ cargo run --release -p deflate-bench -- [--levels 1,6,9] [--stream] PATH...
 
 ### Where decompression stands
 
-The port as it is, before any speed work. AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the Silesia corpus compressed by zlib at levels 1, 6 and 9, best of three rounds taken in turn:
+AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the Silesia corpus compressed by zlib at levels 1, 6 and 9, best of three rounds taken in turn:
 
-| | Mean | Range |
-|---|---|---|
-| In one call | 0.82× zlib | 0.72–0.86× |
-| Streaming, in pieces of 16 KiB as zlib's `zpipe.c` | 0.89× | 0.75–1.02× |
+| | Mean | Range | At 0.95× or more |
+|---|---|---|---|
+| In one call | 0.99× zlib | 0.89–1.09× | 32 of 36 |
+| Streaming, in pieces of 16 KiB as zlib's `zpipe.c` | 1.05× | 0.95–1.16× | 36 of 36 |
 
-Almost all of the time is in `inflate_fast`, and what is left is bounds checks: each input byte, table entry and output byte is checked, where zlib's pointers are not. Tried so far, with no clear gain: copying matches eight bytes at a time, tables of a fixed size so that a mask replaces the check, and reading two input bytes with one check. The speed work comes next, as it did for zstd.
+It was 0.82× in one call (0.71–0.86×) and 0.90× streaming before the speed work, all of it in `inflate_fast`. What made the difference, the largest first, measured at level 6 in one call:
+
+- **Eight bytes of input at once.** zlib pulls two bytes into its bit buffer whenever it has fewer than 15 bits, up to six times per length and distance. The port reads eight bytes once per code, to 56 bits or more, which is enough for a length, a distance and their extra bits (48 at most). The bits past those counted are the input's next bits, so they can be or-ed in again. 0.83× to 0.94×.
+- **Matches copied eight bytes at a time**, when they start at least eight bytes back, each piece read from bytes already written. zlib copies three bytes per loop; byte by byte, every one was a bounds check. +3%.
+- **Runs of one byte filled**: matches one byte back, the commonest of those that overlap. +2%, and 11% on `mr`.
+- **Tables of a fixed size.** `inflate_fast` takes each code table as an array of 1024 entries (the most a table needs is 852), so an index masked with 1023 needs no bounds check. +1%.
+
+Tried, and not worth it: copying matches two to seven bytes back eight bytes at a time too, from the nearest multiple of their distance that is eight or more back. That made decompression 9% slower on average, and is not in the port.
+
+The slowest inputs are text at level 1, mostly literals. arm64 is not measured yet.
 
 ## Progress
 

@@ -2,7 +2,7 @@
 
 Deflate, zlib and gzip decompression in safe Rust, ported from the official library, [zlib](https://zlib.net) 1.3.2.
 
-> **Status:** decompression works, raw or with the zlib and gzip wrappers, with dictionaries and gzip headers, and gives the same results and messages as zlib on every stream the tests try. It runs at about 0.8× zlib's speed, before any speed work. Compression comes next. This crate is not on crates.io.
+> **Status:** decompression works, raw or with the zlib and gzip wrappers, with dictionaries and gzip headers, and gives the same results and messages as zlib on every stream the tests try. It runs at about zlib's speed: 0.99× in one call and 1.05× streaming on average over Silesia, on x86-64. Compression comes next. This crate is not on crates.io.
 
 ```rust
 use hivepack_deflate::{Flush, InBuffer, Inflate, OutBuffer, Status};

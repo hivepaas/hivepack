@@ -106,6 +106,10 @@
  *   hufreadctable <maxSV> <hex>       HUF_readCTable, answered "ok <size> <maxSV>
  *                                     <hasZeroWeights> <table>"
  *
+ * Frames:
+ *   compress <level> <dstCapacity> <hex>
+ *                                     ZSTD_compressCCtx, on one context used again and again
+ *
  * A block's entropy coding, with the tables of the block before kept from
  * request to request, as the block compressor keeps them:
  *   seqreset                          new tables: every word filler, none to be used again
@@ -833,6 +837,25 @@ static void hufreadctable(char** args, int nargs)
     puts("");
 }
 
+/* ---- Frames ---- */
+
+static void compress(char** args, int nargs)
+{
+    static ZSTD_CCtx* cctx;
+    size_t dstCapacity, r;
+    long n;
+    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    dstCapacity = strtoul(args[1], NULL, 10);
+    if (dstCapacity > MAX_BYTES) { puts("bad"); return; }
+    if (!cctx) cctx = ZSTD_createCCtx();
+    r = ZSTD_compressCCtx(cctx, output, dstCapacity, input, (size_t)n, atoi(args[0]));
+    if (ZSTD_isError(r)) { answer_error(r); return; }
+    line_reset();
+    line_append("ok ", 3);
+    line_append_hex(output, r);
+    puts(line_out);
+}
+
 /* ---- A block's entropy coding ---- */
 
 static ZSTD_entropyCTables_t seq_entropy[2];
@@ -1166,6 +1189,7 @@ int main(void)
         else if (!strcmp(command, "hufcompress")) hufcompress(args, nargs);
         else if (!strcmp(command, "hufreadctable")) hufreadctable(args, nargs);
         else if (!strcmp(command, "seqreset")) seqreset(nargs);
+        else if (!strcmp(command, "compress")) compress(args, nargs);
         else if (!strcmp(command, "seqblock")) seqblock(args, nargs);
         else puts("bad");
         fflush(stdout);

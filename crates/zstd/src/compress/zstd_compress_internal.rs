@@ -1,8 +1,11 @@
 //! The encoder's shared types: port of the parts of
 //! `compress/zstd_compress_internal.h` the port needs so far.
 
-use crate::common::bits::highbit32;
+use crate::common::bits::{highbit32, nb_common_bytes};
+use crate::common::error_private::{Result, error};
 use crate::common::fse::fse_ctable_size_u32;
+use crate::common::mem::{read_le16, read_le32, read_le64};
+use crate::common::zstd_internal::ZSTD_BLOCKHEADERSIZE;
 use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG};
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
 
@@ -204,4 +207,300 @@ pub(crate) fn zstd_literals_compression_is_disabled(
         ParamSwitch::Disable => true,
         ParamSwitch::Auto => strategy == Strategy::Fast && target_length > 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parameters
+
+/// `ZSTD_compressionParameters`
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CompressionParameters {
+    /// The largest match distance is `1 << window_log`.
+    pub(crate) window_log: u32,
+    /// The size of the chain or binary tree tables.
+    pub(crate) chain_log: u32,
+    /// The size of the hash table.
+    pub(crate) hash_log: u32,
+    /// The number of searches.
+    pub(crate) search_log: u32,
+    /// The shortest match.
+    pub(crate) min_match: u32,
+    /// How long a match must be to stop searching (or, for `fast`, the
+    /// acceleration).
+    pub(crate) target_length: u32,
+    pub(crate) strategy: Strategy,
+}
+
+/// `ZSTD_frameParameters`
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FrameParameters {
+    /// Write the content size in the frame header, when known.
+    pub(crate) content_size_flag: bool,
+    /// Write a checksum of the content at the end of the frame.
+    pub(crate) checksum_flag: bool,
+    /// Leave the dictionary ID out of the frame header.
+    pub(crate) no_dict_id_flag: bool,
+}
+
+/// `ZSTD_WINDOWLOG_MAX` on 64-bit machines.
+pub(crate) const ZSTD_WINDOWLOG_MAX: u32 = 31;
+/// `ZSTD_HASHLOG_MIN`
+pub(crate) const ZSTD_HASHLOG_MIN: u32 = 6;
+/// `ZSTD_WINDOW_START_INDEX`: the index of the first byte a fresh context
+/// sees, above 0 so that every position is valid.
+pub(crate) const ZSTD_WINDOW_START_INDEX: u32 = 2;
+/// `HASH_READ_SIZE`: the bytes the hashes read at a position.
+pub(crate) const HASH_READ_SIZE: usize = 8;
+/// `kSearchStrength`: how quickly the search speeds up over data without
+/// matches.
+pub(crate) const K_SEARCH_STRENGTH: u32 = 8;
+
+/// `REPCODE1_TO_OFFBASE`
+pub(crate) const REPCODE1_TO_OFFBASE: u32 = 1;
+
+/// `OFFSET_TO_OFFBASE`
+#[inline(always)]
+pub(crate) fn offset_to_offbase(offset: u32) -> u32 {
+    debug_assert!(offset > 0);
+    offset + crate::common::zstd_internal::ZSTD_REP_NUM as u32
+}
+
+// ---------------------------------------------------------------------------
+// The window and the match state
+
+/// `ZSTD_window_t`, for input in one buffer: index `i` is byte `i - base`
+/// of the buffer the window is over. Below `low_limit` no index is valid;
+/// from `dict_limit` on, the prefix starts.
+///
+/// Differs from libzstd: positions are indices into the buffer instead of
+/// pointers, so the window covers one buffer, without an older segment
+/// (an `extDict`) yet.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Window {
+    /// The index of the buffer's first byte.
+    pub(crate) base: u32,
+    /// The index after the last byte seen.
+    pub(crate) next_src: u32,
+    pub(crate) dict_limit: u32,
+    pub(crate) low_limit: u32,
+}
+
+impl Window {
+    /// `ZSTD_window_init`, then `ZSTD_window_update` with a buffer that does
+    /// not follow anything: its first byte gets index
+    /// `ZSTD_WINDOW_START_INDEX`.
+    pub(crate) fn new(src_size: usize) -> Self {
+        Window {
+            base: ZSTD_WINDOW_START_INDEX,
+            next_src: ZSTD_WINDOW_START_INDEX + src_size as u32,
+            dict_limit: ZSTD_WINDOW_START_INDEX,
+            low_limit: ZSTD_WINDOW_START_INDEX,
+        }
+    }
+
+    /// `ZSTD_window_enforceMaxDist`, without a dictionary: makes indices
+    /// more than `max_dist` before `block_end_idx` invalid.
+    pub(crate) fn enforce_max_dist(&mut self, block_end_idx: u32, max_dist: u32) {
+        if block_end_idx > max_dist {
+            let new_low_limit = block_end_idx - max_dist;
+            if self.low_limit < new_low_limit {
+                self.low_limit = new_low_limit;
+            }
+            if self.dict_limit < self.low_limit {
+                self.dict_limit = self.low_limit;
+            }
+        }
+    }
+}
+
+/// `ZSTD_MatchState_t`: what the match finders keep from block to block.
+pub(crate) struct MatchState {
+    pub(crate) window: Window,
+    pub(crate) hash_table: Vec<u32>,
+    pub(crate) next_to_update: u32,
+    /// The index after a loaded dictionary, or 0.
+    pub(crate) loaded_dict_end: u32,
+    pub(crate) c_params: CompressionParameters,
+}
+
+impl MatchState {
+    /// `ZSTD_getLowestPrefixIndex`: the lowest index a match at `curr` may
+    /// reach, at most `1 << window_log` back.
+    #[inline(always)]
+    pub(crate) fn lowest_prefix_index(&self, curr: u32, window_log: u32) -> u32 {
+        let max_distance = 1u32 << window_log;
+        let lowest_valid = self.window.dict_limit;
+        let within_window = if curr.wrapping_sub(lowest_valid) > max_distance {
+            curr - max_distance
+        } else {
+            lowest_valid
+        };
+        let is_dictionary = self.loaded_dict_end != 0;
+        if is_dictionary {
+            lowest_valid
+        } else {
+            within_window
+        }
+    }
+}
+
+/// `ZSTD_compressedBlockState_t`: the tables and repeat offsets a block
+/// leaves for the next one.
+#[derive(Clone)]
+pub(crate) struct CompressedBlockState {
+    pub(crate) entropy: Box<EntropyCTables>,
+    pub(crate) rep: [u32; crate::common::zstd_internal::ZSTD_REP_NUM],
+}
+
+// ---------------------------------------------------------------------------
+// Hashes
+
+const PRIME4BYTES: u32 = 2_654_435_761;
+const PRIME5BYTES: u64 = 889_523_592_379;
+const PRIME6BYTES: u64 = 227_718_039_650_203;
+const PRIME7BYTES: u64 = 58_295_818_150_454_627;
+const PRIME8BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
+
+/// `ZSTD_hashPtr`: the hash of the `mls` bytes at `at`, `h_bits` long. Reads
+/// 4 bytes for `mls` 4 (or less), 8 otherwise.
+#[inline(always)]
+pub(crate) fn zstd_hash_ptr(src: &[u8], at: usize, h_bits: u32, mls: u32) -> usize {
+    debug_assert!(h_bits <= 32);
+    match mls {
+        5 => zstd_hash_n::<5>(read_le64(src, at), PRIME5BYTES, h_bits),
+        6 => zstd_hash_n::<6>(read_le64(src, at), PRIME6BYTES, h_bits),
+        7 => zstd_hash_n::<7>(read_le64(src, at), PRIME7BYTES, h_bits),
+        8 => (read_le64(src, at).wrapping_mul(PRIME8BYTES) >> (64 - h_bits)) as usize,
+        // 4, and anything else
+        _ => (read_le32(src, at).wrapping_mul(PRIME4BYTES) >> (32 - h_bits)) as usize,
+    }
+}
+
+/// `ZSTD_hash5` to `ZSTD_hash7`: the low `N` bytes of `u`.
+#[inline(always)]
+fn zstd_hash_n<const N: u32>(u: u64, prime: u64, h_bits: u32) -> usize {
+    ((u << (64 - 8 * N)).wrapping_mul(prime) >> (64 - h_bits)) as usize
+}
+
+/// `ZSTD_count`: how many bytes from `p_in` equal those from `p_match`,
+/// stopping at `p_in_limit`. `p_match` is before `p_in`.
+#[inline(always)]
+pub(crate) fn zstd_count(
+    src: &[u8],
+    mut p_in: usize,
+    mut p_match: usize,
+    p_in_limit: usize,
+) -> usize {
+    let p_start = p_in;
+    if p_in_limit >= 7 {
+        let p_in_loop_limit = p_in_limit - 7;
+        while p_in < p_in_loop_limit {
+            let diff = read_le64(src, p_match) ^ read_le64(src, p_in);
+            if diff != 0 {
+                return p_in + nb_common_bytes(diff) as usize - p_start;
+            }
+            p_in += 8;
+            p_match += 8;
+        }
+    }
+    if p_in + 3 < p_in_limit && read_le32(src, p_match) == read_le32(src, p_in) {
+        p_in += 4;
+        p_match += 4;
+    }
+    if p_in + 1 < p_in_limit && read_le16(src, p_match) == read_le16(src, p_in) {
+        p_in += 2;
+        p_match += 2;
+    }
+    if p_in < p_in_limit && src[p_match] == src[p_in] {
+        p_in += 1;
+    }
+    p_in - p_start
+}
+
+// ---------------------------------------------------------------------------
+// Storing sequences
+
+impl SeqStore {
+    /// An empty store, for a block of up to `block_size` bytes.
+    pub(crate) fn with_capacity(block_size: usize, max_nb_seq: usize) -> Self {
+        SeqStore {
+            sequences: Vec::with_capacity(max_nb_seq),
+            literals: Vec::with_capacity(block_size),
+            ll_code: Vec::with_capacity(max_nb_seq),
+            ml_code: Vec::with_capacity(max_nb_seq),
+            of_code: Vec::with_capacity(max_nb_seq),
+            long_length_type: LongLengthType::None,
+            long_length_pos: 0,
+        }
+    }
+
+    /// `ZSTD_resetSeqStore`
+    pub(crate) fn reset(&mut self) {
+        self.sequences.clear();
+        self.literals.clear();
+        self.long_length_type = LongLengthType::None;
+    }
+
+    /// `ZSTD_storeSeq`: a sequence and its `lit_length` literals, at
+    /// `literals` in `src`.
+    #[inline(always)]
+    pub(crate) fn store_seq(
+        &mut self,
+        src: &[u8],
+        literals: usize,
+        lit_length: usize,
+        off_base: u32,
+        match_length: usize,
+    ) {
+        self.literals
+            .extend_from_slice(&src[literals..literals + lit_length]);
+        self.store_seq_only(lit_length, off_base, match_length);
+    }
+
+    /// `ZSTD_storeSeqOnly`: a sequence, its literals already stored.
+    #[inline(always)]
+    pub(crate) fn store_seq_only(&mut self, lit_length: usize, off_base: u32, match_length: usize) {
+        debug_assert!(lit_length <= crate::common::zstd_internal::ZSTD_BLOCKSIZE_MAX);
+        if lit_length > 0xFFFF {
+            // A block has at most one long length.
+            debug_assert!(self.long_length_type == LongLengthType::None);
+            self.long_length_type = LongLengthType::LiteralLength;
+            self.long_length_pos = self.sequences.len() as u32;
+        }
+        debug_assert!(match_length >= crate::common::zstd_internal::MINMATCH as usize);
+        let ml_base = match_length - crate::common::zstd_internal::MINMATCH as usize;
+        if ml_base > 0xFFFF {
+            debug_assert!(self.long_length_type == LongLengthType::None);
+            self.long_length_type = LongLengthType::MatchLength;
+            self.long_length_pos = self.sequences.len() as u32;
+        }
+        self.sequences.push(SeqDef {
+            off_base,
+            lit_length: lit_length as u16,
+            ml_base: ml_base as u16,
+        });
+    }
+
+    /// `ZSTD_storeLastLiterals`
+    pub(crate) fn store_last_literals(&mut self, src: &[u8], anchor: usize, last_ll_size: usize) {
+        self.literals
+            .extend_from_slice(&src[anchor..anchor + last_ll_size]);
+    }
+}
+
+/// `ZSTD_noCompressBlock`: `src` as a raw block, after its header.
+pub(crate) fn zstd_no_compress_block(
+    dst: &mut [u8],
+    src: &[u8],
+    last_block: bool,
+) -> Result<usize> {
+    let header = u32::from(last_block)
+        + ((crate::common::zstd_internal::BlockType::Raw as u32) << 1)
+        + ((src.len() as u32) << 3);
+    if src.len() + ZSTD_BLOCKHEADERSIZE > dst.len() {
+        return error!(DstSizeTooSmall);
+    }
+    dst[..3].copy_from_slice(&header.to_le_bytes()[..3]);
+    dst[ZSTD_BLOCKHEADERSIZE..ZSTD_BLOCKHEADERSIZE + src.len()].copy_from_slice(src);
+    Ok(ZSTD_BLOCKHEADERSIZE + src.len())
 }

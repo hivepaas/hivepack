@@ -35,7 +35,7 @@ use crate::compress::huf_compress::{
     huf_compress1x_repeat, huf_compress4x_repeat, huf_optimal_table_log, huf_read_ctable,
     huf_read_ctable_header, huf_write_ctable_wksp,
 };
-use crate::compress::zstd_compress::zstd_entropy_compress_seq_store;
+use crate::compress::zstd_compress::{CCtx, zstd_compress_bound, zstd_entropy_compress_seq_store};
 use crate::compress::zstd_compress_internal::{
     EntropyCTables, FseRepeat, LongLengthType, ParamSwitch, SeqDef, SeqStore, Strategy,
     zstd_literals_compression_is_disabled,
@@ -91,6 +91,9 @@ fn table_unhex(text: &str) -> Box<HufCTable> {
 }
 
 thread_local! {
+    /// The context `compress` uses again and again, as the oracle does.
+    static CCTX: RefCell<CCtx> = RefCell::new(CCtx::new());
+
     /// The tables of the block before and of the next one, kept from
     /// request to request as the oracle keeps them, and which is which.
     static SEQ_ENTROPY: RefCell<([Box<EntropyCTables>; 2], usize)> = RefCell::new((
@@ -426,6 +429,19 @@ pub(crate) fn answer(request: &str) -> String {
                 ),
                 Err(error) => failed(error),
             }
+        }
+        ["compress", level, dst_capacity, src] => {
+            let src = unhex(src);
+            let mut dst = vec![0u8; number(dst_capacity)];
+            CCTX.with(|cctx| {
+                match cctx
+                    .borrow_mut()
+                    .compress_cctx(&mut dst, &src, number(level))
+                {
+                    Ok(size) => format!("ok {}", hex(&dst[..size])),
+                    Err(error) => failed(error),
+                }
+            })
         }
         ["seqreset"] => {
             SEQ_ENTROPY.with(|state| {
@@ -852,6 +868,11 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         requests.extend(seq_chain(rng, chain));
     }
 
+    // Whole frames, at the levels whose strategy is fast.
+    for i in 0..per_command / 4 {
+        requests.push(frame_request(rng, i));
+    }
+
     // Valid tables, as a dictionary gives them: used without a look when
     // the flags prefer them, otherwise when they cost less.
     for _ in 0..per_command / 10 {
@@ -880,6 +901,56 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
     }
 
     requests
+}
+
+/// The data of a frame: as `data`, or pieces of different kinds one after
+/// another, where libzstd may end a block early.
+fn frame_data(rng: &mut Rng, len: usize) -> Vec<u8> {
+    if rng.range(0, 2) != 0 {
+        return data(rng, len);
+    }
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let piece = (rng.range(1000, 80_000) as usize).min(len - out.len());
+        out.extend(data(rng, piece));
+    }
+    out
+}
+
+/// A `compress` request, at a level whose strategy is fast for its size,
+/// with room enough, barely enough, or too little.
+fn frame_request(rng: &mut Rng, i: usize) -> String {
+    // Sizes on both sides of where the tables of levels change, and powers
+    // of 2, where the window just holds the input.
+    const EDGES: [u64; 14] = [
+        1024, 2048, 4096, 8192, 16_383, 16_384, 16_385, 65_536, 131_071, 131_072, 131_073, 262_143,
+        262_144, 262_145,
+    ];
+    let len = match i % 12 {
+        0 => rng.range(0, 16),
+        1 => rng.range(16_000, 17_000),
+        2 => rng.range(120_000, 140_000),
+        3 => rng.range(250_000, 270_000),
+        4 => rng.range(300_000, 1 << 20),
+        5 => EDGES[rng.range(0, EDGES.len() as u64 - 1) as usize],
+        _ => rng.range(0, 6000),
+    } as usize;
+    let src = frame_data(rng, len);
+    // Level 2 is dfast for inputs from 128 to 256 KB.
+    let dfast_at_2 = (128 << 10) < len && len <= 256 << 10;
+    let level: i64 = match rng.range(0, 5) {
+        0 => -(rng.range(1, 10) as i64),
+        1 => -(rng.range(1, 200_000) as i64),
+        2 if !dfast_at_2 => 2,
+        _ => 1,
+    };
+    let bound = zstd_compress_bound(len).unwrap_or(0) as u64;
+    let capacity = match rng.range(0, 7) {
+        0 => rng.range(0, 30),
+        1 => rng.range(len as u64 / 3, bound),
+        _ => bound,
+    };
+    format!("compress {level} {capacity} {}", hex(&src))
 }
 
 /// How a run of blocks draws its sequences.
@@ -1000,6 +1071,29 @@ fn seq_chain(rng: &mut Rng, chain: usize) -> Vec<String> {
     requests
 }
 
+/// The kinds of a frame's blocks, and whether a full-size one was ended
+/// early, for the statistics of the live comparison.
+fn frame_block_kinds(frame: &[u8]) -> Vec<String> {
+    let descriptor = frame[4];
+    let single_segment = descriptor & 0x20 != 0;
+    let fcs = [usize::from(single_segment), 2, 4, 8][usize::from(descriptor >> 6)];
+    let mut at = 5 + usize::from(!single_segment) + fcs;
+    let mut kinds = Vec::new();
+    loop {
+        let header = u32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], 0]);
+        let (last, kind, size) = (header & 1, (header >> 1) & 3, (header >> 3) as usize);
+        kinds.push(format!(
+            "compress block {}",
+            ["raw", "rle", "compressed", "reserved"][kind as usize]
+        ));
+        at += 3 + if kind == 1 { 1 } else { size };
+        if last != 0 {
+            break;
+        }
+    }
+    kinds
+}
+
 /// How a compressed block encodes its parts: its literals, and each kind of
 /// code, for the statistics of the live comparison.
 fn seq_block_kinds(block: &[u8]) -> Vec<String> {
@@ -1091,6 +1185,11 @@ fn port_matches_libzstd_compression() {
         }
         let command = request.split(' ').next().unwrap_or_default();
         let words: Vec<&str> = want.split(' ').collect();
+        if command == "compress" && words[0] == "ok" {
+            for kind in frame_block_kinds(&unhex(words[1])) {
+                *outcomes.entry(kind).or_default() += 1;
+            }
+        }
         if command == "seqblock" && words[0] == "ok" && words[1] != "0" {
             for kind in seq_block_kinds(&unhex(words[2])) {
                 *outcomes.entry(kind).or_default() += 1;
@@ -1159,7 +1258,10 @@ fn record_compress_answers() {
         // Keep the file small: the large inputs are for the live comparison.
         // Huffman requests carry a table, of up to 4 KB of hex.
         let fits = run.iter().all(|request| {
-            let limit = if request.starts_with("hufcompress") || request.starts_with("seqblock") {
+            let limit = if request.starts_with("hufcompress")
+                || request.starts_with("seqblock")
+                || request.starts_with("compress")
+            {
                 8000
             } else {
                 3000

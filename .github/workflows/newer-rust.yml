@@ -1,0 +1,42 @@
+name: Newer Rust
+
+# Users build the libraries with whatever Rust they have, often newer than
+# rust-toolchain.toml's: a weekly look at the latest stable and beta, to meet
+# their new lints and breakage before the pinned version is raised. A failure
+# here warns; it blocks no pull request.
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Lints and tests (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Rust (${{ matrix.toolchain }})
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy
+          echo "RUSTUP_TOOLCHAIN=${{ matrix.toolchain }}" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features hivepack-zstd/unsafe-fast -- -D warnings
+      # Only the committed sets, as the cross-compiled tests in ci.yml.
+      - run: cargo test --workspace --locked
+      - run: cargo test -p hivepack-zstd --locked --features unsafe-fast

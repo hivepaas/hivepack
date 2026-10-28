@@ -31,6 +31,22 @@ cargo test --workspace
 
 The test files come from zstd itself and from other zstd implementations (Go, Java, Rust), with their licenses. [testdata/README.md](testdata/README.md) lists them.
 
+## 🦀 Rust versions
+
+- **Oldest supported: 1.88**, `rust-version` in `Cargo.toml`, which CI checks.
+  It is a promise to the crates' users: raised only when the code needs
+  something newer, never to a Rust less than a year old, and, once the crates
+  are published, in a minor release with a line in its notes.
+- **Development:** `rust-toolchain.toml` pins the stable Rust that formats,
+  lints, documents and tests, so a new Rust never turns CI red on its own. It
+  is raised by hand every second Rust release (about every twelve weeks), once
+  that release is two weeks old, in a pull request of its own, together with
+  the nightly that Miri and cargo-fuzz use (`NIGHTLY` in
+  `.github/workflows/ci.yml`).
+- **Newer Rust:** a weekly workflow (`.github/workflows/newer-rust.yml`) lints
+  and tests with the latest stable and beta, which users may build with before
+  the pin is raised. A failure there warns; it blocks nothing.
+
 ## 🐝 Made by HivePaaS
 
 hivepack is built and maintained by HivePaaS, who also make:

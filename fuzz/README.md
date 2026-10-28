@@ -1,8 +1,10 @@
 # Fuzzing
 
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd, and
-hivepack-deflate with zlib. They need a nightly toolchain and
-`cargo install cargo-fuzz`.
+hivepack-deflate with zlib. They need nightly, where
+`rust-toolchain.toml` pins a stable: the nightly CI uses (`NIGHTLY` in
+`.github/workflows/ci.yml`), chosen for the shell with
+`export RUSTUP_TOOLCHAIN=<that nightly>`, and `cargo install cargo-fuzz`.
 
 | Target | What it checks |
 |---|---|

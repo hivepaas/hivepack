@@ -168,13 +168,16 @@ def build_tool(source: Path, tool: str) -> Path:
     return binary
 
 
-def build_oracle(source: Path, sources: list, folder: Path) -> None:
+def build_oracle(source: Path, sources: list, included: list, folder: Path) -> None:
     """tools/zstd-oracle, compiled with libzstd's own sources (without the
-    assembly loop, which the port does not have either)."""
+    assembly loop, which the port does not have either). The `included`
+    files are left out: the oracle includes them itself, to reach their
+    static functions."""
     lib = next(source.glob("zstd-*/lib"))
     files = [str(ROOT / s) for s in sources]
     for part in ("common", "compress", "decompress"):
-        files += sorted(str(f) for f in (lib / part).glob("*.c"))
+        files += sorted(str(f) for f in (lib / part).glob("*.c")
+                        if f"{part}/{f.name}" not in included)
     compiler = os.environ.get("CC", "cc")
     subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", f"-I{lib}", f"-I{lib / 'common'}",
                     *files, "-o", str(folder / "oracle")], check=True)
@@ -193,7 +196,7 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
     if generate["tool"] == "oracle":
-        build_oracle(cache / origin["name"], generate["sources"], folder)
+        build_oracle(cache / origin["name"], generate["sources"], generate.get("included", []), folder)
     else:
         binary = build_tool(cache / origin["name"], generate["tool"])
         # Each frame goes to z<number>.zst with its original at z<number>.

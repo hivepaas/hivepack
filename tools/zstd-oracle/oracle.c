@@ -106,6 +106,21 @@
  *   hufreadctable <maxSV> <hex>       HUF_readCTable, answered "ok <size> <maxSV>
  *                                     <hasZeroWeights> <table>"
  *
+ * A block's entropy coding, with the tables of the block before kept from
+ * request to request, as the block compressor keeps them:
+ *   seqreset                          new tables: every word filler, none to be used again
+ *   seqblock <strategy> <literalMode> <targetLength> <dstCapacity> <literals> <sequences>
+ *                                     ZSTD_entropyCompressSeqStore of the literals and the
+ *                                     sequences, triples (offBase, litLength, matchLength),
+ *                                     at most one length over 0xFFFF (+ MINMATCH for a match);
+ *                                     the block size is the literals plus the match lengths.
+ *                                     As ZSTD_compressBlock_internal does, a block that
+ *                                     compresses (more than 1 byte) makes its tables the
+ *                                     previous ones. Answered "ok <size> <output> <repeat
+ *                                     modes: huf,of,ml,ll> <FNV-1a of the tables>", the
+ *                                     Huffman table up to its largest symbol (see
+ *                                     hufcompress)
+ *
  * Copyright (c) 2026 HivePaaS. MIT license.
  */
 
@@ -126,6 +141,9 @@
 #include "common/xxhash.h"
 #include "compress/hist.h"
 #include "zstd.h"
+/* Included rather than linked (scripts/testdata.py leaves it out), to reach
+ * its static functions: ZSTD_entropyCompressSeqStore. */
+#include "compress/zstd_compress.c"
 
 /* Large enough for every request the tests send. */
 #define MAX_BYTES (1 << 20)
@@ -815,6 +833,140 @@ static void hufreadctable(char** args, int nargs)
     puts("");
 }
 
+/* ---- A block's entropy coding ---- */
+
+static ZSTD_entropyCTables_t seq_entropy[2];
+static int seq_prev;
+static U32 seq_wksp[TMP_WORKSPACE_SIZE / sizeof(U32)];
+
+static void seqreset(int nargs)
+{
+    int i;
+    size_t w;
+    if (nargs != 0) { puts("bad"); return; }
+    for (i = 0; i < 2; i++) {
+        ZSTD_entropyCTables_t* const e = &seq_entropy[i];
+        for (w = 0; w < HUF_CTABLE_SIZE_ST(255); w++) e->huf.CTable[w] = ((HUF_CElt)FILLER_WORD << 32) | FILLER_WORD;
+        for (w = 0; w < sizeof(e->fse.offcodeCTable) / 4; w++) e->fse.offcodeCTable[w] = FILLER_WORD;
+        for (w = 0; w < sizeof(e->fse.matchlengthCTable) / 4; w++) e->fse.matchlengthCTable[w] = FILLER_WORD;
+        for (w = 0; w < sizeof(e->fse.litlengthCTable) / 4; w++) e->fse.litlengthCTable[w] = FILLER_WORD;
+        e->huf.repeatMode = HUF_repeat_none;
+        e->fse.offcode_repeatMode = FSE_repeat_none;
+        e->fse.matchlength_repeatMode = FSE_repeat_none;
+        e->fse.litlength_repeatMode = FSE_repeat_none;
+    }
+    seq_prev = 0;
+    puts("ok");
+}
+
+static unsigned long long fnv64_from(unsigned long long hash, const void* bytes, size_t n)
+{
+    const unsigned char* const p = (const unsigned char*)bytes;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        hash ^= p[i];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/* The tables as little-endian bytes: FSE words, then Huffman elements up to
+ * the table's largest symbol. */
+static unsigned long long entropy_digest(const ZSTD_entropyCTables_t* e)
+{
+    unsigned long long hash = 0xcbf29ce484222325ULL;
+    size_t w;
+    const FSE_CTable* const tables[3] = { e->fse.offcodeCTable, e->fse.matchlengthCTable, e->fse.litlengthCTable };
+    size_t const sizes[3] = { sizeof(e->fse.offcodeCTable) / 4, sizeof(e->fse.matchlengthCTable) / 4, sizeof(e->fse.litlengthCTable) / 4 };
+    int t;
+    for (t = 0; t < 3; t++) {
+        for (w = 0; w < sizes[t]; w++) {
+            unsigned char bytes[4];
+            int b;
+            for (b = 0; b < 4; b++) bytes[b] = (unsigned char)(tables[t][w] >> (8 * b));
+            hash = fnv64_from(hash, bytes, 4);
+        }
+    }
+    for (w = 0; w < HUF_CTABLE_SIZE_ST(HUF_readCTableHeader(e->huf.CTable).maxSymbolValue); w++) {
+        unsigned char bytes[8];
+        int b;
+        for (b = 0; b < 8; b++) bytes[b] = (unsigned char)((unsigned long long)e->huf.CTable[w] >> (8 * b));
+        hash = fnv64_from(hash, bytes, 8);
+    }
+    return hash;
+}
+
+static void seqblock(char** args, int nargs)
+{
+    static SeqDef sequences[ZSTD_BLOCKSIZE_MAX / MINMATCH + 1];
+    static BYTE llCode[ZSTD_BLOCKSIZE_MAX / MINMATCH + 1], mlCode[ZSTD_BLOCKSIZE_MAX / MINMATCH + 1], ofCode[ZSTD_BLOCKSIZE_MAX / MINMATCH + 1];
+    static BYTE literals[ZSTD_BLOCKSIZE_MAX];
+    static long long triples[3 * (ZSTD_BLOCKSIZE_MAX / MINMATCH + 1)];
+    SeqStore_t seqStore;
+    ZSTD_CCtx_params params;
+    size_t dstCapacity, blockSize, r;
+    long litSize, n, i;
+    int strategy;
+    if (nargs != 6 || (litSize = parse_hex(args[4])) < 0 || litSize > ZSTD_BLOCKSIZE_MAX) { puts("bad"); return; }
+    memcpy(literals, input, (size_t)litSize);
+    n = parse_list(args[5], triples, 3 * (ZSTD_BLOCKSIZE_MAX / MINMATCH + 1));
+    strategy = atoi(args[0]);
+    dstCapacity = strtoul(args[3], NULL, 10);
+    if (n < 0 || n % 3 || strategy < ZSTD_fast || strategy > ZSTD_btultra2 || dstCapacity > MAX_BYTES) { puts("bad"); return; }
+    memset(&seqStore, 0, sizeof(seqStore));
+    seqStore.sequencesStart = sequences;
+    seqStore.litStart = literals;
+    seqStore.lit = literals + litSize;
+    seqStore.llCode = llCode;
+    seqStore.mlCode = mlCode;
+    seqStore.ofCode = ofCode;
+    seqStore.maxNbSeq = ZSTD_BLOCKSIZE_MAX / MINMATCH + 1;
+    seqStore.maxNbLit = ZSTD_BLOCKSIZE_MAX;
+    seqStore.longLengthType = ZSTD_llt_none;
+    blockSize = (size_t)litSize;
+    for (i = 0; i < n / 3; i++) {
+        long long const offBase = triples[3 * i], litLength = triples[3 * i + 1], matchLength = triples[3 * i + 2];
+        if (offBase < 1 || offBase > 0xFFFFFFFFLL || litLength < 0 || matchLength < MINMATCH
+            || litLength > 0x1FFFF || matchLength - MINMATCH > 0x1FFFF) { puts("bad"); return; }
+        if (litLength > 0xFFFF || matchLength - MINMATCH > 0xFFFF) {
+            if (seqStore.longLengthType != ZSTD_llt_none) { puts("bad"); return; }
+            seqStore.longLengthType = litLength > 0xFFFF ? ZSTD_llt_literalLength : ZSTD_llt_matchLength;
+            seqStore.longLengthPos = (U32)i;
+        }
+        sequences[i].offBase = (U32)offBase;
+        sequences[i].litLength = (U16)litLength;
+        sequences[i].mlBase = (U16)(matchLength - MINMATCH);
+        blockSize += (size_t)matchLength;
+    }
+    seqStore.sequences = sequences + n / 3;
+    if (blockSize > ZSTD_BLOCKSIZE_MAX) { puts("bad"); return; }
+    memset(&params, 0, sizeof(params));
+    params.cParams.strategy = (ZSTD_strategy)strategy;
+    params.cParams.targetLength = (unsigned)strtoul(args[2], NULL, 10);
+    params.literalCompressionMode = (ZSTD_ParamSwitch_e)atoi(args[1]);
+    r = ZSTD_entropyCompressSeqStore(&seqStore, &seq_entropy[seq_prev], &seq_entropy[1 - seq_prev], &params,
+                                     output, dstCapacity, blockSize, seq_wksp, sizeof(seq_wksp), 0);
+    if (ZSTD_isError(r)) { answer_error(r); return; }
+    if (r > 1) seq_prev = 1 - seq_prev;
+    if (seq_entropy[seq_prev].fse.offcode_repeatMode == FSE_repeat_valid)
+        seq_entropy[seq_prev].fse.offcode_repeatMode = FSE_repeat_check;
+    line_reset();
+    {   char head[64];
+        int const k = snprintf(head, sizeof(head), "ok %u ", (unsigned)r);
+        line_append(head, (size_t)k);
+    }
+    if (r == 0) line_append("-", 1);
+    line_append_hex(output, r);
+    {   const ZSTD_entropyCTables_t* const e = &seq_entropy[seq_prev];
+        char tail[96];
+        int const k = snprintf(tail, sizeof(tail), " %d,%d,%d,%d %016llx", (int)e->huf.repeatMode,
+            (int)e->fse.offcode_repeatMode, (int)e->fse.matchlength_repeatMode,
+            (int)e->fse.litlength_repeatMode, entropy_digest(e));
+        line_append(tail, (size_t)k);
+    }
+    puts(line_out);
+}
+
 static void mkblocks(char** args, int nargs)
 {
     static ZSTD_CCtx* cctx;
@@ -1013,6 +1165,8 @@ int main(void)
         else if (!strcmp(command, "hufoptlog")) hufoptlog(args, nargs);
         else if (!strcmp(command, "hufcompress")) hufcompress(args, nargs);
         else if (!strcmp(command, "hufreadctable")) hufreadctable(args, nargs);
+        else if (!strcmp(command, "seqreset")) seqreset(nargs);
+        else if (!strcmp(command, "seqblock")) seqblock(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

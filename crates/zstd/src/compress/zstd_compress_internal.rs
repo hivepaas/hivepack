@@ -638,6 +638,22 @@ pub(crate) fn mem_read64(src: &[u8], at: usize) -> u64 {
     read_le64(src, idx(at))
 }
 
+/// `MEM_readLE32` at `at`, or `None` where the 4 bytes are not all in
+/// `src`, whatever `at` is.
+#[inline(always)]
+pub(crate) fn mem_read32_within(src: &[u8], at: usize) -> Option<u32> {
+    let bytes: [u8; 4] = src.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// `MEM_readLE64` at `at`, or `None` where the 8 bytes are not all in
+/// `src`, whatever `at` is.
+#[inline(always)]
+pub(crate) fn mem_read64_within(src: &[u8], at: usize) -> Option<u64> {
+    let bytes: [u8; 8] = src.get(at..at.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
 const PRIME4BYTES: u32 = 2_654_435_761;
 const PRIME5BYTES: u64 = 889_523_592_379;
 const PRIME6BYTES: u64 = 227_718_039_650_203;
@@ -668,6 +684,20 @@ fn zstd_hash_top(src: &[u8], at: usize, mls: u32) -> u64 {
         8 => mem_read64(src, at).wrapping_mul(PRIME8BYTES),
         // 4, and anything else
         _ => (u64::from(mem_read32(src, at)) << 32).wrapping_mul(u64::from(PRIME4BYTES)),
+    }
+}
+
+/// [`zstd_hash_top`] of the 8 bytes `u`, read at a position already: the
+/// hash of their low `mls` bytes before its shift.
+#[inline(always)]
+fn zstd_hash_top_u64(u: u64, mls: u32) -> u64 {
+    match mls {
+        5 => zstd_hash_n::<5>(u, PRIME5BYTES),
+        6 => zstd_hash_n::<6>(u, PRIME6BYTES),
+        7 => zstd_hash_n::<7>(u, PRIME7BYTES),
+        8 => u.wrapping_mul(PRIME8BYTES),
+        // 4, and anything else: the low 4 bytes
+        _ => (u << 32).wrapping_mul(u64::from(PRIME4BYTES)),
     }
 }
 
@@ -705,6 +735,12 @@ impl<'a> HashTable<'a> {
     #[inline(always)]
     pub(crate) fn hash(&self, src: &[u8], at: usize, mls: u32) -> usize {
         (zstd_hash_top(src, at, mls) >> self.shift) as usize
+    }
+
+    /// [`Self::hash`] of the 8 bytes `u`, read at a position already.
+    #[inline(always)]
+    pub(crate) fn hash_u64(&self, u: u64, mls: u32) -> usize {
+        (zstd_hash_top_u64(u, mls) >> self.shift) as usize
     }
 
     /// The entry of `hash`, one of the table's hashes.

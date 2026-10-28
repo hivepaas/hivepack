@@ -7,24 +7,23 @@
 //! and `dict`, the one its older segment is in; the tables hold window
 //! indices, `position + window.base` (or `window.dict_base`).
 
+use crate::common::mem::idx;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
     HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
-    mem_read32, mem_read64, offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr,
-    zstd_index_overlap_check,
+    mem_read32, mem_read32_within, mem_read64, mem_read64_within, offset_to_offbase, zstd_count,
+    zstd_count_2segments, zstd_hash_ptr, zstd_index_overlap_check,
 };
 
-/// How the inner search loop ended.
+/// How the inner search loop ended: which test found a match. `hl1` is
+/// the long hash of the next position.
 enum Found {
-    /// A repcode match, already stored.
-    Stored(usize),
-    /// A match at `offset`, of `m_length` bytes, at the current position;
-    /// `hl1` is the long hash of the next position.
-    Match {
-        offset: u32,
-        m_length: usize,
-        hl1: usize,
-    },
+    /// The repcode, at the next position.
+    Rep,
+    /// A long match, at `matchl0`.
+    Long { matchl0: usize, hl1: usize },
+    /// A short match, at `matchs0`.
+    Short { matchs0: usize, hl1: usize },
     /// The end of the block.
     End,
 }
@@ -62,6 +61,19 @@ fn zstd_compress_block_double_fast_no_dict_generic<const MLS: u32>(
     // Before the block for blocks under 8 bytes, where libzstd's pointer
     // goes before the buffer and the search ends at once; 0 does the same.
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
+    // Differs from libzstd: the search loop tests `ip1 <= ilimit` as
+    // whether 8 bytes fit at ip1 in the block, the same test as the bounds
+    // check of the read there, which the compiler then drops. It gives the
+    // same answers, for blocks under 8 bytes too.
+    let block = &src[..iend];
+    let in_limit = |position: usize| idx(position) + HASH_READ_SIZE <= block.len();
+    // Differs from libzstd: the candidates at ip are read from the prefix,
+    // at their index less prefix_lowest_index, so that one test tells both
+    // whether they are in the window and whether the bytes are there. An
+    // index below the window wraps past the prefix's end, as end_index is
+    // under 2^32; one in it is before ip, so its bytes are there.
+    let prefix = &src[prefix_lowest..iend];
+    let in_prefix = |index: u32| index.wrapping_sub(prefix_lowest_index) as usize;
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     let mut offset_saved1 = 0;
@@ -96,7 +108,7 @@ fn zstd_compress_block_double_fast_no_dict_generic<const MLS: u32>(
     let mut hash_small = HashTable::new(&mut ms.chain_table, h_bits_s);
 
     // The outer loop: one turn per match found and stored.
-    loop {
+    'outer: loop {
         // The current step size.
         let mut step = 1;
         // Where to take a bigger step if no match is found.
@@ -104,92 +116,67 @@ fn zstd_compress_block_double_fast_no_dict_generic<const MLS: u32>(
         // The next position.
         let mut ip1 = ip + step;
 
-        if ip1 > ilimit {
+        if !in_limit(ip1) {
             break;
         }
 
-        // The long hash at ip, and its candidate.
-        let hl0 = hash_long.hash(src, ip, 8);
-        let mut idxl0 = hash_long.get(hl0);
-        // Update the long hash table; see the end of the inner loop.
-        hash_long.set(hl0, index(ip));
-        // The long hash at ip1, and its candidate.
-        let mut hl1;
-        let mut idxl1;
+        // Differs from libzstd: the 8 bytes at ip and at ip1 are read once
+        // each, those at ip1 kept for when it becomes ip; the 4 bytes at
+        // ip and at ip + 1 are taken from those at ip.
+        let mut val0 = mem_read64(block, ip);
+        let mut val1 = mem_read64(block, ip1);
+
+        // The long hash at ip.
+        let mut hl0 = hash_long.hash_u64(val0, 8);
         let mut curr;
 
-        // The inner loop: one turn per position searched.
+        // How far back the repcode is. Differs from libzstd, which tests
+        // that offset_1 is not 0: for 0, the repcode is read at
+        // ip + 1 + iend, past the block, where no bytes are and no match is
+        // found. The compiler then makes one search loop instead of two.
+        let rep_back = if offset_1 > 0 {
+            offset_1 as usize
+        } else {
+            iend.wrapping_neg()
+        };
+
+        // The inner loop: one turn per position searched, until a test
+        // finds a match.
         let found = loop {
-            let hs0 = hash_small.hash(src, ip, mls);
+            // The long candidate at ip. Differs from libzstd: it is read
+            // here instead of as the candidate at ip1 of the position
+            // before, which only the short match needs; no write to the
+            // table comes in between.
+            let idxl0 = hash_long.get(hl0);
+            let hs0 = hash_small.hash_u64(val0, mls);
             let idxs0 = hash_small.get(hs0);
             curr = index(ip);
 
-            // Update the short hash table; the long one is up to date.
+            // Update the hash tables.
+            hash_long.set(hl0, curr);
             hash_small.set(hs0, curr);
 
             // The repcode, without a dictionary.
-            if (offset_1 > 0)
-                & (mem_read32(src, ip + 1 - offset_1 as usize) == mem_read32(src, ip + 1))
+            if mem_read32_within(block, (ip + 1).wrapping_sub(rep_back)) == Some((val0 >> 8) as u32)
             {
-                let m_length =
-                    zstd_count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
-                ip += 1;
-                seq_store.store_seq(src, anchor, ip - anchor, REPCODE1_TO_OFFBASE, m_length);
-                break Found::Stored(m_length);
+                break Found::Rep;
             }
 
-            hl1 = hash_long.hash(src, ip1, 8);
+            // The long hash at ip1.
+            let hl1 = hash_long.hash_u64(val1, 8);
 
             // A long match in the prefix.
-            if idxl0 >= prefix_lowest_index && mem_read64(src, at(idxl0)) == mem_read64(src, ip) {
-                let mut matchl0 = at(idxl0);
-                let mut m_length = zstd_count(src, ip + 8, matchl0 + 8, iend) + 8;
-                let offset = (ip - matchl0) as u32;
-                // Catch up.
-                while (ip > anchor) & (matchl0 > prefix_lowest) && src[ip - 1] == src[matchl0 - 1] {
-                    ip -= 1;
-                    matchl0 -= 1;
-                    m_length += 1;
-                }
-                break Found::Match {
-                    offset,
-                    m_length,
+            if mem_read64_within(prefix, in_prefix(idxl0)) == Some(val0) {
+                break Found::Long {
+                    matchl0: at(idxl0),
                     hl1,
                 };
             }
 
-            idxl1 = hash_long.get(hl1);
-
             // A short match in the prefix.
-            if idxs0 >= prefix_lowest_index && mem_read32(src, at(idxs0)) == mem_read32(src, ip) {
-                // _search_next_long: a short match; try a longer one.
-                let mut matchs0 = at(idxs0);
-                let mut m_length = zstd_count(src, ip + 4, matchs0 + 4, iend) + 4;
-                let mut offset = (ip - matchs0) as u32;
-
-                // A long match at the next position.
-                if idxl1 > prefix_lowest_index && mem_read64(src, at(idxl1)) == mem_read64(src, ip1)
-                {
-                    let matchl1 = at(idxl1);
-                    let l1len = zstd_count(src, ip1 + 8, matchl1 + 8, iend) + 8;
-                    if l1len > m_length {
-                        // Take the long match instead.
-                        ip = ip1;
-                        m_length = l1len;
-                        offset = (ip - matchl1) as u32;
-                        matchs0 = matchl1;
-                    }
-                }
-
-                // Complete backwards.
-                while (ip > anchor) & (matchs0 > prefix_lowest) && src[ip - 1] == src[matchs0 - 1] {
-                    ip -= 1;
-                    matchs0 -= 1;
-                    m_length += 1;
-                }
-                break Found::Match {
-                    offset,
-                    m_length,
+            if mem_read32_within(prefix, in_prefix(idxs0)) == Some(val0 as u32) {
+                break Found::Short {
+                    matchs0: at(idxs0),
                     hl1,
                 };
             }
@@ -201,49 +188,81 @@ fn zstd_compress_block_double_fast_no_dict_generic<const MLS: u32>(
             ip = ip1;
             ip1 += step;
 
-            idxl0 = idxl1;
+            hl0 = hl1;
+            val0 = val1;
 
-            if ip1 > ilimit {
+            if !in_limit(ip1) {
                 break Found::End;
             }
-
-            // Update the long hash table for the next turn. Differs from
-            // libzstd: done here, with the hash just made, rather than at
-            // the top of the loop with the one kept from the turn before,
-            // which makes the loop longer. Nothing touches the long table
-            // between the two places.
-            hash_long.set(hl1, index(ip));
+            val1 = mem_read64(block, ip1);
         };
 
-        let m_length = match found {
-            Found::End => break,
-            Found::Stored(m_length) => m_length,
-            Found::Match {
-                offset,
-                m_length,
-                hl1,
-            } => {
-                // _match_found: needs ip, offset, m_length.
-                offset_2 = offset_1;
-                offset_1 = offset;
-
-                if step < 4 {
-                    // Writing ip1 back is unsafe once it is at or past where
-                    // the match ends; with a step under 4, the distance from
-                    // ip to ip1, and matches of 4 bytes at least, it is
-                    // before.
-                    hash_long.set(hl1, index(ip1));
+        let m_length = 'match_stored: {
+            // The match, and its length so far.
+            let (mut match_pos, mut m_length, hl1) = match found {
+                Found::End => break 'outer,
+                Found::Rep => {
+                    let m_length =
+                        zstd_count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
+                    ip += 1;
+                    seq_store.store_seq(src, anchor, ip - anchor, REPCODE1_TO_OFFBASE, m_length);
+                    break 'match_stored m_length;
                 }
+                Found::Long { matchl0, hl1 } => {
+                    let m_length = zstd_count(src, ip + 8, matchl0 + 8, iend) + 8;
+                    (matchl0, m_length, hl1)
+                }
+                Found::Short { mut matchs0, hl1 } => {
+                    // The long candidate at ip1.
+                    let idxl1 = hash_long.get(hl1);
 
-                seq_store.store_seq(
-                    src,
-                    anchor,
-                    ip - anchor,
-                    offset_to_offbase(offset),
-                    m_length,
-                );
-                m_length
+                    // _search_next_long: a short match; try a longer one.
+                    let mut m_length = zstd_count(src, ip + 4, matchs0 + 4, iend) + 4;
+
+                    // A long match at the next position.
+                    if idxl1 > prefix_lowest_index && mem_read64(src, at(idxl1)) == val1 {
+                        let matchl1 = at(idxl1);
+                        let l1len = zstd_count(src, ip1 + 8, matchl1 + 8, iend) + 8;
+                        if l1len > m_length {
+                            // Take the long match instead.
+                            ip = ip1;
+                            m_length = l1len;
+                            matchs0 = matchl1;
+                        }
+                    }
+                    (matchs0, m_length, hl1)
+                }
+            };
+            let offset = (ip - match_pos) as u32;
+
+            // Catch up. Differs from libzstd: one loop for both kinds of
+            // match.
+            while (ip > anchor) & (match_pos > prefix_lowest) && src[ip - 1] == src[match_pos - 1] {
+                ip -= 1;
+                match_pos -= 1;
+                m_length += 1;
             }
+
+            // _match_found: needs ip, offset, m_length.
+            offset_2 = offset_1;
+            offset_1 = offset;
+
+            if step < 4 {
+                // Writing ip1 back is unsafe once it is at or past where
+                // the match ends; with a step under 4, the distance from
+                // ip to ip1, and matches of 4 bytes at least, it is
+                // before.
+                hash_long.set(hl1, index(ip1));
+            }
+
+            seq_store.store_seq(
+                src,
+                anchor,
+                ip - anchor,
+                offset_to_offbase(offset),
+                m_length,
+            );
+            m_length
         };
 
         // _match_stored

@@ -21,6 +21,7 @@ use crate::compress::zstd_compress_internal::{
     FseCTables, FseRepeat, LongLengthType, MatchState, ParamSwitch, SeqStore, Strategy, Window,
     WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX, zstd_literals_compression_is_disabled,
     zstd_ll_code, zstd_min_gain, zstd_ml_code, zstd_no_compress_block, zstd_reduce_table,
+    zstd_reduce_table_btlazy2,
 };
 use crate::compress::zstd_compress_literals::zstd_compress_literals;
 use crate::compress::zstd_compress_sequences::{
@@ -30,7 +31,7 @@ use crate::compress::zstd_double_fast::{
     zstd_compress_block_double_fast, zstd_compress_block_double_fast_ext_dict,
 };
 use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_fast_ext_dict};
-use crate::compress::zstd_lazy::zstd_compress_block_lazy_hc;
+use crate::compress::zstd_lazy::{zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc};
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
@@ -502,7 +503,7 @@ pub(crate) fn zstd_strategy_ported(
     c_params: &CompressionParameters,
     use_row_match_finder: ParamSwitch,
 ) -> bool {
-    c_params.strategy <= Strategy::Lazy2
+    c_params.strategy <= Strategy::Btlazy2
         && !zstd_row_match_finder_used(c_params.strategy, use_row_match_finder)
 }
 
@@ -886,7 +887,11 @@ fn zstd_overflow_correct_if_needed(
         // ZSTD_reduceIndex
         zstd_reduce_table(&mut ms.hash_table, correction);
         if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
-            zstd_reduce_table(&mut ms.chain_table, correction);
+            if c_params.strategy == Strategy::Btlazy2 {
+                zstd_reduce_table_btlazy2(&mut ms.chain_table, correction);
+            } else {
+                zstd_reduce_table(&mut ms.chain_table, correction);
+            }
         }
         ms.next_to_update = ms.next_to_update.saturating_sub(correction);
         // Dictionaries are invalid after a correction.
@@ -1355,6 +1360,10 @@ impl CCtx {
                 let depth = self.applied_params.c_params.strategy as u32 - Strategy::Greedy as u32;
                 let dict = ext_dict.then_some(dict);
                 zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
+            }
+            (Strategy::Btlazy2, _) => {
+                let dict = ext_dict.then_some(dict);
+                zstd_compress_block_btlazy2(ms, seq_store, rep, src, dict, istart, iend)
             }
             // The other strategies are not ported yet; the context does not
             // take them.

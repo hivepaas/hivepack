@@ -1,6 +1,6 @@
-//! The `greedy`, `lazy` and `lazy2` strategies: port of
+//! The `greedy`, `lazy`, `lazy2` and `btlazy2` strategies: port of
 //! `compress/zstd_lazy.c`, without a dictionary so far: the parser they
-//! share, and the hash chain match finder.
+//! share, the hash chain match finder, and `btlazy2`'s binary tree.
 //!
 //! Positions are indices into `src`, the buffer the window's prefix is in,
 //! and `dict`, the one its older segment is in; the tables hold window
@@ -9,8 +9,9 @@
 use crate::common::bits::highbit32;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
-    K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore, mem_read32, offset_to_offbase,
-    zstd_count, zstd_count_2segments, zstd_hash_ptr, zstd_index_overlap_check,
+    K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore, ZSTD_DUBT_UNSORTED_MARK,
+    mem_read32, offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr,
+    zstd_index_overlap_check,
 };
 
 /// `kLazySkippingStep`: past steps this long over input without matches,
@@ -20,8 +21,9 @@ const K_LAZY_SKIPPING_STEP: usize = 8;
 /// `searchMethod_e`, as the const parameter of the parser.
 pub(crate) const SEARCH_HASH_CHAIN: u8 = 0;
 
-/// What `ZSTD_searchMax` gives when it finds no match: a length under 4,
-/// and libzstd's offset base filler, never used then.
+/// The offset base the parser sets before each search, 999999999: what
+/// `ZSTD_searchMax` gives when it finds no match, with a length under 4.
+/// The binary tree weighs its first match against it.
 const NO_OFFBASE: u32 = 999_999_999;
 
 /// `OFFBASE_IS_OFFSET`
@@ -35,6 +37,402 @@ fn offbase_is_offset(off_base: u32) -> bool {
 fn offbase_to_offset(off_base: u32) -> u32 {
     debug_assert!(offbase_is_offset(off_base));
     off_base - ZSTD_REP_NUM as u32
+}
+
+// ---------------------------------------------------------------------------
+// Binary tree
+//
+// `btlazy2`'s match finder, the deferred-update binary tree (DUBT). The
+// chain table holds two entries per position, `bt[2 * (i & bt_mask)]` and
+// the one after, for the `1 << (chain_log - 1)` positions before the
+// current one. A position is first inserted unsorted, as in a hash chain:
+// its first entry is the previous position of its hash, its second
+// `ZSTD_DUBT_UNSORTED_MARK`. It is sorted when a search reaches it: its
+// entries then point to the positions smaller and larger than it, in the
+// order of the bytes that follow them.
+
+/// `search_binaryTree`, the search method of the parser.
+pub(crate) const SEARCH_BINARY_TREE: u8 = 1;
+
+/// libzstd's `dummy32`: where a search that stops early ends the side it
+/// stopped on.
+///
+/// Differs from libzstd: the write there is left out. Nothing reads it, so
+/// the tree is the same.
+const DUMMY32: usize = usize::MAX;
+
+/// `ZSTD_updateDUBT`: inserts the positions from `next_to_update` up to
+/// `ip`, not included, into the hash table and the tree, unsorted. The
+/// positions are in the prefix.
+#[inline(always)]
+fn update_dubt<const MLS: u32>(ms: &mut MatchState, src: &[u8], ip: usize) {
+    let hash_log = ms.c_params.hash_log;
+    let bt_mask = (1u32 << (ms.c_params.chain_log - 1)) - 1;
+    let base = ms.window.base;
+    let target = ms.window.index(ip);
+    let mut idx = ms.next_to_update;
+    debug_assert!(idx >= ms.window.dict_limit);
+
+    while idx < target {
+        let h = zstd_hash_ptr(src, (i64::from(idx) - base) as usize, hash_log, MLS);
+        let match_index = ms.hash_table[h];
+        let next_candidate = 2 * (idx & bt_mask) as usize;
+        ms.hash_table[h] = idx;
+        // Linked as in a hash chain, and marked unsorted.
+        ms.chain_table[next_candidate] = match_index;
+        ms.chain_table[next_candidate + 1] = ZSTD_DUBT_UNSORTED_MARK;
+        idx += 1;
+    }
+    ms.next_to_update = target;
+}
+
+/// `ZSTD_insertDUBT1`: sorts `curr`, inserted but unsorted, into the tree,
+/// comparing at most `nb_compares` positions, down to `bt_low`. Its bytes
+/// end at `input_end` of `src` in the prefix. With `EXT`, `curr` and the
+/// positions it is compared with may be in the older segment, `dict`,
+/// where its bytes end at the segment's end.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn insert_dubt1<const EXT: bool>(
+    ms: &mut MatchState,
+    src: &[u8],
+    dict: &[u8],
+    curr: u32,
+    input_end: usize,
+    mut nb_compares: u32,
+    bt_low: u32,
+) {
+    let c_params = ms.c_params;
+    let bt_mask = (1u32 << (c_params.chain_log - 1)) - 1;
+    let base = ms.window.base;
+    let dict_base = ms.window.dict_base;
+    let dict_limit = ms.window.dict_limit;
+    let prefix_start = (i64::from(dict_limit) - base) as usize;
+    let dict_end = (i64::from(dict_limit) - dict_base) as usize;
+    // Where `curr` is: its segment, the index of the segment's first byte,
+    // and where the bytes after `curr` end.
+    let (ibuf, ibase, iend) = if !EXT || curr >= dict_limit {
+        (src, base, input_end)
+    } else {
+        (dict, dict_base, dict_end)
+    };
+    let ip = (i64::from(curr) - ibase) as usize;
+    let window_valid = ms.window.low_limit;
+    let max_distance = 1u32 << c_params.window_log;
+    let window_low = if curr.wrapping_sub(window_valid) > max_distance {
+        curr - max_distance
+    } else {
+        window_valid
+    };
+    let bt = &mut ms.chain_table;
+    let mut common_length_smaller = 0;
+    let mut common_length_larger = 0;
+    let mut smaller_ptr = 2 * (curr & bt_mask) as usize;
+    let mut larger_ptr = smaller_ptr + 1;
+    // `curr` is unsorted: its first entry leads to the next candidate,
+    // sorted; its second holds the previous unsorted one, already saved,
+    // and is written over.
+    let mut match_index = bt[smaller_ptr];
+    debug_assert!(curr >= bt_low);
+    debug_assert!(ip < iend);
+
+    while nb_compares > 0 && match_index > window_low {
+        let next_ptr = 2 * (match_index & bt_mask) as usize;
+        // The bytes it has in common with `curr` at least.
+        let mut match_length = common_length_smaller.min(common_length_larger);
+        debug_assert!(match_index < curr);
+
+        // The candidate's segment, and the index of its first byte, for
+        // the byte after the common run.
+        let (mbuf, mbase) = if !EXT
+            || match_index as usize + match_length >= dict_limit as usize
+            || curr < dict_limit
+        {
+            // Both in one segment: the prefix (where a candidate of the
+            // older segment is from its byte `match_length` on), or the
+            // older one.
+            //
+            // Differs from libzstd: the candidate is read in `curr`'s
+            // segment, where libzstd picks the prefix when the run reaches
+            // it. The same: with `curr` in the older segment, the common
+            // run ends before the segment's end, as `curr`'s bytes do, and
+            // the candidate is before `curr`.
+            debug_assert!(
+                !EXT || curr >= dict_limit
+                    || match_index as usize + match_length < dict_limit as usize
+            );
+            let m = (i64::from(match_index) + match_length as i64 - ibase) as usize;
+            match_length += zstd_count(ibuf, ip + match_length, m, iend);
+            (ibuf, ibase)
+        } else {
+            // A candidate of the older segment, `curr` in the prefix.
+            let m = (i64::from(match_index) - dict_base) as usize;
+            match_length += zstd_count_2segments(
+                src,
+                ip + match_length,
+                dict,
+                m + match_length,
+                iend,
+                dict_end,
+                prefix_start,
+            );
+            if match_index as usize + match_length >= dict_limit as usize {
+                // The match runs on into the prefix: its next byte is
+                // there.
+                (src, base)
+            } else {
+                (dict, dict_base)
+            }
+        };
+
+        if ip + match_length == iend {
+            // Equal up to the end: no way to know if smaller or larger.
+            // Dropped, to keep the tree consistent: a bit less compression,
+            // where other ways can corrupt the tree.
+            break;
+        }
+
+        let match_byte = mbuf[(i64::from(match_index) + match_length as i64 - mbase) as usize];
+        if match_byte < ibuf[ip + match_length] {
+            // The candidate is smaller than `curr`.
+            bt[smaller_ptr] = match_index;
+            // Every smaller one has at least this in common.
+            common_length_smaller = match_length;
+            if match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                smaller_ptr = DUMMY32;
+                break;
+            }
+            // The next one is larger than the candidate.
+            smaller_ptr = next_ptr + 1;
+            match_index = bt[next_ptr + 1];
+        } else {
+            // The candidate is larger than `curr`.
+            bt[larger_ptr] = match_index;
+            common_length_larger = match_length;
+            if match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                larger_ptr = DUMMY32;
+                break;
+            }
+            larger_ptr = next_ptr;
+            match_index = bt[next_ptr];
+        }
+        nb_compares -= 1;
+    }
+
+    // *smallerPtr = *largerPtr = 0
+    for ptr in [smaller_ptr, larger_ptr] {
+        if ptr != DUMMY32 {
+            bt[ptr] = 0;
+        }
+    }
+}
+
+/// `ZSTD_DUBT_findBestMatch`: sorts the unsorted positions of `ip`'s hash
+/// (up to `1 << search_log` of them, the oldest first), then inserts `ip`
+/// into the tree, sorted, and returns the best match the way down gave, up
+/// to `iend`, and its offset base. With `EXT`, candidates below the prefix
+/// are in `dict`.
+#[allow(clippy::too_many_lines)]
+#[inline(always)]
+fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
+    ms: &mut MatchState,
+    src: &[u8],
+    dict: &[u8],
+    ip: usize,
+    iend: usize,
+) -> (usize, u32) {
+    let c_params = ms.c_params;
+    let h = zstd_hash_ptr(src, ip, c_params.hash_log, MLS);
+    let mut match_index = ms.hash_table[h];
+
+    let base = ms.window.base;
+    let curr = ms.window.index(ip);
+    let window_low = ms.lowest_match_index(curr, c_params.window_log);
+
+    let bt_mask = (1u32 << (c_params.chain_log - 1)) - 1;
+    // The oldest position the tree holds, or 0.
+    let bt_low = curr.saturating_sub(bt_mask);
+    let unsort_limit = bt_low.max(window_low);
+
+    let mut nb_compares = 1u32 << c_params.search_log;
+    let mut nb_candidates = nb_compares;
+    let mut previous_candidate = 0;
+    debug_assert!(ip + 8 <= iend);
+
+    // The end of the list of unsorted candidates: on the way, their marks
+    // become a chain back up.
+    {
+        let bt = &mut ms.chain_table;
+        let mut next_candidate = 2 * (match_index & bt_mask) as usize;
+        let mut unsorted_mark = next_candidate + 1;
+        while match_index > unsort_limit
+            && bt[unsorted_mark] == ZSTD_DUBT_UNSORTED_MARK
+            && nb_candidates > 1
+        {
+            bt[unsorted_mark] = previous_candidate;
+            previous_candidate = match_index;
+            match_index = bt[next_candidate];
+            next_candidate = 2 * (match_index & bt_mask) as usize;
+            unsorted_mark = next_candidate + 1;
+            nb_candidates -= 1;
+        }
+
+        // The last candidate, if still unsorted, is cut off: worse
+        // compression, but faster.
+        if match_index > unsort_limit && bt[unsorted_mark] == ZSTD_DUBT_UNSORTED_MARK {
+            bt[unsorted_mark] = 0;
+            bt[next_candidate] = 0;
+        }
+    }
+
+    // Sorts the candidates stacked, the oldest first, back up the chain;
+    // it ends at 0.
+    match_index = previous_candidate;
+    while match_index != 0 {
+        let next_candidate_idx = ms.chain_table[2 * (match_index & bt_mask) as usize + 1];
+        insert_dubt1::<EXT>(
+            ms,
+            src,
+            dict,
+            match_index,
+            iend,
+            nb_candidates,
+            unsort_limit,
+        );
+        match_index = next_candidate_idx;
+        nb_candidates += 1;
+    }
+
+    // The longest match.
+    let dict_base = ms.window.dict_base;
+    let dict_limit = ms.window.dict_limit;
+    let dict_end = (i64::from(dict_limit) - dict_base) as usize;
+    let prefix_start = (i64::from(dict_limit) - base) as usize;
+    let mut common_length_smaller = 0;
+    let mut common_length_larger = 0;
+    let mut smaller_ptr = 2 * (curr & bt_mask) as usize;
+    let mut larger_ptr = smaller_ptr + 1;
+    let mut match_end_idx = curr + 8 + 1;
+    let mut best_length = 0;
+    // What the parser's offset base is before the search: the first match
+    // is weighed against it.
+    let mut off_base = NO_OFFBASE;
+
+    match_index = ms.hash_table[h];
+    ms.hash_table[h] = curr;
+
+    let bt = &mut ms.chain_table;
+    while nb_compares > 0 && match_index > window_low {
+        let next_ptr = 2 * (match_index & bt_mask) as usize;
+        // The bytes it has in common with `ip` at least.
+        let mut match_length = common_length_smaller.min(common_length_larger);
+
+        // The candidate's segment, and the index of its first byte, for
+        // the byte after the common run.
+        let (mbuf, mbase) = if !EXT || match_index as usize + match_length >= dict_limit as usize {
+            let m = (i64::from(match_index) + match_length as i64 - base) as usize;
+            match_length += zstd_count(src, ip + match_length, m, iend);
+            (src, base)
+        } else {
+            let m = (i64::from(match_index) - dict_base) as usize;
+            match_length += zstd_count_2segments(
+                src,
+                ip + match_length,
+                dict,
+                m + match_length,
+                iend,
+                dict_end,
+                prefix_start,
+            );
+            if match_index as usize + match_length >= dict_limit as usize {
+                // The match runs on into the prefix: its next byte is
+                // there.
+                (src, base)
+            } else {
+                (dict, dict_base)
+            }
+        };
+
+        if match_length > best_length {
+            if match_length > (match_end_idx - match_index) as usize {
+                match_end_idx = match_index + match_length as u32;
+            }
+            // Longer, unless its offset costs more than the bytes gained.
+            if 4 * (match_length - best_length) as i32
+                > highbit32(curr - match_index + 1) as i32 - highbit32(off_base) as i32
+            {
+                best_length = match_length;
+                off_base = offset_to_offbase(curr - match_index);
+            }
+            if ip + match_length == iend {
+                // Equal up to the end: no way to know if smaller or
+                // larger. Dropped, to keep the tree consistent.
+                break;
+            }
+        }
+
+        let match_byte = mbuf[(i64::from(match_index) + match_length as i64 - mbase) as usize];
+        if match_byte < src[ip + match_length] {
+            // The candidate is smaller than `ip`.
+            bt[smaller_ptr] = match_index;
+            // Every smaller one has at least this in common.
+            common_length_smaller = match_length;
+            if match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                smaller_ptr = DUMMY32;
+                break;
+            }
+            // The next one is larger than the candidate.
+            smaller_ptr = next_ptr + 1;
+            match_index = bt[next_ptr + 1];
+        } else {
+            // The candidate is larger than `ip`.
+            bt[larger_ptr] = match_index;
+            common_length_larger = match_length;
+            if match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                larger_ptr = DUMMY32;
+                break;
+            }
+            larger_ptr = next_ptr;
+            match_index = bt[next_ptr];
+        }
+        nb_compares -= 1;
+    }
+
+    // *smallerPtr = *largerPtr = 0
+    for ptr in [smaller_ptr, larger_ptr] {
+        if ptr != DUMMY32 {
+            bt[ptr] = 0;
+        }
+    }
+
+    // Past the longest match: repetitive data is not inserted again.
+    debug_assert!(match_end_idx > curr + 8);
+    ms.next_to_update = match_end_idx - 8;
+    (best_length, off_base)
+}
+
+/// `ZSTD_BtFindBestMatch`: the tree updated up to `ip`, then searched at
+/// `ip`. Nothing for a position a long match skipped. Not inlined, as
+/// libzstd's search functions: one copy serves the parser's three
+/// searches.
+#[inline(never)]
+fn bt_find_best_match<const MLS: u32, const EXT: bool>(
+    ms: &mut MatchState,
+    src: &[u8],
+    dict: &[u8],
+    ip: usize,
+    i_limit: usize,
+) -> (usize, u32) {
+    if ms.window.index(ip) < ms.next_to_update {
+        // A skipped area.
+        return (0, NO_OFFBASE);
+    }
+    update_dubt::<MLS>(ms, src, ip);
+    dubt_find_best_match::<MLS, EXT>(ms, src, dict, ip, i_limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +549,7 @@ fn search_max<const SEARCH: u8, const MLS: u32, const EXT: bool>(
 ) -> (usize, u32) {
     match SEARCH {
         SEARCH_HASH_CHAIN => hc_find_best_match::<MLS, EXT>(ms, src, dict, ip, iend),
+        SEARCH_BINARY_TREE => bt_find_best_match::<MLS, EXT>(ms, src, dict, ip, iend),
         _ => unreachable!("a search method the port does not have"),
     }
 }
@@ -628,4 +1027,20 @@ pub(crate) fn zstd_compress_block_lazy_hc(
         1 => lazy::<SEARCH_HASH_CHAIN, 1>(ms, seq_store, rep, src, dict, istart, iend),
         _ => lazy::<SEARCH_HASH_CHAIN, 2>(ms, seq_store, rep, src, dict, istart, iend),
     }
+}
+
+/// `ZSTD_compressBlock_btlazy2`, and `ZSTD_compressBlock_btlazy2_extDict`
+/// when `dict` is given: the parser of `lazy2` with the binary tree.
+/// Returns the size of the literals left after the last sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zstd_compress_block_btlazy2(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dict: Option<&[u8]>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    lazy::<SEARCH_BINARY_TREE, 2>(ms, seq_store, rep, src, dict, istart, iend)
 }

@@ -6,7 +6,7 @@
 use crate::compress::zstd_compress::{
     CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_level_ported,
 };
-use crate::compress::zstd_compress_internal::OVERFLOW_CORRECT_FREQUENTLY;
+use crate::compress::zstd_compress_internal::{OVERFLOW_CORRECT_FREQUENTLY, Strategy};
 use crate::decompress::zstd_decompress::decompress;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer};
 use crate::oracle::Rng;
@@ -120,6 +120,8 @@ fn stream(cctx: &mut CCtx, data: &[u8], seed: u64) -> Result<Vec<u8>, String> {
 /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, which its fuzzers are built
 /// with), the frames come out the same: in one call, and streaming with
 /// small windows, where matches reach into the window's older segment.
+/// Half the frames are btlazy2, whose tree keeps its unsorted positions
+/// through the lowering.
 #[test]
 fn lowering_the_indices_changes_no_frame() {
     let mut rng = Rng::new(0x5EED_0202);
@@ -134,6 +136,7 @@ fn lowering_the_indices_changes_no_frame() {
         } else {
             rng.range(10, 17) as u32
         };
+        let strategy = (i % 4 >= 2).then_some(Strategy::Btlazy2);
         let seed = rng.next();
         let frames: Vec<Result<(Vec<u8>, u32), String>> = [false, true]
             .into_iter()
@@ -142,7 +145,8 @@ fn lowering_the_indices_changes_no_frame() {
                 let mut cctx = CCtx::new();
                 let set = cctx
                     .set_parameter(CParameter::CompressionLevel(level))
-                    .and_then(|()| cctx.set_parameter(CParameter::WindowLog(window_log)));
+                    .and_then(|()| cctx.set_parameter(CParameter::WindowLog(window_log)))
+                    .and_then(|()| cctx.set_parameter(CParameter::Strategy(strategy)));
                 if let Err(error) = set {
                     return Err(format!("{error:?}"));
                 }
@@ -165,8 +169,8 @@ fn lowering_the_indices_changes_no_frame() {
                 corrections += lowered;
                 if want != got {
                     problems.push(format!(
-                        "{len} bytes at level {level}, window log {window_log}, {}: \
-                         the frames differ after {lowered} corrections",
+                        "{len} bytes at level {level}, strategy {strategy:?}, window log \
+                         {window_log}, {}: the frames differ after {lowered} corrections",
                         if i % 2 == 0 { "one call" } else { "streaming" }
                     ));
                 }

@@ -263,6 +263,11 @@ pub(crate) const ZSTD_HASHLOG_MIN: u32 = 6;
 /// `ZSTD_WINDOW_START_INDEX`: the index of the first byte a fresh context
 /// sees, above 0 so that every position is valid.
 pub(crate) const ZSTD_WINDOW_START_INDEX: u32 = 2;
+/// `ZSTD_DUBT_UNSORTED_MARK`: in the binary tree of `btlazy2`, the second
+/// entry of a position inserted but not sorted yet. No index is 1: they
+/// start at `ZSTD_WINDOW_START_INDEX`.
+pub(crate) const ZSTD_DUBT_UNSORTED_MARK: u32 = 1;
+const _: () = assert!(ZSTD_DUBT_UNSORTED_MARK < ZSTD_WINDOW_START_INDEX);
 /// `HASH_READ_SIZE`: the bytes the hashes read at a position.
 pub(crate) const HASH_READ_SIZE: usize = 8;
 /// `kSearchStrength`: how quickly the search speeds up over data without
@@ -540,18 +545,33 @@ fn overflow_correct_frequently() -> bool {
     false
 }
 
-/// `ZSTD_reduceTable`: lowers every index of a table by `reducer_value`;
-/// those it would take below `ZSTD_WINDOW_START_INDEX` become 0.
-pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
+/// `ZSTD_reduceTable_internal`: lowers every index of a table by
+/// `reducer_value`; those it would take below `ZSTD_WINDOW_START_INDEX`
+/// become 0. With `PRESERVE_MARK`, `ZSTD_DUBT_UNSORTED_MARK` stays.
+#[inline(always)]
+fn zstd_reduce_table_internal<const PRESERVE_MARK: bool>(table: &mut [u32], reducer_value: u32) {
     // Indices below ZSTD_WINDOW_START_INDEX are special.
     let reducer_threshold = reducer_value + ZSTD_WINDOW_START_INDEX;
     for cell in table {
-        *cell = if *cell < reducer_threshold {
+        *cell = if PRESERVE_MARK && *cell == ZSTD_DUBT_UNSORTED_MARK {
+            ZSTD_DUBT_UNSORTED_MARK
+        } else if *cell < reducer_threshold {
             0
         } else {
             *cell - reducer_value
         };
     }
+}
+
+/// `ZSTD_reduceTable`
+pub(crate) fn zstd_reduce_table(table: &mut [u32], reducer_value: u32) {
+    zstd_reduce_table_internal::<false>(table, reducer_value);
+}
+
+/// `ZSTD_reduceTable_btlazy2`: for the binary tree of `btlazy2`, whose
+/// unsorted positions stay unsorted.
+pub(crate) fn zstd_reduce_table_btlazy2(table: &mut [u32], reducer_value: u32) {
+    zstd_reduce_table_internal::<true>(table, reducer_value);
 }
 
 /// `ZSTD_MatchState_t`: what the match finders keep from block to block.

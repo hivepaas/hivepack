@@ -7,9 +7,10 @@
 //!
 //! The data has repeats near and far, and the windows are small: the input
 //! buffer wraps around, and matches reach into the window's older segment.
-//! When the port refuses a frame with `ParameterUnsupported`, a strategy it
-//! does not have yet, that context is left, whatever libzstd answers: the
-//! port refuses when the frame starts, before libzstd can fail.
+//! When the port refuses a frame with `ParameterUnsupported`, for what it
+//! does not have yet (the block splitter after the sequences, long distance
+//! matching), that context is left, whatever libzstd answers: the port
+//! refuses when the frame starts, before libzstd can fail.
 //!
 //! The `zstd` crate does not let the input buffer be stable, nor set the
 //! block splitter level; the oracle tests those (`src/oracle_compress.rs`).
@@ -72,8 +73,9 @@ fn piece(rng: &mut Rng) -> usize {
 /// Random parameters, the same for both; some out of bounds.
 fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
     let mut list = Vec::new();
-    let level =
-        [-7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][rng.range(0, 16) as usize];
+    let level = [
+        -7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 15, 16, 17, 18, 19, 20, 22,
+    ][rng.range(0, 21) as usize];
     list.push((P::CompressionLevel(level), C::CompressionLevel(level)));
     if rng.chance(2) {
         let value = rng.range(9, 20) as u32;
@@ -92,7 +94,12 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         list.push((P::SearchLog(value), C::SearchLog(value)));
     }
     if rng.chance(3) {
-        let value = rng.range(2, 8) as u32;
+        // Often 3, for the optimal parser's 3-byte hash table.
+        let value = if rng.chance(2) {
+            3
+        } else {
+            rng.range(2, 8) as u32
+        };
         list.push((P::MinMatch(value), C::MinMatch(value)));
     }
     if rng.chance(4) {
@@ -108,8 +115,22 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
             (Strategy::Lazy, S::ZSTD_lazy),
             (Strategy::Lazy2, S::ZSTD_lazy2),
             (Strategy::Btlazy2, S::ZSTD_btlazy2),
-        ][rng.range(0, 5) as usize];
+            (Strategy::Btopt, S::ZSTD_btopt),
+            (Strategy::Btultra, S::ZSTD_btultra),
+            (Strategy::Btultra2, S::ZSTD_btultra2),
+        ][rng.range(0, 8) as usize];
         list.push((P::Strategy(Some(p)), C::Strategy(c)));
+    }
+    // The block splitter after the sequences, which the optimal parser's
+    // strategies use with windows of 128 KB or more: the port refuses it
+    // for now, so mostly off.
+    if !rng.chance(8) {
+        let (p, c) = if rng.chance(8) {
+            (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto)
+        } else {
+            (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable)
+        };
+        list.push((P::SplitAfterSequences(p), C::UseBlockSplitter(c)));
     }
     if rng.chance(2) {
         let (p, c) = match rng.range(0, 2) {

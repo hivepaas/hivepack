@@ -165,6 +165,43 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         let value = [0, 1000, 1024, 5000, 65_536, 131_072, 131_073][rng.range(0, 6) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
     }
+    if rng.chance(3) {
+        // Long distance matching, with small parameters, so that it finds
+        // matches in these inputs, some of them out of bounds. zstd-safe
+        // sets it on (1) or to 0, auto in libzstd, which is off below btopt.
+        let on = !rng.chance(4);
+        let p = if on {
+            ParamSwitch::Enable
+        } else {
+            ParamSwitch::Auto
+        };
+        list.push((
+            P::EnableLongDistanceMatching(p),
+            C::EnableLongDistanceMatching(on),
+        ));
+        if rng.chance(2) {
+            let value = rng.range(3, 100) as u32;
+            list.push((P::LdmMinMatch(value), C::LdmMinMatch(value)));
+        }
+        if rng.chance(2) {
+            let value = rng.range(0, 4) as u32;
+            list.push((P::LdmHashRateLog(value), C::LdmHashRateLog(value)));
+        }
+        if rng.chance(3) {
+            let value = rng.range(5, 20) as u32;
+            list.push((P::LdmHashLog(value), C::LdmHashLog(value)));
+        }
+        if rng.chance(3) {
+            let value = rng.range(0, 9) as u32;
+            list.push((P::LdmBucketSizeLog(value), C::LdmBucketSizeLog(value)));
+        }
+        // A small window: the input buffer then wraps around, and matches
+        // reach into the window's older segment. Without one set, long
+        // distance matching takes 2^27 bytes, and its hash table, from a
+        // small hash rate log, up to 2^26 entries.
+        let value = rng.range(10, 20) as u32;
+        list.push((P::WindowLog(value), C::WindowLog(value)));
+    }
     // On big-endian machines libzstd's block splitter, which the strategies
     // from `greedy` up use on full blocks, hashes pairs of bytes in the
     // machine's order and splits elsewhere; the port gives the same frames
@@ -581,29 +618,35 @@ fn compress2_compresses_as_libzstd_does() {
 }
 
 /// More than 4 GiB in one frame, past `ZSTD_CURRENT_MAX` (3.5 GB), where
-/// both lower the window's indices for real; compared call by call. Slow:
-/// run it in release, by hand.
+/// both lower the window's indices for real; compared call by call. The
+/// last frame has long distance matching, whose window lowers its own
+/// indices. Slow: run it in release, by hand.
 #[test]
 #[ignore = "streams 4.5 GiB; run with --release"]
 fn streams_past_4_gib_as_libzstd_does() {
     const ROUNDS: usize = 72;
     let mut rng = Rng(99);
     let base = data(&mut rng, 64 << 20);
-    for (level, window_log) in [(1, 0), (3, 12)] {
+    for (level, window_log, ldm) in [(1, 0, false), (3, 12, false), (2, 20, true)] {
         let mut c = zstd_safe::CCtx::create();
         let mut p = CCtx::new();
-        set_both(
-            &mut c,
-            &mut p,
+        let mut parameters = vec![
             (P::CompressionLevel(level), C::CompressionLevel(level)),
-        )
-        .expect("both set it");
-        set_both(
-            &mut c,
-            &mut p,
             (P::WindowLog(window_log), C::WindowLog(window_log)),
-        )
-        .expect("both set it");
+        ];
+        if ldm {
+            parameters.extend([
+                (
+                    P::EnableLongDistanceMatching(ParamSwitch::Enable),
+                    C::EnableLongDistanceMatching(true),
+                ),
+                (P::LdmMinMatch(16), C::LdmMinMatch(16)),
+                (P::LdmHashRateLog(4), C::LdmHashRateLog(4)),
+            ]);
+        }
+        for parameter in parameters {
+            set_both(&mut c, &mut p, parameter).expect("both set it");
+        }
         let mut c_out = vec![0u8; hivepack_zstd::cstream_out_size()];
         let mut p_out = vec![0u8; hivepack_zstd::cstream_out_size()];
         let mut written = 0u64;
@@ -657,7 +700,7 @@ fn streams_past_4_gib_as_libzstd_does() {
             }
         }
         println!(
-            "level {level}: {written} bytes for {} GiB",
+            "level {level}, long distance matching {ldm}: {written} bytes for {} GiB",
             ROUNDS as f64 / 16.0
         );
     }

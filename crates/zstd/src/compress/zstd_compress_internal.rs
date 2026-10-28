@@ -661,6 +661,120 @@ pub(crate) struct CompressedBlockState {
 }
 
 // ---------------------------------------------------------------------------
+// Long distance matching
+
+/// `rawSeq`: a match long distance matching found, after its literals.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct RawSeq {
+    /// The offset of the match, its distance back; 0 in the sequence
+    /// `maybeSplitSequence` returns when the rest of the block is literals.
+    pub(crate) offset: u32,
+    /// The literals before the match.
+    pub(crate) lit_length: u32,
+    /// The length of the match, all of it (not less `MINMATCH`).
+    pub(crate) match_length: u32,
+}
+
+/// `RawSeqStore_t`: the sequences long distance matching found for a
+/// block, and how far they have been read.
+///
+/// Differs from libzstd: the sequences are a vector, `size` its length, the
+/// context's `ldmSequences` storage its buffer. libzstd makes a new store
+/// over that storage for each block (`kNullRawSeqStore`, then `seq` and
+/// `capacity`); the port keeps one in the context and empties it for each
+/// block with [`RawSeqStore::reset`]. The default store is
+/// `kNullRawSeqStore`: empty, with no room.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct RawSeqStore {
+    /// The sequences, `seq.len()` being libzstd's `size`.
+    pub(crate) seq: Vec<RawSeq>,
+    /// The index in `seq` where reading stopped: `pos <= size`.
+    pub(crate) pos: usize,
+    /// Where reading stopped in the sequence at `pos`, from the start of
+    /// its literals: up to its literals and its match.
+    pub(crate) pos_in_sequence: usize,
+    /// The most sequences `seq` may hold.
+    pub(crate) capacity: usize,
+}
+
+impl RawSeqStore {
+    /// `size`: how many sequences there are.
+    #[inline(always)]
+    pub(crate) fn size(&self) -> usize {
+        self.seq.len()
+    }
+
+    /// Empty, for the next block, with the same capacity.
+    pub(crate) fn reset(&mut self) {
+        self.seq.clear();
+        self.pos = 0;
+        self.pos_in_sequence = 0;
+    }
+}
+
+/// `ldmParams_t`: the parameters of long distance matching, 0 for those
+/// left to `ZSTD_ldm_adjustParameters`.
+///
+/// Differs from libzstd: `enableLdm` is apart, in the context parameters'
+/// `ldm_enable`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct LdmParams {
+    /// The log of the hash table's size, in entries.
+    pub(crate) hash_log: u32,
+    /// The log of the entries in a bucket, at most 8.
+    pub(crate) bucket_size_log: u32,
+    /// The shortest match.
+    pub(crate) min_match_length: u32,
+    /// About one position in `1 << hash_rate_log` goes into the table.
+    pub(crate) hash_rate_log: u32,
+    /// The window of long distance matching: the frame's.
+    pub(crate) window_log: u32,
+}
+
+/// `ldmEntry_t`: a position in the hash table of long distance matching.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct LdmEntry {
+    /// The index of the position, in the window of long distance matching.
+    pub(crate) offset: u32,
+    /// The top 32 bits of the hash of its `min_match_length` bytes.
+    pub(crate) checksum: u32,
+}
+
+/// `LDM_BATCH_SIZE`: how many split points the gear hash finds before they
+/// are looked up.
+pub(crate) const LDM_BATCH_SIZE: usize = 64;
+
+/// `ldmState_t`: what long distance matching keeps from block to block.
+///
+/// Differs from libzstd: the split points and match candidates of a batch
+/// (`splitIndices`, `matchCandidates`) are local to
+/// `ZSTD_ldm_generateSequences_internal`, which fills them before it reads
+/// them.
+pub(crate) struct LdmState {
+    /// The window, over the same input as the match state's, apart from it:
+    /// it keeps a maximum distance and lowers its indices on its own.
+    pub(crate) window: Window,
+    /// The buckets, one after another, `1 << bucket_size_log` entries each.
+    pub(crate) hash_table: Vec<LdmEntry>,
+    /// The index after a loaded dictionary, or 0.
+    pub(crate) loaded_dict_end: u32,
+    /// For each bucket, the entry to write next.
+    pub(crate) bucket_offsets: Vec<u8>,
+}
+
+impl LdmState {
+    /// No tables, until a frame with long distance matching sets them up.
+    pub(crate) fn new() -> Self {
+        LdmState {
+            window: Window::new(),
+            hash_table: Vec::new(),
+            loaded_dict_end: 0,
+            bucket_offsets: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hashes
 
 /// `MEM_readLE16` on the input, its index masked with `idx`: the compiler

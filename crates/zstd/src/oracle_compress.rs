@@ -522,8 +522,13 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         1017 => CParameter::BlockSplitterLevel(unsigned()),
         // ZSTD_c_splitAfterSequences
         1010 => CParameter::SplitAfterSequences(switch()),
-        // ZSTD_c_enableLongDistanceMatching
+        // ZSTD_c_enableLongDistanceMatching, ZSTD_c_ldmHashLog,
+        // ZSTD_c_ldmMinMatch, ZSTD_c_ldmBucketSizeLog, ZSTD_c_ldmHashRateLog
         160 => CParameter::EnableLongDistanceMatching(switch()),
+        161 => CParameter::LdmHashLog(unsigned()),
+        162 => CParameter::LdmMinMatch(unsigned()),
+        163 => CParameter::LdmBucketSizeLog(unsigned()),
+        164 => CParameter::LdmHashRateLog(unsigned()),
         // ZSTD_c_useRowMatchFinder
         1011 => CParameter::UseRowMatchFinder(switch()),
         _ => panic!("parameter {number}"),
@@ -1175,6 +1180,24 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         if rng.range(0, 4) == 0 {
             steps.extend([7, number, rng.range(low, high) as i64]);
         }
+    }
+    if rng.range(0, 2) == 0 {
+        // Long distance matching, on, off or auto (off below btopt), with
+        // small parameters so that it finds matches in these inputs, some
+        // out of bounds; and a small window, which it would otherwise set
+        // to 2^27 bytes, with up to 2^26 entries in its hash table.
+        steps.extend([7, 160, rng.range(0, 2) as i64]);
+        for (number, low, high) in [(161, 5, 18), (162, 3, 80), (163, 0, 9), (164, 0, 4)] {
+            if rng.range(0, 1) == 0 {
+                steps.extend([7, number, rng.range(low, high) as i64]);
+            }
+        }
+        let window_log = if small {
+            rng.range(10, 13)
+        } else {
+            rng.range(10, 18)
+        };
+        steps.extend([7, 101, window_log as i64]);
     }
     if level > 10 {
         // Levels 11 to 15 are btopt for some sizes, which the port does not

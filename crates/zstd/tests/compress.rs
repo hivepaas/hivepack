@@ -8,6 +8,8 @@
 //! context too: both contexts compress the same frames in the same order.
 //! Then again through `compress2`, with the blocks split after their
 //! sequences (`ZSTD_c_splitAfterSequences`).
+//! Then every file twice over with long distance matching, through
+//! `ZSTD_compress2`.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -197,6 +199,92 @@ fn every_test_file_splits_its_blocks_as_libzstd_splits_them() {
         250
     };
     assert!(count > least, "only {count} frames compared");
+    problems.check();
+}
+
+/// Every file of the test data twice over, with long distance matching on,
+/// through `ZSTD_compress2`: the second copy is one long match with the
+/// first. One level per file, all of them across the files; every other
+/// file with small parameters, so that it finds more.
+#[test]
+fn every_test_file_twice_compresses_with_long_distance_matching_as_libzstd() {
+    use hivepack_zstd::{CParameter as P, ParamSwitch};
+    use zstd_safe::CParameter as C;
+    let mut problems = Problems::default();
+    let mut cctx = Contexts::new();
+    let set_both = |cctx: &mut Contexts, (p, c): (P, C)| {
+        cctx.port.set_parameter(p).expect("the port takes it");
+        cctx.libzstd.set_parameter(c).expect("libzstd takes it");
+    };
+    set_both(
+        &mut cctx,
+        (
+            P::EnableLongDistanceMatching(ParamSwitch::Enable),
+            C::EnableLongDistanceMatching(true),
+        ),
+    );
+    let mut count = 0;
+    for set in sets() {
+        for (i, file) in set.list().iter().enumerate() {
+            let mut data = set.read(file);
+            data.extend_from_within(..);
+            let name = format!("{}/{} twice", set.name, file.display());
+            let level = LEVELS[(i + 5) % LEVELS.len()];
+            let (min_match, hash_rate_log) = if i % 2 == 0 { (16, 4) } else { (0, 0) };
+            set_both(
+                &mut cctx,
+                (P::CompressionLevel(level), C::CompressionLevel(level)),
+            );
+            set_both(
+                &mut cctx,
+                (P::LdmMinMatch(min_match), C::LdmMinMatch(min_match)),
+            );
+            set_both(
+                &mut cctx,
+                (
+                    P::LdmHashRateLog(hash_rate_log),
+                    C::LdmHashRateLog(hash_rate_log),
+                ),
+            );
+            // On big-endian machines, see `compare`.
+            if cfg!(target_endian = "big") && level >= 4 && data.len() >= 128 << 10 {
+                continue;
+            }
+            let bound = hivepack_zstd::compress_bound(data.len()).expect("a bound");
+            let mut got = vec![0u8; bound];
+            let size = match cctx.port.compress2(&mut got, &data) {
+                Ok(size) => size,
+                // A strategy the port does not have yet.
+                Err(error) if error.code() == ErrorCode::ParameterUnsupported => continue,
+                Err(error) => {
+                    problems.add(format!("{name} at level {level}: {error}"));
+                    continue;
+                }
+            };
+            let mut want = vec![0u8; bound];
+            let want_size = cctx
+                .libzstd
+                .compress2(&mut want[..], &data)
+                .expect("libzstd compresses");
+            count += 1;
+            if got[..size] != want[..want_size] {
+                problems.add(format!(
+                    "{name} at level {level}: {size} bytes, libzstd {want_size}"
+                ));
+                continue;
+            }
+            let mut back = vec![0u8; data.len()];
+            match hivepack_zstd::decompress(&mut back, &got[..size]) {
+                Ok(n) if back[..n] == *data => {}
+                other => problems.add(format!(
+                    "{name} at level {level}: does not decode back ({:?})",
+                    other.map(|_| ())
+                )),
+            }
+        }
+    }
+    eprintln!("compared {count} frames");
+    assert!(count > 200, "only {count} frames compared");
     problems.check();
 }
 

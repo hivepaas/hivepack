@@ -155,6 +155,15 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         let value = [0, 1000, 1024, 5000, 65_536, 131_072, 131_073][rng.range(0, 6) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
     }
+    // On big-endian machines libzstd's row match finder gives other frames
+    // than on little-endian ones on some inputs; the port gives the same
+    // everywhere. There the hash chain instead.
+    if cfg!(target_endian = "big") {
+        list.push((
+            P::UseRowMatchFinder(ParamSwitch::Disable),
+            C::UseRowMatchFinder(zstd_safe::ParamSwitch::Disable),
+        ));
+    }
     list
 }
 

@@ -5,11 +5,11 @@
 //! and `dict`, the one its older segment is in; the hash table holds window
 //! indices, `position + window.base` (or `window.dict_base`).
 
+use crate::common::mem::idx as mem_idx;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
     HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
-    mem_read32, offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr,
-    zstd_index_overlap_check,
+    mem_read32, mem_read32_within, offset_to_offbase, zstd_count, zstd_count_2segments,
 };
 
 /// `ZSTD_compressBlock_fast_noDict_generic`: the sequences of the block
@@ -375,6 +375,13 @@ pub(crate) fn zstd_compress_block_fast(
 /// `ZSTD_compressBlock_fast_extDict_generic`: as the noDict variant, with
 /// matches in the window's older segment too, `dict`; a match there may run
 /// on into the prefix. Without that segment in reach, the noDict variant.
+///
+/// Differs from libzstd: the search keeps ip0 and ip2 only and reads the
+/// bytes at the four positions through `at0` and `at2`, as the noDict
+/// variant does. A candidate or a repcode is read only where its 4 bytes
+/// are all in its segment, the older one cut out of `dict` or the prefix,
+/// and that test stands for libzstd's tests that it is in the window. The
+/// comments in the search say why the answers are the same.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
     ms: &mut MatchState,
@@ -411,9 +418,9 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
     let mut offset_saved2 = 0;
 
     let mut ip0 = istart;
-    let mut ip1;
     let mut ip2;
-    let mut ip3;
+    let mut at0: &[u8];
+    let mut at2: &[u8];
     let mut current0: u32;
 
     let mut hash0;
@@ -430,14 +437,39 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
         return zstd_compress_block_fast(ms, seq_store, rep, src, istart, iend);
     }
 
+    // Nothing past the block is read, as in libzstd; this makes iend the
+    // end of `src`, for `fits_hash_window`.
+    let src = &src[..iend];
+    // The two segments: the older one from dictStart to dictEnd, and the
+    // prefix from prefixStart to iend. Each ends where libzstd's matchEnd
+    // is, and starts where its lowMatchPtr is. The prefix starts at
+    // dictLimit, which here is prefixStartIndex (above lowLimit), at or
+    // before the block.
+    let dict = &dict[dict_start..dict_end];
+    let prefix = &src[prefix_start..];
+
     let index = |position: usize| (position as i64 + base) as u32;
-    // Where index `i` is: the buffer of its segment, and its position there.
+    // Where index `i` is: its segment, and its position there.
     let locate = |i: u32| {
         if i < prefix_start_index {
-            (dict, (i64::from(i) - dict_base) as usize)
+            (dict, i.wrapping_sub(dict_start_index) as usize)
         } else {
-            (src, (i64::from(i) - base) as usize)
+            (prefix, (i - prefix_start_index) as usize)
         }
+    };
+    // The 4 bytes at index `i`, if they are all in its segment: the older
+    // one if `in_dict`, else the prefix, read in `src` so that the search
+    // needs no other slice. An index below dictStartIndex wraps past the
+    // older segment's end, as indices are under 2^32 and the segment is
+    // shorter. The position in `src` is masked as `mem_read32` does, which
+    // changes none from prefixStart on.
+    let read_at = |i: u32, in_dict: bool| {
+        let (buf, pos) = if in_dict {
+            (dict, i.wrapping_sub(dict_start_index) as usize)
+        } else {
+            (src, mem_idx((i64::from(i) - base) as usize))
+        };
+        mem_read32_within(buf, pos)
     };
 
     {
@@ -453,7 +485,7 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
         }
     }
 
-    let hash_table = &mut ms.hash_table;
+    let mut hash_table = HashTable::new(&mut ms.hash_table, hlog);
 
     'start: loop {
         // Needs ip0.
@@ -461,125 +493,124 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
         next_step = ip0 + k_step_incr;
 
         // The positions; ip0 - anchor == 0, so no step to work out.
-        ip1 = ip0 + 1;
         ip2 = ip0 + step;
-        ip3 = ip2 + 1;
 
-        if ip3 >= ilimit {
+        // ip3 at or past ilimit.
+        if !fits_hash_window(src, ip2) {
             break 'start;
         }
+        at2 = &src[ip2..][..HASH_WINDOW];
+        // Before ip2, so in the block too: this test never fails.
+        if !fits_hash_window(src, ip0) {
+            break 'start;
+        }
+        at0 = &src[ip0..][..HASH_WINDOW];
 
-        hash0 = zstd_hash_ptr(src, ip0, hlog, mls);
-        hash1 = zstd_hash_ptr(src, ip1, hlog, mls);
+        hash0 = hash_table.hash(at0, 0, mls);
+        hash1 = hash_table.hash(at0, 1, mls);
 
-        idx = hash_table[hash0];
+        idx = hash_table.get(hash0);
 
-        // The match: its buffer, where it is there and where its segment
-        // ends, its offset code and its length so far.
-        let (mbuf, match0, match_end, offcode, mut m_length) = 'search: loop {
-            {
-                // The repcode match for ip2.
-                let current2 = index(ip2);
-                let rep_index = current2.wrapping_sub(offset_1);
-                let rep_valid = (prefix_start_index.wrapping_sub(rep_index) >= 4) & (offset_1 > 0);
+        // The match: its segment, where it is there, its offset code, its
+        // length so far, and libzstd's ip1 when it was found.
+        let (mbuf, match0, offcode, mut m_length, ip1) = 'search: loop {
+            let ip1 = ip0 + 1;
 
-                // Write back the hash table entry.
-                current0 = index(ip0);
-                hash_table[hash0] = current0;
-
-                // Check the repcode at ip2; libzstd reads a value that cannot
-                // match when it is not valid.
-                if rep_valid {
-                    let (rbuf, rpos) = locate(rep_index);
-                    if mem_read32(src, ip2) == mem_read32(rbuf, rpos) {
-                        ip0 = ip2;
-                        let mut match0 = rpos;
-                        let match_end = if rep_index < prefix_start_index {
-                            dict_end
-                        } else {
-                            iend
-                        };
-                        let mut m_length = usize::from(src[ip0 - 1] == rbuf[match0 - 1]);
-                        ip0 -= m_length;
-                        match0 -= m_length;
-                        m_length += 4;
-                        break 'search (rbuf, match0, match_end, REPCODE1_TO_OFFBASE, m_length);
-                    }
-                }
-            }
-
-            // The match for ip0.
-            if idx >= dict_start_index {
-                let (ibuf, ipos) = locate(idx);
-                if mem_read32(src, ip0) == mem_read32(ibuf, ipos) {
-                    break 'search offset_match_ext(
-                        &mut offset_1,
-                        &mut offset_2,
-                        src,
-                        &mut ip0,
-                        anchor,
-                        current0,
-                        idx,
-                        (ibuf, ipos),
-                        prefix_start_index,
-                        prefix_start,
-                        dict_start,
-                        dict_end,
-                        iend,
-                    );
-                }
-            }
-
-            // Look up ip1.
-            idx = hash_table[hash1];
-
-            // Hash ip2.
-            hash0 = hash1;
-            hash1 = zstd_hash_ptr(src, ip2, hlog, mls);
-
-            // Advance to the next positions.
-            ip0 = ip1;
-            ip1 = ip2;
-            ip2 = ip3;
+            // The repcode match for ip2. libzstd reads it where offset_1 is
+            // not 0 and the index is not prefixStartIndex nor one of the 3
+            // before it. Differs from libzstd: an index up to
+            // prefixStartIndex is read in the older segment, which has not
+            // 4 bytes at those 4, so the read stands for the second test.
+            // Where libzstd reads, so does the port: offset_1 is under the
+            // distance from dictStartIndex to the block (tested above) or
+            // the offset of a match found since, so the index is past
+            // dictStartIndex, and before ip2. That also leaves a byte
+            // before the match, for the test below.
+            let rep_index = index(ip2).wrapping_sub(offset_1);
+            let rval = read_at(rep_index, rep_index <= prefix_start_index);
 
             // Write back the hash table entry.
             current0 = index(ip0);
-            hash_table[hash0] = current0;
+            hash_table.set(hash0, current0);
 
-            // The match for ip0.
-            if idx >= dict_start_index {
-                let (ibuf, ipos) = locate(idx);
-                if mem_read32(src, ip0) == mem_read32(ibuf, ipos) {
-                    break 'search offset_match_ext(
-                        &mut offset_1,
-                        &mut offset_2,
-                        src,
-                        &mut ip0,
-                        anchor,
-                        current0,
-                        idx,
-                        (ibuf, ipos),
-                        prefix_start_index,
-                        prefix_start,
-                        dict_start,
-                        dict_end,
-                        iend,
-                    );
-                }
+            // Check the repcode at ip2.
+            if (offset_1 > 0) & (rval == Some(mem_read32(at2, 0))) {
+                let (rbuf, rpos) = locate(rep_index);
+                ip0 = ip2;
+                let mut match0 = rpos;
+                let mut m_length = usize::from(src[ip0 - 1] == rbuf[match0 - 1]);
+                ip0 -= m_length;
+                match0 -= m_length;
+                m_length += 4;
+                break 'search (rbuf, match0, REPCODE1_TO_OFFBASE, m_length, ip1);
+            }
+
+            // The match for ip0. libzstd reads the candidate from
+            // dictStartIndex on. Differs from libzstd: the read in its
+            // segment stands for that test. Where libzstd reads, so does
+            // the port: every table entry is a position before ip0, hashed
+            // when 8 bytes from it were in the input. One in the older
+            // segment has its 4 bytes in it; one in the prefix is before
+            // ip0.
+            if read_at(idx, idx < prefix_start_index) == Some(mem_read32(at0, 0)) {
+                let (mbuf, match0, offcode, m_length) = offset_match_ext(
+                    &mut offset_1,
+                    &mut offset_2,
+                    src,
+                    &mut ip0,
+                    anchor,
+                    current0,
+                    idx,
+                    locate(idx),
+                );
+                break 'search (mbuf, match0, offcode, m_length, ip1);
             }
 
             // Look up ip1.
-            idx = hash_table[hash1];
+            idx = hash_table.get(hash1);
 
             // Hash ip2.
             hash0 = hash1;
-            hash1 = zstd_hash_ptr(src, ip2, hlog, mls);
+            hash1 = hash_table.hash(at2, 0, mls);
 
-            // Advance to the next positions.
+            // Advance to the next positions: ip0 to ip1, ip1 to ip2 and ip2
+            // to ip3. Until the next advance, libzstd's ip1 is the port's
+            // ip2, and the bytes at its ip0 and ip2 are those at 1 in `at0`
+            // and `at2`.
             ip0 = ip1;
-            ip1 = ip2;
+
+            // Write back the hash table entry.
+            current0 = index(ip0);
+            hash_table.set(hash0, current0);
+
+            // The match for ip0, as above.
+            if read_at(idx, idx < prefix_start_index) == Some(mem_read32(at0, 1)) {
+                let (mbuf, match0, offcode, m_length) = offset_match_ext(
+                    &mut offset_1,
+                    &mut offset_2,
+                    src,
+                    &mut ip0,
+                    anchor,
+                    current0,
+                    idx,
+                    locate(idx),
+                );
+                // libzstd's ip1, now.
+                break 'search (mbuf, match0, offcode, m_length, ip2);
+            }
+
+            // Look up ip1.
+            idx = hash_table.get(hash1);
+
+            // Hash ip2.
+            hash0 = hash1;
+            hash1 = hash_table.hash(at2, 1, mls);
+
+            // Advance to the next positions: ip0 to ip2 (ip1 now), and ip2
+            // to ip0 + step.
+            ip0 = ip2;
             ip2 = ip0 + step;
-            ip3 = ip1 + step;
+            at0 = at2;
 
             // The step.
             if ip2 >= next_step {
@@ -587,9 +618,11 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
                 next_step += k_step_incr;
             }
 
-            if ip3 >= ilimit {
+            // ip3 at or past ilimit.
+            if !fits_hash_window(src, ip2) {
                 break 'start;
             }
+            at2 = &src[ip2..][..HASH_WINDOW];
         };
 
         // _match: needs ip0, the match and offcode.
@@ -601,7 +634,7 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
             mbuf,
             match0 + m_length,
             iend,
-            match_end,
+            mbuf.len(),
             prefix_start,
         );
 
@@ -612,43 +645,40 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
 
         // Write the next hash table entry.
         if ip1 < ip0 {
-            hash_table[hash1] = index(ip1);
+            hash_table.set(hash1, index(ip1));
         }
 
         // Fill the table, and check for an immediate repcode.
         if ip0 <= ilimit {
             // Here because current + 2 could be past iend - 8.
             let at = (i64::from(current0 + 2) - base) as usize;
-            hash_table[zstd_hash_ptr(src, at, hlog, mls)] = current0 + 2;
-            hash_table[zstd_hash_ptr(src, ip0 - 2, hlog, mls)] = index(ip0 - 2);
+            hash_table.set(hash_table.hash(src, at, mls), current0 + 2);
+            hash_table.set(hash_table.hash(src, ip0 - 2, mls), index(ip0 - 2));
 
             while ip0 <= ilimit {
+                // libzstd reads the repcode where offset_2 is not 0 and its
+                // 4 bytes are in one segment. Differs from libzstd: the read
+                // in its segment stands for the second test, as in the
+                // search; prefixStartIndex itself is in the prefix here.
                 let rep_index2 = index(ip0).wrapping_sub(offset_2);
-                if zstd_index_overlap_check(prefix_start_index, rep_index2) & (offset_2 > 0) {
-                    let (rbuf, rpos) = locate(rep_index2);
-                    if mem_read32(rbuf, rpos) == mem_read32(src, ip0) {
-                        let rep_end2 = if rep_index2 < prefix_start_index {
-                            dict_end
-                        } else {
-                            iend
-                        };
-                        let rep_length2 = zstd_count_2segments(
-                            src,
-                            ip0 + 4,
-                            rbuf,
-                            rpos + 4,
-                            iend,
-                            rep_end2,
-                            prefix_start,
-                        ) + 4;
-                        // Swap offset_2 and offset_1.
-                        std::mem::swap(&mut offset_1, &mut offset_2);
-                        seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, rep_length2);
-                        hash_table[zstd_hash_ptr(src, ip0, hlog, mls)] = index(ip0);
-                        ip0 += rep_length2;
-                        anchor = ip0;
-                        continue;
-                    }
+                let (rbuf, rpos) = locate(rep_index2);
+                if (offset_2 > 0) & (mem_read32_within(rbuf, rpos) == Some(mem_read32(src, ip0))) {
+                    let rep_length2 = zstd_count_2segments(
+                        src,
+                        ip0 + 4,
+                        rbuf,
+                        rpos + 4,
+                        iend,
+                        rbuf.len(),
+                        prefix_start,
+                    ) + 4;
+                    // Swap offset_2 and offset_1.
+                    std::mem::swap(&mut offset_1, &mut offset_2);
+                    seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, rep_length2);
+                    hash_table.set(hash_table.hash(src, ip0, mls), index(ip0));
+                    ip0 += rep_length2;
+                    anchor = ip0;
+                    continue;
                 }
                 break;
             }
@@ -679,8 +709,8 @@ fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
 }
 
 /// `_offset` of the extDict variant: the match at `idx`, found at `ip0`,
-/// extended backwards in its segment. Returns its buffer, its position
-/// there, where its segment ends, its offset code and its length so far,
+/// extended backwards in its segment, which starts at position 0. Returns
+/// its segment, its position there, its offset code and its length so far,
 /// and moves `ip0` back with it.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -693,30 +723,22 @@ fn offset_match_ext<'a>(
     current0: u32,
     idx: u32,
     (mbuf, mut match0): (&'a [u8], usize),
-    prefix_start_index: u32,
-    prefix_start: usize,
-    dict_start: usize,
-    dict_end: usize,
-    iend: usize,
-) -> (&'a [u8], usize, usize, u32, usize) {
+) -> (&'a [u8], usize, u32, usize) {
     let offset = current0 - idx;
-    let in_dict = idx < prefix_start_index;
-    let low_match = if in_dict { dict_start } else { prefix_start };
-    let match_end = if in_dict { dict_end } else { iend };
     *offset_2 = *offset_1;
     *offset_1 = offset;
     let offcode = offset_to_offbase(offset);
     let mut m_length = 4;
 
-    // The backwards match length.
+    // The backwards match length, down to the segment's start.
     let mut ip = *ip0;
-    while (ip > anchor) & (match0 > low_match) && src[ip - 1] == mbuf[match0 - 1] {
+    while (ip > anchor) & (match0 > 0) && src[ip - 1] == mbuf[match0 - 1] {
         ip -= 1;
         match0 -= 1;
         m_length += 1;
     }
     *ip0 = ip;
-    (mbuf, match0, match_end, offcode, m_length)
+    (mbuf, match0, offcode, m_length)
 }
 
 /// `ZSTD_compressBlock_fast_extDict`: dispatches on the shortest match, 4

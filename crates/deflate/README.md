@@ -1,0 +1,33 @@
+# hivepack-deflate
+
+Deflate, zlib and gzip decompression in safe Rust, ported from the official library, [zlib](https://zlib.net) 1.3.2.
+
+> **Status:** decompression works, raw or with the zlib and gzip wrappers, with dictionaries and gzip headers, and gives the same results and messages as zlib on every stream the tests try. It runs at about 0.8× zlib's speed, before any speed work. Compression comes next. This crate is not on crates.io.
+
+```rust
+use hivepack_deflate::{Flush, InBuffer, Inflate, OutBuffer, Status};
+
+// "hello", deflated with no header or trailer, as in a ZIP archive.
+let raw = [0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+let mut inflate = Inflate::new(-15)?;
+let mut out = [0; 16];
+let mut output = OutBuffer::new(&mut out);
+let status = inflate.inflate(&mut output, &mut InBuffer::new(&raw), Flush::Finish)?;
+assert_eq!(status, Status::StreamEnd);
+let written = output.pos;
+assert_eq!(&out[..written], b"hello");
+```
+
+It also has zlib's checksums, `crc32` and `adler32`, with their `_combine` functions.
+
+The goals:
+
+- **No unsafe code.** The crate forbids it; see [docs/safety.md](../../docs/safety.md).
+- **The same output as zlib.** Decompression gives the same output, return codes and error messages; compressed output will be identical byte for byte.
+- **The same speed as zlib**, on x86-64 and arm64.
+
+How the port follows zlib, how it is checked, and what is left are in [docs/deflate.md](../../docs/deflate.md).
+
+## License
+
+The zlib license, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler, and (c) 2026 HivePaaS.

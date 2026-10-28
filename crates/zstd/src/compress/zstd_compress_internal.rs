@@ -4,7 +4,7 @@
 use crate::common::bits::{highbit32, nb_common_bytes};
 use crate::common::error_private::{Result, error};
 use crate::common::fse::fse_ctable_size_u32;
-use crate::common::mem::{read_le16, read_le32, read_le64};
+use crate::common::mem::{idx, read_le16, read_le32, read_le64};
 use crate::common::zstd_internal::ZSTD_BLOCKHEADERSIZE;
 use crate::common::zstd_internal::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG};
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
@@ -149,11 +149,15 @@ pub(crate) enum LongLengthType {
 /// sequences' lengths and offsets.
 ///
 /// Differs from libzstd: the buffers are vectors, and the positions their
-/// lengths, instead of pointers into the context's workspace.
+/// lengths (or, for the literals, `lit_len`), instead of pointers into the
+/// context's workspace.
 #[derive(Clone)]
 pub(crate) struct SeqStore {
     pub(crate) sequences: Vec<SeqDef>,
-    pub(crate) literals: Vec<u8>,
+    /// The literals, `lit_buffer[..lit_len]`, with `WILDCOPY_OVERLENGTH`
+    /// bytes more for the copies in pieces of 16 that may run past them.
+    lit_buffer: Vec<u8>,
+    lit_len: usize,
     pub(crate) ll_code: Vec<u8>,
     pub(crate) ml_code: Vec<u8>,
     pub(crate) of_code: Vec<u8>,
@@ -614,6 +618,26 @@ pub(crate) struct CompressedBlockState {
 // ---------------------------------------------------------------------------
 // Hashes
 
+/// `MEM_readLE16` on the input, its index masked with `idx`: the compiler
+/// then sees that the end of the read does not overflow, which saves a
+/// check.
+#[inline(always)]
+pub(crate) fn mem_read16(src: &[u8], at: usize) -> u16 {
+    read_le16(src, idx(at))
+}
+
+/// `MEM_readLE32` on the input; see [`mem_read16`].
+#[inline(always)]
+pub(crate) fn mem_read32(src: &[u8], at: usize) -> u32 {
+    read_le32(src, idx(at))
+}
+
+/// `MEM_readLE64` on the input; see [`mem_read16`].
+#[inline(always)]
+pub(crate) fn mem_read64(src: &[u8], at: usize) -> u64 {
+    read_le64(src, idx(at))
+}
+
 const PRIME4BYTES: u32 = 2_654_435_761;
 const PRIME5BYTES: u64 = 889_523_592_379;
 const PRIME6BYTES: u64 = 227_718_039_650_203;
@@ -626,12 +650,12 @@ const PRIME8BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
 pub(crate) fn zstd_hash_ptr(src: &[u8], at: usize, h_bits: u32, mls: u32) -> usize {
     debug_assert!(h_bits <= 32);
     match mls {
-        5 => zstd_hash_n::<5>(read_le64(src, at), PRIME5BYTES, h_bits),
-        6 => zstd_hash_n::<6>(read_le64(src, at), PRIME6BYTES, h_bits),
-        7 => zstd_hash_n::<7>(read_le64(src, at), PRIME7BYTES, h_bits),
-        8 => (read_le64(src, at).wrapping_mul(PRIME8BYTES) >> (64 - h_bits)) as usize,
+        5 => zstd_hash_n::<5>(mem_read64(src, at), PRIME5BYTES, h_bits),
+        6 => zstd_hash_n::<6>(mem_read64(src, at), PRIME6BYTES, h_bits),
+        7 => zstd_hash_n::<7>(mem_read64(src, at), PRIME7BYTES, h_bits),
+        8 => (mem_read64(src, at).wrapping_mul(PRIME8BYTES) >> (64 - h_bits)) as usize,
         // 4, and anything else
-        _ => (read_le32(src, at).wrapping_mul(PRIME4BYTES) >> (32 - h_bits)) as usize,
+        _ => (mem_read32(src, at).wrapping_mul(PRIME4BYTES) >> (32 - h_bits)) as usize,
     }
 }
 
@@ -654,7 +678,7 @@ pub(crate) fn zstd_count(
     if p_in_limit >= 7 {
         let p_in_loop_limit = p_in_limit - 7;
         while p_in < p_in_loop_limit {
-            let diff = read_le64(src, p_match) ^ read_le64(src, p_in);
+            let diff = mem_read64(src, p_match) ^ mem_read64(src, p_in);
             if diff != 0 {
                 return p_in + nb_common_bytes(diff) as usize - p_start;
             }
@@ -662,11 +686,11 @@ pub(crate) fn zstd_count(
             p_match += 8;
         }
     }
-    if p_in + 3 < p_in_limit && read_le32(src, p_match) == read_le32(src, p_in) {
+    if p_in + 3 < p_in_limit && mem_read32(src, p_match) == mem_read32(src, p_in) {
         p_in += 4;
         p_match += 4;
     }
-    if p_in + 1 < p_in_limit && read_le16(src, p_match) == read_le16(src, p_in) {
+    if p_in + 1 < p_in_limit && mem_read16(src, p_match) == mem_read16(src, p_in) {
         p_in += 2;
         p_match += 2;
     }
@@ -689,7 +713,7 @@ fn zstd_count_from(
     if p_in_limit >= 7 {
         let p_in_loop_limit = p_in_limit - 7;
         while p_in < p_in_loop_limit {
-            let diff = read_le64(mbuf, p_match) ^ read_le64(src, p_in);
+            let diff = mem_read64(mbuf, p_match) ^ mem_read64(src, p_in);
             if diff != 0 {
                 return p_in + nb_common_bytes(diff) as usize - p_start;
             }
@@ -697,11 +721,11 @@ fn zstd_count_from(
             p_match += 8;
         }
     }
-    if p_in + 3 < p_in_limit && read_le32(mbuf, p_match) == read_le32(src, p_in) {
+    if p_in + 3 < p_in_limit && mem_read32(mbuf, p_match) == mem_read32(src, p_in) {
         p_in += 4;
         p_match += 4;
     }
-    if p_in + 1 < p_in_limit && read_le16(mbuf, p_match) == read_le16(src, p_in) {
+    if p_in + 1 < p_in_limit && mem_read16(mbuf, p_match) == mem_read16(src, p_in) {
         p_in += 2;
         p_match += 2;
     }
@@ -750,7 +774,8 @@ impl SeqStore {
     pub(crate) fn with_capacity(block_size: usize, max_nb_seq: usize) -> Self {
         SeqStore {
             sequences: Vec::with_capacity(max_nb_seq),
-            literals: Vec::with_capacity(block_size),
+            lit_buffer: vec![0; block_size + WILDCOPY_OVERLENGTH],
+            lit_len: 0,
             ll_code: Vec::with_capacity(max_nb_seq),
             ml_code: Vec::with_capacity(max_nb_seq),
             of_code: Vec::with_capacity(max_nb_seq),
@@ -759,15 +784,34 @@ impl SeqStore {
         }
     }
 
+    /// A store of `literals` and room for `nb_seq` sequences, for tests.
+    pub(crate) fn with_literals(literals: &[u8], nb_seq: usize) -> Self {
+        let mut store = SeqStore::with_capacity(literals.len(), nb_seq);
+        store.lit_buffer[..literals.len()].copy_from_slice(literals);
+        store.lit_len = literals.len();
+        store
+    }
+
+    /// The literals stored.
+    #[inline(always)]
+    pub(crate) fn literals(&self) -> &[u8] {
+        &self.lit_buffer[..self.lit_len]
+    }
+
     /// `ZSTD_resetSeqStore`
     pub(crate) fn reset(&mut self) {
         self.sequences.clear();
-        self.literals.clear();
+        self.lit_len = 0;
         self.long_length_type = LongLengthType::None;
     }
 
     /// `ZSTD_storeSeq`: a sequence and its `lit_length` literals, at
     /// `literals` in `src`.
+    ///
+    /// As libzstd, the literals are copied in pieces of 16 bytes when the
+    /// source has 32 bytes more (libzstd counts them to the block's end,
+    /// the port to its buffer's): the bytes past them land in the store's
+    /// margin, where the next literals go.
     #[inline(always)]
     pub(crate) fn store_seq(
         &mut self,
@@ -777,8 +821,25 @@ impl SeqStore {
         off_base: u32,
         match_length: usize,
     ) {
-        self.literals
-            .extend_from_slice(&src[literals..literals + lit_length]);
+        let lit_end = literals + lit_length;
+        let op = self.lit_len;
+        if lit_end + WILDCOPY_OVERLENGTH <= src.len() {
+            // The common case: literals are likely short.
+            copy16(&mut self.lit_buffer, op, src, literals);
+            if lit_length > 16 {
+                wildcopy(
+                    &mut self.lit_buffer,
+                    op + 16,
+                    src,
+                    literals + 16,
+                    lit_length - 16,
+                );
+            }
+        } else {
+            // ZSTD_safecopyLiterals
+            self.lit_buffer[op..op + lit_length].copy_from_slice(&src[literals..lit_end]);
+        }
+        self.lit_len += lit_length;
         self.store_seq_only(lit_length, off_base, match_length);
     }
 
@@ -808,8 +869,38 @@ impl SeqStore {
 
     /// `ZSTD_storeLastLiterals`
     pub(crate) fn store_last_literals(&mut self, src: &[u8], anchor: usize, last_ll_size: usize) {
-        self.literals
-            .extend_from_slice(&src[anchor..anchor + last_ll_size]);
+        let op = self.lit_len;
+        self.lit_buffer[op..op + last_ll_size].copy_from_slice(&src[anchor..anchor + last_ll_size]);
+        self.lit_len += last_ll_size;
+    }
+}
+
+/// `WILDCOPY_OVERLENGTH`: how far past their end copies in pieces may
+/// write.
+pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
+
+/// `ZSTD_copy16`
+#[inline(always)]
+fn copy16(dst: &mut [u8], op: usize, src: &[u8], ip: usize) {
+    let (op, ip) = (idx(op), idx(ip));
+    let mut piece = [0u8; 16];
+    piece.copy_from_slice(&src[ip..ip + 16]);
+    dst[op..op + 16].copy_from_slice(&piece);
+}
+
+/// `ZSTD_wildcopy` with `ZSTD_no_overlap`: `length` bytes and up to 32
+/// more, in pieces of 16.
+#[inline(always)]
+fn wildcopy(dst: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, length: usize) {
+    let oend = op + length;
+    loop {
+        copy16(dst, op, src, ip);
+        copy16(dst, op + 16, src, ip + 16);
+        op += 32;
+        ip += 32;
+        if op >= oend {
+            break;
+        }
     }
 }
 

@@ -86,8 +86,9 @@ impl<'a> BitCStream<'a> {
     pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
         debug_assert!(nb_bits < 32);
         debug_assert!(nb_bits + self.bit_pos < CONTAINER_BITS);
-        // BIT_getLowerBits
-        self.bit_container |= (value & u64::from(BIT_MASK[nb_bits as usize])) << self.bit_pos;
+        // BIT_getLowerBits, `BIT_mask[nb_bits]` worked out rather than
+        // looked up, which saves a bounds check.
+        self.bit_container |= (value & ((1u64 << nb_bits) - 1)) << self.bit_pos;
         self.bit_pos += nb_bits;
     }
 

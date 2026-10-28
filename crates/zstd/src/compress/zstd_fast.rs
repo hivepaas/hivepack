@@ -5,10 +5,9 @@
 //! and `dict`, the one its older segment is in; the hash table holds window
 //! indices, `position + window.base` (or `window.dict_base`).
 
-use crate::common::mem::read_le32;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
-    HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
+    HASH_READ_SIZE, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore, mem_read32,
     offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr, zstd_index_overlap_check,
 };
 
@@ -25,15 +24,17 @@ use crate::compress::zstd_compress_internal::{
 /// `_branch`, chosen by the window log) give the same answer: the candidate
 /// is in the window and its first 4 bytes are the same.
 #[allow(clippy::too_many_lines)]
-fn zstd_compress_block_fast_no_dict_generic(
+fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
     ms: &mut MatchState,
     seq_store: &mut SeqStore,
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
     istart: usize,
     iend: usize,
-    mls: u32,
 ) -> usize {
+    // The shortest match, a constant in each copy, as libzstd's templates
+    // make it.
+    let mls = MLS;
     let c_params = ms.c_params;
     let hlog = c_params.hash_log;
     // At least 2.
@@ -77,7 +78,7 @@ fn zstd_compress_block_fast_no_dict_generic(
     // ZSTD_match4Found
     let match_found = |current: usize, match_idx: u32| {
         match_idx >= prefix_start_index
-            && read_le32(src, current) == read_le32(src, (i64::from(match_idx) - base) as usize)
+            && mem_read32(src, current) == mem_read32(src, (i64::from(match_idx) - base) as usize)
     };
 
     ip0 += usize::from(ip0 == prefix_start);
@@ -118,14 +119,14 @@ fn zstd_compress_block_fast_no_dict_generic(
 
         'search: loop {
             // The repcode match for ip2.
-            let rval = read_le32(src, ip2 - rep_offset1 as usize);
+            let rval = mem_read32(src, ip2 - rep_offset1 as usize);
 
             // Write back the hash table entry.
             current0 = index(ip0);
             hash_table[hash0] = current0;
 
             // Check the repcode at ip2.
-            if (read_le32(src, ip2) == rval) & (rep_offset1 > 0) {
+            if (mem_read32(src, ip2) == rval) & (rep_offset1 > 0) {
                 ip0 = ip2;
                 match0 = ip0 - rep_offset1 as usize;
                 m_length = usize::from(src[ip0 - 1] == src[match0 - 1]);
@@ -240,7 +241,7 @@ fn zstd_compress_block_fast_no_dict_generic(
             if rep_offset2 > 0 {
                 // rep_offset2 == 0 means it is invalid.
                 while ip0 <= ilimit
-                    && read_le32(src, ip0) == read_le32(src, ip0 - rep_offset2 as usize)
+                    && mem_read32(src, ip0) == mem_read32(src, ip0 - rep_offset2 as usize)
                 {
                     // Store the sequence.
                     let r_length =
@@ -328,19 +329,20 @@ pub(crate) fn zstd_compress_block_fast(
     istart: usize,
     iend: usize,
 ) -> usize {
-    let mml = ms.c_params.min_match;
-    let mls = match mml {
-        5..=7 => mml,
-        _ => 4,
+    let f = match ms.c_params.min_match {
+        5 => zstd_compress_block_fast_no_dict_generic::<5>,
+        6 => zstd_compress_block_fast_no_dict_generic::<6>,
+        7 => zstd_compress_block_fast_no_dict_generic::<7>,
+        _ => zstd_compress_block_fast_no_dict_generic::<4>,
     };
-    zstd_compress_block_fast_no_dict_generic(ms, seq_store, rep, src, istart, iend, mls)
+    f(ms, seq_store, rep, src, istart, iend)
 }
 
 /// `ZSTD_compressBlock_fast_extDict_generic`: as the noDict variant, with
 /// matches in the window's older segment too, `dict`; a match there may run
 /// on into the prefix. Without that segment in reach, the noDict variant.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn zstd_compress_block_fast_ext_dict_generic(
+fn zstd_compress_block_fast_ext_dict_generic<const MLS: u32>(
     ms: &mut MatchState,
     seq_store: &mut SeqStore,
     rep: &mut [u32; ZSTD_REP_NUM],
@@ -348,8 +350,10 @@ fn zstd_compress_block_fast_ext_dict_generic(
     dict: &[u8],
     istart: usize,
     iend: usize,
-    mls: u32,
 ) -> usize {
+    // The shortest match, a constant in each copy, as libzstd's templates
+    // make it.
+    let mls = MLS;
     let c_params = ms.c_params;
     let hlog = c_params.hash_log;
     // At least 2.
@@ -453,7 +457,7 @@ fn zstd_compress_block_fast_ext_dict_generic(
                 // match when it is not valid.
                 if rep_valid {
                     let (rbuf, rpos) = locate(rep_index);
-                    if read_le32(src, ip2) == read_le32(rbuf, rpos) {
+                    if mem_read32(src, ip2) == mem_read32(rbuf, rpos) {
                         ip0 = ip2;
                         let mut match0 = rpos;
                         let match_end = if rep_index < prefix_start_index {
@@ -473,7 +477,7 @@ fn zstd_compress_block_fast_ext_dict_generic(
             // The match for ip0.
             if idx >= dict_start_index {
                 let (ibuf, ipos) = locate(idx);
-                if read_le32(src, ip0) == read_le32(ibuf, ipos) {
+                if mem_read32(src, ip0) == mem_read32(ibuf, ipos) {
                     break 'search offset_match_ext(
                         &mut offset_1,
                         &mut offset_2,
@@ -511,7 +515,7 @@ fn zstd_compress_block_fast_ext_dict_generic(
             // The match for ip0.
             if idx >= dict_start_index {
                 let (ibuf, ipos) = locate(idx);
-                if read_le32(src, ip0) == read_le32(ibuf, ipos) {
+                if mem_read32(src, ip0) == mem_read32(ibuf, ipos) {
                     break 'search offset_match_ext(
                         &mut offset_1,
                         &mut offset_2,
@@ -588,7 +592,7 @@ fn zstd_compress_block_fast_ext_dict_generic(
                 let rep_index2 = index(ip0).wrapping_sub(offset_2);
                 if zstd_index_overlap_check(prefix_start_index, rep_index2) & (offset_2 > 0) {
                     let (rbuf, rpos) = locate(rep_index2);
-                    if read_le32(rbuf, rpos) == read_le32(src, ip0) {
+                    if mem_read32(rbuf, rpos) == mem_read32(src, ip0) {
                         let rep_end2 = if rep_index2 < prefix_start_index {
                             dict_end
                         } else {
@@ -692,9 +696,11 @@ pub(crate) fn zstd_compress_block_fast_ext_dict(
     istart: usize,
     iend: usize,
 ) -> usize {
-    let mls = match ms.c_params.min_match {
-        m @ 5..=7 => m,
-        _ => 4,
+    let f = match ms.c_params.min_match {
+        5 => zstd_compress_block_fast_ext_dict_generic::<5>,
+        6 => zstd_compress_block_fast_ext_dict_generic::<6>,
+        7 => zstd_compress_block_fast_ext_dict_generic::<7>,
+        _ => zstd_compress_block_fast_ext_dict_generic::<4>,
     };
-    zstd_compress_block_fast_ext_dict_generic(ms, seq_store, rep, src, dict, istart, iend, mls)
+    f(ms, seq_store, rep, src, dict, istart, iend)
 }

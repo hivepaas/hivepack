@@ -62,6 +62,29 @@ What is left is bounds checks: libzstd's fast-path condition keeps the sequence 
 
 How much it gains depends on how the compiler lays out the loop, which is fragile: a version of the same copies that returned an error from the loop when its buffers did not fit was slower than the safe code, by up to 10%, through spilled registers alone. Measure again after changing the loop.
 
+### Where compression stands
+
+On an Apple M1 Pro (October 2026), the 12 files of the Silesia corpus, in one call (`ZSTD_compressCCtx`), best of three rounds taken in turn:
+
+| Level | Mean | Range |
+|---|---|---|
+| 1 (`fast`) | 0.79× libzstd | 0.67–0.91× |
+| 3 (`dfast`) | 0.81× | 0.77–0.86× |
+
+At negative levels the port does worst on data that hardly compresses: `sao` at level −1 runs at 0.59×. Streaming runs at the same speed as one call.
+
+It was 0.69× and 0.76× before the speed work. What made the difference, the largest first:
+
+- **The shortest match as a constant.** libzstd compiles each match finder once per shortest match, 4 to 7 bytes, through its templates; the port does the same with a const generic, so that the hashes do not ask which one each time. Up to 16%, at the negative levels.
+- **Reads that cannot overflow.** The match finders, the hashes and `ZSTD_count` mask their indices to `isize::MAX` (see above), which drops one comparison from each bounds check.
+- **Literals copied in pieces, as libzstd copies them**, 16 bytes at a time into a buffer with slack, instead of a `memcpy` call per sequence.
+- **The sequence encoder's loop over slices**: the codes and sequences read through iterators rather than indices, the lengths' extra bits from tables of 256 entries that a byte indexes without a check, and the bit masks worked out rather than looked up.
+- **The codes of the sequences written through slices apart from the store**, which the compiler otherwise read again after each byte written.
+
+Tried, and not worth it: the FSE states over fixed-size arrays, `ZSTD_count` over runs cut out first, candidates chosen without a branch (`ZSTD_selectAddr`, through `select_unpredictable`), hashes masked to the table's size, and the bit writer's position masked. Each changed speeds by −7% to +1%.
+
+What is left is spread over the whole of each match finder: bounds checks on the candidates the hash tables give, which the compiler cannot know are in bounds, and the registers those checks take in loops that already hold many values. Measured on a scratch copy, with the finders' reads and table accesses unchecked: +4% to +40% (`sao` at level −1 from 0.59× to 0.71×), so that alone would not reach the target either (see [safety.md](safety.md)).
+
 ## Progress
 
 | libzstd | Port | Status | Checked against libzstd by |

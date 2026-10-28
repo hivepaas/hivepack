@@ -113,8 +113,14 @@ fn every_test_file_compresses_as_libzstd_compresses_it() {
         }
     }
     eprintln!("compared {count} frames");
-    // The committed sets alone have more than 300 files.
-    assert!(count > 500);
+    // The committed sets alone have more than 300 files; on big-endian
+    // machines the levels 4 to 12 are left out (see `compare`).
+    let least = if cfg!(target_endian = "big") {
+        300
+    } else {
+        500
+    };
+    assert!(count > least, "only {count} frames compared");
     problems.check();
 }
 

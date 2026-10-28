@@ -1235,9 +1235,7 @@ impl Inflate {
                     state.mode = Mode::Len;
                 }
                 Mode::Len => {
-                    // Differs from zlib: 8 bytes of input rather than 6,
-                    // for inflate_fast()'s 8-byte refills.
-                    if have >= 8 && left >= 258 {
+                    if have >= 6 && left >= 258 {
                         // RESTORE()
                         state.hold = hold;
                         state.bits = bits;

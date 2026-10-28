@@ -187,7 +187,8 @@ pub(crate) fn inflate_fast(
                             }
                         } else if op & 64 == 0 {
                             // 2nd level distance code
-                            let index = usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize;
+                            let index =
+                                usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize;
                             here = dcode[index & SPAN];
                             continue;
                         } else {

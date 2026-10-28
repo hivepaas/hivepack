@@ -1,0 +1,105 @@
+//! The internal constants and types of `zipint.h`, with `zip_entry.c`.
+
+use crate::dirent::Dirent;
+use crate::string::ZipString;
+use crate::zip::Flags;
+
+pub(crate) const CENTRAL_MAGIC: &[u8; 4] = b"PK\x01\x02";
+pub(crate) const LOCAL_MAGIC: &[u8; 4] = b"PK\x03\x04";
+pub(crate) const EOCD_MAGIC: &[u8; 4] = b"PK\x05\x06";
+pub(crate) const DATADES_MAGIC: &[u8; 4] = b"PK\x07\x08";
+pub(crate) const EOCD64LOC_MAGIC: &[u8; 4] = b"PK\x06\x07";
+pub(crate) const EOCD64_MAGIC: &[u8; 4] = b"PK\x06\x06";
+pub(crate) const MAGIC_LEN: u64 = 4;
+pub(crate) const CDENTRYSIZE: u64 = 46;
+pub(crate) const LENTRYSIZE: u64 = 30;
+pub(crate) const MAXCOMLEN: u64 = 65536;
+pub(crate) const EOCDLEN: u64 = 22;
+pub(crate) const EOCD64LOCLEN: u64 = 20;
+pub(crate) const EOCD64LEN: u64 = 56;
+pub(crate) const CDBUFSIZE: u64 = MAXCOMLEN + EOCDLEN + EOCD64LOCLEN;
+pub(crate) const MAX_DATA_DESCRIPTOR_LENGTH: u64 = 24;
+
+pub(crate) const TORRENTZIP_SIGNATURE: &[u8; 14] = b"TORRENTZIPPED-";
+pub(crate) const TORRENTZIP_SIGNATURE_LENGTH: usize = 14;
+pub(crate) const TORRENTZIP_CRC_LENGTH: usize = 8;
+
+/// `ZIP_CM_WINZIP_AES`: WinZip AES encrypted.
+pub(crate) const CM_WINZIP_AES: u16 = 99;
+
+pub(crate) const EF_UTF_8_COMMENT: u16 = 0x6375;
+pub(crate) const EF_UTF_8_NAME: u16 = 0x7075;
+pub(crate) const EF_WINZIP_AES: u16 = 0x9901;
+pub(crate) const EF_ZIP64: u16 = 0x0001;
+
+/// `ZIP_EF_IS_INTERNAL`: the extra fields libzip interprets itself, and
+/// removes from those it keeps.
+pub(crate) fn ef_is_internal(id: u16) -> bool {
+    id == EF_UTF_8_COMMENT || id == EF_UTF_8_NAME || id == EF_WINZIP_AES || id == EF_ZIP64
+}
+
+/// `ZIP_GPBF_*`: general purpose bit flags.
+pub(crate) const GPBF_ENCRYPTED: u16 = 0x0001;
+pub(crate) const GPBF_DATA_DESCRIPTOR: u16 = 0x0008;
+pub(crate) const GPBF_STRONG_ENCRYPTION: u16 = 0x0040;
+pub(crate) const GPBF_ENCODING_UTF_8: u16 = 0x0800;
+
+/// `ZIP_EF_LOCAL`, `ZIP_EF_CENTRAL` and `ZIP_EF_BOTH`.
+pub(crate) const EF_LOCAL: Flags = Flags::LOCAL;
+pub(crate) const EF_CENTRAL: Flags = Flags::CENTRAL;
+pub(crate) const EF_BOTH: Flags = Flags(Flags::LOCAL.0 | Flags::CENTRAL.0);
+
+/// `ZIP_FL_ENCODING_ALL`.
+pub(crate) const FL_ENCODING_ALL: Flags =
+    Flags(Flags::ENC_GUESS.0 | Flags::ENC_CP437.0 | Flags::ENC_UTF_8.0);
+
+/// `ZIP_EXT_ATTRIB_DEFAULT`: a regular file, readable and writable by all.
+pub(crate) const EXT_ATTRIB_DEFAULT: u32 = 0o100666 << 16;
+
+/// `zip_encoding_type`: what a string's encoding is known or guessed to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Encoding {
+    /// not yet analyzed
+    Unknown,
+    /// plain ASCII
+    Ascii,
+    /// is UTF-8
+    Utf8Known,
+    /// possibly UTF-8
+    Utf8Guessed,
+    /// Code Page 437
+    Cp437,
+    /// should be UTF-8 but isn't
+    Error,
+}
+
+/// `zip_cdir_t`: the central directory, as read from the end of central
+/// directory record and its entries.
+pub(crate) struct Cdir {
+    /// directory entries
+    pub entry: Vec<Entry>,
+    pub this_disk: u32,
+    pub eocd_disk: u32,
+    /// number of entries on this disk
+    pub disk_entries: u64,
+    /// number of entries on all disks
+    pub num_entries: u64,
+    /// size of central directory
+    pub size: u64,
+    /// offset of central directory in file
+    pub offset: u64,
+    /// offset of EOCD in file
+    pub eocd_offset: u64,
+    /// zip archive comment
+    pub comment: Option<ZipString>,
+    /// central directory in zip64 format
+    pub is_zip64: bool,
+}
+
+/// `zip_entry_t`: an entry of the archive, boxed as libzip keeps a
+/// pointer, so that a directory sized from a large count of entries is
+/// small until the entries are read. The editor will add its changes.
+#[derive(Default)]
+pub(crate) struct Entry {
+    pub orig: Option<Box<Dirent>>,
+}

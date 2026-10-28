@@ -564,6 +564,9 @@ pub(crate) struct MatchState {
     pub(crate) next_to_update: u32,
     /// The index after a loaded dictionary, or 0.
     pub(crate) loaded_dict_end: u32,
+    /// `lazySkipping`: the lazy strategies, over input without matches,
+    /// insert only the positions they search.
+    pub(crate) lazy_skipping: bool,
     pub(crate) c_params: CompressionParameters,
 }
 

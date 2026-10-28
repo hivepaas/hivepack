@@ -30,6 +30,7 @@ use crate::compress::zstd_double_fast::{
     zstd_compress_block_double_fast, zstd_compress_block_double_fast_ext_dict,
 };
 use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_fast_ext_dict};
+use crate::compress::zstd_lazy::zstd_compress_block_lazy_hc;
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
@@ -478,6 +479,22 @@ fn zstd_row_match_finder_used(strategy: Strategy, mode: ParamSwitch) -> bool {
     zstd_row_match_finder_supported(strategy) && mode == ParamSwitch::Enable
 }
 
+/// `ZSTD_resolveRowMatchFinderMode`: whether a frame with `c_params` uses
+/// the row match finder, for `Auto` from the strategy and the window.
+pub(crate) fn zstd_resolve_row_match_finder_mode(
+    mode: ParamSwitch,
+    c_params: &CompressionParameters,
+) -> ParamSwitch {
+    if mode != ParamSwitch::Auto {
+        return mode;
+    }
+    if zstd_row_match_finder_supported(c_params.strategy) && c_params.window_log > 14 {
+        ParamSwitch::Enable
+    } else {
+        ParamSwitch::Disable
+    }
+}
+
 /// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for
 /// `dfast`, its short hash table).
 fn zstd_allocate_chain_table(strategy: Strategy, use_row_match_finder: ParamSwitch) -> bool {
@@ -733,6 +750,9 @@ pub(crate) struct CCtxParams {
     pub(crate) max_block_size: usize,
     /// 0 for the strategy's level of block splitting, 1 for none, 2 to 6.
     pub(crate) pre_block_splitter_level: i32,
+    /// Whether the lazy strategies use the row match finder: `Auto` until
+    /// a frame resolves it.
+    pub(crate) use_row_match_finder: ParamSwitch,
 }
 
 impl CCtxParams {
@@ -753,6 +773,7 @@ impl CCtxParams {
             out_buffer_mode: BufferMode::Buffered,
             max_block_size: 0,
             pre_block_splitter_level: 0,
+            use_row_match_finder: zstd_resolve_row_match_finder_mode(ParamSwitch::Auto, &c_params),
         }
     }
 
@@ -766,10 +787,9 @@ impl CCtxParams {
             0,
             CParamMode::Unknown,
         );
-        (
-            CCtxParams::new(c_params, f_params, ZSTD_CLEVEL_DEFAULT),
-            CParamOverrides::default(),
-        )
+        let mut params = CCtxParams::new(c_params, f_params, ZSTD_CLEVEL_DEFAULT);
+        params.use_row_match_finder = ParamSwitch::Auto;
+        (params, CParamOverrides::default())
     }
 }
 
@@ -792,7 +812,13 @@ fn zstd_get_cparams_from_cctx_params(
     // have it.
     zstd_override_cparams(&mut c_params, overrides);
     // A size hint of 0 means 0.
-    zstd_adjust_cparams_internal(c_params, src_size_hint, dict_size, mode, ParamSwitch::Auto)
+    zstd_adjust_cparams_internal(
+        c_params,
+        src_size_hint,
+        dict_size,
+        mode,
+        params.use_row_match_finder,
+    )
 }
 
 /// `ZSTD_resolveMaxBlockSize`
@@ -839,7 +865,7 @@ fn zstd_overflow_correct_if_needed(
         let correction = ms.window.correct_overflow(cycle_log, max_dist, src);
         // ZSTD_reduceIndex
         zstd_reduce_table(&mut ms.hash_table, correction);
-        if zstd_allocate_chain_table(c_params.strategy, ParamSwitch::Disable) {
+        if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
             zstd_reduce_table(&mut ms.chain_table, correction);
         }
         ms.next_to_update = ms.next_to_update.saturating_sub(correction);
@@ -983,6 +1009,10 @@ pub enum CParameter {
     BlockSplitterLevel(u32),
     /// The largest block: 1024 to 131072; 0 for 131072.
     MaxBlockSize(u32),
+    /// Whether `greedy`, `lazy` and `lazy2` search with the row match
+    /// finder or the hash chain; `Auto` takes the row match finder for
+    /// windows over 16 KB.
+    UseRowMatchFinder(ParamSwitch),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -1006,6 +1036,7 @@ pub enum CParameterKind {
     StableOutBuffer,
     BlockSplitterLevel,
     MaxBlockSize,
+    UseRowMatchFinder,
 }
 
 impl CParameter {
@@ -1030,6 +1061,7 @@ impl CParameter {
             CParameter::StableOutBuffer(_) => CParameterKind::StableOutBuffer,
             CParameter::BlockSplitterLevel(_) => CParameterKind::BlockSplitterLevel,
             CParameter::MaxBlockSize(_) => CParameterKind::MaxBlockSize,
+            CParameter::UseRowMatchFinder(_) => CParameterKind::UseRowMatchFinder,
         }
     }
 }
@@ -1135,6 +1167,7 @@ impl CCtx {
                 chain_table: Vec::new(),
                 next_to_update: 0,
                 loaded_dict_end: 0,
+                lazy_skipping: false,
                 c_params,
             },
             seq_store: SeqStore::with_capacity(0, 0),
@@ -1173,7 +1206,9 @@ impl CCtx {
         pledged_src_size: u64,
         buffered: bool,
     ) -> Result<()> {
-        if params.c_params.strategy > Strategy::Dfast {
+        if params.c_params.strategy >= Strategy::Btlazy2
+            || zstd_row_match_finder_used(params.c_params.strategy, params.use_row_match_finder)
+        {
             return error!(ParameterUnsupported);
         }
         self.is_first_block = true;
@@ -1220,15 +1255,17 @@ impl CCtx {
         ms.window = Window::new();
         ms.next_to_update = ms.window.dict_limit;
         ms.loaded_dict_end = 0;
+        ms.lazy_skipping = false;
         ms.hash_table.clear();
         ms.hash_table.resize(1 << c_params.hash_log, 0);
         // ZSTD_allocateChainTable: none for fast, nor for the row match
-        // finder, which the port does not have yet.
-        let chain_size = if zstd_allocate_chain_table(c_params.strategy, ParamSwitch::Disable) {
-            1 << c_params.chain_log
-        } else {
-            0
-        };
+        // finder.
+        let chain_size =
+            if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
+                1 << c_params.chain_log
+            } else {
+                0
+            };
         ms.chain_table.clear();
         ms.chain_table.resize(chain_size, 0);
         ms.c_params = c_params;
@@ -1296,6 +1333,11 @@ impl CCtx {
             (Strategy::Dfast, true) => zstd_compress_block_double_fast_ext_dict(
                 ms, seq_store, rep, src, dict, istart, iend,
             ),
+            (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2, _) => {
+                let depth = self.applied_params.c_params.strategy as u32 - Strategy::Greedy as u32;
+                let dict = ext_dict.then_some(dict);
+                zstd_compress_block_lazy_hc(depth, ms, seq_store, rep, src, dict, istart, iend)
+            }
             // The other strategies are not ported yet; the context does not
             // take them.
             _ => return error!(ParameterUnsupported),
@@ -1857,6 +1899,7 @@ impl CCtx {
                 }
                 params.max_block_size = value as usize;
             }
+            CParameter::UseRowMatchFinder(mode) => params.use_row_match_finder = mode,
         }
         Ok(())
     }
@@ -1891,6 +1934,7 @@ impl CCtx {
             CParameterKind::StableOutBuffer => buffer_mode(params.out_buffer_mode),
             CParameterKind::BlockSplitterLevel => params.pre_block_splitter_level,
             CParameterKind::MaxBlockSize => params.max_block_size as i32,
+            CParameterKind::UseRowMatchFinder => params.use_row_match_finder as i32,
         }
     }
 
@@ -2137,6 +2181,8 @@ impl CCtx {
             0,
             CParamMode::NoAttachDict,
         );
+        params.use_row_match_finder =
+            zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
 
         self.compress_begin_internal(&params, pledged_src_size, true)?;

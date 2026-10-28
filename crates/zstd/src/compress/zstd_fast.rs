@@ -24,6 +24,13 @@ use crate::compress::zstd_compress_internal::{
 /// libzstd's two ways of testing a candidate (`ZSTD_match4Found_cmov` and
 /// `_branch`, chosen by the window log) give the same answer: the candidate
 /// is in the window and its first 4 bytes are the same.
+///
+/// Differs from libzstd: the search keeps ip0 and ip2 only, ip1 and ip3
+/// being always one after them, and reads the bytes at them through
+/// `at0` and `at2`, the 10 bytes from ip0 and from ip2. libzstd's test
+/// that ip3 is before ilimit is the test that those from ip2 fit before
+/// iend, which makes every read at the four positions one the compiler
+/// sees in bounds.
 #[allow(clippy::too_many_lines)]
 fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
     ms: &mut MatchState,
@@ -44,15 +51,18 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
     let end_index = ms.window.index(iend);
     let prefix_start_index = ms.lowest_prefix_index(end_index, c_params.window_log);
     let prefix_start = (i64::from(prefix_start_index) - base) as usize;
+    // Nothing past the block is read, as in libzstd; this makes iend the
+    // end of `src`, for `fits_hash_window`.
+    let src = &src[..iend];
     // Before the block for blocks under 8 bytes, where libzstd's pointer
     // goes before the buffer and the search ends at once; 0 does the same.
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
 
     let mut anchor = istart;
     let mut ip0 = istart;
-    let mut ip1;
     let mut ip2;
-    let mut ip3;
+    let mut at0: &[u8];
+    let mut at2: &[u8];
     let mut current0: u32;
 
     let mut rep_offset1 = rep[0];
@@ -76,10 +86,10 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
     let mut next_step;
     let k_step_incr = 1usize << (K_SEARCH_STRENGTH - 1);
     let index = |position: usize| (position as i64 + base) as u32;
-    // ZSTD_match4Found
-    let match_found = |current: usize, match_idx: u32| {
+    // ZSTD_match4Found, given the 4 bytes at the current position.
+    let match_found = |current: u32, match_idx: u32| {
         match_idx >= prefix_start_index
-            && mem_read32(src, current) == mem_read32(src, (i64::from(match_idx) - base) as usize)
+            && current == mem_read32(src, (i64::from(match_idx) - base) as usize)
     };
 
     ip0 += usize::from(ip0 == prefix_start);
@@ -105,20 +115,27 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
         next_step = ip0 + k_step_incr;
 
         // The positions; ip0 - anchor == 0, so no step to work out.
-        ip1 = ip0 + 1;
         ip2 = ip0 + step;
-        ip3 = ip2 + 1;
 
-        if ip3 >= ilimit {
+        // ip3 at or past ilimit.
+        if !fits_hash_window(src, ip2) {
             break 'start;
         }
+        at2 = &src[ip2..][..HASH_WINDOW];
+        // Before ip2, so in the block too: this test never fails.
+        if !fits_hash_window(src, ip0) {
+            break 'start;
+        }
+        at0 = &src[ip0..][..HASH_WINDOW];
 
-        hash0 = hash_table.hash(src, ip0, mls);
-        hash1 = hash_table.hash(src, ip1, mls);
+        hash0 = hash_table.hash(at0, 0, mls);
+        hash1 = hash_table.hash(at0, 1, mls);
 
         match_idx = hash_table.get(hash0);
 
         'search: loop {
+            let ip1 = ip0 + 1;
+
             // The repcode match for ip2.
             let rval = mem_read32(src, ip2 - rep_offset1 as usize);
 
@@ -127,7 +144,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
             hash_table.set(hash0, current0);
 
             // Check the repcode at ip2.
-            if (mem_read32(src, ip2) == rval) & (rep_offset1 > 0) {
+            if (mem_read32(at2, 0) == rval) & (rep_offset1 > 0) {
                 ip0 = ip2;
                 match0 = ip0 - rep_offset1 as usize;
                 m_length = usize::from(src[ip0 - 1] == src[match0 - 1]);
@@ -143,7 +160,7 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
                 break 'search;
             }
 
-            if match_found(ip0, match_idx) {
+            if match_found(mem_read32(at0, 0), match_idx) {
                 // The next hash table entry, already computed. Safe since
                 // ip1 == ip0 + 1, and the search resumes after ip1.
                 hash_table.set(hash1, index(ip1));
@@ -166,23 +183,25 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
 
             // Hash ip2.
             hash0 = hash1;
-            hash1 = hash_table.hash(src, ip2, mls);
+            hash1 = hash_table.hash(at2, 0, mls);
 
-            // Advance to the next positions.
+            // Advance to the next positions: ip0 to ip1, ip1 to ip2 and ip2
+            // to ip3. Until the next advance, libzstd's ip1 is the port's
+            // ip2, and the bytes at its ip0 and ip2 are those at 1 in `at0`
+            // and `at2`.
             ip0 = ip1;
-            ip1 = ip2;
-            ip2 = ip3;
 
             // Write back the hash table entry.
             current0 = index(ip0);
             hash_table.set(hash0, current0);
 
-            if match_found(ip0, match_idx) {
+            if match_found(mem_read32(at0, 1), match_idx) {
                 // The next hash table entry, already computed. Not written
                 // if it is at or past where the search will resume: the
                 // shortest match has 4 bytes, so it resumes at ip0 + 4.
                 if step <= 4 {
-                    hash_table.set(hash1, index(ip1));
+                    // ip1, now.
+                    hash_table.set(hash1, index(ip2));
                 }
                 (offcode, match0, m_length) = offset_match(
                     &mut rep_offset1,
@@ -203,13 +222,13 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
 
             // Hash ip2.
             hash0 = hash1;
-            hash1 = hash_table.hash(src, ip2, mls);
+            hash1 = hash_table.hash(at2, 1, mls);
 
-            // Advance to the next positions.
-            ip0 = ip1;
-            ip1 = ip2;
+            // Advance to the next positions: ip0 to ip2 (ip1 now), and ip2
+            // to ip0 + step.
+            ip0 = ip2;
             ip2 = ip0 + step;
-            ip3 = ip1 + step;
+            at0 = at2;
 
             // The step.
             if ip2 >= next_step {
@@ -217,9 +236,11 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
                 next_step += k_step_incr;
             }
 
-            if ip3 >= ilimit {
+            // ip3 at or past ilimit.
+            if !fits_hash_window(src, ip2) {
                 break 'start;
             }
+            at2 = &src[ip2..][..HASH_WINDOW];
         }
 
         // _match: needs ip0, match0, offcode.
@@ -285,6 +306,18 @@ fn zstd_compress_block_fast_no_dict_generic<const MLS: u32>(
 
     // The size of the last literals.
     iend - anchor
+}
+
+/// The bytes from ip2 that libzstd's test, ip3 (ip2 + 1) before ilimit
+/// (iend - 8), keeps in the block: one more than the hashes at ip2 and ip3
+/// read.
+const HASH_WINDOW: usize = HASH_READ_SIZE + 2;
+
+/// Whether the `HASH_WINDOW` bytes from `at` are all in `src`: from ip2,
+/// with `src` ending at iend, whether ip3 is before ilimit.
+#[inline(always)]
+fn fits_hash_window(src: &[u8], at: usize) -> bool {
+    at <= src.len() && src.len() - at >= HASH_WINDOW
 }
 
 /// `_offset`: a match found in the hash table at `match_idx`, extended

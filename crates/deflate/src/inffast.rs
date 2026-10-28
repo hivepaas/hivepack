@@ -11,7 +11,7 @@ use crate::inflate::{InflateState, Mode};
 ///
 /// Entry assumptions:
 /// - `state.mode` is `Len`;
-/// - at least 6 bytes of input are left at `*next_in`;
+/// - at least 8 bytes of input are left at `*next_in`;
 /// - at least 258 bytes of output space are left at `*next_out`;
 /// - `start` is the output space inflate() had when it was called, so that
 ///   the output written in this call starts at `*next_out - (start -
@@ -24,8 +24,18 @@ use crate::inflate::{InflateState, Mode};
 ///
 /// Port of `inflate_fast`, `inffast.c` (without `INFLATE_STRICT` and
 /// `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR`, as zlib is built by
-/// default). Differs from zlib: positions are indices into `input`,
-/// `output` and the window rather than pointers.
+/// default). Differs from zlib:
+/// - positions are indices into `input`, `output` and the window rather
+///   than pointers;
+/// - the bit buffer is refilled once per code, with eight bytes read at
+///   once, to 56 bits or more, which is enough for a length, a distance and
+///   their extra bits (at most 48). zlib pulls two bytes at a time, when it
+///   has fewer than 15 bits. The bits are the same: those past `bits` in
+///   `hold` are always either zero or the next bits of the input, so they
+///   can be or-ed again. The loop needs eight bytes of input where zlib's
+///   needs six, and stops as zlib's does after each code; whichever of them
+///   stops first, inflate() goes on with its slower loop to the same
+///   result.
 pub(crate) fn inflate_fast(
     state: &mut InflateState,
     input: &[u8],
@@ -37,7 +47,7 @@ pub(crate) fn inflate_fast(
 ) {
     // copy state to local variables
     let mut inp = *next_in; // local strm->next_in
-    let last = inp + (input.len() - inp - 5); // have enough input while in < last
+    let last = input.len() - 8; // have enough input for a refill while in <= last
     let mut out = *next_out; // local strm->next_out
     let beg = out - (start - (output.len() - out)); // inflate()'s initial strm->next_out
     let end = out + (output.len() - out - 257); // while out < end, enough space available
@@ -59,14 +69,10 @@ pub(crate) fn inflate_fast(
         // decode literals and length/distances until end-of-block or not
         // enough input data or output space
         'outer: loop {
-            if bits < 15 {
-                hold += u64::from(input[inp]) << bits;
-                inp += 1;
-                bits += 8;
-                hold += u64::from(input[inp]) << bits;
-                inp += 1;
-                bits += 8;
-            }
+            // refill to 56 bits or more
+            hold |= read_word(input, inp) << bits;
+            inp += ((63 - bits) >> 3) as usize;
+            bits |= 56;
             let mut here = lcode[(hold & lmask) as usize];
             // dolen:
             loop {
@@ -83,22 +89,9 @@ pub(crate) fn inflate_fast(
                     let mut len = u32::from(here.val);
                     op &= 15; // number of extra bits
                     if op != 0 {
-                        if bits < op {
-                            hold += u64::from(input[inp]) << bits;
-                            inp += 1;
-                            bits += 8;
-                        }
                         len += (hold as u32) & ((1u32 << op) - 1);
                         hold >>= op;
                         bits -= op;
-                    }
-                    if bits < 15 {
-                        hold += u64::from(input[inp]) << bits;
-                        inp += 1;
-                        bits += 8;
-                        hold += u64::from(input[inp]) << bits;
-                        inp += 1;
-                        bits += 8;
                     }
                     here = dcode[(hold & dmask) as usize];
                     // dodist:
@@ -111,16 +104,6 @@ pub(crate) fn inflate_fast(
                             // distance base
                             let mut dist = u32::from(here.val);
                             op &= 15; // number of extra bits
-                            if bits < op {
-                                hold += u64::from(input[inp]) << bits;
-                                inp += 1;
-                                bits += 8;
-                                if bits < op {
-                                    hold += u64::from(input[inp]) << bits;
-                                    inp += 1;
-                                    bits += 8;
-                                }
-                            }
                             dist += (hold as u32) & ((1u32 << op) - 1);
                             hold >>= op;
                             bits -= op;
@@ -225,7 +208,7 @@ pub(crate) fn inflate_fast(
                 }
                 break;
             }
-            if !(inp < last && out < end) {
+            if !(inp <= last && out < end) {
                 break;
             }
         }
@@ -245,6 +228,14 @@ pub(crate) fn inflate_fast(
     if let Some(mode) = mode {
         state.mode = mode;
     }
+}
+
+/// Eight bytes of input from `pos`, the first the lowest.
+#[inline(always)]
+fn read_word(input: &[u8], pos: usize) -> u64 {
+    let mut word = [0; 8];
+    word.copy_from_slice(&input[pos..pos + 8]);
+    u64::from_le_bytes(word)
 }
 
 /// Copies `len` bytes (at least three) from `from`, earlier in `output`, to

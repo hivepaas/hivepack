@@ -936,16 +936,44 @@ fn deflate_matches_zlib() {
     }
 }
 
+/// The operating system byte the port writes in a gzip header of its own,
+/// as zlib's build would on this machine.
+fn os_code() -> u8 {
+    let mut deflate = Deflate::new(6, 31, 8, 0).unwrap();
+    let mut out = [0; 64];
+    let mut output = OutBuffer::new(&mut out);
+    deflate
+        .deflate(&mut output, &mut InBuffer::new(&[]), Flush::Finish)
+        .unwrap();
+    out[9]
+}
+
+/// Whether a `deflate2` request makes a gzip stream with zlib's own
+/// header, whose operating system byte depends on the machine.
+fn writes_default_gzip_header(request: &str) -> bool {
+    let words: Vec<&str> = request.split(' ').collect();
+    let window_bits: i32 = words[2].parse().unwrap();
+    (24..=31).contains(&window_bits) && words[5] == "-"
+}
+
 #[test]
 fn deflate_matches_recorded_answers() {
     let text =
         std::fs::read_to_string(recorded_deflate_path()).expect("testdata/oracle/deflate.txt");
+    // The answers were recorded on Linux, where zlib writes 3 as the
+    // operating system of a gzip header; on Windows and Apple systems it
+    // writes 10 and 19, and the port too. There the streams with zlib's own
+    // header are compared live and with flate2, and skipped here.
+    let skip_default_headers = os_code() != 3;
     let mut checked = 0;
     for line in text
         .lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
         let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        if skip_default_headers && writes_default_gzip_header(request) && !want.starts_with("err") {
+            continue;
+        }
         assert_eq!(
             recorded_form(&answer_deflate(request)),
             want,
@@ -953,7 +981,7 @@ fn deflate_matches_recorded_answers() {
         );
         checked += 1;
     }
-    assert!(checked > 500, "only {checked} recorded answers");
+    assert!(checked > 400, "only {checked} recorded answers");
 }
 
 #[test]

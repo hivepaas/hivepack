@@ -36,7 +36,31 @@ use crate::adler32::{ADLER32_INIT, adler32};
 use crate::crc32::crc32;
 use crate::inffast::inflate_fast;
 use crate::inffixed::{DISTFIX, LENFIX};
-use crate::inftrees::{Code, CodeType, ENOUGH, inflate_fixed, inflate_table};
+use crate::inftrees::{Code, CodeType, ENOUGH, ENOUGH_LENS, inflate_fixed, inflate_table};
+
+/// How many entries [`InflateState::fast_table`] gives: a power of two at
+/// least `ENOUGH_LENS`, the most entries a table and its sub-tables take.
+pub(crate) const TABLE_SPAN: usize = 1024;
+
+/// The size of `codes`: `ENOUGH` would do, but with `TABLE_SPAN` entries
+/// from the start of the distance table, which starts at most
+/// `ENOUGH_LENS` entries in, every table has `TABLE_SPAN` entries.
+const CODES_SIZE: usize = ENOUGH_LENS + TABLE_SPAN;
+const _: () = assert!(CODES_SIZE >= ENOUGH);
+
+/// `table` at the start of `TABLE_SPAN` entries, the rest invalid codes.
+const fn span<const N: usize>(table: &[Code; N]) -> [Code; TABLE_SPAN] {
+    let mut span = [Code::new(64, 1, 0); TABLE_SPAN];
+    let mut i = 0;
+    while i < N {
+        span[i] = table[i];
+        i += 1;
+    }
+    span
+}
+
+static LENFIX_SPAN: [Code; TABLE_SPAN] = span(&LENFIX);
+static DISTFIX_SPAN: [Code; TABLE_SPAN] = span(&DISTFIX);
 
 use crate::zutil::{
     DEF_WBITS, Error, ErrorCode, Flush, Result, Status, Z_BUF_ERROR, Z_DATA_ERROR, Z_DEFLATED,
@@ -277,7 +301,9 @@ pub(crate) struct InflateState {
     /// work area for code table building
     pub work: [u16; 288],
     /// space for code tables
-    pub codes: [Code; ENOUGH],
+    ///
+    /// Differs from zlib: longer than `ENOUGH` (see `CODES_SIZE`).
+    pub codes: [Code; CODES_SIZE],
     /// if false, allow invalid distance too far
     pub sane: bool,
     /// bits back of last unprocessed length/lit
@@ -294,6 +320,21 @@ impl InflateState {
             Table::LenFix => &LENFIX,
             Table::DistFix => &DISTFIX,
             Table::Codes(start) => &self.codes[start..],
+        }
+    }
+
+    /// The same table as an array of `TABLE_SPAN` entries, for
+    /// inflate_fast(): every index into a table is below `ENOUGH_LENS`, so
+    /// masking it with `TABLE_SPAN - 1` changes nothing, and lets the
+    /// compiler leave out the bounds check.
+    #[inline(always)]
+    pub(crate) fn fast_table(&self, table: Table) -> &[Code; TABLE_SPAN] {
+        match table {
+            Table::LenFix => &LENFIX_SPAN,
+            Table::DistFix => &DISTFIX_SPAN,
+            // The distance table starts at most ENOUGH_LENS entries in, so
+            // there is always a full span; the fixed table is never used.
+            Table::Codes(start) => self.codes[start..].first_chunk().unwrap_or(&LENFIX_SPAN),
         }
     }
 
@@ -445,7 +486,7 @@ impl Inflate {
             next: 0,
             lens: [0; 320],
             work: [0; 288],
-            codes: [Code::default(); ENOUGH],
+            codes: [Code::default(); CODES_SIZE],
             sane: false,
             back: 0,
             was: 0,

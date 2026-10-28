@@ -1,6 +1,6 @@
 //! The fast decoding loop: port of `inffast.{h,c}`.
 
-use crate::inflate::{InflateState, Mode};
+use crate::inflate::{InflateState, Mode, TABLE_SPAN};
 
 /// Decodes literal, length and distance codes and writes literals and match
 /// bytes until either not enough input or output is available, an
@@ -63,8 +63,12 @@ pub(crate) fn inflate_fast(
 
     {
         let window = &state.window[..];
-        let lcode = state.table(state.lencode); // local strm->lencode
-        let dcode = state.table(state.distcode); // local strm->distcode
+        // Differs from zlib: every index into these is masked with
+        // `TABLE_SPAN - 1`, which changes none (see `fast_table`), so that
+        // the compiler leaves out the bounds checks.
+        let lcode = state.fast_table(state.lencode); // local strm->lencode
+        let dcode = state.fast_table(state.distcode); // local strm->distcode
+        const SPAN: usize = TABLE_SPAN - 1;
 
         // decode literals and length/distances until end-of-block or not
         // enough input data or output space
@@ -73,7 +77,7 @@ pub(crate) fn inflate_fast(
             hold |= read_word(input, inp) << bits;
             inp += ((63 - bits) >> 3) as usize;
             bits |= 56;
-            let mut here = lcode[(hold & lmask) as usize];
+            let mut here = lcode[(hold & lmask) as usize & SPAN];
             // dolen:
             loop {
                 let op = u32::from(here.bits);
@@ -93,7 +97,7 @@ pub(crate) fn inflate_fast(
                         hold >>= op;
                         bits -= op;
                     }
-                    here = dcode[(hold & dmask) as usize];
+                    here = dcode[(hold & dmask) as usize & SPAN];
                     // dodist:
                     loop {
                         let op = u32::from(here.bits);
@@ -183,8 +187,8 @@ pub(crate) fn inflate_fast(
                             }
                         } else if op & 64 == 0 {
                             // 2nd level distance code
-                            here =
-                                dcode[usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize];
+                            let index = usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize;
+                            here = dcode[index & SPAN];
                             continue;
                         } else {
                             *msg = Some("invalid distance code");
@@ -195,7 +199,8 @@ pub(crate) fn inflate_fast(
                     }
                 } else if op & 64 == 0 {
                     // 2nd level length code
-                    here = lcode[usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize];
+                    let index = usize::from(here.val) + (hold & ((1u64 << op) - 1)) as usize;
+                    here = lcode[index & SPAN];
                     continue;
                 } else if op & 32 != 0 {
                     // end-of-block
@@ -239,14 +244,26 @@ fn read_word(input: &[u8], pos: usize) -> u64 {
 }
 
 /// Copies `len` bytes (at least three) from `from`, earlier in `output`, to
-/// `*out`, a byte at a time so that the copy repeats when they overlap.
+/// `*out`, so that the copy repeats when they overlap.
 ///
-/// Differs from zlib: zlib copies three bytes per loop, with the same
-/// result.
+/// Differs from zlib: zlib copies three bytes per loop. When the bytes are
+/// at least eight back, the port copies eight at a time, each piece read
+/// before it is written, which gives the same bytes.
 #[inline(always)]
 fn copy_from_output(output: &mut [u8], out: &mut usize, from: usize, len: usize) {
-    for i in 0..len {
-        output[*out + i] = output[from + i];
+    let dst = *out;
+    let mut i = 0;
+    if dst - from >= 8 {
+        while i + 8 <= len {
+            let mut piece = [0; 8];
+            piece.copy_from_slice(&output[from + i..from + i + 8]);
+            output[dst + i..dst + i + 8].copy_from_slice(&piece);
+            i += 8;
+        }
+    }
+    while i < len {
+        output[dst + i] = output[from + i];
+        i += 1;
     }
     *out += len;
 }

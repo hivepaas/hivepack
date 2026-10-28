@@ -248,12 +248,18 @@ fn read_word(input: &[u8], pos: usize) -> u64 {
 ///
 /// Differs from zlib: zlib copies three bytes per loop. When the bytes are
 /// at least eight back, the port copies eight at a time, each piece read
-/// before it is written, which gives the same bytes.
+/// before it is written, and a run of one byte (one back) it fills, which
+/// give the same bytes.
 #[inline(always)]
 fn copy_from_output(output: &mut [u8], out: &mut usize, from: usize, len: usize) {
     let dst = *out;
     let mut i = 0;
-    if dst - from >= 8 {
+    if dst - from == 1 {
+        // A run of one byte.
+        let byte = output[from];
+        output[dst..dst + len].fill(byte);
+        i = len;
+    } else if dst - from >= 8 {
         while i + 8 <= len {
             let mut piece = [0; 8];
             piece.copy_from_slice(&output[from + i..from + i + 8]);

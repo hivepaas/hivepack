@@ -49,12 +49,13 @@ const BIT_MASK: [u32; 32] = {
 /// `BIT_CStream_t`: a bitstream being written into `dst`.
 ///
 /// Positions are indices into `dst`, as libzstd's pointers would be. Every
-/// flush writes a whole register at the position, which never passes
+/// flush writes a whole register, at a place that never passes
 /// `dst.len() - 8` (`endPtr`), so the write stays inside `dst`.
 ///
 /// Differs from libzstd: `endPtr` is worked out from `dst` rather than
 /// kept, and [`BitCStream::flush_bits`] holds the position back at
-/// `endPtr` when it writes rather than after.
+/// `endPtr` when it writes rather than after, so that the position itself
+/// may pass `endPtr` by up to 7 once the stream does not fit.
 pub(crate) struct BitCStream<'a> {
     bit_container: u64,
     bit_pos: u32,

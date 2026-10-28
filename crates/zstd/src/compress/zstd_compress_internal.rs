@@ -725,7 +725,7 @@ impl<'a> HashTable<'a> {
     /// The first `1 << h_bits` entries of `table`, which has that many.
     #[inline(always)]
     pub(crate) fn new(table: &'a mut [u32], h_bits: u32) -> Self {
-        debug_assert!(h_bits <= 32);
+        debug_assert!((1..=32).contains(&h_bits));
         let shift = 64 - h_bits;
         let table = &mut table[..=(u64::MAX >> shift) as usize];
         HashTable { table, shift }
@@ -764,14 +764,18 @@ pub(crate) fn zstd_count(src: &[u8], p_in: usize, p_match: usize, p_in_limit: us
     zstd_count_from(src, p_in, src, p_match, p_in_limit)
 }
 
-/// `ZSTD_count`, with the match in another buffer, `mbuf`.
+/// `ZSTD_count`, with the match in another buffer, `mbuf`. The match run,
+/// as long as the one from `p_in` to `p_in_limit`, must be in `mbuf`.
 ///
 /// Differs from libzstd: the first 8 bytes, where most counts end, are read
 /// at the two positions, as in C; past them, the two runs are cut out of
 /// their buffers once and compared 8 bytes at a time, then 4, 2 and 1, with
 /// no bounds check for each read. `p_in_limit` is never past the end of
 /// `src`, so taking the smaller of the two changes nothing, and lets the
-/// test of the limit stand for the bounds check on `src`.
+/// test of the limit stand for the bounds check on `src`. Cutting the match
+/// run is what needs it whole in `mbuf`, where C reads only up to the first
+/// difference: every caller's match is before `p_in` in `src`, or in the
+/// older segment with the count stopping at its end.
 #[inline(always)]
 fn zstd_count_from(
     src: &[u8],

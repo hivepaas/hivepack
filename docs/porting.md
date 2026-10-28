@@ -68,22 +68,30 @@ On an Apple M1 Pro (October 2026), the 12 files of the Silesia corpus, in one ca
 
 | Level | Mean | Range |
 |---|---|---|
-| 1 (`fast`) | 0.79× libzstd | 0.67–0.91× |
-| 3 (`dfast`) | 0.81× | 0.77–0.86× |
+| 1 (`fast`) | 0.88× libzstd | 0.80–0.93× |
+| 3 (`dfast`) | 0.88× | 0.83–0.93× |
 
-At negative levels the port does worst on data that hardly compresses: `sao` at level −1 runs at 0.59×. Streaming runs at the same speed as one call.
+At negative levels the port does worst on data that hardly compresses: `sao` at level −1 runs at 0.76×, `dickens` at level −5 at 0.86×. Streaming runs a little slower at level 1, 0.74–0.89× on `dickens`, `mozilla`, `sao` and `xml` against 0.79–0.90× in one call: once its buffer wraps around, it searches with the `extDict` finders, which are not reshaped yet (below).
 
 It was 0.69× and 0.76× before the speed work. What made the difference, the largest first:
 
+- **Loops shaped so that libzstd's own tests are the bounds checks.** Each gained between +1% and +20%, and together +4% to +20% per file:
+  - The `fast` finder keeps two of its four positions and reads the bytes at all four through two windows of 10 bytes; libzstd's end test, ip3 before `ilimit`, is the test that the window at ip2 fits in the block. No read at those positions keeps a check, and the hash shift stays in a register (`sao` at level −1 +20%).
+  - The `dfast` finder reads the 8 bytes at each position once, and tests its candidates within the prefix with one comparison that stands for both the window test and the bounds check. It reads the repcode where an offset of 0 finds nothing instead of testing the offset, so the compiler makes one search loop instead of two.
+  - The hash tables are cut once per block to the `1 << hashLog` entries a hash reaches, every hash shifting by `64 - hashLog` (the 4-byte hash too, on 64 bits), so that the compiler sees each hash in bounds.
+  - `ZSTD_count` reads the first 8 bytes at the two positions, where most counts end, and past them cuts the two runs out once and compares them with no check.
+  - The sequence encoder copies the block's three FSE state tables onto the stack as 16-bit states, cut to their sizes, so that a state is one load at a fixed place; the bit writer holds back where a flush writes rather than its position, which drops the flush's check.
 - **The shortest match as a constant.** libzstd compiles each match finder once per shortest match, 4 to 7 bytes, through its templates; the port does the same with a const generic, so that the hashes do not ask which one each time. Up to 16%, at the negative levels.
 - **Reads that cannot overflow.** The match finders, the hashes and `ZSTD_count` mask their indices to `isize::MAX` (see above), which drops one comparison from each bounds check.
 - **Literals copied in pieces, as libzstd copies them**, 16 bytes at a time into a buffer with slack, instead of a `memcpy` call per sequence.
 - **The sequence encoder's loop over slices**: the codes and sequences read through iterators rather than indices, the lengths' extra bits from tables of 256 entries that a byte indexes without a check, and the bit masks worked out rather than looked up.
 - **The codes of the sequences written through slices apart from the store**, which the compiler otherwise read again after each byte written.
 
-Tried, and not worth it: the FSE states over fixed-size arrays, `ZSTD_count` over runs cut out first, candidates chosen without a branch (`ZSTD_selectAddr`, through `select_unpredictable`), hashes masked to the table's size, and the bit writer's position masked. Each changed speeds by −7% to +1%.
+Tried, and not worth it, each changing speeds by −9% to +1%: the FSE states over fixed-size arrays in the tables themselves, `ZSTD_count` over runs cut out from their first byte, candidates chosen without a branch (`ZSTD_selectAddr`, through `select_unpredictable`), hashes masked to the table's size without the cut above, the bit writer's position masked, the sequence store's buffers and counts held in locals through the search (they take the registers the search loop needs), and, on top of the `fast` windows, its candidates and repcode tested by position.
 
-What is left is spread over the whole of each match finder: bounds checks on the candidates the hash tables give, which the compiler cannot know are in bounds, and the registers those checks take in loops that already hold many values. Measured on a scratch copy, with the finders' reads and table accesses unchecked: +4% to +40% (`sao` at level −1 from 0.59× to 0.71×), so that alone would not reach the target either (see [safety.md](safety.md)).
+These loops are fragile: the register allocator moves them by several instructions, and a spill or two, on small changes anywhere in the finder. The asm of the search loops is worth checking after any change there.
+
+What is left: the `extDict` finders, which streaming uses once its buffer wraps, are as before; the candidates' reads keep a check each, since nothing tells the compiler that a table entry is before the current position; and at level 3 the search loop still reloads three values each turn and rebuilds its 64-bit prime. Measured on a scratch copy before these loops were reshaped, with the finders' reads and table accesses unchecked, compression gained +4% to +40%, `sao` at level −1 reaching 0.71×; the safe loops gained more, and it runs at 0.76× now.
 
 ## Progress
 

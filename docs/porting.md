@@ -71,7 +71,7 @@ On an Apple M1 Pro (October 2026), the 12 files of the Silesia corpus, in one ca
 | 1 (`fast`) | 0.88× libzstd | 0.80–0.93× |
 | 3 (`dfast`) | 0.88× | 0.83–0.93× |
 
-At negative levels the port does worst on data that hardly compresses: `sao` at level −1 runs at 0.76×, `dickens` at level −5 at 0.86×. Streaming runs a little slower at level 1, 0.74–0.89× on `dickens`, `mozilla`, `sao` and `xml` against 0.79–0.90× in one call: once its buffer wraps around, it searches with the `extDict` finders, which are not reshaped yet (below).
+At negative levels the port does worst on data that hardly compresses: `sao` at level −1 runs at 0.76×, `dickens` at level −5 at 0.86×. Streaming, in the pieces the zstd command line uses and against libzstd streaming the same way, runs at 0.82–0.90× at level 1 (`dickens`, `mozilla`, `osdb`, `sao`, `xml`) and 0.86–1.00× at level 3 (eight files); once its buffer wraps around, it searches with the `extDict` finders.
 
 It was 0.69× and 0.76× before the speed work. What made the difference, the largest first:
 
@@ -80,6 +80,7 @@ It was 0.69× and 0.76× before the speed work. What made the difference, the la
   - The `dfast` finder reads the 8 bytes at each position once, and tests its candidates within the prefix with one comparison that stands for both the window test and the bounds check. It reads the repcode where an offset of 0 finds nothing instead of testing the offset, so the compiler makes one search loop instead of two.
   - The hash tables are cut once per block to the `1 << hashLog` entries a hash reaches, every hash shifting by `64 - hashLog` (the 4-byte hash too, on 64 bits), so that the compiler sees each hash in bounds.
   - `ZSTD_count` reads the first 8 bytes at the two positions, where most counts end, and past them cuts the two runs out once and compares them with no check.
+  - The `extDict` finders, which streaming searches with once its buffer wraps around, work on positions within each segment, the prefix and the older one, cut out once. A candidate or a repcode is read with one test that stands for libzstd's tests of the window and of the segment's end. The `dfast` one went from 98 instructions per position to 50, with no check or spill left. Streaming gained +2% to +14%.
   - The sequence encoder copies the block's three FSE state tables onto the stack as 16-bit states, cut to their sizes, so that a state is one load at a fixed place; the bit writer holds back where a flush writes rather than its position, which drops the flush's check.
 - **The shortest match as a constant.** libzstd compiles each match finder once per shortest match, 4 to 7 bytes, through its templates; the port does the same with a const generic, so that the hashes do not ask which one each time. Up to 16%, at the negative levels.
 - **Reads that cannot overflow.** The match finders, the hashes and `ZSTD_count` mask their indices to `isize::MAX` (see above), which drops one comparison from each bounds check.
@@ -91,7 +92,7 @@ Tried, and not worth it, each changing speeds by −9% to +1%: the FSE states ov
 
 These loops are fragile: the register allocator moves them by several instructions, and a spill or two, on small changes anywhere in the finder. The asm of the search loops is worth checking after any change there.
 
-What is left: the `extDict` finders, which streaming uses once its buffer wraps, are as before; the candidates' reads keep a check each, since nothing tells the compiler that a table entry is before the current position; and at level 3 the search loop still reloads three values each turn and rebuilds its 64-bit prime. Measured on a scratch copy before these loops were reshaped, with the finders' reads and table accesses unchecked, compression gained +4% to +40%, `sao` at level −1 reaching 0.71×; the safe loops gained more, and it runs at 0.76× now.
+What is left: the one-segment finders' candidates keep a check each, since nothing tells the compiler that a table entry is before the current position; and at level 3 the one-segment search loop still reloads three values each turn and rebuilds its 64-bit prime. Measured on a scratch copy before these loops were reshaped, with the finders' reads and table accesses unchecked, compression gained +4% to +40%, `sao` at level −1 reaching 0.71×; the safe loops gained more, and it runs at 0.76× now.
 
 ## Progress
 

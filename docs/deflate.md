@@ -23,6 +23,7 @@ The compressor keeps zlib's memory layout where the output depends on it: the sy
 - A gzip header's name and comment end at their first zero byte, or at their end; zlib needs the zero and would read past a buffer without one. An extra field shorter than `extra_len` is written with zeros after it.
 - The operating system written in a gzip header is the one zlib's build would write: 3 (Unix), 10 on Windows, 19 on Apple systems.
 - `deflateParams`, which calls `deflate()` with the stream's current buffers, takes them as arguments: `Deflate::params(output, input, level, strategy)`.
+- The Deflate64 decoder, `InflateBack9`, has its own 64K window, which zlib's caller gives `inflateBack9Init`. Its `in()` and `out()` are the traits `BackIn` and `BackOut`, and the input it leaves unused, which zlib puts back in `strm->next_in` and `strm->avail_in`, comes with its result.
 
 ## How it is shown
 
@@ -33,9 +34,10 @@ The reference is zlib 1.3.2 itself, reached two ways: built from the sources bun
 - **`tests/oracle.rs`** reaches what `flate2` cannot: `Flush::Block` and `Flush::Trees`, `data_type`, `inflateMark`, `inflatePrime`, `inflateSync`, `inflateValidate`, dictionaries set at any point, and the gzip header fields, on streams from every level, window, memory level, strategy and flush (`Z_BLOCK` included) of zlib's compressor, some of them damaged. Each request is a stream and a list of calls; the port must answer each call as zlib does: the result, bytes read and written, `data_type`, `inflateMark` and `msg`, then the totals, the check value, a hash of the output and the header. About 1,800 requests are compared with zlib where the oracle is built (Linux and macOS in CI), and `testdata/oracle/inflate.txt` replays 1,173 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
 
   The compressor is compared the same way, through the oracle's `deflate2` requests, for what `flate2` cannot set: every memory level and strategy (`Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`), parameters out of range, gzip headers with every field, dictionaries before and between blocks, `deflateParams` and `deflateTune` between calls, `deflatePrime`, `deflateBound`, `Z_BLOCK`, and output space from none up. Each call is answered with the result, bytes read and written, `data_type`, `deflatePending`, `deflateUsed` and `msg`, then the totals, the check value and a hash of the output. About 800 requests are compared live, and `testdata/oracle/deflate.txt` replays 586.
+- **`tests/deflate64.rs`** compares Deflate64 decoding with zlib's `contrib/infback9`, through the oracle's `inflate9` requests. zlib has no Deflate64 compressor, so the test makes the streams: stored, fixed and dynamic blocks, with random complete codes up to 15 bits, lengths up to 65,538 and distances up to 65,536, knowing the data each decodes to. Some are damaged, some code a distance their table leaves out, and deflate streams and random bytes are given too. Each is decoded by `inflateBack9` with its input in random pieces and an `out()` that fails now and then; the port must give the same result and message, the same input left unused, the same number of `in()` and `out()` calls and the same output. Every message of `infback9.c` comes up. About 600 requests are compared live, `testdata/oracle/inflate9.txt` replays 414, and on every machine the generated streams must decode to their data.
 - **`tests/infcover.rs`** is zlib's own coverage test of inflate, `test/infcover.c`, ported with the same inputs and expected results, including the messages of every data error.
-- **Unit tests** compare the CRC tables with `crc32.h` and the static trees with `trees.h`, build `inffixed.h`'s tables with the ported `inflate_table` as zlib's `makefixed()` does, and check CRC-32 and Adler-32, combined or not, against their definitions.
-- **`fuzz/fuzz_targets/inflate.rs`** and **`deflate.rs`** do what `tests/zlib.rs` and `tests/deflate.rs` do, with the fuzzer's input as the stream or the data (see [fuzz/README.md](../fuzz/README.md)).
+- **Unit tests** compare the CRC tables with `crc32.h` and the static trees with `trees.h`, build `inffixed.h`'s tables with the ported `inflate_table` as zlib's `makefixed()` does, and `inffix9.h`'s with `inflate_table9` (whose entries for the two unused length symbols, 286 and 287, are from an older table, but are invalid codes either way), and check CRC-32 and Adler-32, combined or not, against their definitions.
+- **`fuzz/fuzz_targets/inflate.rs`** and **`deflate.rs`** do what `tests/zlib.rs` and `tests/deflate.rs` do, with the fuzzer's input as the stream or the data (see [fuzz/README.md](../fuzz/README.md)). **`inflate9.rs`** decodes its input as Deflate64 all at once and in pieces, which must agree.
 
 ## The speed target
 
@@ -79,6 +81,18 @@ Tried, and not worth it: copying matches two to seven bytes back eight bytes at 
 
 The slowest inputs are text at level 1, mostly literals. arm64 is not measured yet.
 
+### Deflate64
+
+zlib's `contrib/infback9` has no fast loop: it decodes one code at a time and pulls one byte at a time, and so does the port. A zlib stream with no length code 285 decodes the same as Deflate64; at level 6 that is three of the Silesia files. Timed by hand (`tools/deflate-bench` cannot reach `infback9`, which `libz-sys` does not bundle), same machine, best of seven runs:
+
+| File | Port | zlib's `infback9` | |
+|---|---|---|---|
+| osdb | 550 MB/s | 492 MB/s | 1.12× |
+| sao | 370 MB/s | 360 MB/s | 1.03× |
+| x-ray | 255 MB/s | 265 MB/s | 0.96× |
+
+It was 0.92–0.94× as first ported. The codes of a block are now decoded in a loop of their own, with the block's tables looked up once, and a match that does not overlap the bytes it writes is copied at once rather than byte by byte.
+
 ## Progress
 
 | zlib | Port | Status | Checked against zlib by |
@@ -92,7 +106,7 @@ The slowest inputs are text at level 1, mostly literals. arm64 is not measured y
 | `trees.{h,c}` | `trees.rs` | done | `trees.h`'s tables; every block of `tests/deflate.rs` and `tests/oracle.rs` |
 | `deflate.{h,c}` | `deflate.rs` | done | `tests/deflate.rs`, byte for byte, call by call; `tests/oracle.rs`, for every function, strategy, memory level and flush |
 | `compress.c`, `uncompr.c` | | later | |
-| Deflate64 (not in zlib itself) | | next | zlib's `contrib/infback9`, which decodes it; ZIP archives from Windows and 7-Zip |
+| `contrib/infback9`: `infback9.{h,c}`, `inftree9.{h,c}`, `inffix9.h`, `inflate9.h` (Deflate64) | `infback9.rs`, `inftree9.rs`, `inffix9.rs` | done | `tests/deflate64.rs`, through the oracle; `inffix9.h` rebuilt |
 
 ## Not ported, for now
 
@@ -100,7 +114,7 @@ The slowest inputs are text at level 1, mostly literals. arm64 is not measured y
 - `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`: reading and writing gzip files. The gzip format itself is in `inflate.c` and is ported.
 - Parts that exist only because zlib is in C: custom allocators (`zalloc`, `zfree`), the version checks of `inflateInit_` and `deflateInit_`, the `method` argument of `deflateInit2` (always `Z_DEFLATED`), the checks of a null or uninitialised stream, and building the CRC tables on first use (`DYNAMIC_CRC_TABLE`).
 - Build options that zlib leaves off by default: `INFLATE_STRICT`, `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR` (so `inflateUndermine` always fails, as in a default build), `PKZIP_BUG_WORKAROUND`, `BUILDFIXED`, the ARMv8 CRC instructions, and in the compressor `FASTEST`, `LIT_MEM`, `UNALIGNED_OK`, `FORCE_STATIC`, `FORCE_STORED`, `GEN_TREES_H` and `ZLIB_DEBUG`.
-- `contrib/`, except `infback9`, for Deflate64, later.
+- `contrib/`, except `infback9`.
 
 ## Following new releases
 

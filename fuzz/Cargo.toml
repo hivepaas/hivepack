@@ -58,6 +58,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "inflate9"
+path = "fuzz_targets/inflate9.rs"
+test = false
+doc = false
+bench = false
+
 # Not in the main workspace: cargo-fuzz builds it with nightly and its own
 # flags.
 [workspace]

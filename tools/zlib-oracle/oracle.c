@@ -62,6 +62,17 @@
  *         n: <bound>
  *       then "<total_in>/<total_out>/<adler>", the FNV-1a hash of all the
  *       output, and the ret of deflateSetHeader with <head>.
+ *
+ *   inflate9 <pieces> <outs> <hex>
+ *       inflateBack9 (contrib/infback9, Deflate64) on the raw stream <hex>.
+ *       <pieces> are comma-separated input sizes: the first is in
+ *       strm.next_in at the start, each next one what one in() call gives
+ *       (fewer if fewer bytes are left), and after them in() gives the
+ *       rest, then 0 when nothing is left. out() fails on its call number
+ *       <outs> (from 0), or never if it is -1. Answered
+ *       "ok <ret>/<avail_in>/<msg>/<in calls>/<out calls>/<written>" with
+ *       <avail_in> "null" if strm.next_in was set to Z_NULL, and the FNV-1a
+ *       hash of all the bytes given to out().
  */
 
 #include <stdio.h>
@@ -69,6 +80,7 @@
 #include <string.h>
 
 #include "zlib.h"
+#include "infback9.h"
 
 static unsigned char *unhex(const char *text, size_t *len) {
     size_t n, i;
@@ -446,6 +458,82 @@ done:
     free(comment);
 }
 
+/* The input and output of an inflate9 request, for in() and out(). */
+struct back9 {
+    unsigned char *data;
+    size_t len, given;
+    const char *pieces;
+    long outs;
+    unsigned long in_calls, out_calls, written;
+    unsigned long long hash;
+};
+
+static unsigned back9_in(void *desc, z_const unsigned char **buf) {
+    struct back9 *b = desc;
+    size_t size = b->len - b->given;
+    b->in_calls++;
+    if (b->pieces && *b->pieces) {
+        size_t piece = strtoul(b->pieces, NULL, 10);
+        b->pieces = strchr(b->pieces, ',');
+        if (b->pieces)
+            b->pieces++;
+        if (piece < size)
+            size = piece;
+    }
+    *buf = b->data + b->given;
+    b->given += size;
+    return (unsigned)size;
+}
+
+static int back9_out(void *desc, unsigned char *buf, unsigned len) {
+    struct back9 *b = desc;
+    unsigned i;
+    for (i = 0; i < len; i++)
+        b->hash = (b->hash ^ buf[i]) * 0x100000001b3ULL;
+    b->written += len;
+    return (long)b->out_calls++ == b->outs;
+}
+
+static void do_inflate9(const char *pieces, long outs, const char *data_hex) {
+    z_stream strm;
+    struct back9 b;
+    unsigned char *window = malloc(65536);
+    size_t first;
+    int ret;
+
+    memset(&strm, 0, sizeof(strm));
+    memset(&b, 0, sizeof(b));
+    b.data = unhex(data_hex, &b.len);
+    b.hash = 0xcbf29ce484222325ULL;
+    b.outs = outs;
+    first = strtoul(pieces, NULL, 10);
+    b.pieces = strchr(pieces, ',');
+    if (b.pieces)
+        b.pieces++;
+    b.given = first < b.len ? first : b.len;
+    strm.next_in = b.data;
+    strm.avail_in = (uInt)b.given;
+    ret = inflateBack9Init(&strm, window);
+    if (ret != Z_OK) {
+        printf("err %d\n", ret);
+    } else {
+        ret = inflateBack9(&strm, back9_in, &b, back9_out, &b);
+        printf("ok %d/", ret);
+        if (strm.next_in)
+            printf("%u/", strm.avail_in);
+        else
+            fputs("null/", stdout);
+        if (strm.msg)
+            put_hex((const unsigned char *)strm.msg, strlen(strm.msg));
+        else
+            fputs("-", stdout);
+        printf("/%lu/%lu/%lu %016llx\n", b.in_calls, b.out_calls, b.written, b.hash);
+        inflateBack9End(&strm);
+    }
+    free(b.data);
+    free(window);
+}
+
 int main(void) {
     size_t cap = 1 << 20;
     char *line = malloc(cap);
@@ -470,6 +558,8 @@ int main(void) {
         else if (count == 8 && strcmp(words[0], "deflate") == 0)
             do_deflate(atoi(words[1]), atoi(words[2]), atoi(words[3]), atoi(words[4]), words[5],
                        words[6], words[7]);
+        else if (count == 4 && strcmp(words[0], "inflate9") == 0)
+            do_inflate9(words[1], atol(words[2]), words[3]);
         else if (count == 8 && strcmp(words[0], "deflate2") == 0)
             do_deflate2(atoi(words[1]), atoi(words[2]), atoi(words[3]), atoi(words[4]), words[5],
                         words[6], words[7]);

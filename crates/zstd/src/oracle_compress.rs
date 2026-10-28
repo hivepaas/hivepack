@@ -1124,17 +1124,19 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
     let mut steps: Vec<i64> = Vec::new();
     let small = len < 50_000;
 
-    // The parameters: the levels whose strategy the port has (up to 8, the
-    // lazy strategies for every size), small windows and blocks for the
-    // input buffer to wrap around.
+    // The parameters: the levels whose strategy the port has (up to 10,
+    // the lazy strategies and btlazy2 for every size; up to 15 with the
+    // strategy set, below), small windows and blocks for the input buffer
+    // to wrap around.
     let stable_in = rng.range(0, 3) == 0;
     let stable_out = rng.range(0, 3) == 0;
-    let level: i64 = match rng.range(0, 8) {
+    let level: i64 = match rng.range(0, 10) {
         0 => -(rng.range(1, 10) as i64),
         1 => 1,
         2 => 2,
         3 | 4 => 3,
-        _ => rng.range(4, 8) as i64,
+        5..=7 => rng.range(4, 8) as i64,
+        _ => rng.range(9, 15) as i64,
     };
     steps.extend([7, 100, level]);
     // The lazy strategies with the hash chain: the port has no row match
@@ -1158,7 +1160,7 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         (104, 0, 8),
         (105, 2, 8),
         (106, 0, 300),
-        (107, 0, 5),
+        (107, 0, 6),
         (200, 0, 1),
         (201, 0, 1),
         (202, 0, 1),
@@ -1170,6 +1172,16 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         if rng.range(0, 4) == 0 {
             steps.extend([7, number, rng.range(low, high) as i64]);
         }
+    }
+    if level > 10 {
+        // Levels 11 to 15 are btopt for some sizes, which the port does not
+        // have: a strategy it has, btlazy2 the most often.
+        let strategy = if rng.range(0, 1) == 0 {
+            6
+        } else {
+            rng.range(1, 6)
+        };
+        steps.extend([7, 107, strategy as i64]);
     }
     steps.extend([7, 1006, i64::from(stable_in)]);
     steps.extend([7, 1007, i64::from(stable_out)]);
@@ -1206,8 +1218,11 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         // With a stable input buffer, the port differs from libzstd in
         // ZSTD_flushStream, ZSTD_endStream, and after a reset while input
         // waits (see CCtx::flush_stream and CCtx::reset): none of them.
+        // Nor ZSTD_compressStream: its hint wraps around when more input
+        // waits than a block holds, to what can read as an error to the
+        // oracle, which then resets while input waits.
         let op = match rng.range(0, 20) {
-            15 | 16 | 18 | 19 if stable_in => 0,
+            14..=16 | 18 | 19 if stable_in => 0,
             20 => 10,
             0..=10 => 0,
             11 | 12 => 1,

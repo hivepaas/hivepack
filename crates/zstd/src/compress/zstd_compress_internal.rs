@@ -443,6 +443,17 @@ pub(crate) struct DictMatchState<'a> {
     pub(crate) content: &'a [u8],
 }
 
+/// `ZSTD_dictMode_e`, as the const parameter of the block compressors and
+/// their searches: where matches are besides the window's prefix. Nowhere
+/// (`ZSTD_noDict`), in the window's older segment (`ZSTD_extDict`), or in
+/// the attached `CDict`'s match state (`ZSTD_dictMatchState`, a
+/// [`DictMatchState`]), whose tables may be laid out for the dedicated
+/// dictionary search (`ZSTD_dedicatedDictSearch`).
+pub(crate) const ZSTD_NO_DICT: u8 = 0;
+pub(crate) const ZSTD_EXT_DICT: u8 = 1;
+pub(crate) const ZSTD_DICT_MATCH_STATE: u8 = 2;
+pub(crate) const ZSTD_DEDICATED_DICT_SEARCH: u8 = 3;
+
 /// `ZSTD_window_t`: the input seen so far, in two segments. Index `i` of
 /// the prefix, from `dict_limit` on, is byte `i - base` of its buffer;
 /// index `i` of the older segment (the `extDict`), from `low_limit` to

@@ -20,6 +20,7 @@ A name is refused (`check_name`, `NameError`) when it:
 | a backslash | Windows takes it for a separator |
 | a leading `/` | absolute |
 | a colon | a drive (`C:`), or an NTFS alternate data stream (`a.txt:hidden`) |
+| `<`, `>`, `"`, `\|`, `?` or `*` | Windows does not allow them in names, so an archive that has them extracts on Linux and fails half way on Windows |
 | a component `.` or `..` | climbs out |
 | a Windows device name, with or without extension, in any case: `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, `COM¹`–`COM³`, `LPT¹`–`LPT³`, `CONIN$`, `CONOUT$` | names a device in every directory |
 | a component ending in a space or a dot | Windows drops them, so `a.` and `a` are one file |
@@ -106,10 +107,12 @@ The same test extracts every archive of libzip's `regress/` that opens with `ZIP
 
 Fifield's three published bombs (the `fifield-zipbombs` set) stop before anything is written, whether opened with `ZIP_CHECKCONS` or not: libzip's consistency check passes them, as their local headers agree with the central directory. With the default limits, `zbsm.zip` (250 entries, 42 kB to 5.5 GB) stops on its shared data, as its 5.5 GB pass the limits; without the overlap check it writes them all, which is how the test was checked. `zblg.zip` (10 MB to 281 TB) stops on the sizes it declares, and `zbxl.zip` (190,023 entries, 46 MB to 4.5 PB) on its number of entries. With those limits lifted, each stops on its shared data, once the entries refused are skipped: the names of the two big ones, every name of digits and capital letters of one character, then of two, then of three, include `AUX`, `CON`, `NUL` and `PRN`, which are refused on every system. The test sets a ratio of ten to one throughout, checked only while writing, so that a bomb let through stops within its first entry rather than fill the disk.
 
+ZipDiff's archives (the `zipdiff-constructions` set: 5,927 archives that ZIP parsers read differently, made once by ZipDiff's own program) each extract or stop with their reason, opened with `ZIP_CHECKCONS` and without, and the test holds the count of each outcome for each type, so that a change shows. `hivepack-zip` reads every one as libzip does (see [zip.md](zip.md)), so what is extracted is what libzip reads. With `ZIP_CHECKCONS`, most of those whose headers disagree do not open (4,248 of `a2`'s 4,609 size combinations, every several-ends archive of `c2`, the moved central directory of `c4`). The name rules refuse every one of `b3`'s twenty forms of `a/b` (`/a/b`, `a//b`, `a\b`, `./a/b`, `../a/b`, `.../a/b`, `c/../a/b`...), whichever comes first, and the same path stops `b1` (one name twice, without the check) and `b4` (`test.txt` and `test.TXT`). The data that overlaps stops one of `c1`'s. It was this run that found the characters Windows does not allow (`a<b`, `a*b` and the others of `b2`), which were extracted on Linux and would have failed on Windows; they are refused now.
+
 The `extract` fuzz target (see [fuzz/README.md](../fuzz/README.md)) extracts its input with options its first byte picks, cancelling it after some progress if that byte says so, and checks that nothing is written beside the destination, that every link created stays inside it by its text, that the summary counts what is there, and, however the extraction ends, that the files left hold exactly the bytes of the entries written in full, so that none is left cut off. 11 million inputs over four minutes found nothing before the first commit, and 9.6 million with cancelling; with the removal of a failed file taken out, it fails on the seed corpus, before mutating anything.
 
 ## What comes next
 
 - **Marks of origin**: the archive's `Zone.Identifier` on Windows and `com.apple.quarantine` on macOS, carried to every file written, a failure to write one being a failure to extract. The macOS one takes a system call the standard library does not wrap.
 - **tar and RAR**, through the same checks and writing.
-- **Corpora**: ZipDiff's archives (made by its own program, which would have to be built and run) and the archives behind recent CVEs.
+- **Corpora**: the archives behind recent CVEs.

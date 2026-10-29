@@ -1060,3 +1060,129 @@ fn fifield_zip_bombs_write_nothing() {
         }
     }
 }
+
+/// ZipDiff's archives (`testdata/zipdiff`), which ZIP parsers read
+/// differently, read from the one archive they are kept in.
+fn zipdiff_archives() -> Vec<(String, Vec<u8>)> {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/zipdiff/constructions.zip");
+    let data = std::fs::read(path).unwrap();
+    let za = Archive::open(data.as_slice(), OpenFlags::CHECKCONS).unwrap();
+    (0..za.get_num_entries(Flags::NONE))
+        .map(|i| {
+            let name = String::from_utf8_lossy(za.get_name(i, Flags::NONE).unwrap()).into_owned();
+            let mut file = za.fopen_index(i, Flags::NONE).unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// Every archive of ZipDiff that opens extracts, or stops with its reason,
+/// and writes nothing outside the destination.
+#[test]
+fn zipdiff_archives_extract_or_stop_cleanly() {
+    let archives = zipdiff_archives();
+    assert_eq!(archives.len(), 5927);
+    let mut outcomes = std::collections::BTreeMap::<(String, &str, String), usize>::new();
+    for ((name, data), (flags, opened)) in archives.iter().flat_map(|archive| {
+        [
+            (OpenFlags::CHECKCONS, "checked"),
+            (OpenFlags(0), "unchecked"),
+        ]
+        .map(|flags| (archive, flags))
+    }) {
+        let group = name.split('/').next().unwrap().to_string();
+        let Ok(archive) = Archive::open(data.as_slice(), flags) else {
+            *outcomes
+                .entry((group, opened, "not opened".into()))
+                .or_default() += 1;
+            continue;
+        };
+        let scratch = Scratch::new();
+        std::fs::write(scratch.path().join("sentinel"), b"untouched").unwrap();
+        let outcome = match extract_zip(&archive, &scratch.out(), &Options::default()) {
+            Ok(summary) => {
+                let files = listing(&scratch.out())
+                    .iter()
+                    .filter(|path| !path.ends_with('/'))
+                    .count();
+                assert_eq!(files as u64, summary.files, "{name}");
+                "extracted".to_string()
+            }
+            Err(error) => {
+                let kind = format!("{:?}", error.kind);
+                kind.split(['(', ' ', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        let mut around = listing(scratch.path());
+        around.retain(|path| !path.starts_with("out/") && path != "out/");
+        assert_eq!(around, ["sentinel"], "{name}");
+        *outcomes.entry((group, opened, outcome)).or_default() += 1;
+    }
+    let found: Vec<String> = outcomes
+        .iter()
+        .map(|((group, opened, outcome), n)| format!("{group} {opened} {outcome}: {n}"))
+        .collect();
+    // What each folder holds is in testdata/zipdiff/README.md, and what
+    // these say in docs/extract.md.
+    let expected = [
+        "a1 checked not opened: 2",
+        "a1 unchecked Archive: 1",
+        "a1 unchecked extracted: 1",
+        "a2 checked Archive: 8",
+        "a2 checked SizeMismatch: 80",
+        "a2 checked extracted: 273",
+        "a2 checked not opened: 4248",
+        "a2 unchecked Archive: 1152",
+        "a2 unchecked SizeMismatch: 576",
+        "a2 unchecked extracted: 2881",
+        "a3 checked extracted: 2",
+        "a3 checked not opened: 5",
+        "a3 unchecked extracted: 7",
+        "a4 checked Name: 1",
+        "a4 checked extracted: 8",
+        "a4 unchecked Name: 1",
+        "a4 unchecked extracted: 8",
+        "a5 checked extracted: 1",
+        "a5 checked not opened: 2",
+        "a5 unchecked Archive: 2",
+        "a5 unchecked extracted: 1",
+        "b1 checked not opened: 1",
+        "b1 unchecked Duplicate: 1",
+        "b2 checked Duplicate: 1",
+        "b2 checked Name: 275",
+        "b2 checked extracted: 685",
+        "b2 checked not opened: 221",
+        "b2 unchecked Duplicate: 154",
+        "b2 unchecked Name: 343",
+        "b2 unchecked extracted: 685",
+        "b3 checked Name: 20",
+        "b3 unchecked Name: 20",
+        "b4 checked Duplicate: 1",
+        "b4 unchecked Duplicate: 1",
+        "c1 checked Overlap: 1",
+        "c1 checked extracted: 4",
+        "c1 checked not opened: 2",
+        "c1 unchecked Overlap: 1",
+        "c1 unchecked extracted: 5",
+        "c1 unchecked not opened: 1",
+        "c2 checked not opened: 3",
+        "c2 unchecked extracted: 3",
+        "c3 checked extracted: 1",
+        "c3 checked not opened: 7",
+        "c3 unchecked extracted: 2",
+        "c3 unchecked not opened: 6",
+        "c4 checked not opened: 1",
+        "c4 unchecked extracted: 1",
+        "c5 checked extracted: 7",
+        "c5 checked not opened: 67",
+        "c5 unchecked extracted: 9",
+        "c5 unchecked not opened: 65",
+    ];
+    assert_eq!(found, expected);
+}

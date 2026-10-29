@@ -10,7 +10,7 @@
 
 use std::io::{Cursor, Read};
 
-use hivepack_zip::{Archive, ArchiveFlags, Closed, Detail, Flags, OpenFlags, ReadAt, stat};
+use hivepack_zip::{Archive, ArchiveFlags, Closed, Flags, OpenFlags, ReadAt, stat};
 use libfuzzer_sys::fuzz_target;
 
 /// The raw data of entry `i`, as stored.
@@ -38,10 +38,6 @@ fn check_written<R: ReadAt>(za: &Archive<R>, written: &[u8]) {
     }
     let new = match Archive::open(written, OpenFlags(0)) {
         Ok(new) => new,
-        // libzip writes a size of 0xffffffff, or a disk number of 0xffff, in
-        // the header without the Zip64 extra field that should then have
-        // it, and refuses that as invalid; so does the port.
-        Err(e) if matches!(e.detail(), Some((Detail::InvalidZip64Ef, _))) => return,
         Err(e) => panic!("the written archive does not open: {e} ({:?})", e.detail()),
     };
     assert_eq!(new.get_num_entries(Flags::NONE), kept.len() as u64);

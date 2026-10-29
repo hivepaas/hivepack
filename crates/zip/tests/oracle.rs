@@ -432,6 +432,36 @@ fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
     text
 }
 
+/// Whether the archive libzip wrote, in its answer to an edit request,
+/// does not read back for want of a value in a Zip64 extra field: libzip
+/// writes a size or offset of exactly 0xffffffff, or a disk number of
+/// 0xffff or more, without one, where the port writes it.
+fn writes_invalid_zip64(want: &str) -> bool {
+    want.rsplit_once(" |written ").is_some_and(|(_, written)| {
+        Archive::open(unhex(written).as_slice(), OpenFlags(0))
+            .err()
+            .and_then(|e| e.detail())
+            .is_some_and(|(detail, _)| detail == Detail::InvalidZip64Ef)
+    })
+}
+
+/// Checks the port's answer to an edit request against libzip's: the same,
+/// but for the archive written where libzip's does not read back (see
+/// [`writes_invalid_zip64`]); the port's is checked by [`check_written`].
+fn assert_edit(request: &str, want: &str, context: &str) {
+    let got = answer(request);
+    if got != want && writes_invalid_zip64(want) {
+        let head = |answer: &str| {
+            answer
+                .rsplit_once(" |written ")
+                .map(|(head, _)| head.to_string())
+        };
+        assert_eq!(head(&got), head(want), "{context}");
+        return;
+    }
+    assert_eq!(got, want, "{context}");
+}
+
 /// The raw data of entry `i`, as stored.
 fn raw_data<R: ReadAt>(za: &Archive<R>, i: u64) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -459,10 +489,6 @@ fn check_written<R: ReadAt>(za: &Archive<R>, written: &[u8]) {
     }
     let new = match Archive::open(written, OpenFlags(0)) {
         Ok(new) => new,
-        // libzip writes a size of 0xffffffff, or a disk number of 0xffff, in
-        // the header without the Zip64 extra field that should then have
-        // it, and refuses that as invalid; so does the port.
-        Err(e) if matches!(e.detail(), Some((Detail::InvalidZip64Ef, _))) => return,
         Err(e) => panic!("the written archive does not open: {e} ({:?})", e.detail()),
     };
     assert_eq!(new.get_num_entries(Flags::NONE), kept.len() as u64);
@@ -1544,7 +1570,7 @@ fn generated_archives_edit_like_libzip() {
     let mut rng = Rng(0x3000_0001);
     for request in edit_requests(&mut rng, 3000) {
         let want = oracle.ask(&request);
-        assert_eq!(answer(&request), want, "{request:.400}");
+        assert_edit(&request, &want, &format!("{request:.400}"));
     }
 }
 
@@ -1566,7 +1592,7 @@ fn regress_archives_edit_like_libzip() {
         ] {
             let request = format!("edit 0 {ops} {}", hex(data));
             let want = oracle.ask(&request);
-            assert_eq!(answer(&request), want, "{name}: edit {ops}");
+            assert_edit(&request, &want, &format!("{name}: edit {ops}"));
         }
     }
 }
@@ -1646,8 +1672,94 @@ fn many_entries_edit_like_libzip() {
         let request = format!("edit 0 {ops} {zip}");
         let want = oracle.ask(&request);
         assert!(want.contains("|written 504b"), "{:.200}", want);
-        assert!(answer(&request) == want, "edit {ops}");
+        assert_edit(&request, &want, &format!("edit {ops}"));
     }
+}
+
+/// Two deflated entries of 10 bytes whose Zip64 fields libzip writes
+/// short: "a", whose size is exactly 0xffffffff, and "b", larger, on disk
+/// 0xffff.
+fn zip64_edge_archive() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, size, disk) in [(b'a', 0xffff_ffff_u64, 0u32), (b'b', 0x1_0000_0000, 0xffff)] {
+        let offset = out.len() as u32;
+        out.extend_from_slice(b"PK\x03\x04");
+        for v in [45, 0, 8, 0, 0x21] {
+            put16(&mut out, v);
+        }
+        put32(&mut out, 0);
+        put32(&mut out, 10);
+        put32(&mut out, 0xffff_ffff);
+        put16(&mut out, 1);
+        put16(&mut out, 20);
+        out.push(name);
+        put16(&mut out, 1);
+        put16(&mut out, 16);
+        put64(&mut out, size);
+        put64(&mut out, 10);
+        out.extend_from_slice(&[0x55; 10]);
+
+        central.extend_from_slice(b"PK\x01\x02");
+        for v in [0x031e, 45, 0, 8, 0, 0x21] {
+            put16(&mut central, v);
+        }
+        put32(&mut central, 0);
+        put32(&mut central, 10);
+        put32(&mut central, 0xffff_ffff);
+        let ef_len = if disk == 0 { 12 } else { 16 };
+        for v in [1, ef_len, 0, disk as u16, 0] {
+            put16(&mut central, v);
+        }
+        put32(&mut central, 0);
+        put32(&mut central, offset);
+        central.push(name);
+        put16(&mut central, 1);
+        put16(&mut central, ef_len - 4);
+        put64(&mut central, size);
+        if disk != 0 {
+            put32(&mut central, disk);
+        }
+    }
+    let cd_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    for v in [0, 0, 2, 2] {
+        put16(&mut out, v);
+    }
+    put32(&mut out, central.len() as u32);
+    put32(&mut out, cd_offset);
+    put16(&mut out, 0);
+    out
+}
+
+/// Differs from libzip, which writes these Zip64 fields without the value
+/// and then refuses the archive: the port writes one that reads back.
+#[test]
+fn zip64_edge_values_read_back() {
+    let zip = zip64_edge_archive();
+    let mut za = Archive::open(zip.as_slice(), OpenFlags(0)).unwrap();
+    za.set_archive_comment(b"hi").unwrap();
+    let mut out = std::io::Cursor::new(Vec::new());
+    assert_eq!(za.close_to(&mut out).unwrap(), Closed::Written);
+    check_written(&za, out.get_ref());
+    let written = Archive::open(out.get_ref().as_slice(), OpenFlags(0)).unwrap();
+    assert_eq!(
+        written.stat_index(0, Flags::NONE).unwrap().size,
+        0xffff_ffff
+    );
+    assert_eq!(
+        written.stat_index(1, Flags::NONE).unwrap().size,
+        0x1_0000_0000
+    );
+
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let request = format!("edit 0 a6869 {}", hex(&zip));
+    let want = oracle.ask(&request);
+    assert!(writes_invalid_zip64(&want), "{want:.300}");
+    assert_edit(&request, &want, "a6869");
 }
 
 #[test]
@@ -1658,12 +1770,19 @@ fn port_edits_as_recorded() {
 #[test]
 #[ignore = "rewrites testdata/oracle/zip-edit.txt from the oracle"]
 fn record_edit_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
     let mut rng = Rng(0x3000_0003);
+    // Not those where the port writes differently, as the recorded answer
+    // may be a hash.
+    let requests = edit_requests(&mut rng, 1000)
+        .into_iter()
+        .filter(|request| !writes_invalid_zip64(&oracle.ask(request)))
+        .collect();
     record(
         &recorded_edit_path(),
         "Edits",
         "record_edit_answers",
-        edit_requests(&mut rng, 1000),
+        requests,
         2_500,
         5,
     );

@@ -816,22 +816,24 @@ impl Dirent {
             _ => 0,
         };
 
+        // Differs from libzip, whose archive does not read back otherwise:
+        // a size or offset of exactly 0xffffffff, which the header has as
+        // 0xffffffff, has its value in the Zip64 extra field too (libzip
+        // adds it only when it is larger), and so does the disk number
+        // when the header has it as 0xffff, which tells a reader of the
+        // field to look for it there.
         if is_zip64 {
             let mut ef_buffer = Buffer::with_size(EFZIP64SIZE);
             let max = u64::from(u32::MAX);
             if local {
                 if flags.intersects(FL_FORCE_ZIP64)
-                    || self.comp_size > max
-                    || self.uncomp_size > max
+                    || self.comp_size >= max
+                    || self.uncomp_size >= max
                 {
                     ef_buffer.put_64(self.uncomp_size);
                     ef_buffer.put_64(self.comp_size);
                 }
-            } else if flags.intersects(FL_FORCE_ZIP64)
-                || self.comp_size > max
-                || self.uncomp_size > max
-                || self.offset > max
-            {
+            } else {
                 if self.uncomp_size >= max {
                     ef_buffer.put_64(self.uncomp_size);
                 }
@@ -840,6 +842,9 @@ impl Dirent {
                 }
                 if self.offset >= max {
                     ef_buffer.put_64(self.offset);
+                }
+                if self.disk_number as u16 == u16::MAX {
+                    ef_buffer.put_32(self.disk_number);
                 }
             }
             if !ef_buffer.ok() {

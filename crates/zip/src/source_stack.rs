@@ -1,18 +1,24 @@
-//! The sources libzip stacks to read an entry, and the rules every
-//! `zip_source_t` follows around its callback: port of the reading parts
-//! of `zip_source_read.c`, `zip_source_open.c`, `zip_source_close.c`,
-//! `zip_source_at_eof.c`, `zip_source_stat.c` and `zip_source_layered.c`.
+//! The sources libzip stacks to read an entry, and those `zip_close` stacks
+//! on the data it writes, with the rules every `zip_source_t` follows
+//! around its callback: port of the reading parts of `zip_source_read.c`,
+//! `zip_source_open.c`, `zip_source_close.c`, `zip_source_at_eof.c`,
+//! `zip_source_stat.c`, `zip_source_get_file_attributes.c`,
+//! `zip_source_get_dostime.c` and `zip_source_layered.c`.
 //!
-//! Differs from libzip: the stack is a struct, not a chain of callbacks.
-//! It is always a window on the archive (or on an empty buffer), then the
-//! decompressing layer if the data is compressed, then the CRC layer if
-//! the CRC is to be checked, and each layer keeps the state libzip keeps
-//! in its `zip_source_t`.
+//! Differs from libzip: a stack is a struct, not a chain of callbacks. To
+//! read, it is always a window on the archive, on an empty buffer or on
+//! new data, then the decompressing layer if the data is compressed, then
+//! the CRC layer if the CRC is to be checked; to write, the data or an
+//! entry's stack, then layers to decompress, compute the CRC and compress.
+//! Each layer keeps the state libzip keeps in its `zip_source_t`.
+
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::source::ReadAt;
-use crate::source_compress::Decompress;
+use crate::source_compress::{Compress, Decompress};
 use crate::source_crc::Crc;
+use crate::source_data::{DataSource, FileAttributes};
 use crate::source_window::{Lower, UpperWindow, Window};
 use crate::zip::Stat;
 
@@ -41,7 +47,7 @@ impl<T> Layer<T> {
     }
 
     /// What `zip_source_open` resets once the callback opened.
-    fn opened(&mut self) {
+    pub(crate) fn opened(&mut self) {
         self.eof = false;
         self.had_read_error = false;
         self.error = Error::OK;
@@ -51,7 +57,7 @@ impl<T> Layer<T> {
     /// callback returns none: port of `zip_source_read`. After an error,
     /// every read fails with it, and the bytes read before it in the same
     /// call are returned first.
-    fn read(
+    pub(crate) fn read(
         &mut self,
         data: &mut [u8],
         call: &mut dyn FnMut(&mut T, &mut [u8]) -> Result<usize>,
@@ -305,5 +311,276 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
             }
         }
         ret
+    }
+}
+
+impl<R: ReadAt + ?Sized> Stack<'_, R> {
+    /// `zip_source_stat` of the top layer.
+    pub(crate) fn stat(&self) -> Result<Stat<'static>> {
+        let mut st = stat_below_crc(&self.decompress, &self.window, &self.lower);
+        if let Some(crc) = &self.crc {
+            crc.ctx.stat(&mut st)?;
+        }
+        if let Some(partial) = &self.partial {
+            partial.ctx.stat(&mut st);
+        }
+        Ok(st)
+    }
+
+    /// `zip_source_get_file_attributes` of the top layer: the window's,
+    /// from the entry's header, over those of new data, under those of the
+    /// decompressing layer.
+    pub(crate) fn file_attributes(&self) -> Result<FileAttributes> {
+        let mut attributes = self.window.ctx.file_attributes();
+        attributes.merge_lower(&self.lower.file_attributes()?);
+        if let Some(decompress) = &self.decompress {
+            let mut upper = decompress.ctx.file_attributes();
+            upper.merge_lower(&attributes);
+            attributes = upper;
+        }
+        Ok(attributes)
+    }
+
+    /// `zip_source_get_dos_time` of the top layer: the window's, which the
+    /// CRC layer passes on and the decompressing one does not; none for a
+    /// part of the data, whose window has none.
+    pub(crate) fn dos_time(&self) -> Option<(u16, u16)> {
+        match (&self.decompress, &self.partial) {
+            (None, None) => self.window.ctx.dos_time(),
+            _ => None,
+        }
+    }
+}
+
+/// What `add_data` reads an entry's data from: its new data, or the stack
+/// that reads an entry of the archive, to recompress it.
+pub(crate) enum Base<'a, R: ?Sized> {
+    Data {
+        source: Arc<dyn DataSource>,
+        /// the position of the next read
+        layer: Layer<u64>,
+    },
+    Entry(Box<Stack<'a, R>>),
+}
+
+impl<R: ReadAt + ?Sized> Base<'_, R> {
+    /// The new data `source`.
+    pub(crate) fn data(source: Arc<dyn DataSource>) -> Self {
+        Base::Data {
+            source,
+            layer: Layer::new(0),
+        }
+    }
+
+    fn open(&mut self) -> Result<()> {
+        match self {
+            Base::Data { layer, .. } => {
+                layer.ctx = 0;
+                layer.opened();
+                Ok(())
+            }
+            Base::Entry(stack) => stack.open(),
+        }
+    }
+
+    fn read(&mut self, data: &mut [u8]) -> Result<usize> {
+        match self {
+            Base::Data { source, layer } => layer.read(data, &mut |position, buf| {
+                let n = source.read_at(*position, buf)?;
+                *position += n as u64;
+                Ok(n)
+            }),
+            Base::Entry(stack) => stack.read(data),
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        match self {
+            Base::Data { .. } => Ok(()),
+            Base::Entry(stack) => stack.close(),
+        }
+    }
+
+    /// `zip_source_stat`.
+    pub(crate) fn stat(&self) -> Result<Stat<'static>> {
+        match self {
+            Base::Data { source, .. } => source.stat(),
+            Base::Entry(stack) => stack.stat(),
+        }
+    }
+
+    /// `zip_source_get_file_attributes`.
+    pub(crate) fn file_attributes(&self) -> Result<FileAttributes> {
+        match self {
+            Base::Data { source, .. } => source.file_attributes(),
+            Base::Entry(stack) => stack.file_attributes(),
+        }
+    }
+
+    /// `zip_source_get_dos_time`.
+    pub(crate) fn dos_time(&self) -> Result<Option<(u16, u16)>> {
+        match self {
+            Base::Data { source, .. } => source.dos_time(),
+            Base::Entry(stack) => Ok(stack.dos_time()),
+        }
+    }
+}
+
+/// The sources `add_data` stacks on an entry's data, from the bottom up.
+pub(crate) struct WriteStack<'a, R: ?Sized> {
+    pub(crate) base: Base<'a, R>,
+    pub(crate) decompress: Option<Layer<Decompress>>,
+    pub(crate) crc: Option<Layer<Crc>>,
+    pub(crate) compress: Option<Layer<Compress>>,
+}
+
+/// Reads from the layers under the compressing one.
+fn read_below_compress<R: ReadAt + ?Sized>(
+    base: &mut Base<'_, R>,
+    decompress: &mut Option<Layer<Decompress>>,
+    crc: &mut Option<Layer<Crc>>,
+    data: &mut [u8],
+) -> Result<usize> {
+    let read_below_crc = |base: &mut Base<'_, R>,
+                          decompress: &mut Option<Layer<Decompress>>,
+                          data: &mut [u8]|
+     -> Result<usize> {
+        match decompress {
+            Some(decompress) => {
+                decompress.read(data, &mut |ctx, buf| ctx.read(buf, &mut |b| base.read(b)))
+            }
+            None => base.read(data),
+        }
+    };
+    match crc {
+        Some(crc) => crc.read(data, &mut |ctx, buf| {
+            let n = read_below_crc(base, decompress, buf);
+            // A CRC layer that computes the CRC never asks for the stat.
+            ctx.read(buf, n, Stat::default)
+        }),
+        None => read_below_crc(base, decompress, data),
+    }
+}
+
+/// `zip_source_stat` under the compressing layer.
+fn stat_below_compress<R: ReadAt + ?Sized>(
+    base: &Base<'_, R>,
+    decompress: &Option<Layer<Decompress>>,
+    crc: &Option<Layer<Crc>>,
+) -> Result<Stat<'static>> {
+    let mut st = base.stat()?;
+    if let Some(decompress) = decompress {
+        decompress.ctx.stat(&mut st);
+    }
+    if let Some(crc) = crc {
+        crc.ctx.stat(&mut st)?;
+    }
+    Ok(st)
+}
+
+/// `zip_source_get_file_attributes` under the compressing layer.
+fn attributes_below_compress<R: ReadAt + ?Sized>(
+    base: &Base<'_, R>,
+    decompress: &Option<Layer<Decompress>>,
+) -> Result<FileAttributes> {
+    let mut attributes = base.file_attributes()?;
+    if let Some(decompress) = decompress {
+        let mut upper = decompress.ctx.file_attributes();
+        upper.merge_lower(&attributes);
+        attributes = upper;
+    }
+    Ok(attributes)
+}
+
+impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
+    /// Opens the layers, the lowest first: port of `zip_source_open`.
+    pub(crate) fn open(&mut self) -> Result<()> {
+        self.base.open()?;
+        if let Some(decompress) = self.decompress.as_mut() {
+            if let Err(e) = decompress.ctx.open() {
+                decompress.error = e;
+                return Err(e);
+            }
+            decompress.opened();
+        }
+        if let Some(crc) = self.crc.as_mut() {
+            crc.ctx.open();
+            crc.opened();
+        }
+        if self.compress.is_some() {
+            // The compressing layer asks for the stat and attributes of the
+            // source below it when it opens.
+            stat_below_compress(&self.base, &self.decompress, &self.crc)?;
+            attributes_below_compress(&self.base, &self.decompress)?;
+        }
+        if let Some(compress) = self.compress.as_mut() {
+            if let Err(e) = compress.ctx.open() {
+                compress.error = e;
+                return Err(e);
+            }
+            compress.opened();
+        }
+        Ok(())
+    }
+
+    /// `zip_source_read` of the top layer.
+    pub(crate) fn read(&mut self, data: &mut [u8]) -> Result<usize> {
+        let WriteStack {
+            base,
+            decompress,
+            crc,
+            compress,
+        } = self;
+        match compress {
+            Some(compress) => compress.read(data, &mut |ctx, buf| {
+                ctx.read(buf, &mut |b| read_below_compress(base, decompress, crc, b))
+            }),
+            None => read_below_compress(base, decompress, crc, data),
+        }
+    }
+
+    /// Closes the layers, the top first: port of `zip_source_close`.
+    pub(crate) fn close(&mut self) -> Result<()> {
+        let mut ret = Ok(());
+        if let Some(compress) = self.compress.as_mut()
+            && let Err(e) = compress.ctx.close()
+        {
+            compress.error = e;
+            ret = Err(e);
+        }
+        if let Some(decompress) = self.decompress.as_mut()
+            && let Err(e) = decompress.ctx.close()
+        {
+            decompress.error = e;
+            if ret.is_ok() {
+                ret = Err(e);
+            }
+        }
+        if let Err(e) = self.base.close()
+            && ret.is_ok()
+        {
+            ret = Err(e);
+        }
+        ret
+    }
+
+    /// `zip_source_stat` of the top layer.
+    pub(crate) fn stat(&self) -> Result<Stat<'static>> {
+        let mut st = stat_below_compress(&self.base, &self.decompress, &self.crc)?;
+        if let Some(compress) = &self.compress {
+            compress.ctx.stat(&mut st);
+        }
+        Ok(st)
+    }
+
+    /// `zip_source_get_file_attributes` of the top layer.
+    pub(crate) fn file_attributes(&self) -> Result<FileAttributes> {
+        let mut attributes = attributes_below_compress(&self.base, &self.decompress)?;
+        if let Some(compress) = &self.compress {
+            let mut upper = compress.ctx.file_attributes();
+            upper.merge_lower(&attributes);
+            attributes = upper;
+        }
+        Ok(attributes)
     }
 }

@@ -48,5 +48,11 @@ opt-level = 3
 [profile.dev.package.libz-sys]
 opt-level = 3
 
+# hivepack-zip's tests compress and decompress gigabytes (libzip's
+# zip64_creation adds 4 GiB): optimized, as the C libraries are, though
+# with the checks of a dev build.
+[profile.dev.package.hivepack-deflate]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"

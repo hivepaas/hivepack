@@ -31,7 +31,8 @@ use hivepack_deflate::{
     Deflate, Flush as DeflateFlush, InBuffer, OutBuffer, Status as DeflateStatus, crc32,
 };
 use hivepack_zip::{
-    Archive, ArchiveFlags, Closed, Detail, Error, ErrorCode, Flags, OpenFlags, ReadAt,
+    Archive, ArchiveFlags, BufferSource, Closed, DataSource, Detail, Error, ErrorCode, Flags,
+    OpenFlags, ReadAt,
 };
 use support::{Oracle, Rng, damage, hex, recorded_form, repository, unhex};
 
@@ -348,51 +349,113 @@ fn edit_ops_and_state<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
         let index = || fields[0].parse::<u64>().unwrap();
         let number = |k: usize| fields[k].parse::<i64>().unwrap();
         let flags = |k: usize| Flags(fields[k].parse().unwrap());
-        let result = match op.as_bytes()[0] {
-            b'd' => za.delete(index()),
-            b'r' => za.file_rename(index(), &unhex(fields[1]), flags(2)),
-            b'c' => za.file_set_comment(index(), &unhex(fields[1]), flags(2)),
-            b'a' => za.set_archive_comment(&unhex(fields[0])),
-            b't' => za.file_set_dostime(index(), number(1) as u16, number(2) as u16, Flags::NONE),
-            b'm' => za.file_set_mtime(index(), number(1), Flags::NONE),
-            b'x' => za.file_set_external_attributes(
-                index(),
-                Flags::NONE,
-                number(1) as u8,
-                number(2) as u32,
+        let result: hivepack_zip::Result<u64> = match op.as_bytes()[0] {
+            b'+' => za.file_add(
+                &unhex(fields[0]),
+                memory_source(fields[2], fields[3], fields[4]),
+                flags(1),
             ),
-            b'u' => za.unchange(index()),
-            b'U' => {
-                za.unchange_all();
-                Ok(())
-            }
-            b'A' => {
-                za.unchange_archive();
-                Ok(())
-            }
-            b'f' => za.set_archive_flag(ArchiveFlags(fields[0].parse().unwrap()), fields[1] != "0"),
-            b'e' => za.file_extra_field_set(
-                index(),
-                number(1) as u16,
-                number(2) as u16,
-                &unhex(fields[3]),
-                flags(4),
-            ),
-            b'E' => za.file_extra_field_delete_by_id(
-                index(),
-                number(1) as u16,
-                number(2) as u16,
-                flags(3),
-            ),
-            b'D' => za.file_extra_field_delete(index(), number(1) as u16, flags(2)),
-            _ => panic!("unknown op {op}"),
+            b'R' => za
+                .file_replace(
+                    index(),
+                    memory_source(fields[1], fields[2], fields[3]),
+                    Flags::NONE,
+                )
+                .map(|()| 0),
+            b'N' => za.dir_add(&unhex(fields[0]), flags(1)).and_then(|idx| {
+                za.file_set_dostime(idx, number(2) as u16, number(3) as u16, Flags::NONE)
+                    .map(|()| idx)
+            }),
+            b'z' => za
+                .set_file_compression(index(), number(1) as i32, number(2) as u32)
+                .map(|()| 0),
+            _ => edit_op(za, op, &fields).map(|()| 0),
         };
         match result {
-            Ok(()) => text.push_str(" 0"),
+            Ok(n) => text.push_str(&format!(" {n}")),
             Err(e) => text.push_str(&format!(" {}", error_text(e))),
         }
     }
+    edit_state(za, text)
+}
 
+/// An op of an edit request that answers 0.
+fn edit_op<R: ReadAt>(za: &mut Archive<R>, op: &str, fields: &[&str]) -> hivepack_zip::Result<()> {
+    let index = || fields[0].parse::<u64>().unwrap();
+    let number = |k: usize| fields[k].parse::<i64>().unwrap();
+    let flags = |k: usize| Flags(fields[k].parse().unwrap());
+    match op.as_bytes()[0] {
+        b'd' => za.delete(index()),
+        b'r' => za.file_rename(index(), &unhex(fields[1]), flags(2)),
+        b'c' => za.file_set_comment(index(), &unhex(fields[1]), flags(2)),
+        b'a' => za.set_archive_comment(&unhex(fields[0])),
+        b't' => za.file_set_dostime(index(), number(1) as u16, number(2) as u16, Flags::NONE),
+        b'm' => za.file_set_mtime(index(), number(1), Flags::NONE),
+        b'x' => {
+            za.file_set_external_attributes(index(), Flags::NONE, number(1) as u8, number(2) as u32)
+        }
+        b'u' => za.unchange(index()),
+        b'U' => {
+            za.unchange_all();
+            Ok(())
+        }
+        b'A' => {
+            za.unchange_archive();
+            Ok(())
+        }
+        b'f' => za.set_archive_flag(ArchiveFlags(fields[0].parse().unwrap()), fields[1] != "0"),
+        b'e' => za.file_extra_field_set(
+            index(),
+            number(1) as u16,
+            number(2) as u16,
+            &unhex(fields[3]),
+            flags(4),
+        ),
+        b'E' => {
+            za.file_extra_field_delete_by_id(index(), number(1) as u16, number(2) as u16, flags(3))
+        }
+        b'D' => za.file_extra_field_delete(index(), number(1) as u16, flags(2)),
+        _ => panic!("unknown op {op}"),
+    }
+}
+
+/// The oracle's source of data in memory with a time: its size known
+/// (`s`), as a buffer source has it, or not (`u`).
+fn memory_source(mtime: &str, data: &str, kind: &str) -> MemorySource {
+    MemorySource {
+        data: unhex(data),
+        mtime: mtime.parse().unwrap(),
+        known_size: kind != "u",
+    }
+}
+
+struct MemorySource {
+    data: Vec<u8>,
+    mtime: i64,
+    known_size: bool,
+}
+
+impl DataSource for MemorySource {
+    fn stat(&self) -> hivepack_zip::Result<hivepack_zip::Stat<'static>> {
+        use hivepack_zip::stat;
+        let mut st = BufferSource::with_mtime(self.data.clone(), self.mtime).stat()?;
+        if !self.known_size {
+            st.valid = stat::MTIME;
+        }
+        Ok(st)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> hivepack_zip::Result<usize> {
+        let start = (offset as usize).min(self.data.len());
+        let n = buf.len().min(self.data.len() - start);
+        buf[..n].copy_from_slice(&self.data[start..start + n]);
+        Ok(n)
+    }
+}
+
+/// What the oracle answers after the edits: the archive comment, and for
+/// each entry what the API says of it.
+fn edit_state<R: ReadAt>(za: &Archive<R>, mut text: String) -> String {
     let _ = write!(
         text,
         " |{} {}",
@@ -442,12 +505,13 @@ fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
     let mut text = edit_ops_and_state(za, ops);
     text.push_str(" |");
     let mut out = std::io::Cursor::new(Vec::new());
+    let expected = archive_state(za);
     match za.close_to(&mut out) {
         Ok(Closed::Unchanged) => text.push_str("unchanged"),
         Ok(Closed::Removed) => text.push_str("removed"),
         Ok(Closed::Written) => {
             if !za.get_archive_flag(ArchiveFlags::WANT_TORRENTZIP, Flags::NONE) {
-                check_written(za, out.get_ref());
+                check_written(&expected, out.get_ref());
             }
             let _ = write!(text, "written {}", hex(out.get_ref()));
         }
@@ -469,6 +533,17 @@ fn writes_invalid_zip64(want: &str) -> bool {
     })
 }
 
+/// Whether the archive of a request has a Deflate64 entry.
+fn has_deflate64(request: &str) -> bool {
+    let data = unhex(request.rsplit(' ').next().unwrap_or("-"));
+    Archive::open(data.as_slice(), OpenFlags(0)).is_ok_and(|za| {
+        (0..za.get_num_entries(Flags::NONE)).any(|i| {
+            za.stat_index(i, Flags::NONE)
+                .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64)
+        })
+    })
+}
+
 /// An edit answer before the archive written, and the archive, from a
 /// file (`written`) or a buffer (`buffer`).
 fn written_part(answer: &str) -> Option<(&str, &str)> {
@@ -483,7 +558,14 @@ fn written_part(answer: &str) -> Option<(&str, &str)> {
 /// but for the archive written where libzip's does not read back (see
 /// [`writes_invalid_zip64`]); the port's is checked by [`check_written`].
 fn assert_edit(request: &str, want: &str, context: &str) {
-    let got = answer(request);
+    let got = checked_answer(request, want);
+    // libzip has no Deflate64: where it refuses to recompress such an
+    // entry, the port recompresses it, or fails on its data.
+    if got != want && want.ends_with(" |e16/0") && has_deflate64(request) {
+        let head = |answer: &str| answer.rsplit_once(" |").map(|(head, _)| head.to_string());
+        assert_eq!(head(&got), head(want), "{context}");
+        return;
+    }
     if got != want && writes_invalid_zip64(want) {
         let head = |answer: &str| written_part(answer).map(|(head, _)| head.to_string());
         assert_eq!(head(&got), head(want), "{context}");
@@ -547,6 +629,8 @@ fn edit_buffer(data: &[u8], flags: OpenFlags, fragment_size: u64, ops: &str) -> 
     text.push_str(" |");
     let mut out = std::io::Cursor::new(Vec::new());
     let len = data.len() as u64;
+    let expected = archive_state(&za);
+    let apart = entries_apart(&za);
     match za.close_to_cloning(&mut out, |offset| {
         buffer_can_clone(len, fragment_size, offset)
     }) {
@@ -557,16 +641,23 @@ fn edit_buffer(data: &[u8], flags: OpenFlags, fragment_size: u64, ops: &str) -> 
         Ok(Closed::Written) => {
             // What is kept is kept as it is: an entry before the first one
             // that changed is cut there if its data reaches past it.
-            if !za.get_archive_flag(ArchiveFlags::WANT_TORRENTZIP, Flags::NONE)
-                && entries_apart(&za)
-            {
-                check_written(&za, out.get_ref());
+            if !za.get_archive_flag(ArchiveFlags::WANT_TORRENTZIP, Flags::NONE) && apart {
+                check_written(&expected, out.get_ref());
             }
             let _ = write!(text, "buffer {}", hex(out.get_ref()));
         }
         Err(e) => text.push_str(&error_text(e)),
     }
     text
+}
+
+/// The data of entry `i`, decompressed, if it reads.
+fn entry_data<R: ReadAt>(za: &Archive<R>, i: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut zf = za.fopen_index(i, Flags::NONE).ok()?;
+    let mut data = Vec::new();
+    zf.read_to_end(&mut data).ok()?;
+    Some(data)
 }
 
 /// The raw data of entry `i`, as stored.
@@ -578,13 +669,87 @@ fn raw_data<R: ReadAt>(za: &Archive<R>, i: u64) -> Option<Vec<u8>> {
     Some(data)
 }
 
-/// That the archive `written` from `za` has its entries that are not
-/// deleted, in order, as they are now: their names, comments, attributes,
-/// times, sizes and data.
-fn check_written<R: ReadAt>(za: &Archive<R>, written: &[u8]) {
-    let kept: Vec<u64> = (0..za.get_num_entries(Flags::NONE))
-        .filter(|&i| za.get_name(i, Flags::NONE).is_ok())
+thread_local! {
+    /// Whether [`check_written`] checks.
+    static CHECK_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// The port's answer to `request`: if a check of an archive written fails,
+/// the answer without it, so that a difference from libzip shows first,
+/// then the check's failure.
+fn checked_answer(request: &str, want: &str) -> String {
+    match std::panic::catch_unwind(|| answer(request)) {
+        Ok(got) => got,
+        Err(panic) => {
+            CHECK_WRITTEN.with(|c| c.set(false));
+            let got = answer(request);
+            CHECK_WRITTEN.with(|c| c.set(true));
+            assert_eq!(
+                got, want,
+                "libzip differs where the check failed: {request:.400}"
+            );
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+/// What the API says of an entry, as it is to be written.
+struct EntryState {
+    index: u64,
+    name: Vec<u8>,
+    comment: Vec<u8>,
+    attributes: (u8, u32),
+    /// as stored, which new data only has once written, from its source
+    dos_time: Option<(u16, u16)>,
+    stat: hivepack_zip::Stat<'static>,
+    data: Option<Vec<u8>>,
+    raw: Option<Vec<u8>>,
+}
+
+/// What the API says of an archive before it is written: the entries with
+/// names, which are those written, and the archive comment.
+struct ArchiveState {
+    entries: Vec<EntryState>,
+    comment: Vec<u8>,
+}
+
+fn archive_state<R: ReadAt>(za: &Archive<R>) -> ArchiveState {
+    let entries = (0..za.get_num_entries(Flags::NONE))
+        .filter_map(|i| {
+            let name = za.get_name(i, Flags::ENC_RAW).ok()?.to_vec();
+            Some(EntryState {
+                index: i,
+                name,
+                comment: za.file_get_comment(i, Flags::ENC_RAW).unwrap().to_vec(),
+                attributes: za.file_get_external_attributes(i, Flags::NONE).unwrap(),
+                // An entry with new data cannot be read raw.
+                dos_time: match za.fopen_index(i, Flags::COMPRESSED) {
+                    Err(e) if e.code() == ErrorCode::Changed => None,
+                    _ => Some(za.file_get_dos_time(i, Flags::NONE).unwrap()),
+                },
+                stat: hivepack_zip::Stat {
+                    name: None,
+                    ..za.stat_index(i, Flags::NONE).unwrap()
+                },
+                data: entry_data(za, i),
+                raw: raw_data(za, i),
+            })
+        })
         .collect();
+    ArchiveState {
+        entries,
+        comment: za.get_archive_comment(Flags::ENC_RAW).to_vec(),
+    }
+}
+
+/// That the archive `written` has the entries of `expected`, in order, as
+/// they were edited: their names, comments, attributes, times, sizes and
+/// data.
+fn check_written(expected: &ArchiveState, written: &[u8]) {
+    use hivepack_zip::stat;
+    if !CHECK_WRITTEN.with(std::cell::Cell::get) {
+        return;
+    }
     // Something that looks like an end of central directory record, or a
     // Zip64 one or its locator, in a name, a comment, an extra field or the
     // data may be taken for the real one: libzip does not check that what
@@ -598,56 +763,93 @@ fn check_written<R: ReadAt>(za: &Archive<R>, written: &[u8]) {
         Ok(new) => new,
         Err(e) => panic!("the written archive does not open: {e} ({:?})", e.detail()),
     };
-    assert_eq!(new.get_num_entries(Flags::NONE), kept.len() as u64);
-    for (j, &i) in kept.iter().enumerate() {
-        let j = j as u64;
-        assert_eq!(
-            new.get_name(j, Flags::ENC_RAW).unwrap(),
-            za.get_name(i, Flags::ENC_RAW).unwrap()
-        );
-        assert_eq!(
-            new.file_get_comment(j, Flags::ENC_RAW).unwrap(),
-            za.file_get_comment(i, Flags::ENC_RAW).unwrap()
-        );
+    // An entry deleted, then given changes (zip_set_file_compression and
+    // others do not check), has its name again, though it is not written:
+    // the API cannot tell it from one that is kept. The comparison with
+    // libzip covers it.
+    if new.get_num_entries(Flags::NONE) != expected.entries.len() as u64 {
+        return;
+    }
+    for (j, e) in expected.entries.iter().enumerate() {
+        let (i, j) = (e.index, j as u64);
+        assert_eq!(new.get_name(j, Flags::ENC_RAW).unwrap(), e.name);
+        assert_eq!(new.file_get_comment(j, Flags::ENC_RAW).unwrap(), e.comment);
         assert_eq!(
             new.file_get_external_attributes(j, Flags::NONE).unwrap(),
-            za.file_get_external_attributes(i, Flags::NONE).unwrap()
+            e.attributes
         );
-        assert_eq!(
-            new.file_get_dos_time(j, Flags::NONE).unwrap(),
-            za.file_get_dos_time(i, Flags::NONE).unwrap()
-        );
-        let (a, b) = (
-            new.stat_index(j, Flags::NONE).unwrap(),
-            za.stat_index(i, Flags::NONE).unwrap(),
-        );
-        assert_eq!(
-            (a.size, a.comp_size, a.comp_method, a.encryption_method),
-            (b.size, b.comp_size, b.comp_method, b.encryption_method)
-        );
-        if a.valid & b.valid & hivepack_zip::stat::CRC != 0 {
-            assert_eq!(a.crc, b.crc);
+        let (a, b) = (new.stat_index(j, Flags::NONE).unwrap(), e.stat);
+        // An entry compressed again, which has no compressed size until it
+        // is, is stored differently, with the time of its stat (an MS-DOS
+        // time out of range comes back in range), and, from
+        // ZIP_CM_DEFAULT, deflated or stored.
+        let recompressed = b.valid & stat::COMP_SIZE == 0;
+        if let Some(dos_time) = e.dos_time
+            && !recompressed
+        {
+            assert_eq!(new.file_get_dos_time(j, Flags::NONE).unwrap(), dos_time);
+        }
+        // What the edited archive knows: new data has the stat of its
+        // source, which lacks what compressing gives, and the method the
+        // entry had until it is written.
+        let mut both = a.valid & b.valid;
+        if e.dos_time.is_none() {
+            both &= stat::SIZE | stat::CRC;
+        }
+        // The length of data compressed again is what it decompresses to,
+        // which the header may have wrong.
+        if recompressed {
+            both &= stat::CRC;
+        }
+        for (field, x, y) in [
+            (stat::SIZE, a.size, b.size),
+            (stat::COMP_SIZE, a.comp_size, b.comp_size),
+            (
+                stat::COMP_METHOD,
+                u64::from(a.comp_method),
+                u64::from(b.comp_method),
+            ),
+            (
+                stat::ENCRYPTION_METHOD,
+                u64::from(a.encryption_method),
+                u64::from(b.encryption_method),
+            ),
+            (stat::CRC, u64::from(a.crc), u64::from(b.crc)),
+        ] {
+            if both & field != 0 {
+                assert_eq!(x, y, "stat field {field:#x} of entry {i}");
+            }
+        }
+        // Before it is written, new data is read with the method the entry
+        // had, as libzip reads it.
+        if let Some(data) = &e.data
+            && e.dos_time.is_some()
+        {
+            assert_eq!(
+                entry_data(&new, j).as_ref(),
+                Some(data),
+                "data of entry {i}"
+            );
         }
         // A WinZip AES entry of AE-2, without a CRC, is written as AE-1 if
         // it has 20 bytes or more, and its CRC is then checked on reading,
         // on the encrypted data.
-        let same_crc_check = a.valid & hivepack_zip::stat::CRC == b.valid & hivepack_zip::stat::CRC;
-        if let Some(data) = raw_data(za, i)
+        let same_crc_check = a.valid & stat::CRC == b.valid & stat::CRC;
+        if let Some(raw) = &e.raw
             && same_crc_check
+            && !recompressed
         {
             assert_eq!(
                 raw_data(&new, j).as_ref(),
-                Some(&data),
-                "entry {i}: {:?} in {}",
-                new.fopen_index(j, Flags::ENCRYPTED).err(),
-                hex(written)
+                Some(raw),
+                "raw data of entry {i}"
             );
         }
     }
     // As in libzip, a comment removed is still given until the archive is
     // written.
     let comment = new.get_archive_comment(Flags::ENC_RAW);
-    assert!(comment.is_empty() || comment == za.get_archive_comment(Flags::ENC_RAW));
+    assert!(comment.is_empty() || comment == expected.comment);
 }
 
 /// A path for a temporary archive of this process.
@@ -1384,14 +1586,38 @@ fn editb_requests(rng: &mut Rng, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// A time for new data: in DOS range, before 1980 or past 2107.
+fn new_mtime(rng: &mut Rng) -> i64 {
+    match rng.below(4) {
+        0 => rng.pick(&[0, 315_532_800, 4_354_819_200, -1]),
+        _ => 315_532_800 + rng.below(4_000_000_000) as i64,
+    }
+}
+
+/// New data for an entry: empty, text, runs, or bytes that do not compress,
+/// some longer than the 8 KiB libzip reads at a time.
+fn new_data(rng: &mut Rng) -> Vec<u8> {
+    match rng.below(7) {
+        0 => Vec::new(),
+        1 => {
+            let len = 1 + rng.below(60) as usize;
+            text(rng, len)
+        }
+        2 => vec![b'a'; rng.pick(&[1, 10, 300, 9000])],
+        3 => (0..rng.pick(&[5, 100, 8192, 8193]))
+            .map(|_| rng.next() as u8)
+            .collect(),
+        4 => (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect(),
+        _ => plain(rng),
+    }
+}
+
 /// The edits of an edit request on `zip`.
 fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
     let mut names = Vec::new();
     let mut comments = Vec::new();
     let mut attributes = Vec::new();
-    let mut torrentzip = false;
     if let Ok(za) = Archive::open(zip, OpenFlags(0)) {
-        torrentzip = za.get_archive_flag(ArchiveFlags::IS_TORRENTZIP, Flags::NONE);
         for i in 0..za.get_num_entries(Flags::NONE) {
             names.push(za.get_name(i, Flags::ENC_RAW).unwrap().to_vec());
             comments.push(za.file_get_comment(i, Flags::ENC_RAW).unwrap().to_vec());
@@ -1430,7 +1656,7 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
             0 => n + rng.below(3),
             _ => rng.below(n.max(1)),
         };
-        let op = match rng.below(19) {
+        let op = match rng.below(26) {
             0..=2 => format!("d{i}"),
             3..=5 => {
                 let name = match rng.below(5) {
@@ -1511,13 +1737,50 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
                 let idx = rng.pick(&[0, 1, 2, 0xffff]);
                 format!("D{i}:{idx}:{flags}")
             }
-            _ => {
-                let flag = match rng.below(4) {
-                    0 => 4,
-                    1 if torrentzip => 8,
-                    1 | 2 => 16,
-                    _ => 2,
+            18..=20 => {
+                let name = match rng.below(4) {
+                    0 => some(rng, &names),
+                    _ => made_up(rng),
                 };
+                // 0, ZIP_FL_OVERWRITE, ZIP_FL_ENC_UTF_8 or ZIP_FL_ENC_CP437
+                let flags = rng.pick(&[0, 0, 8192, 2048, 4096]);
+                format!(
+                    "+{}:{flags}:{}:{}:{}",
+                    hex(&name),
+                    new_mtime(rng),
+                    hex(&new_data(rng)),
+                    rng.pick(&["s", "s", "s", "u"])
+                )
+            }
+            21 => format!(
+                "R{i}:{}:{}:{}",
+                new_mtime(rng),
+                hex(&new_data(rng)),
+                rng.pick(&["s", "s", "u"])
+            ),
+            22 => {
+                let name = match rng.below(3) {
+                    0 => some(rng, &names),
+                    _ => made_up(rng),
+                };
+                format!(
+                    "N{}:0:{}:{}",
+                    hex(&name),
+                    rng.below(65536),
+                    rng.below(65536)
+                )
+            }
+            23 | 24 => {
+                // stored, deflated, the default, and methods there are no
+                // compressors for, or that wrap to deflate as a u16
+                let method: i64 = rng.pick(&[0, 8, 8, -1, -1, 9, 12, 14, 65544, 99]);
+                let flags = rng.pick(&[0, 0, 1, 3, 6, 9, 10, 0xffff, 0x1_0005]);
+                format!("z{i}:{method}:{flags}")
+            }
+            _ => {
+                // IS_TORRENTZIP (refused), WANT_TORRENTZIP,
+                // CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE, RDONLY
+                let flag = rng.pick(&[4, 8, 8, 16, 2]);
                 format!("f{flag}:{}", rng.below(2))
             }
         };
@@ -1908,8 +2171,9 @@ fn zip64_edge_values_read_back() {
     let mut za = Archive::open(zip.as_slice(), OpenFlags(0)).unwrap();
     za.set_archive_comment(b"hi").unwrap();
     let mut out = std::io::Cursor::new(Vec::new());
+    let expected = archive_state(&za);
     assert_eq!(za.close_to(&mut out).unwrap(), Closed::Written);
-    check_written(&za, out.get_ref());
+    check_written(&expected, out.get_ref());
     let written = Archive::open(out.get_ref().as_slice(), OpenFlags(0)).unwrap();
     assert_eq!(
         written.stat_index(0, Flags::NONE).unwrap().size,
@@ -1939,13 +2203,16 @@ fn port_edits_as_recorded() {
 fn record_edit_answers() {
     let mut oracle = Oracle::spawn().expect("the oracle is built");
     let mut rng = Rng(0x3000_0003);
-    // Not those where the port writes differently, as the recorded answer
-    // may be a hash.
+    // Not those where the port writes differently, or reads Deflate64
+    // where libzip refuses it, as the recorded answer may be a hash.
     let mut requests = edit_requests(&mut rng, 700);
     requests.extend(editb_requests(&mut rng, 400));
     let requests = requests
         .into_iter()
-        .filter(|request| !writes_invalid_zip64(&oracle.ask(request)))
+        .filter(|request| {
+            let want = oracle.ask(request);
+            !writes_invalid_zip64(&want) && !(want.ends_with(" |e16/0") && has_deflate64(request))
+        })
         .collect();
     record(
         &recorded_edit_path(),

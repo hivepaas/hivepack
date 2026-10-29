@@ -88,6 +88,8 @@ impl Flags {
     pub const ENC_UTF_8: Flags = Flags(2048);
     /// `ZIP_FL_ENC_CP437`: string is CP437 encoded.
     pub const ENC_CP437: Flags = Flags(4096);
+    /// `ZIP_FL_OVERWRITE`: when adding, replace the entry with the name.
+    pub const OVERWRITE: Flags = Flags(8192);
 }
 
 flag_type!(
@@ -110,6 +112,9 @@ impl ArchiveFlags {
 
 /// Compression methods: `ZIP_CM_*`.
 pub mod cm {
+    /// better of deflate or store, for
+    /// [`Archive::set_file_compression`](crate::Archive::set_file_compression)
+    pub const DEFAULT: i32 = -1;
     /// stored (uncompressed)
     pub const STORE: u16 = 0;
     /// shrunk

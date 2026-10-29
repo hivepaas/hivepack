@@ -4,10 +4,12 @@
 //! standard error with those the script gives.
 //!
 //! The programs are this crate's `ziptool`, which stands for libzip's
-//! `ziptool_regress`, and `tryopen`. The tests run are those that only read:
-//! a test that changes an archive, needs a feature hivepack-zip has not got
-//! yet (encryption, bzip2, LZMA, Zstandard), or another of libzip's test
-//! programs, is skipped and counted. The tests come from the libzip 1.12.1
+//! `ziptool_regress`, and `tryopen`. A test that uses a command the port's
+//! ziptool has not got yet (adding data, compression, encryption), needs a
+//! feature hivepack-zip has not got (bzip2, LZMA, Zstandard), or runs
+//! another of libzip's test programs, is skipped and counted. Each file a
+//! test gives must hold what it says afterwards, or be gone where it says
+//! `{}`, and no other file may be left in the folder. The tests come from the libzip 1.12.1
 //! release that `scripts/testdata.py fetch --group generated` fetches; without
 //! it the test notes that and passes, unless `HIVEPACK_TESTDATA_REQUIRED`
 //! names the group.
@@ -18,11 +20,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// The commands of the port's ziptool, with how many arguments each takes.
-const READ_COMMANDS: &[(&str, usize)] = &[
+const COMMANDS: &[(&str, usize)] = &[
     ("cat", 1),
     ("cat_partial", 3),
     ("count_extra", 2),
     ("count_extra_by_id", 3),
+    ("delete", 1),
+    ("delete_extra", 3),
+    ("delete_extra_by_id", 4),
     ("extract_as", 2),
     ("fopen", 1),
     ("fread", 2),
@@ -33,8 +38,33 @@ const READ_COMMANDS: &[(&str, usize)] = &[
     ("get_file_comment", 1),
     ("get_num_entries", 1),
     ("name_locate", 2),
+    ("rename", 2),
+    ("set_archive_comment", 1),
+    ("set_archive_flag", 2),
+    ("set_extra", 5),
+    ("set_file_comment", 2),
+    ("set_file_dostime", 3),
+    ("set_file_mtime", 2),
+    ("set_file_mtime_all", 1),
     ("stat", 1),
+    ("unchange", 1),
+    ("unchange_all", 0),
 ];
+
+/// The tests that wait for what the port cannot do yet, and why.
+const WAITING: &[(&str, &str)] = &[
+    ("convert_to_torrentzip", "recompresses"),
+    ("convert_to_torrentzip_ef", "recompresses"),
+];
+
+/// What a file of a test holds: nothing (`{}`, no file), the lines given
+/// in the script (`<inline>`), or a file of libzip's.
+#[derive(Clone, PartialEq)]
+enum Content {
+    None,
+    Inline(Vec<u8>),
+    File(String),
+}
 
 /// A test, as its script describes it.
 #[derive(Default)]
@@ -42,8 +72,9 @@ struct Test {
     program: Option<String>,
     arguments: Vec<String>,
     ret: i32,
-    /// (name in the test folder, input file, expected file afterwards)
-    files: Vec<(String, String, Option<String>)>,
+    /// (name in the test folder, what it holds before, what it must hold
+    /// after: the same if not given)
+    files: Vec<(String, Content, Option<Content>)>,
     stdin: Vec<String>,
     stdout: Vec<String>,
     stderr: Vec<String>,
@@ -51,18 +82,28 @@ struct Test {
     skip: Option<String>,
 }
 
-/// The words of an `arguments` line, with double quotes grouping.
+/// The words of an `arguments` line, with double quotes grouping, and in
+/// them `\n`, `\r` and `\t` for those characters and a backslash before
+/// any other for it.
 fn words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quoted = false;
     let mut in_word = false;
-    for c in line.chars() {
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
         match c {
             '"' => {
                 quoted = !quoted;
                 in_word = true;
             }
+            '\\' if quoted => match chars.next() {
+                Some('n') => word.push('\n'),
+                Some('r') => word.push('\r'),
+                Some('t') => word.push('\t'),
+                Some(other) => word.push(other),
+                None => {}
+            },
             c if c.is_whitespace() && !quoted => {
                 if in_word {
                     words.push(std::mem::take(&mut word));
@@ -103,19 +144,20 @@ fn parse(text: &str) -> Test {
             "return" => test.ret = rest.trim().parse().unwrap(),
             "file" => {
                 let parts: Vec<&str> = rest.split_whitespace().collect();
-                // A file given in the script, and what it must hold after:
-                // the tests that have them all change files.
-                for part in &parts[1..] {
-                    if *part == "<inline>" {
-                        inline(&mut lines);
-                        test.skip.get_or_insert("changes a file".into());
-                    }
-                }
-                test.files.push((
-                    parts[0].into(),
-                    parts[1].into(),
-                    parts.get(2).map(|p| p.to_string()),
-                ));
+                let mut content = |part: &str| match part {
+                    "{}" => Content::None,
+                    // The lines of the script, each ending in a newline.
+                    "<inline>" => Content::Inline(
+                        inline(&mut lines)
+                            .iter()
+                            .flat_map(|l| format!("{l}\n").into_bytes())
+                            .collect(),
+                    ),
+                    file => Content::File(file.into()),
+                };
+                let before = content(parts[1]);
+                let after = parts.get(2).map(|p| content(p));
+                test.files.push((parts[0].into(), before, after));
             }
             "stdin" if rest.is_empty() => test.stdin = inline(&mut lines),
             "stdout" if rest.is_empty() => test.stdout = inline(&mut lines),
@@ -133,22 +175,8 @@ fn unsupported(test: &Test) -> Option<String> {
     if let Some(skip) = &test.skip {
         return Some(skip.clone());
     }
-    for (_, input, expected) in &test.files {
-        if input == "{}" || expected.as_ref().is_some_and(|e| e != input) {
-            return Some("changes a file".into());
-        }
-    }
     match test.program.as_deref() {
-        Some("tryopen") => {
-            if test
-                .arguments
-                .iter()
-                .any(|a| a.starts_with('-') && a.contains('t'))
-            {
-                return Some("truncates".into());
-            }
-            None
-        }
+        Some("tryopen") => None,
         None => {
             let mut i = 0;
             let args = &test.arguments;
@@ -180,7 +208,7 @@ fn unsupported(test: &Test) -> Option<String> {
             };
             let mut j = 0;
             while j < commands.len() {
-                match READ_COMMANDS.iter().find(|(name, _)| *name == commands[j]) {
+                match COMMANDS.iter().find(|(name, _)| *name == commands[j]) {
                     Some((_, count)) => j += 1 + count,
                     None => return Some(format!("command {}", commands[j])),
                 }
@@ -209,16 +237,25 @@ fn strip_program(line: &str) -> String {
 
 /// Runs `test` in `folder`: `Err` with what differs.
 fn run(test: &Test, regress: &Path, extracted: &Path, folder: &Path) -> Result<(), String> {
-    for (name, input, _) in &test.files {
-        let source = [
-            regress.join(input),
-            regress.join("data").join(input),
-            extracted.join(input),
+    // What a file of libzip's holds: in regress/, regress/data/, or among
+    // the archives extracted for the tests.
+    let read = |file: &str| -> Result<Vec<u8>, String> {
+        [
+            regress.join(file),
+            regress.join("data").join(file),
+            extracted.join(file),
         ]
         .into_iter()
         .find(|p| p.is_file())
-        .ok_or(format!("no input file {input}"))?;
-        std::fs::copy(source, folder.join(name)).unwrap();
+        .map(|p| std::fs::read(p).unwrap())
+        .ok_or(format!("no file {file}"))
+    };
+    for (name, before, _) in &test.files {
+        match before {
+            Content::None => {}
+            Content::Inline(data) => std::fs::write(folder.join(name), data).unwrap(),
+            Content::File(file) => std::fs::write(folder.join(name), read(file)?).unwrap(),
+        }
     }
     let program = match test.program.as_deref() {
         Some("tryopen") => env!("CARGO_BIN_EXE_tryopen"),
@@ -269,15 +306,51 @@ fn run(test: &Test, regress: &Path, extracted: &Path, folder: &Path) -> Result<(
             test.stderr.join("\n")
         ));
     }
-    for (name, input, expected) in &test.files {
-        let expected = expected.as_ref().unwrap_or(input);
-        let source = [regress.join(expected), regress.join("data").join(expected)]
-            .into_iter()
-            .find(|p| p.is_file());
-        if let Some(source) = source
-            && std::fs::read(folder.join(name)).ok() != std::fs::read(source).ok()
+    for (name, before, after) in &test.files {
+        let want = match after.as_ref().unwrap_or(before) {
+            Content::None => None,
+            Content::Inline(data) => Some(data.clone()),
+            Content::File(file) => Some(read(file)?),
+        };
+        // nihtest.conf's comparators: an archive written as one with the
+        // same name is compared with `zipcmp -pv`, anything else byte for
+        // byte.
+        if let (Some(Content::File(expected)), Some(_)) = (after, &want)
+            && name.ends_with(".zip")
+            && expected.ends_with(".zip")
+            && folder.join(name).is_file()
         {
-            problems.push(format!("{name} changed"));
+            let expected_path = [regress.join(expected), regress.join("data").join(expected)]
+                .into_iter()
+                .find(|p| p.is_file())
+                .ok_or(format!("no file {expected}"))?;
+            let zipcmp = Command::new(env!("CARGO_BIN_EXE_zipcmp"))
+                .arg("-pv")
+                .arg(&expected_path)
+                .arg(folder.join(name))
+                .output()
+                .unwrap();
+            if !zipcmp.status.success() {
+                problems.push(format!(
+                    "{name} differs:\n{}",
+                    String::from_utf8_lossy(&zipcmp.stdout)
+                ));
+            }
+            continue;
+        }
+        let got = std::fs::read(folder.join(name)).ok();
+        if got != want {
+            problems.push(match (&got, &want) {
+                (None, _) => format!("{name} is not there"),
+                (_, None) => format!("{name} is there"),
+                _ => format!("{name} differs"),
+            });
+        }
+    }
+    for entry in std::fs::read_dir(folder).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if !test.files.iter().any(|(listed, _, _)| *listed == name) {
+            problems.push(format!("{name} is left"));
         }
     }
     if problems.is_empty() {
@@ -350,6 +423,10 @@ fn libzip_tests_pass() {
     for path in &names {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         let test = parse(&std::fs::read_to_string(path).unwrap());
+        if let Some((_, why)) = WAITING.iter().find(|(waiting, _)| *waiting == name) {
+            skipped.push(format!("{name}: {why}"));
+            continue;
+        }
         if let Some(why) = unsupported(&test) {
             skipped.push(format!("{name}: {why}"));
             continue;

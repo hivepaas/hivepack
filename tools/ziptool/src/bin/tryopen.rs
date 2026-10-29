@@ -4,24 +4,23 @@
 use std::process::ExitCode;
 
 use hivepack_zip::{Error, Flags, OpenFlags, SystemType};
-use ziptool::{Create, Getopt, zip_open};
+use ziptool::{Getopt, zip_close, zip_open};
 
 const TRYOPEN_USAGE: &str = "usage: {} [-cent] file\n\n\t-c\tcheck consistency\n\t-e\texclusively open archive\n\t-n\tcreate new file\n\t-s\tprint error string\n\t-t\ttruncate file to size 0";
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let mut flags = OpenFlags(0);
-    let mut create = Create::default();
     let mut error_strings = false;
 
     let mut getopt = Getopt::new(&argv);
     while let Some(option) = getopt.next("censt") {
         match option {
             Ok(('c', _)) => flags = flags | OpenFlags::CHECKCONS,
-            Ok(('e', _)) => create.excl = true,
-            Ok(('n', _)) => create.create = true,
+            Ok(('e', _)) => flags = flags | OpenFlags::EXCL,
+            Ok(('n', _)) => flags = flags | OpenFlags::CREATE,
             Ok(('s', _)) => error_strings = true,
-            Ok(('t', _)) => create.truncate = true,
+            Ok(('t', _)) => flags = flags | OpenFlags::TRUNCATE,
             _ => {
                 eprintln!("{}", TRYOPEN_USAGE.replacen("{}", &argv[0], 1));
                 return ExitCode::from(1);
@@ -31,12 +30,13 @@ fn main() -> ExitCode {
 
     let mut error_count = 0;
     for fname in &argv[getopt.optind..] {
-        match zip_open(fname, flags, create, 0, 0) {
-            Ok(z) => {
+        match zip_open(fname, flags, 0, 0) {
+            Ok(mut z) => {
                 println!(
                     "opening '{fname}' succeeded, {} entries",
                     z.get_num_entries(Flags::NONE)
                 );
+                let _ = zip_close(&mut z, fname);
                 continue;
             }
             Err(error) => {

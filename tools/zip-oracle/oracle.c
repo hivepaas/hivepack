@@ -9,10 +9,10 @@
  * MS-DOS times into time_t with mktime.
  *
  * Byte strings are hexadecimal, and "-" is an empty one. An error is
- * "e<zip error>/<system error>". errno is cleared before each request and
- * before zip_close: libzip gives it, stale, with some errors (ZIP_ER_SEEK
- * when a local header's extra fields cannot be reached), where the port
- * gives 0.
+ * "e<zip error>/<system error>". errno is cleared before each request,
+ * and in edit requests before each edit, each entry's answers and
+ * zip_close: libzip gives it, stale, with some errors (ZIP_ER_SEEK when a
+ * local header's extra fields cannot be reached), where the port gives 0.
  *
  *   open <flags> <source> <hex>
  *       zip_open_from_source with <flags> | ZIP_RDONLY, on <hex> as a buffer
@@ -74,13 +74,23 @@
  *         U                         zip_unchange_all
  *         A                         zip_unchange_archive
  *         f<flag>:<value>           zip_set_archive_flag
+ *         e<i>:<id>:<idx>:<data>:<flags>  zip_file_extra_field_set
+ *         E<i>:<id>:<idx>:<flags>   zip_file_extra_field_delete_by_id
+ *         D<i>:<idx>:<flags>        zip_file_extra_field_delete
  *       Answered with the error of opening, or "ok", each op's result (" 0"
  *       or " " and the error), " |" and the archive comment with 0 and
  *       ZIP_FL_UNCHANGED, then for each entry " |" and "<name>/<name as
- *       read>/<comment>/<opsys>:<attributes>/<mtime>/<index of the name>",
- *       each an error if it fails, then " |" and the error of zip_close,
+ *       read>/<comment>/<opsys>:<attributes>/<mtime>/<index of the
+ *       name>/c<central extra fields>/l<local ones>", each an error if it
+ *       fails, the extra fields as open has them, then " |" and the error of zip_close,
  *       or "unchanged" (the file was not written), "removed" or "written
  *       <hex>" with the file written.
+ *
+ *   editb <flags> <fragment> <ops> <hex>
+ *       As edit, on a buffer source of <hex> in fragments of <fragment>
+ *       bytes (one if 0), as ziptool's -m and -F make it, which can clone
+ *       what zip_close keeps. After zip_close, " |" and "deleted" if the
+ *       buffer was removed, or "buffer <hex>" with what it holds.
  */
 
 #include <errno.h>
@@ -357,10 +367,10 @@ done:
 /* Applies one op of an edit request; its result, 0 or -1. */
 static int edit_op(zip_t *za, char *op) {
     char *rest = op + 1;
-    char *fields[3] = {rest, NULL, NULL};
+    char *fields[5] = {rest, NULL, NULL, NULL, NULL};
     int count = 1;
     char *colon;
-    while (count < 3 && (colon = strchr(fields[count - 1], ':')) != NULL) {
+    while (count < 5 && (colon = strchr(fields[count - 1], ':')) != NULL) {
         *colon = '\0';
         fields[count++] = colon + 1;
     }
@@ -409,15 +419,50 @@ static int edit_op(zip_t *za, char *op) {
         return zip_unchange_archive(za);
     case 'f':
         return zip_set_archive_flag(za, (zip_flags_t)strtoul(fields[0], NULL, 10), atoi(fields[1]));
+    case 'e': {
+        size_t len;
+        unsigned char *data = unhex(fields[3], &len);
+        int ret = zip_file_extra_field_set(za, strtoull(fields[0], NULL, 10), (zip_uint16_t)atoi(fields[1]),
+                                           (zip_uint16_t)atoi(fields[2]), data, (zip_uint16_t)len,
+                                           (zip_flags_t)strtoul(fields[4], NULL, 10));
+        free(data);
+        return ret;
+    }
+    case 'E':
+        return zip_file_extra_field_delete_by_id(za, strtoull(fields[0], NULL, 10), (zip_uint16_t)atoi(fields[1]),
+                                                 (zip_uint16_t)atoi(fields[2]), (zip_flags_t)strtoul(fields[3], NULL, 10));
+    case 'D':
+        return zip_file_extra_field_delete(za, strtoull(fields[0], NULL, 10), (zip_uint16_t)atoi(fields[1]),
+                                           (zip_flags_t)strtoul(fields[2], NULL, 10));
     default:
         return -2;
     }
 }
 
-static void do_edit(int flags, char *ops, const char *data_hex) {
+/* A buffer source of data in fragments of fragment_size bytes, or one. */
+static zip_source_t *fragment_source(unsigned char *data, size_t len, size_t fragment_size, zip_buffer_fragment_t **fragmentsp,
+                                     zip_error_t *error) {
+    zip_uint64_t nfragments, i;
+    zip_buffer_fragment_t *fragments;
+
+    if (fragment_size == 0 || len == 0)
+        return zip_source_buffer_create(len ? data : NULL, len, 0, error);
+    nfragments = (len + fragment_size - 1) / fragment_size;
+    fragments = malloc(sizeof(fragments[0]) * nfragments);
+    for (i = 0; i < nfragments; i++) {
+        fragments[i].data = data + i * fragment_size;
+        fragments[i].length = ZIP_MIN(fragment_size, len - i * fragment_size);
+    }
+    *fragmentsp = fragments;
+    return zip_source_buffer_fragment_create(fragments, nfragments, 0, error);
+}
+
+/* An edit request, on a file if fragment is -1, else on a buffer. */
+static void do_edit(int flags, long long fragment, char *ops, const char *data_hex) {
     size_t len;
     unsigned char *data = unhex(data_hex, &len);
     char path[] = "/tmp/zip-oracle-XXXXXX";
+    zip_buffer_fragment_t *fragments = NULL;
     zip_error_t error;
     zip_source_t *src;
     zip_t *za;
@@ -426,22 +471,32 @@ static void do_edit(int flags, char *ops, const char *data_hex) {
     int comment_len;
     const char *comment;
     char *op;
-    int fd = mkstemp(path);
+    int made_file = 0;
 
-    if (fd < 0 || write(fd, data, len) != (ssize_t)len) {
-        puts("bad");
-        free(data);
-        return;
-    }
-    close(fd);
-    stat(path, &before);
     zip_error_init(&error);
-    if ((src = zip_source_file_create(path, 0, -1, &error)) == NULL) {
+    if (fragment < 0) {
+        int fd = mkstemp(path);
+        if (fd < 0 || write(fd, data, len) != (ssize_t)len) {
+            puts("bad");
+            free(data);
+            return;
+        }
+        close(fd);
+        made_file = 1;
+        stat(path, &before);
+        src = zip_source_file_create(path, 0, -1, &error);
+    }
+    else {
+        src = fragment_source(data, len, (size_t)fragment, &fragments, &error);
+    }
+    if (src == NULL) {
         put_error(&error);
         putchar('\n');
         goto done;
     }
+    zip_source_keep(src);
     if ((za = zip_open_from_source(src, flags, &error)) == NULL) {
+        zip_source_free(src);
         zip_source_free(src);
         put_error(&error);
         putchar('\n');
@@ -451,7 +506,9 @@ static void do_edit(int flags, char *ops, const char *data_hex) {
     fputs("ok", stdout);
     if (strcmp(ops, "-") != 0) {
         for (op = strtok(ops, ","); op; op = strtok(NULL, ",")) {
-            int ret = edit_op(za, op);
+            int ret;
+            errno = 0;
+            ret = edit_op(za, op);
             putchar(' ');
             if (ret == 0)
                 putchar('0');
@@ -477,6 +534,7 @@ static void do_edit(int flags, char *ops, const char *data_hex) {
         const char *name;
 
         fputs(" |", stdout);
+        errno = 0;
         put_name(za, i, 0);
         putchar('/');
         put_name(za, i, ZIP_FL_UNCHANGED);
@@ -497,6 +555,10 @@ static void do_edit(int flags, char *ops, const char *data_hex) {
             put_locate(za, name, 0);
         else
             put_error(zip_get_error(za));
+        fputs("/c", stdout);
+        put_extra_fields(za, i, ZIP_FL_CENTRAL);
+        fputs("/l", stdout);
+        put_extra_fields(za, i, ZIP_FL_LOCAL);
     }
 
     fputs(" |", stdout);
@@ -504,6 +566,30 @@ static void do_edit(int flags, char *ops, const char *data_hex) {
     if (zip_close(za) < 0) {
         put_error(zip_get_error(za));
         zip_discard(za);
+    }
+    else if (fragment >= 0) {
+        zip_stat_t st;
+        zip_stat_init(&st);
+        if (zip_source_open(src) < 0) {
+            if (zip_error_code_zip(zip_source_error(src)) == ZIP_ER_DELETED)
+                fputs("deleted", stdout);
+            else
+                put_error(zip_source_error(src));
+        }
+        else {
+            unsigned char buffer[8192];
+            zip_int64_t got, total = 0;
+            fputs("buffer ", stdout);
+            while ((got = zip_source_read(src, buffer, sizeof(buffer))) > 0) {
+                zip_int64_t k;
+                for (k = 0; k < got; k++)
+                    printf("%02x", buffer[k]);
+                total += got;
+            }
+            if (total == 0)
+                putchar('-');
+            zip_source_close(src);
+        }
     }
     else if (stat(path, &after) < 0) {
         fputs("removed", stdout);
@@ -528,9 +614,13 @@ static void do_edit(int flags, char *ops, const char *data_hex) {
     }
     putchar('\n');
 
+    zip_source_free(src);
+
 done:
     zip_error_fini(&error);
-    unlink(path);
+    if (made_file)
+        unlink(path);
+    free(fragments);
     free(data);
 }
 
@@ -679,7 +769,9 @@ int main(void) {
         else if (count == 6 && strcmp(words[0], "range") == 0)
             do_range(atoi(words[1]), words[2], strtoull(words[3], NULL, 10), atoll(words[4]), words[5]);
         else if (count == 4 && strcmp(words[0], "edit") == 0)
-            do_edit(atoi(words[1]), words[2], words[3]);
+            do_edit(atoi(words[1]), -1, words[2], words[3]);
+        else if (count == 5 && strcmp(words[0], "editb") == 0)
+            do_edit(atoi(words[1]), atoll(words[2]), words[3], words[4]);
         else if (count == 7 && strcmp(words[0], "read") == 0)
             do_read(atoi(words[1]), words[2], atoi(words[3]), words[4], atoll(words[5]), words[6]);
         else

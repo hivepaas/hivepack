@@ -10,7 +10,7 @@ use crate::open::Archive;
 use crate::source::{ReadAt, Whence};
 use crate::source_write::Output;
 use crate::zip::Flags;
-use crate::zipint::{EF_CENTRAL, EF_LOCAL, ef_is_internal};
+use crate::zipint::{EF_CENTRAL, EF_LOCAL, EXTRA_FIELD_ALL, EXTRA_FIELD_NEW, ef_is_internal};
 
 /// `zip_extra_field_t`: one field, its header id and data. A list of them
 /// is a `Vec`, in the order of the header.
@@ -116,7 +116,107 @@ fn ef_count(ef: &[ExtraField], id: i32) -> i16 {
         .count() as i16
 }
 
+/// Deletes field number `id_idx` with header id `id` (any, with
+/// `ZIP_EXTRA_FIELD_ALL`), or all of them with `ZIP_EXTRA_FIELD_ALL`: port
+/// of `_zip_ef_delete_by_id`.
+fn ef_delete_by_id(ef: &mut Vec<ExtraField>, id: u16, id_idx: u16) {
+    let mut i: u32 = 0;
+    let mut at = 0;
+    while at < ef.len() {
+        if ef[at].id == id || id == EXTRA_FIELD_ALL {
+            if id_idx == EXTRA_FIELD_ALL || i == u32::from(id_idx) {
+                ef.remove(at);
+                if id_idx == EXTRA_FIELD_ALL {
+                    continue;
+                }
+                // Field number id_idx is gone.
+                break;
+            }
+            i += 1;
+            if i > u32::from(id_idx) {
+                break;
+            }
+        }
+        at += 1;
+    }
+}
+
+/// Sets field number `ef_idx` with header id `ef_id` to `data`, or adds
+/// one at the end with `ZIP_EXTRA_FIELD_NEW`, unless the fields would take
+/// more than 65,535 bytes: port of `_zip_ef_set`, with `_zip_ef_find`.
+fn ef_set(ef: &mut Vec<ExtraField>, ef_id: u16, ef_idx: u16, data: &[u8]) -> Result<()> {
+    let found = ef
+        .iter()
+        .enumerate()
+        .filter(|(_, ef)| ef.id == ef_id)
+        .nth(usize::from(ef_idx))
+        .map(|(at, _)| at);
+
+    if found.is_none() && ef_idx != EXTRA_FIELD_NEW {
+        return Err(Error::new(ErrorCode::Inval, 0));
+    }
+
+    // This should not happen, but we want to assume lengths are >= 0
+    // later.
+    let Some(len) = ef_size(ef) else {
+        return Err(Error::new(ErrorCode::EfTooLarge, 0));
+    };
+    let mut new_len = u32::from(len);
+    if let Some(at) = found {
+        new_len -= ef[at].data.len() as u32 + 4;
+    }
+    new_len += data.len() as u32 + 4;
+    if new_len > 0xffff {
+        return Err(Error::new(ErrorCode::EfTooLarge, 0));
+    }
+
+    let ef_new = ExtraField {
+        id: ef_id,
+        data: data.to_vec(),
+    };
+    match found {
+        Some(at) => ef[at] = ef_new,
+        None => ef.push(ef_new),
+    }
+    Ok(())
+}
+
 impl ExtraFields {
+    /// Changes the fields of the local header with `f`; none if they were
+    /// not read, as for a new entry.
+    fn with_local<T>(&mut self, f: impl FnOnce(&mut Vec<ExtraField>) -> T) -> T {
+        let mut local = std::mem::take(&mut self.local)
+            .into_inner()
+            .unwrap_or_default();
+        let ret = f(&mut local);
+        self.local = OnceLock::from(local);
+        ret
+    }
+
+    /// Deletes fields from the local header, the central directory or
+    /// both, as `flags` ask: port of `_zip_extra_fields_delete_by_id`.
+    pub(crate) fn delete_by_id(&mut self, ef_id: u16, ef_idx: u16, flags: Flags) {
+        if flags.intersects(EF_LOCAL) {
+            self.with_local(|local| ef_delete_by_id(local, ef_id, ef_idx));
+        }
+        if flags.intersects(EF_CENTRAL) {
+            ef_delete_by_id(&mut self.central, ef_id, ef_idx);
+        }
+    }
+
+    /// Sets a field in the local header, then the central directory, as
+    /// `flags` ask: port of `_zip_extra_fields_set`. If the second fails,
+    /// the first stays set, as in libzip.
+    pub(crate) fn set(&mut self, flags: Flags, ef_id: u16, ef_idx: u16, data: &[u8]) -> Result<()> {
+        if flags.intersects(EF_LOCAL) {
+            self.with_local(|local| ef_set(local, ef_id, ef_idx, data))?;
+        }
+        if flags.intersects(EF_CENTRAL) {
+            ef_set(&mut self.central, ef_id, ef_idx, data)?;
+        }
+        Ok(())
+    }
+
     /// The data of field number `extra_field_index` with header id
     /// `extra_field_id`, looked for in the local header first, then in the
     /// central directory, as `flags` allow: port of

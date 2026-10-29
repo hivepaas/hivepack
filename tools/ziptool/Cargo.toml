@@ -1,9 +1,9 @@
 [package]
 name = "ziptool"
 version = "0.0.0"
-description = "libzip's ziptool and tryopen on hivepack-zip, the programs libzip's tests run"
+description = "libzip's ziptool, tryopen and zipcmp on hivepack-zip, the programs libzip's tests run"
 publish = false
-# Ported from libzip's src/ziptool.c and regress/programs.
+# Ported from libzip's src/ziptool.c, src/zipcmp.c and regress/programs.
 license = "BSD-3-Clause"
 edition.workspace = true
 rust-version.workspace = true
@@ -12,4 +12,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+hivepack-deflate.workspace = true
 hivepack-zip.workspace = true

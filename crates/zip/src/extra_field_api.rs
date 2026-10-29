@@ -1,11 +1,12 @@
-//! Reading extra fields: port of `zip_extra_field_api.c`, the reading half.
+//! Reading and changing extra fields: port of `zip_extra_field_api.c`.
 
+use crate::dirent::Dirent;
 use crate::error::{Error, ErrorCode, Result};
 use crate::extra_field::ExtraField;
 use crate::open::Archive;
 use crate::source::ReadAt;
 use crate::zip::Flags;
-use crate::zipint::{EF_BOTH, EF_CENTRAL};
+use crate::zipint::{EF_BOTH, EF_CENTRAL, EXTRA_FIELD_ALL, changed, ef_is_internal};
 
 impl<R: ReadAt> Archive<R> {
     /// Extra field number `ef_idx` of entry `idx`, counted through those of
@@ -57,6 +58,134 @@ impl<R: ReadAt> Archive<R> {
             self.read_local_ef(idx)?;
         }
         Ok(self.get_dirent(idx, flags)?.extra_fields.count(id, flags))
+    }
+
+    /// Deletes extra field number `ef_idx` of entry `idx`, counted through
+    /// the fields of the local header or the central directory, as `flags`
+    /// ask, or all of them with [`EXTRA_FIELD_ALL`]: port of
+    /// `zip_file_extra_field_delete`. With both, only all can be deleted.
+    pub fn file_extra_field_delete(&mut self, idx: u64, ef_idx: u16, flags: Flags) -> Result<()> {
+        self.extra_field_delete_impl(idx, EXTRA_FIELD_ALL, ef_idx, flags, true)
+    }
+
+    /// Deletes extra field number `ef_idx` among those of entry `idx` with
+    /// header id `ef_id`, or all of them with [`EXTRA_FIELD_ALL`]: port of
+    /// `zip_file_extra_field_delete_by_id`.
+    pub fn file_extra_field_delete_by_id(
+        &mut self,
+        idx: u64,
+        ef_id: u16,
+        ef_idx: u16,
+        flags: Flags,
+    ) -> Result<()> {
+        self.extra_field_delete_impl(idx, ef_id, ef_idx, flags, false)
+    }
+
+    fn extra_field_delete_impl(
+        &mut self,
+        idx: u64,
+        ef_id: u16,
+        ef_idx: u16,
+        flags: Flags,
+        any_id: bool,
+    ) -> Result<()> {
+        if !flags.intersects(EF_BOTH) {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        if flags.contains(EF_BOTH) && ef_idx != EXTRA_FIELD_ALL {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        self.get_dirent(idx, Flags::NONE)?;
+
+        if self.is_rdonly() {
+            return Err(Error::new(ErrorCode::RdOnly, 0));
+        }
+        // Since torrentzip does not allow extra fields, allow deleting all
+        // of them (zip_file_extra_field_delete). Also, this is used
+        // internally by zip_file_replace().
+        if self.want_torrentzip()
+            && (!any_id || ef_idx != EXTRA_FIELD_ALL || !flags.contains(EF_BOTH))
+        {
+            return Err(Error::new(ErrorCode::NotAllowed, 0));
+        }
+
+        self.file_extra_field_prepare_for_change(idx)?;
+
+        if let Some(de) = self.entry[idx as usize].changes.as_deref_mut() {
+            de.extra_fields.delete_by_id(ef_id, ef_idx, flags);
+        }
+        Ok(())
+    }
+
+    /// Sets extra field number `ef_idx` with header id `ef_id` of entry
+    /// `idx` to `data`, in the local header or the central directory or
+    /// both, as `flags` ask, or adds one at the end with
+    /// [`EXTRA_FIELD_NEW`](crate::EXTRA_FIELD_NEW): port of `zip_file_extra_field_set`. The fields
+    /// libzip writes itself (Zip64, the Info-ZIP UTF-8 name and comment,
+    /// WinZip AES) cannot be set.
+    pub fn file_extra_field_set(
+        &mut self,
+        idx: u64,
+        ef_id: u16,
+        ef_idx: u16,
+        data: &[u8],
+        flags: Flags,
+    ) -> Result<()> {
+        if !flags.intersects(EF_BOTH) {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        let Ok(_) = u16::try_from(data.len()) else {
+            // Differs from libzip, which takes the length as a zip_uint16_t.
+            return Err(Error::new(ErrorCode::Inval, 0));
+        };
+
+        self.get_dirent(idx, Flags::NONE)?;
+
+        if self.is_rdonly() {
+            return Err(Error::new(ErrorCode::RdOnly, 0));
+        }
+        if self.want_torrentzip() {
+            return Err(Error::new(ErrorCode::NotAllowed, 0));
+        }
+
+        if ef_is_internal(ef_id) {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        self.file_extra_field_prepare_for_change(idx)?;
+
+        match self.entry[idx as usize].changes.as_deref_mut() {
+            Some(de) => de.extra_fields.set(flags, ef_id, ef_idx, data),
+            None => Err(Error::new(ErrorCode::Internal, 0)),
+        }
+    }
+
+    /// Gives entry `idx` a dirent of changes with the extra fields of both
+    /// headers, to be changed: port of
+    /// `_zip_file_extra_field_prepare_for_change`.
+    fn file_extra_field_prepare_for_change(&mut self, idx: u64) -> Result<()> {
+        if idx >= self.entry.len() as u64 {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+
+        let e = &self.entry[idx as usize];
+        if e.changed(changed::EXTRA_FIELD) {
+            return Ok(());
+        }
+
+        if e.orig.is_some() {
+            self.read_local_ef(idx)?;
+        }
+
+        let e = &mut self.entry[idx as usize];
+        let changes = e
+            .changes
+            .get_or_insert_with(|| Box::new(Dirent::clone_changes(e.orig.as_deref())));
+        changes.changed |= changed::EXTRA_FIELD;
+        Ok(())
     }
 
     /// Port of `_zip_file_extra_field_get`. The field is found first, then

@@ -114,22 +114,7 @@ fn describe<R: ReadAt>(result: hivepack_zip::Result<Archive<R>>) -> String {
             }
         }
         for (tag, flags) in [("c", Flags::CENTRAL), ("l", Flags::LOCAL)] {
-            text.push_str(&format!(" {tag}"));
-            match za.file_extra_fields_count(i, flags) {
-                Ok(count) => {
-                    text.push_str(&format!("{count}:"));
-                    for j in 0..count {
-                        if j > 0 {
-                            text.push(',');
-                        }
-                        match za.file_extra_field_get(i, j as u16, flags) {
-                            Ok((id, data)) => text.push_str(&format!("{id}={}", hex(data))),
-                            Err(e) => text.push_str(&error_text(e)),
-                        }
-                    }
-                }
-                Err(e) => text.push_str(&error_text(e)),
-            }
+            text.push_str(&format!(" {tag}{}", extra_fields(&za, i, flags)));
         }
         match za.file_get_offset(i) {
             Ok(offset) => text.push_str(&format!(" o{offset}")),
@@ -163,6 +148,22 @@ fn describe<R: ReadAt>(result: hivepack_zip::Result<Archive<R>>) -> String {
         }
     }
     text
+}
+
+/// The oracle's `put_extra_fields`: the count and each field of entry `i`
+/// as `flags` ask, or the error.
+fn extra_fields<R: ReadAt>(za: &Archive<R>, i: u64, flags: Flags) -> String {
+    let count = match za.file_extra_fields_count(i, flags) {
+        Ok(count) => count,
+        Err(e) => return error_text(e),
+    };
+    let fields: Vec<String> = (0..count)
+        .map(|j| match za.file_extra_field_get(i, j as u16, flags) {
+            Ok((id, data)) => format!("{id}={}", hex(data)),
+            Err(e) => error_text(e),
+        })
+        .collect();
+    format!("{count}:{}", fields.join(","))
 }
 
 fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -338,12 +339,12 @@ fn respond<R: ReadAt>(words: &[&str], result: hivepack_zip::Result<Archive<R>>) 
     }
 }
 
-/// The port's answer to an `edit` request: the edits made to the archive
-/// opened from a file, as the oracle opens it, then the archive written.
-fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
+/// The port's answer to an `edit` request, but for closing: the edits
+/// made, and what the API then says.
+fn edit_ops_and_state<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
     let mut text = String::from("ok");
     for op in ops.split(',').filter(|&op| op != "-") {
-        let fields: Vec<&str> = op[1..].splitn(3, ':').collect();
+        let fields: Vec<&str> = op[1..].splitn(5, ':').collect();
         let index = || fields[0].parse::<u64>().unwrap();
         let number = |k: usize| fields[k].parse::<i64>().unwrap();
         let flags = |k: usize| Flags(fields[k].parse().unwrap());
@@ -370,6 +371,20 @@ fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
                 Ok(())
             }
             b'f' => za.set_archive_flag(ArchiveFlags(fields[0].parse().unwrap()), fields[1] != "0"),
+            b'e' => za.file_extra_field_set(
+                index(),
+                number(1) as u16,
+                number(2) as u16,
+                &unhex(fields[3]),
+                flags(4),
+            ),
+            b'E' => za.file_extra_field_delete_by_id(
+                index(),
+                number(1) as u16,
+                number(2) as u16,
+                flags(3),
+            ),
+            b'D' => za.file_extra_field_delete(index(), number(1) as u16, flags(2)),
             _ => panic!("unknown op {op}"),
         };
         match result {
@@ -410,12 +425,21 @@ fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
         };
         let _ = write!(
             text,
-            " |{}/{}/{comment}/{attributes}/{mtime}/{found}",
+            " |{}/{}/{comment}/{attributes}/{mtime}/{found}/c{}/l{}",
             name(za, Flags::NONE),
-            name(za, Flags::UNCHANGED)
+            name(za, Flags::UNCHANGED),
+            extra_fields(za, i, Flags::CENTRAL),
+            extra_fields(za, i, Flags::LOCAL)
         );
     }
 
+    text
+}
+
+/// [`edit_ops_and_state`], then the archive written as the oracle's file
+/// source has it written.
+fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
+    let mut text = edit_ops_and_state(za, ops);
     text.push_str(" |");
     let mut out = std::io::Cursor::new(Vec::new());
     match za.close_to(&mut out) {
@@ -437,12 +461,22 @@ fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
 /// writes a size or offset of exactly 0xffffffff, or a disk number of
 /// 0xffff or more, without one, where the port writes it.
 fn writes_invalid_zip64(want: &str) -> bool {
-    want.rsplit_once(" |written ").is_some_and(|(_, written)| {
+    written_part(want).is_some_and(|(_, written)| {
         Archive::open(unhex(written).as_slice(), OpenFlags(0))
             .err()
             .and_then(|e| e.detail())
             .is_some_and(|(detail, _)| detail == Detail::InvalidZip64Ef)
     })
+}
+
+/// An edit answer before the archive written, and the archive, from a
+/// file (`written`) or a buffer (`buffer`).
+fn written_part(answer: &str) -> Option<(&str, &str)> {
+    let (head, tail) = answer.rsplit_once(" |")?;
+    let written = tail
+        .strip_prefix("written ")
+        .or_else(|| tail.strip_prefix("buffer "))?;
+    Some((head, written))
 }
 
 /// Checks the port's answer to an edit request against libzip's: the same,
@@ -451,15 +485,88 @@ fn writes_invalid_zip64(want: &str) -> bool {
 fn assert_edit(request: &str, want: &str, context: &str) {
     let got = answer(request);
     if got != want && writes_invalid_zip64(want) {
-        let head = |answer: &str| {
-            answer
-                .rsplit_once(" |written ")
-                .map(|(head, _)| head.to_string())
-        };
+        let head = |answer: &str| written_part(answer).map(|(head, _)| head.to_string());
         assert_eq!(head(&got), head(want), "{context}");
         return;
     }
     assert_eq!(got, want, "{context}");
+}
+
+/// Whether libzip's buffer source of `len` bytes, in fragments of
+/// `fragment_size` (one if 0), can clone its first `offset` bytes, as
+/// `buffer_clone` decides: not past its end, nor where more of the
+/// fragment it ends in would be left over than it keeps.
+fn buffer_can_clone(len: u64, fragment_size: u64, offset: u64) -> bool {
+    if offset == 0 {
+        return true;
+    }
+    if offset > len {
+        return false;
+    }
+    let fragment_size = if fragment_size == 0 {
+        len
+    } else {
+        fragment_size
+    };
+    let nfragments = len.div_ceil(fragment_size);
+    let length = |i: u64| fragment_size.min(len - i * fragment_size);
+    let mut fragment = (offset / fragment_size).min(nfragments - 1);
+    let mut fragment_offset = offset - fragment * fragment_size;
+    if fragment_offset == 0 {
+        // We can't be at beginning of fragment zero if offset > 0.
+        fragment -= 1;
+        fragment_offset = length(fragment);
+    }
+    length(fragment) - fragment_offset <= offset
+}
+
+/// Whether the data of each entry of `za`, as read, ends before the local
+/// header of the next.
+fn entries_apart<R: ReadAt>(za: &Archive<R>) -> bool {
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    for i in 0..za.get_num_entries(Flags::UNCHANGED) {
+        let (Ok(start), Ok(st)) = (za.file_get_offset(i), za.stat_index(i, Flags::UNCHANGED))
+        else {
+            return false;
+        };
+        spans.push((start, start + st.comp_size));
+    }
+    spans.sort_unstable();
+    // A local header takes 30 bytes at least.
+    spans.windows(2).all(|w| w[0].1 + 30 <= w[1].0)
+}
+
+/// [`edit_ops_and_state`], then the archive written to a buffer source in
+/// fragments of `fragment_size` bytes, as the oracle's `editb` has it.
+fn edit_buffer(data: &[u8], flags: OpenFlags, fragment_size: u64, ops: &str) -> String {
+    let mut za = match Archive::open(data, flags) {
+        Ok(za) => za,
+        Err(e) => return error_text(e),
+    };
+    let mut text = edit_ops_and_state(&mut za, ops);
+    text.push_str(" |");
+    let mut out = std::io::Cursor::new(Vec::new());
+    let len = data.len() as u64;
+    match za.close_to_cloning(&mut out, |offset| {
+        buffer_can_clone(len, fragment_size, offset)
+    }) {
+        Ok(Closed::Unchanged) => {
+            let _ = write!(text, "buffer {}", hex(data));
+        }
+        Ok(Closed::Removed) => text.push_str("deleted"),
+        Ok(Closed::Written) => {
+            // What is kept is kept as it is: an entry before the first one
+            // that changed is cut there if its data reaches past it.
+            if !za.get_archive_flag(ArchiveFlags::WANT_TORRENTZIP, Flags::NONE)
+                && entries_apart(&za)
+            {
+                check_written(&za, out.get_ref());
+            }
+            let _ = write!(text, "buffer {}", hex(out.get_ref()));
+        }
+        Err(e) => text.push_str(&error_text(e)),
+    }
+    text
 }
 
 /// The raw data of entry `i`, as stored.
@@ -556,6 +663,14 @@ fn temporary_path() -> PathBuf {
 /// The port's answer to a request, in the oracle's format.
 fn answer(request: &str) -> String {
     let words: Vec<&str> = request.split(' ').collect();
+    if let ["editb", flags, fragment, ops, data] = words[..] {
+        return edit_buffer(
+            &unhex(data),
+            OpenFlags(flags.parse().unwrap()),
+            fragment.parse().unwrap(),
+            ops,
+        );
+    }
     if let ["edit", flags, ops, data] = words[..] {
         let path = temporary_path();
         std::fs::write(&path, unhex(data)).unwrap();
@@ -1227,7 +1342,14 @@ fn range_requests(rng: &mut Rng, count: usize) -> Vec<String> {
 fn edit_requests(rng: &mut Rng, count: usize) -> Vec<String> {
     (0..count)
         .map(|_| {
-            let flags = rng.pick(&[0, 0, 0, 0, 0, 0, 4, 4, 16]);
+            // Mostly none or ZIP_CHECKCONS, and ZIP_RDONLY, ZIP_CREATE,
+            // ZIP_EXCL, ZIP_TRUNCATE, both of the last and ZIP_RDONLY with
+            // ZIP_TRUNCATE.
+            let flags = match rng.below(14) {
+                0..=7 => 0,
+                8 | 9 => 4,
+                _ => rng.pick(&[16, 1, 2, 8, 9, 24]),
+            };
             let mut zip = archive(rng);
             if rng.below(8) == 0 {
                 zip = damage(rng, &zip);
@@ -1245,6 +1367,19 @@ fn edit_requests(rng: &mut Rng, count: usize) -> Vec<String> {
             }
             let ops = edit_ops(rng, &zip);
             format!("edit {flags} {ops} {}", hex(&zip))
+        })
+        .collect()
+}
+
+/// `count` `editb` requests: as [`edit_requests`], on buffers of every
+/// fragment size.
+fn editb_requests(rng: &mut Rng, count: usize) -> Vec<String> {
+    edit_requests(rng, count)
+        .into_iter()
+        .map(|request| {
+            let (flags, rest) = request["edit ".len()..].split_once(' ').unwrap();
+            let fragment = rng.pick(&[0, 0, 1, 7, 50, 100, 256, 1000, 4096]);
+            format!("editb {flags} {fragment} {rest}")
         })
         .collect()
 }
@@ -1295,7 +1430,7 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
             0 => n + rng.below(3),
             _ => rng.below(n.max(1)),
         };
-        let op = match rng.below(15) {
+        let op = match rng.below(19) {
             0..=2 => format!("d{i}"),
             3..=5 => {
                 let name = match rng.below(5) {
@@ -1356,6 +1491,26 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
             }
             12 => format!("u{i}"),
             13 => rng.pick(&["U", "A"]).to_string(),
+            14 | 15 => {
+                // ZIP_FL_LOCAL, ZIP_FL_CENTRAL or both, or neither.
+                let flags = rng.pick(&[256, 512, 768, 768, 0]);
+                let id = rng.pick(&[0x5455u16, 0xcafe, 0x7875, 0x0001, 0x7075, 0x000a]);
+                let idx = rng.pick(&[0, 0, 1, 2, 0xffff]);
+                let len = rng.pick(&[0, 1, 4, 30]);
+                let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                format!("e{i}:{id}:{idx}:{}:{flags}", hex(&data))
+            }
+            16 => {
+                let flags = rng.pick(&[256, 512, 768, 0]);
+                let id = rng.pick(&[0x5455u16, 0xcafe, 0x7875, 0x000a, 0xffff]);
+                let idx = rng.pick(&[0, 1, 0xffff]);
+                format!("E{i}:{id}:{idx}:{flags}")
+            }
+            17 => {
+                let flags = rng.pick(&[256, 512, 768, 0]);
+                let idx = rng.pick(&[0, 1, 2, 0xffff]);
+                format!("D{i}:{idx}:{flags}")
+            }
             _ => {
                 let flag = match rng.below(4) {
                     0 => 4,
@@ -1575,6 +1730,18 @@ fn generated_archives_edit_like_libzip() {
 }
 
 #[test]
+fn generated_archives_edit_in_buffers_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x3000_0004);
+    for request in editb_requests(&mut rng, 2000) {
+        let want = oracle.ask(&request);
+        assert_edit(&request, &want, &format!("{request:.400}"));
+    }
+}
+
+#[test]
 fn regress_archives_edit_like_libzip() {
     let Some(mut oracle) = Oracle::spawn() else {
         return;
@@ -1774,7 +1941,9 @@ fn record_edit_answers() {
     let mut rng = Rng(0x3000_0003);
     // Not those where the port writes differently, as the recorded answer
     // may be a hash.
-    let requests = edit_requests(&mut rng, 1000)
+    let mut requests = edit_requests(&mut rng, 700);
+    requests.extend(editb_requests(&mut rng, 400));
+    let requests = requests
         .into_iter()
         .filter(|request| !writes_invalid_zip64(&oracle.ask(request)))
         .collect();

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/crypto", "crates/deflate", "crates/extract", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ repository = "https://github.com/hivepaas/hivepack-rs"
 homepage = "https://github.com/hivepaas/hivepack-rs"
 
 [workspace.dependencies]
+hivepack-bzip2 = { path = "crates/bzip2" }
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-extract = { path = "crates/extract" }
@@ -27,6 +28,12 @@ zstd = { version = "0.14.3", default-features = false, features = ["zdict_builde
 # interface to it.
 libz-sys = { version = "=1.1.31", features = ["static"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
+# bzip2-sys 0.1.13 bundles libbzip2 1.0.8, the release hivepack-bzip2
+# ports, and its `static` feature builds that rather than linking the
+# system's libbz2, which distributions patch. The bzip2 crate is the safe
+# interface to it, with its default backend, libbz2-rs-sys (a translation
+# of the same C), left out.
+bzip2 = { version = "0.6.1", default-features = false, features = ["bzip2-sys", "static"] }
 # Directories opened by handle, where nothing resolves outside them or
 # through a symbolic link: hivepack-extract's way to write, until the
 # standard library's directory handles (`std::fs::Dir`) are stable. The one
@@ -54,6 +61,9 @@ dbg_macro = "deny"
 opt-level = 3
 
 [profile.dev.package.libz-sys]
+opt-level = 3
+
+[profile.dev.package.bzip2-sys]
 opt-level = 3
 
 # hivepack-zip's tests compress and decompress gigabytes (libzip's

@@ -1,14 +1,15 @@
-//! What is to be extracted, and the checks made on all of it before
-//! anything is written: the limits that can be checked on what the archive
-//! says, the same path named twice, links and special files, and data that
+//! What is to be extracted, the options, and the checks made on all of it
+//! before anything is written: the limits that can be checked on what the
+//! archive says, the same path named twice, links, and data that
 //! overlaps.
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, ErrorKind};
-use crate::name::Name;
+use crate::name::{Name, NameError};
+use crate::progress::{Cancel, ProgressFn};
 
 /// Limits on what an archive may write, against archive bombs. They count
 /// the bytes actually written, not what the archive says: the declared
@@ -46,6 +47,66 @@ impl Default for Limits {
     }
 }
 
+/// What to do with symbolic links.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Links {
+    /// Refuse them (the default).
+    #[default]
+    Refuse,
+    /// Write a file holding the link's target, as extractors on Windows do.
+    AsFile,
+    /// Create those whose target is relative and stays inside the
+    /// destination, after every other entry, so that nothing is written
+    /// through them; refuse the others. On Windows, creating a link takes a
+    /// privilege that most accounts lack.
+    Inside,
+}
+
+/// How names are taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Names {
+    /// Refuse what [`check_name`](crate::check_name) refuses (the
+    /// default).
+    #[default]
+    Strict,
+    /// First drop what Python's `zipfile` drops: a leading `/`, a drive
+    /// (`C:`), and `.`, `..` and empty components; then refuse what is
+    /// still refused. Two extractors that clean names differently write
+    /// different files, which is why this is not the default.
+    Sanitize,
+}
+
+/// What to do with an entry that is refused for its name, as a link, or
+/// as the same path as another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OnRefused {
+    /// Stop, before anything is written (the default).
+    #[default]
+    Stop,
+    /// Leave it out, and extract the rest; the entries left out are in
+    /// [`Summary::skipped`](crate::Summary::skipped). The limits and data
+    /// that overlaps still stop the extraction.
+    Skip,
+}
+
+/// What permissions files get on Unix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Permissions {
+    /// The entry's, masked as Python's `data` filter masks them: no
+    /// setuid, setgid or sticky bit, nothing writable by group or others,
+    /// readable and writable by the owner (the default).
+    #[default]
+    Masked,
+    /// The entry's, without the setuid, setgid and sticky bits.
+    Preserve,
+    /// The system's defaults.
+    Ignore,
+}
+
 /// How to extract.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -53,14 +114,41 @@ pub struct Options {
     pub limits: Limits,
     /// The password encrypted entries are read with.
     pub password: Option<Vec<u8>>,
+    pub links: Links,
+    pub names: Names,
+    /// Takes `\` in names for a separator, as PowerShell 5.1's
+    /// `Compress-Archive` writes it; refused otherwise.
+    pub backslash_separator: bool,
+    pub on_refused: OnRefused,
+    /// Replaces files that are there, which must be files: not links, not
+    /// directories. Nothing is overwritten otherwise.
+    pub overwrite: bool,
+    pub permissions: Permissions,
+    /// How long the extraction may take, from when it starts; none by
+    /// default. It stops with [`ErrorKind::TimeLimit`] once past it.
+    pub time_limit: Option<Duration>,
+    /// A token that stops the extraction with [`ErrorKind::Cancelled`].
+    pub cancel: Option<Cancel>,
+    /// Told how far the extraction is: once the entries are checked, after
+    /// each piece of data written (at most 64 KiB), and after each entry.
+    pub progress: Option<ProgressFn>,
 }
 
-/// Shows the limits, not the password.
+/// Shows the options, not the password or the progress function.
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Options")
             .field("limits", &self.limits)
             .field("password", &self.password.as_ref().map(|_| ".."))
+            .field("links", &self.links)
+            .field("names", &self.names)
+            .field("backslash_separator", &self.backslash_separator)
+            .field("on_refused", &self.on_refused)
+            .field("overwrite", &self.overwrite)
+            .field("permissions", &self.permissions)
+            .field("time_limit", &self.time_limit)
+            .field("cancel", &self.cancel)
+            .field("progress", &self.progress.as_ref().map(|_| ".."))
             .finish()
     }
 }
@@ -71,14 +159,13 @@ pub(crate) enum Kind {
     File,
     Dir,
     Link,
-    Special,
 }
 
 /// An entry to extract.
 pub(crate) struct Item {
     pub index: u64,
     pub raw_name: Vec<u8>,
-    pub name: Name,
+    pub name: Result<Name, NameError>,
     pub kind: Kind,
     /// what the archive says it decompresses to
     pub size: u64,
@@ -91,9 +178,15 @@ pub(crate) struct Item {
     pub mtime: Option<SystemTime>,
 }
 
+impl Item {
+    pub(crate) fn error(&self, kind: ErrorKind) -> Error {
+        Error::new(self.index, &self.raw_name, kind)
+    }
+}
+
 /// A path as the checks see it: case folded, as a case-insensitive file
 /// system would.
-fn fold(components: &[String]) -> String {
+pub(crate) fn fold(components: &[String]) -> String {
     components.join("/").to_lowercase()
 }
 
@@ -107,75 +200,56 @@ struct Seen {
     named: bool,
 }
 
+/// Why an entry is refused for itself, before the others are looked at.
+fn refused(item: &Item, options: &Options) -> Option<ErrorKind> {
+    match (&item.name, item.kind) {
+        (Err(e), _) => Some(ErrorKind::Name(*e)),
+        (Ok(_), Kind::Link) if options.links == Links::Refuse => Some(ErrorKind::Link),
+        (Ok(_), _) => None,
+    }
+}
+
 /// Checks the entries before anything is written: their number, what
-/// they say of their sizes, that no two name the same path (ignoring case,
-/// and a directory one way and a file another), that none is a link or a
-/// special file, and that no two share compressed data.
-pub(crate) fn check(items: &[Item], limits: &Limits) -> Result<(), Error> {
+/// they say of their sizes, their names, that no two name the same path
+/// (ignoring case, and a directory one way and a file another), links,
+/// and that no two share compressed data. The entries to
+/// extract, with those refused but skipped (with [`OnRefused::Skip`])
+/// left out, and the errors that left them out.
+pub(crate) fn check<'a>(
+    items: &'a [Item],
+    options: &Options,
+) -> Result<(Vec<&'a Item>, Vec<Error>), Error> {
+    let limits = &options.limits;
     if items.len() as u64 > limits.max_entries {
         return Err(Error::global(ErrorKind::TooManyEntries));
     }
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
     let mut total: u64 = 0;
     let mut seen: HashMap<String, Seen> = HashMap::new();
     for item in items {
-        let error = |kind| Error::new(item.index, &item.raw_name, kind);
-        match item.kind {
-            Kind::Link => return Err(error(ErrorKind::Link)),
-            Kind::Special => return Err(error(ErrorKind::SpecialFile)),
-            Kind::File | Kind::Dir => {}
-        }
-        if item.size > limits.max_entry_size {
-            return Err(error(ErrorKind::EntryTooLarge));
-        }
-        total = total.saturating_add(item.size);
-        if total > limits.max_total_size {
-            return Err(error(ErrorKind::TotalTooLarge));
-        }
-
-        let components = &item.name.components;
-        // The directories on the way.
-        for end in 1..components.len() {
-            let prefix = &components[..end];
-            match seen.get(&fold(prefix)) {
-                Some(other) if other.spelling != prefix || !other.is_dir => {
-                    return Err(error(ErrorKind::Duplicate { first: other.first }));
-                }
-                Some(_) => {}
-                None => {
-                    seen.insert(
-                        fold(prefix),
-                        Seen {
-                            spelling: prefix.to_vec(),
-                            is_dir: true,
-                            first: item.index,
-                            named: false,
-                        },
-                    );
-                }
-            }
-        }
-        let is_dir = item.kind == Kind::Dir;
-        match seen.get_mut(&fold(components)) {
-            // A directory named after files in it.
-            Some(other)
-                if is_dir && other.is_dir && !other.named && other.spelling == *components =>
-            {
-                other.named = true;
-            }
-            Some(other) => {
-                return Err(error(ErrorKind::Duplicate { first: other.first }));
-            }
+        let refusal = match refused(item, options) {
+            Some(kind) => Some(kind),
             None => {
-                seen.insert(
-                    fold(components),
-                    Seen {
-                        spelling: components.clone(),
-                        is_dir,
-                        first: item.index,
-                        named: true,
-                    },
-                );
+                if item.size > limits.max_entry_size {
+                    return Err(item.error(ErrorKind::EntryTooLarge));
+                }
+                total = total.saturating_add(item.size);
+                if total > limits.max_total_size {
+                    return Err(item.error(ErrorKind::TotalTooLarge));
+                }
+                match &item.name {
+                    Ok(name) => {
+                        duplicate(&mut seen, item, name).map(|first| ErrorKind::Duplicate { first })
+                    }
+                    Err(e) => Some(ErrorKind::Name(*e)),
+                }
             }
+        };
+        match (refusal, options.on_refused) {
+            (None, _) => kept.push(item),
+            (Some(kind), OnRefused::Stop) => return Err(item.error(kind)),
+            (Some(kind), OnRefused::Skip) => skipped.push(item.error(kind)),
         }
     }
 
@@ -190,12 +264,54 @@ pub(crate) fn check(items: &[Item], limits: &Limits) -> Result<(), Error> {
     for pair in ranges.windows(2) {
         let ((before, first), (after, second)) = (pair[0], pair[1]);
         if after.start < before.end {
-            return Err(Error::new(
-                second.index,
-                &second.raw_name,
-                ErrorKind::Overlap { other: first.index },
-            ));
+            return Err(second.error(ErrorKind::Overlap { other: first.index }));
         }
     }
-    Ok(())
+    Ok((kept, skipped))
+}
+
+/// Records the path of `item`, and the directories on its way, in `seen`:
+/// the entry it is the same path as, if one is. A link is a file here.
+fn duplicate(seen: &mut HashMap<String, Seen>, item: &Item, name: &Name) -> Option<u64> {
+    let components = &name.components;
+    // The directories on the way.
+    for end in 1..components.len() {
+        let prefix = &components[..end];
+        match seen.get(&fold(prefix)) {
+            Some(other) if other.spelling != prefix || !other.is_dir => return Some(other.first),
+            Some(_) => {}
+            None => {
+                seen.insert(
+                    fold(prefix),
+                    Seen {
+                        spelling: prefix.to_vec(),
+                        is_dir: true,
+                        first: item.index,
+                        named: false,
+                    },
+                );
+            }
+        }
+    }
+    let is_dir = item.kind == Kind::Dir;
+    match seen.get_mut(&fold(components)) {
+        // A directory named after files in it.
+        Some(other) if is_dir && other.is_dir && !other.named && other.spelling == *components => {
+            other.named = true;
+            None
+        }
+        Some(other) => Some(other.first),
+        None => {
+            seen.insert(
+                fold(components),
+                Seen {
+                    spelling: components.clone(),
+                    is_dir,
+                    first: item.index,
+                    named: true,
+                },
+            );
+            None
+        }
+    }
 }

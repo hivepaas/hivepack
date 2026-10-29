@@ -2,8 +2,12 @@
 //! and decompression of what libzstd wrote.
 //!
 //! ```text
-//! cargo run --release -p zstd-bench -- [--levels 1,3,19] [--rounds 3] [--seconds 0.5] [--stream] PATH...
+//! cargo run --release -p zstd-bench -- [--levels 1,3,19] [--rounds 3] [--seconds 0.5] [--stream] [--workers 1,2,4,8] PATH...
 //! ```
+//!
+//! With `--workers`, only compression, through `ZSTD_compress2` with
+//! `ZSTD_c_nbWorkers` at each count given: a row per count, and the ratio of
+//! the speeds. The frames must be the same.
 //!
 //! With `--stream`, compression goes through `ZSTD_compressStream2`, in
 //! pieces of `ZSTD_CStreamInSize` and `ZSTD_CStreamOutSize`, the size not
@@ -16,8 +20,6 @@
 //! Speeds are the range over rounds in MB/s of uncompressed data (10^6 bytes
 //! per second), and the output is a Markdown table.
 //!
-//! hivepack-zstd compresses at the levels up to 3 so far; its compression
-//! column is empty for the others.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,6 +38,14 @@ trait Codec {
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
     /// The same by streaming, one piece at a time.
     fn compress_stream(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()>;
+    /// The same through `ZSTD_compress2`, with `workers` threads.
+    fn compress_workers(
+        &mut self,
+        level: i32,
+        workers: u32,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()>;
     /// Decompresses `input`, whose content is `size` bytes long.
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
     /// The same by streaming, one piece at a time.
@@ -112,6 +122,30 @@ impl Codec for Libzstd {
         }
     }
 
+    fn compress_workers(
+        &mut self,
+        level: i32,
+        workers: u32,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        use zstd_safe::CParameter;
+        output.clear();
+        output.reserve(zstd_safe::compress_bound(input.len()));
+        for parameter in [
+            CParameter::CompressionLevel(level),
+            CParameter::NbWorkers(workers),
+        ] {
+            self.compressor
+                .set_parameter(parameter)
+                .map_err(error_name)?;
+        }
+        self.compressor
+            .compress2(output, input)
+            .map(drop)
+            .map_err(error_name)
+    }
+
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
         output.clear();
         output.reserve(size);
@@ -149,8 +183,7 @@ impl Codec for Libzstd {
     }
 }
 
-/// The port: compression at the levels it has so far (up to 3), and
-/// decompression.
+/// The port.
 struct Hivepack {
     cctx: hivepack_zstd::CCtx,
     dctx: hivepack_zstd::DCtx,
@@ -166,10 +199,6 @@ impl Codec for Hivepack {
         } else {
             "hivepack-zstd".into()
         }
-    }
-
-    fn compresses(&self, level: i32) -> bool {
-        level <= 3
     }
 
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
@@ -218,6 +247,31 @@ impl Codec for Hivepack {
         }
     }
 
+    fn compress_workers(
+        &mut self,
+        level: i32,
+        workers: u32,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        use hivepack_zstd::CParameter;
+        output.resize(hivepack_zstd::compress_bound(input.len()).unwrap_or(0), 0);
+        for parameter in [
+            CParameter::CompressionLevel(level),
+            CParameter::NbWorkers(workers),
+        ] {
+            self.cctx
+                .set_parameter(parameter)
+                .map_err(|e| e.to_string())?;
+        }
+        let size = self
+            .cctx
+            .compress2(output, input)
+            .map_err(|e| e.to_string())?;
+        output.truncate(size);
+        Ok(())
+    }
+
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
         output.resize(size, 0);
         let decoded = self
@@ -257,6 +311,8 @@ impl Codec for Hivepack {
 
 struct Options {
     stream: bool,
+    /// With `--workers`: compression only, with these numbers of threads.
+    workers: Vec<u32>,
     levels: Vec<i32>,
     rounds: usize,
     budget: Duration,
@@ -266,6 +322,7 @@ struct Options {
 fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
     let mut options = Options {
         stream: false,
+        workers: Vec::new(),
         levels: vec![1, 3, 9, 19],
         rounds: 3,
         budget: Duration::from_millis(500),
@@ -282,6 +339,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
                     .collect::<Result<_>>()?;
             }
             "--stream" => options.stream = true,
+            "--workers" => {
+                options.workers = value()?
+                    .split(',')
+                    .map(|w| w.parse().map_err(|_| format!("bad worker count {w:?}")))
+                    .collect::<Result<_>>()?;
+            }
             "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
             "--seconds" => {
                 let seconds: f64 = value()?.parse().map_err(|_| "bad --seconds")?;
@@ -290,7 +353,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: zstd-bench [--levels 1,3,19] [--rounds N] [--seconds S] [--stream] PATH..."
+                    "usage: zstd-bench [--levels 1,3,19] [--rounds N] [--seconds S] [--stream] [--workers 1,2,4,8] PATH..."
                         .into(),
                 );
             }
@@ -363,12 +426,60 @@ impl std::fmt::Display for Range {
     }
 }
 
+/// With `--workers`: a row per level and number of threads, compression
+/// only, the same frames from every codec.
+fn bench_workers(
+    options: &Options,
+    codecs: &mut [Box<dyn Codec>],
+    name: &str,
+    data: &[u8],
+) -> Result<()> {
+    let megabytes = data.len() as f64 / 1e6;
+    let mut frames: Vec<Vec<u8>> = codecs.iter().map(|_| Vec::new()).collect();
+    for &level in &options.levels {
+        for &workers in &options.workers {
+            let mut speeds: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
+            for _ in 0..options.rounds {
+                for (i, codec) in codecs.iter_mut().enumerate() {
+                    let seconds = time(options.budget, || {
+                        codec.compress_workers(level, workers, data, &mut frames[i])
+                    })?;
+                    speeds[i] = Range::add(speeds[i].take(), megabytes / seconds);
+                }
+            }
+            if frames.iter().any(|frame| *frame != frames[0]) {
+                return Err(format!(
+                    "{name} level {level}, {workers} workers: the frames differ"
+                ));
+            }
+            let ratio = data.len() as f64 / frames[0].len().max(1) as f64;
+            let best = |range: &Option<Range>| range.as_ref().map_or(0.0, |r| r.1);
+            let cells: Vec<String> = speeds
+                .iter()
+                .map(|r| {
+                    r.as_ref()
+                        .map_or_else(|| "–".to_string(), |r| r.to_string())
+                })
+                .collect();
+            println!(
+                "| {name} | {megabytes:.1} | {level} | {workers} | {ratio:.3} | {} | {:.2} |",
+                cells.join(" | "),
+                best(&speeds[1]) / best(&speeds[0]).max(f64::MIN_POSITIVE)
+            );
+        }
+    }
+    Ok(())
+}
+
 fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Result<()> {
     let data = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let name = input.file_name().map_or_else(
         || input.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
+    if !options.workers.is_empty() {
+        return bench_workers(options, codecs, &name, &data);
+    }
     let megabytes = data.len() as f64 / 1e6;
     let mut compressed = Vec::new();
     let mut scratch = Vec::new();
@@ -442,6 +553,21 @@ fn run() -> Result<()> {
             compressed_piece: vec![0; hivepack_zstd::cstream_out_size()],
         }),
     ];
+    if !options.workers.is_empty() {
+        let header: Vec<String> = codecs
+            .iter()
+            .map(|c| format!("{} compress2", c.name()))
+            .collect();
+        println!(
+            "| input | MB | level | workers | ratio | {} | ratio of speeds |",
+            header.join(" | ")
+        );
+        println!("|---|---|---|---|---|{}---|", "---|".repeat(codecs.len()));
+        for input in inputs(&options.paths)? {
+            bench(&options, &mut codecs, &input)?;
+        }
+        return Ok(());
+    }
     let how = if options.stream { " (stream)" } else { "" };
     let header: Vec<String> = codecs
         .iter()

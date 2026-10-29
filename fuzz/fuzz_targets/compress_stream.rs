@@ -4,7 +4,14 @@
 //! call returns the same, moves as far and writes the same, and that the
 //! port decodes the frame back. A third of the time with a dictionary
 //! from the start of the input, loaded, a prefix or a `CDict`, attached,
-//! copied in or loaded again. A panic or a difference is a bug.
+//! copied in or loaded again.
+//!
+//! A quarter of the time with worker threads (`ZSTD_c_nbWorkers`), a
+//! different number on each side, and their job size, overlap and
+//! synchronization points: how much each call takes and writes then
+//! depends on the threads, but not the frame. Then each side goes through
+//! the same steps on its own, each step's calls repeated until it is done,
+//! and the frames must be the same. A panic or a difference is a bug.
 
 #![no_main]
 
@@ -48,6 +55,58 @@ fn name(code: usize) -> String {
     zstd_safe::get_error_name(code).to_string()
 }
 
+/// A step with workers: input up to `end` with `directive`, its calls
+/// repeated until it is done, each with `room` bytes of output (or, with a
+/// stable output buffer, the rest of it).
+struct Step {
+    end: usize,
+    directive: EndDirective,
+    room: usize,
+}
+
+/// Each step's calls, through `call(output, out_pos, input, directive)`
+/// returning the result, the input read and where the output stops: the
+/// frame written, and the error that stopped it, if any.
+fn drive(
+    steps: &[Step],
+    src: &[u8],
+    stable_room: Option<usize>,
+    mut call: impl FnMut(&mut [u8], usize, &[u8], EndDirective) -> (Result<usize, String>, usize, usize),
+) -> (Vec<u8>, Result<(), String>) {
+    let mut frame = Vec::new();
+    let mut stable = vec![0u8; stable_room.unwrap_or(0)];
+    let mut taken = 0;
+    for step in steps {
+        let mut done = false;
+        for _ in 0..MAX_CALLS {
+            let mut fresh = vec![0u8; step.room];
+            let (dst, out_pos) = if stable_room.is_some() {
+                (&mut stable[..], frame.len())
+            } else {
+                (&mut fresh[..], 0)
+            };
+            let (result, read, wrote) = call(dst, out_pos, &src[taken..step.end], step.directive);
+            frame.extend_from_slice(&dst[out_pos..wrote]);
+            taken += read;
+            let remaining = match result {
+                Ok(remaining) => remaining,
+                Err(error) => return (frame, Err(error)),
+            };
+            if taken == step.end && (step.directive == EndDirective::Continue || remaining == 0) {
+                done = true;
+                break;
+            }
+            if (read, wrote) == (0, out_pos) {
+                std::thread::yield_now();
+            }
+        }
+        if !done {
+            return (frame, Err("no end".into()));
+        }
+    }
+    (frame, Ok(()))
+}
+
 fuzz_target!(|input: &[u8]| {
     if input.len() < 8 {
         return;
@@ -60,6 +119,7 @@ fuzz_target!(|input: &[u8]| {
     let checksum = head[2] & 2 != 0;
     let max_block = [0, 1024, 4096, 65_536][usize::from(head[2] >> 2) % 4];
     let ldm = head[2] & 16 != 0;
+    let workers = head[0] & 0x30 == 0x30;
     let mut rng = Rng(u64::from(u32::from_le_bytes([head[3], head[4], head[5], head[6]])) | 1);
 
     let mut parameters = vec![
@@ -133,6 +193,26 @@ fuzz_target!(|input: &[u8]| {
         P::SplitAfterSequences(p_split),
         C::UseBlockSplitter(c_split),
     ));
+    if workers {
+        // A number of workers on each side, the job size (raised to the
+        // smallest but for 0), the overlap, and synchronization points.
+        let count = 1 + u32::from(head[0] >> 6);
+        parameters.push((P::NbWorkers(count), C::NbWorkers(5 - count)));
+        // The default job size is up to 1 GB at the strongest level and
+        // with long distance matching, and libzstd's round buffer 4 times
+        // that: then a small one.
+        let job_size = [0, 1, 1 << 19, 1 << 20][(rng.next() % 4) as usize];
+        let job_size = if job_size == 0 && (ldm || level > 19) {
+            1
+        } else {
+            job_size
+        };
+        parameters.push((P::JobSize(job_size), C::JobSize(job_size)));
+        let overlap = (rng.next() % 10) as u32;
+        parameters.push((P::OverlapLog(overlap as i32), C::OverlapSizeLog(overlap)));
+        let rsyncable = rng.next() % 2 == 0;
+        parameters.push((P::Rsyncable(rsyncable), C::RSyncable(rsyncable)));
+    }
 
     // A dictionary, a third of the time: the start of the input, copied
     // apart (libzstd takes a dictionary that ends where the input starts
@@ -227,6 +307,71 @@ fuzz_target!(|input: &[u8]| {
     } else {
         (Vec::new(), Vec::new())
     };
+    if workers {
+        // The steps, the same for both: pieces with their directives, the
+        // last one the end, and the room for output.
+        let mut steps = Vec::new();
+        let mut end = 0;
+        loop {
+            end = (end + rng.piece()).min(src.len());
+            let directive = if end == src.len() && rng.next() % 4 != 0 {
+                EndDirective::End
+            } else if rng.next() % 8 == 0 {
+                EndDirective::Flush
+            } else {
+                EndDirective::Continue
+            };
+            steps.push(Step {
+                end,
+                directive,
+                room: 1 + rng.piece(),
+            });
+            if directive == EndDirective::End {
+                break;
+            }
+        }
+        let stable_room = stable_out.then_some(room);
+        let (want, want_end) = drive(&steps, src, stable_room, |dst, out_pos, piece, directive| {
+            let c_directive = match directive {
+                EndDirective::Continue => ZSTD_EndDirective::ZSTD_e_continue,
+                EndDirective::Flush => ZSTD_EndDirective::ZSTD_e_flush,
+                EndDirective::End => ZSTD_EndDirective::ZSTD_e_end,
+            };
+            let mut output = zstd_safe::OutBuffer::around_pos(dst, out_pos);
+            let mut input = zstd_safe::InBuffer::around(piece);
+            let result = c.compress_stream2(&mut output, &mut input, c_directive);
+            (result.map_err(name), input.pos(), output.pos())
+        });
+        let (got, got_end) = drive(&steps, src, stable_room, |dst, out_pos, piece, directive| {
+            let mut output = hivepack_zstd::OutBuffer { dst, pos: out_pos };
+            let mut input = hivepack_zstd::InBuffer::new(piece);
+            let result = p.compress_stream2(&mut output, &mut input, directive);
+            (
+                result.map_err(|error| error.code().message().to_string()),
+                input.pos,
+                output.pos,
+            )
+        });
+        assert!(
+            want_end == got_end,
+            "with workers: libzstd {want_end:?}, port {got_end:?}"
+        );
+        if want_end.is_ok() {
+            assert!(want == got, "with workers: the frames differ");
+            let mut back = vec![0u8; src.len()];
+            let mut dctx = DCtx::new();
+            let size = if prefix {
+                dctx.ref_prefix(&dict)
+                    .and_then(|()| dctx.decompress(&mut back, &got))
+            } else {
+                dctx.decompress_using_dict(&mut back, &got, &dict)
+            }
+            .expect("the frame decodes");
+            assert!(back[..size] == *src, "with workers: does not decode back");
+        }
+        return;
+    }
+
     let mut stable_pos = 0;
     let mut frame = Vec::new();
     let mut taken = 0;

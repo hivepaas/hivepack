@@ -132,6 +132,78 @@ pub fn check_name(raw: &[u8]) -> Result<Name, NameError> {
     Ok(Name { components, is_dir })
 }
 
+/// `name` as the options take it, before [`check_name`]: with
+/// `backslash`, `\` turned into `/`; with `sanitize`, what Python's
+/// `zipfile` drops dropped (a leading `/`, a drive `C:`, and `.`, `..` and
+/// empty components). A directory keeps its final `/`.
+pub(crate) fn prepare(name: &str, backslash: bool, sanitize: bool) -> String {
+    let name = if backslash {
+        name.replace('\\', "/")
+    } else {
+        name.to_string()
+    };
+    if !sanitize {
+        return name;
+    }
+    let is_dir = name.ends_with('/');
+    let mut rest = name.as_str();
+    // A drive: a letter and a colon.
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        rest = &rest[2..];
+    }
+    let components: Vec<&str> = rest
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .collect();
+    let mut cleaned = components.join("/");
+    if is_dir && !cleaned.is_empty() {
+        cleaned.push('/');
+    }
+    cleaned
+}
+
+/// Where a symbolic link at `parent` (its directory, under the
+/// destination) leads, as components under the destination: its target
+/// must be relative, with `/` its only separator, components that pass
+/// [`check_name`] besides `.` and `..`, and must not climb out of the
+/// destination. The path is resolved by its text, which is how the system
+/// resolves it as long as no component on the way is itself a link.
+pub(crate) fn link_target(target: &[u8], parent: &[String]) -> Result<Vec<String>, NameError> {
+    if target.is_empty() {
+        return Err(NameError::Empty);
+    }
+    let text = std::str::from_utf8(target).map_err(|_| NameError::NotUtf8)?;
+    if text.chars().any(|c| c.is_ascii_control()) {
+        return Err(NameError::Control);
+    }
+    if text.contains('\\') {
+        return Err(NameError::Backslash);
+    }
+    if text.starts_with('/') {
+        return Err(NameError::Absolute);
+    }
+    if text.contains(':') {
+        return Err(NameError::Colon);
+    }
+    let mut resolved = parent.to_vec();
+    for component in text.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(NameError::Dot);
+                }
+            }
+            _ => {
+                let name = check_name(component.as_bytes())?;
+                resolved.extend(name.components);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +286,46 @@ mod tests {
         let long = "x".repeat(MAX_COMPONENT + 1);
         assert_eq!(check_name(long.as_bytes()), Err(NameError::TooLong));
         assert!(check_name("x".repeat(MAX_COMPONENT).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn names_are_prepared_as_asked() {
+        assert_eq!(prepare("a\\b\\c", true, false), "a/b/c");
+        assert_eq!(prepare("a\\b", false, false), "a\\b");
+        assert_eq!(prepare("/etc/passwd", false, true), "etc/passwd");
+        assert_eq!(prepare("C:\\x\\..\\y", true, true), "x/y");
+        assert_eq!(prepare("a/./b//../c/", false, true), "a/b/c/");
+        assert_eq!(prepare("../../", false, true), "");
+        // A drive is a letter and a colon, as Windows reads it.
+        assert_eq!(prepare("a:b", false, true), "b");
+        assert_eq!(prepare("ab:c", false, true), "ab:c");
+    }
+
+    #[test]
+    fn link_targets_stay_inside() {
+        let parent = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            link_target(b"c", &parent),
+            Ok(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
+            link_target(b"../c", &parent),
+            Ok(vec!["a".into(), "c".into()])
+        );
+        assert_eq!(
+            link_target(b"../../c/./d", &parent),
+            Ok(vec!["c".into(), "d".into()])
+        );
+        assert_eq!(link_target(b"../..", &parent), Ok(vec![]));
+        assert_eq!(link_target(b"../../../c", &parent), Err(NameError::Dot));
+        assert_eq!(
+            link_target(b"/etc/passwd", &parent),
+            Err(NameError::Absolute)
+        );
+        assert_eq!(link_target(b"C:/x", &parent), Err(NameError::Colon));
+        assert_eq!(link_target(b"..\\x", &parent), Err(NameError::Backslash));
+        assert_eq!(link_target(b"nul", &parent), Err(NameError::Device));
+        assert_eq!(link_target(b"", &parent), Err(NameError::Empty));
     }
 
     /// Names are the archive's: any bytes are checked without panicking.

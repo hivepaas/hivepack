@@ -20,8 +20,9 @@ hivepack-zstd = { path = "crates/zstd" }
 # The official libraries, used only as the reference in tests and
 # benchmarks. zstd 0.14.3 builds libzstd 1.5.7, the release hivepack-zstd
 # ports. The legacy formats (v0.1 to v0.7) are left out, as the port does not
-# read them.
-zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "experimental"] }
+# read them. With its worker threads (`zstdmt`), for the frames compressed
+# with `ZSTD_c_nbWorkers`.
+zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "experimental", "zstdmt"] }
 # libz-sys 1.1.31 bundles zlib 1.3.2, the release hivepack-deflate ports, and
 # its `static` feature builds that rather than linking the system's zlib,
 # which may be another version. flate2, with its zlib backend, is the safe

@@ -13,7 +13,9 @@
 //!   `..`, carry a backslash, a colon, a control character or a Windows
 //!   device name, or end a component with a space or a dot, on every
 //!   system alike. Two entries may not name the same path, ignoring case.
-//! - **Links and special files** are not created.
+//! - **Links** are not created, unless [`Options::links`] says to create
+//!   those that stay inside the destination; a device or FIFO in a ZIP
+//!   archive, only a mode with data, is written as a file.
 //! - **Writing** goes through handles: each directory is opened from its
 //!   parent without following a link, and each file is created new, so a
 //!   link already in the destination, or put there while extracting, is
@@ -25,6 +27,9 @@
 //!   AES's authentication code) is removed.
 //! - **Permissions** are masked: no setuid, setgid or sticky bit, and
 //!   nothing writable by group or others.
+//! - **Time**: an extraction can be given a time limit
+//!   ([`Options::time_limit`]), stopped from another thread ([`Cancel`]),
+//!   and followed ([`Options::progress`]).
 //!
 //! ```no_run
 //! use hivepack_extract::{Options, extract_zip};
@@ -39,17 +44,19 @@
 //! # }
 //! ```
 //!
-//! The design, and what comes next (tar and RAR, links kept inside the
-//! destination, marks of origin), are in the repository's
+//! The design, and what comes next (marks of origin, Unicode
+//! normalization, tar and RAR), are in the repository's
 //! `docs/extract.md`.
 
 mod destination;
 mod error;
 mod name;
 mod plan;
+mod progress;
 mod zip;
 
 pub use error::{Error, ErrorKind};
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};
-pub use plan::{Limits, Options};
+pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};
+pub use progress::{Cancel, Progress, ProgressFn};
 pub use zip::{Summary, extract_zip};

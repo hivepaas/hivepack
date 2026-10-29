@@ -537,6 +537,12 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         1011 => CParameter::UseRowMatchFinder(switch()),
         // ZSTD_c_enableDedicatedDictSearch
         1005 => CParameter::EnableDedicatedDictSearch(flag),
+        // ZSTD_c_nbWorkers, ZSTD_c_jobSize, ZSTD_c_overlapLog,
+        // ZSTD_c_rsyncable
+        400 => CParameter::NbWorkers(unsigned()),
+        401 => CParameter::JobSize(unsigned()),
+        402 => CParameter::OverlapLog(value as i32),
+        500 => CParameter::Rsyncable(flag),
         // ZSTD_c_forceAttachDict
         1001 => CParameter::ForceAttachDict(match value {
             0 => DictAttachPref::DefaultAttach,
@@ -1264,8 +1270,8 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
     steps.extend([7, 1006, i64::from(stable_in)]);
     steps.extend([7, 1007, i64::from(stable_out)]);
     // A dictionary, a third of the time: loaded, a prefix, or a CDict, made
-    // for a level or with the parameters set. Copied in or loaded again:
-    // the port does not attach CDicts yet.
+    // for a level or with the parameters set, attached, copied in or
+    // loaded again.
     let dict = if rng.range(0, 2) == 0 {
         cstream_dict(rng, &src)
     } else {
@@ -1373,6 +1379,96 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         1 => rng.range(len as u64 / 3, bound + 30),
         _ => 2 * bound + 64,
     };
+    if dict.is_empty() {
+        format!("cstream {capacity} {} {}", list(steps), hex(&src))
+    } else {
+        format!(
+            "cstream {capacity} {} {} {}",
+            list(steps),
+            hex(&src),
+            hex(&dict)
+        )
+    }
+}
+
+/// A `cstream` request with workers (`ZSTD_c_nbWorkers`), their job size,
+/// overlap and synchronization points, and the other parameters, the block
+/// splitter level among them, which zstd-safe does not set; a dictionary
+/// sometimes, a prefix read as `ZSTD_dct_auto` among them; then
+/// `ZSTD_compress2` of an input on both sides of 512 KB, where workers
+/// start, up to the oracle's 1 MB. With workers, only `ZSTD_compress2`
+/// gives the same answers every time: how far a streaming call goes
+/// depends on the threads (`tests/compress_mt.rs` streams with them).
+fn cstream_workers_request(rng: &mut Rng) -> String {
+    let len = if rng.range(0, 4) == 0 {
+        rng.range(400_000, 524_288)
+    } else {
+        rng.range(524_289, 1_000_000)
+    } as usize;
+    let src = frame_data(rng, len);
+    let level: i64 = match rng.range(0, 6) {
+        0 => -(rng.range(1, 5) as i64),
+        1 | 2 => rng.range(1, 3) as i64,
+        3 => rng.range(4, 9) as i64,
+        4 => rng.range(10, 15) as i64,
+        _ => rng.range(16, 19) as i64,
+    };
+    let mut steps: Vec<i64> = vec![7, 100, level, 7, 400, rng.range(1, 8) as i64];
+    if rng.range(0, 1) == 0 {
+        let job_size = [0, 1, 524_288, 600_000][rng.range(0, 3) as usize];
+        steps.extend([7, 401, job_size]);
+    }
+    if rng.range(0, 1) == 0 {
+        steps.extend([7, 402, rng.range(0, 9) as i64]);
+    }
+    if rng.range(0, 3) == 0 {
+        steps.extend([7, 500, 1]);
+    }
+    if rng.range(0, 1) == 0 {
+        steps.extend([7, 201, 1]);
+    }
+    if rng.range(0, 2) == 0 {
+        steps.extend([7, 1017, rng.range(0, 6) as i64]);
+    }
+    if rng.range(0, 2) == 0 {
+        steps.extend([7, 1010, rng.range(0, 2) as i64]);
+    }
+    if rng.range(0, 2) == 0 {
+        steps.extend([7, 101, rng.range(10, 22) as i64]);
+    }
+    if rng.range(0, 3) == 0 {
+        steps.extend([7, 107, rng.range(1, 9) as i64]);
+    }
+    if rng.range(0, 4) == 0 {
+        // Long distance matching, with a small window and small
+        // parameters.
+        steps.extend([7, 160, 1, 7, 162, rng.range(4, 64) as i64]);
+        steps.extend([
+            7,
+            164,
+            rng.range(0, 4) as i64,
+            7,
+            101,
+            rng.range(10, 20) as i64,
+        ]);
+    }
+    let dict = if rng.range(0, 1) == 0 {
+        cstream_dict(rng, &src)
+    } else {
+        Vec::new()
+    };
+    if !dict.is_empty() {
+        steps.extend(cstream_dict_steps(rng, dict.len(), false));
+    }
+    // Room for the frame, or less.
+    let bound = zstd_compress_bound(len).unwrap_or(0) as i64;
+    let room = if rng.range(0, 7) == 0 {
+        rng.range(0, bound as u64) as i64
+    } else {
+        bound
+    };
+    steps.extend([6, len as i64, room]);
+    let capacity = 1 << 20;
     if dict.is_empty() {
         format!("cstream {capacity} {} {}", list(steps), hex(&src))
     } else {
@@ -1742,6 +1838,53 @@ fn port_matches_libzstd_compression() {
         requests.len(),
         problems.len(),
         problems[..problems.len().min(20)].join("\n")
+    );
+}
+
+/// `ZSTD_compress2` with workers against libzstd's, through `cstream`
+/// requests (see `cstream_workers_request`), where the oracle is built with
+/// libzstd's threads (`scripts/testdata.py` builds it so): one built from
+/// older sources answers `zstdmt` "bad", and the test is skipped.
+#[test]
+fn port_matches_libzstd_compression_with_workers() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    if oracle.try_ask("zstdmt") != "1" {
+        eprintln!(
+            "skipping: the oracle is built without libzstd's threads \
+             (scripts/testdata.py fetch --group generated)"
+        );
+        return;
+    }
+    let mut rng = Rng::new(0x5EED_4D55);
+    let count = if cfg!(debug_assertions) { 30 } else { 120 };
+    let mut problems = Vec::new();
+    let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
+    for _ in 0..count {
+        let request = cstream_workers_request(&mut rng);
+        let want = oracle.ask(&request);
+        let got = answer(&request);
+        if got != want {
+            problems.push(format!(
+                "{request:.300}\n  libzstd: {want:.300}\n  port:    {got:.300}"
+            ));
+        }
+        // How the frame ended: compressed, or the error.
+        let words: Vec<&str> = want.split(' ').collect();
+        let last = words[words.len().saturating_sub(2)];
+        let outcome = match last.split_once('/') {
+            Some((code, _)) if code.starts_with('e') => format!("compress2 {code}"),
+            _ => "compress2 ok".to_string(),
+        };
+        *outcomes.entry(outcome).or_default() += 1;
+    }
+    eprintln!("compared {count} frames with workers: {outcomes:?}");
+    assert!(
+        problems.is_empty(),
+        "{} differences:\n{}",
+        problems.len(),
+        problems[..problems.len().min(10)].join("\n")
     );
 }
 

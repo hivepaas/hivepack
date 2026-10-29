@@ -2,7 +2,7 @@
 
 ZIP archives in safe Rust, the container logic ported from [libzip](https://libzip.org) 1.12.1.
 
-> **Status:** opens archives, reads their central directory and local headers, and reads stored and deflated entries, with libzip's rules and errors, compared with libzip itself. Deflate64 entries and `ziptool` come next, then writing. This crate is not on crates.io.
+> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries, with libzip's rules and errors, compared with libzip itself. `ziptool` and libzip's own tests come next, then writing. This crate is not on crates.io.
 
 ```rust
 use hivepack_zip::{Archive, Flags, OpenFlags};

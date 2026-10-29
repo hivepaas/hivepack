@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hivepack_deflate::{
     Deflate, Flush as DeflateFlush, InBuffer, OutBuffer, Status as DeflateStatus, crc32,
 };
-use hivepack_zip::{Archive, ArchiveFlags, Error, Flags, OpenFlags, ReadAt};
+use hivepack_zip::{Archive, ArchiveFlags, Error, ErrorCode, Flags, OpenFlags, ReadAt};
 use support::{Oracle, Rng, damage, hex, recorded_form, repository, unhex};
 
 fn recorded_path() -> PathBuf {
@@ -180,8 +180,21 @@ fn read_entries<R: ReadAt>(
     let mut buffer = vec![0u8; 1 << 20];
     for i in 0..n {
         text.push_str(" |");
+        // libzip has no Deflate64: where the port decodes it, libzip refuses
+        // to open the entry, once it has checked the password and sizes and
+        // before it reads the local header. tests/deflate64.rs checks what
+        // the port reads.
+        let raw = Flags(fflags).intersects(Flags::COMPRESSED | Flags::ENCRYPTED);
+        let deflate64 = !raw
+            && za
+                .stat_index(i, Flags::NONE)
+                .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
         let mut zf = match za.fopen_index(i, Flags(fflags)) {
             Ok(zf) => zf,
+            Err(e) if deflate64 && !matches!(e.code(), ErrorCode::Inval | ErrorCode::NoPasswd) => {
+                text.push_str("e16/0");
+                continue;
+            }
             Err(e) => {
                 text.push_str(&error_text(e));
                 continue;
@@ -221,6 +234,10 @@ fn read_entries<R: ReadAt>(
             Ok(()) => 0,
             Err(e) => e.code().number(),
         };
+        if deflate64 {
+            text.push_str("e16/0");
+            continue;
+        }
         let _ = write!(
             text,
             "{total}/{data_hash:016x}/{reads}/{returns_hash:016x}/{end}/{close}"

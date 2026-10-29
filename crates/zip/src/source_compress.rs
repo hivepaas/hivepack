@@ -23,9 +23,13 @@ pub(crate) struct Decompress {
 /// The decompressing algorithm for `method`, if libzip has one: port of
 /// `_zip_get_compression_algorithm`, for decompressing. Differs from
 /// libzip, which is often built with bzip2, LZMA, XZ and Zstandard: those
-/// come with their crates.
+/// come with their crates; and libzip has no Deflate64, which is read here.
 pub(crate) fn get_compression_algorithm(method: u16) -> Option<DeflateDecompress> {
-    (method == cm::DEFLATE).then(DeflateDecompress::new)
+    match method {
+        cm::DEFLATE => Some(DeflateDecompress::new(false)),
+        cm::DEFLATE64 => Some(DeflateDecompress::new(true)),
+        _ => None,
+    }
 }
 
 impl Decompress {

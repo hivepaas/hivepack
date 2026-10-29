@@ -1,7 +1,13 @@
 //! Deflate through hivepack-deflate, whose inflate gives zlib's results:
 //! port of `zip_algorithm_deflate.c`, the decompressing half.
+//!
+//! Differs from libzip, which has no Deflate64: the same algorithm decodes
+//! Deflate64 (method 9) with `Inflate9`, which follows zlib's
+//! `contrib/infback9`, and reports its errors as zlib's (`ZIP_ER_ZLIB`).
 
-use hivepack_deflate::{ErrorCode as ZErrorCode, Flush, InBuffer, Inflate, OutBuffer, Status};
+use hivepack_deflate::{
+    ErrorCode as ZErrorCode, Flush, InBuffer, Inflate, Inflate9, OutBuffer, Status,
+};
 
 use crate::error::{Error, ErrorCode};
 
@@ -15,10 +21,17 @@ pub(crate) enum CompressionStatus {
     NeedData,
 }
 
+/// The stream being decoded: deflate, or Deflate64.
+enum Stream {
+    Deflate(Inflate),
+    Deflate64(Box<Inflate9>),
+}
+
 /// `struct ctx`, for decompressing: the stream, and the input it holds,
 /// a range of the compression source's buffer.
 pub(crate) struct DeflateDecompress {
-    zstr: Option<Inflate>,
+    deflate64: bool,
+    zstr: Option<Stream>,
     end_of_input: bool,
     /// `next_in` and `avail_in`, as positions in the buffer given to
     /// `process`.
@@ -27,9 +40,10 @@ pub(crate) struct DeflateDecompress {
 }
 
 impl DeflateDecompress {
-    /// `decompress_allocate`.
-    pub(crate) fn new() -> DeflateDecompress {
+    /// `decompress_allocate`, for Deflate64 if `deflate64`.
+    pub(crate) fn new(deflate64: bool) -> DeflateDecompress {
         DeflateDecompress {
+            deflate64,
             zstr: None,
             end_of_input: false,
             next_in: 0,
@@ -41,9 +55,13 @@ impl DeflateDecompress {
     pub(crate) fn start(&mut self) -> Result<(), Error> {
         self.next_in = 0;
         self.avail_in = 0;
+        if self.deflate64 {
+            self.zstr = Some(Stream::Deflate64(Box::new(Inflate9::new())));
+            return Ok(());
+        }
         match Inflate::new(-15) {
             Ok(zstr) => {
-                self.zstr = Some(zstr);
+                self.zstr = Some(Stream::Deflate(zstr));
                 Ok(())
             }
             Err(e) => Err(Error::new(ErrorCode::Zlib, e.code().number())),
@@ -84,7 +102,10 @@ impl DeflateDecompress {
         let avail_out = data.len().min(u32::MAX as usize);
         let mut output = OutBuffer::new(&mut data[..avail_out]);
         let mut input = InBuffer::new(&buffer[self.next_in..self.next_in + self.avail_in]);
-        let ret = zstr.inflate(&mut output, &mut input, Flush::SyncFlush);
+        let ret = match zstr {
+            Stream::Deflate(zstr) => zstr.inflate(&mut output, &mut input, Flush::SyncFlush),
+            Stream::Deflate64(zstr) => zstr.inflate(&mut output, &mut input),
+        };
         self.next_in += input.pos;
         self.avail_in -= input.pos;
         let length = output.pos;

@@ -22,7 +22,7 @@ zstd = { version = "0.14.3", default-features = false, features = ["experimental
 hivepack-deflate = { path = "../crates/deflate" }
 hivepack-zip = { path = "../crates/zip" }
 # zlib 1.3.2, built from libz-sys's bundled sources, as the tests build it.
-libz-sys = { version = "=1.1.30", features = ["static"] }
+libz-sys = { version = "=1.1.31", features = ["static"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 
 [[bin]]

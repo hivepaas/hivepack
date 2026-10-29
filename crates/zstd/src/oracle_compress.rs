@@ -1270,8 +1270,8 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
     steps.extend([7, 1006, i64::from(stable_in)]);
     steps.extend([7, 1007, i64::from(stable_out)]);
     // A dictionary, a third of the time: loaded, a prefix, or a CDict, made
-    // for a level or with the parameters set. Copied in or loaded again:
-    // the port does not attach CDicts yet.
+    // for a level or with the parameters set, attached, copied in or
+    // loaded again.
     let dict = if rng.range(0, 2) == 0 {
         cstream_dict(rng, &src)
     } else {

@@ -2564,12 +2564,10 @@ struct LocalDict {
 /// number. The threads end when the context is dropped, once their jobs
 /// are done. The context can move between threads.
 ///
-/// Not yet: frames that would attach a [`CDict`], searching its tables
-/// where they are (`dictMatchState`), which libzstd does for small inputs
-/// and inputs of unknown size. They fail with
-/// [`ErrorCode::ParameterUnsupported`] when they start; with
-/// [`CParameter::ForceAttachDict`] set to [`DictAttachPref::ForceCopy`] or
-/// [`DictAttachPref::ForceLoad`], they compress as libzstd does.
+/// A [`CDict`] is attached, its tables searched where they are
+/// (`dictMatchState`), for small inputs and inputs of unknown size, and
+/// copied in or its content loaded again otherwise, as libzstd decides;
+/// [`CParameter::ForceAttachDict`] can force one way.
 pub struct CCtx {
     stage: CompressionStage,
     /// The parameters set for the next frames (`requestedParams`); the
@@ -3976,9 +3974,6 @@ impl CCtx {
     /// large as the input, up to 512 KB. As [`CCtx::compress`], the
     /// parameters set and the dictionaries loaded or referenced do not
     /// apply.
-    ///
-    /// Not yet for inputs small enough to attach the `CDict` (up to 8 to
-    /// 32 KB, by strategy, when it has content): see [`CCtx`].
     pub fn compress_using_cdict(
         &mut self,
         dst: &mut [u8],
@@ -4263,8 +4258,6 @@ impl CCtx {
     /// otherwise. Copied in, its tables keep their own sizes. It drops the
     /// dictionary, prefix or `CDict` set before. Only between frames (or
     /// fails with [`ErrorCode::StageWrong`]).
-    ///
-    /// Not yet for frames that attach it: see [`CCtx`].
     pub fn ref_cdict(&mut self, cdict: Option<Arc<CDict>>) -> Result<()> {
         if self.stream_stage != StreamStage::Init {
             // Only in the init stage.

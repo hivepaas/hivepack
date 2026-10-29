@@ -18,7 +18,8 @@ homepage.workspace = true
 # The sequence loop's copies without per-piece bounds checks: faster
 # (about 0.95x libzstd instead of 0.92x on Apple M1), at the cost of some
 # `unsafe` code, in `src/decompress/unchecked.rs` and the block that turns
-# it on. Off by default: without it the crate has no unsafe code at all.
+# it on. And the row match finder's prefetches, in `src/common/prefetch.rs`.
+# Off by default: without it the crate has no unsafe code at all.
 # See docs/unsafe.md.
 unsafe-fast = []
 

@@ -244,8 +244,9 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     """An oracle program, compiled with the library's own sources.
 
     tools/zstd-oracle is built with libzstd's (without the assembly loop,
-    which the port does not have either); the `included` files are left
-    out, as the oracle includes them itself to reach their static functions.
+    which the port does not have either, and with its threads); the
+    `included` files are left out, as the oracle includes them itself to
+    reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
     Deflate64. tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
@@ -291,8 +292,9 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     for part in ("common", "compress", "decompress"):
         files += sorted(str(f) for f in (lib / part).glob("*.c")
                         if f"{part}/{f.name}" not in included)
-    subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", f"-I{lib}", f"-I{lib / 'common'}",
-                    *files, "-o", str(folder / "oracle")], check=True)
+    subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", "-DZSTD_MULTITHREAD", "-pthread",
+                    f"-I{lib}", f"-I{lib / 'common'}", *files, "-o", str(folder / "oracle")],
+                   check=True)
 
 
 def generate_set(entry: dict, cache: Path, sets: dict) -> None:

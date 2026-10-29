@@ -8,6 +8,8 @@ pub(crate) mod huf_compress;
 mod tests;
 #[cfg(test)]
 mod tests_dict_lazy;
+#[cfg(test)]
+mod tests_mt;
 pub(crate) mod zstd_cdict;
 pub(crate) mod zstd_compress;
 pub(crate) mod zstd_compress_internal;
@@ -20,3 +22,4 @@ pub(crate) mod zstd_ldm;
 pub(crate) mod zstd_ldm_geartab;
 pub(crate) mod zstd_opt;
 pub(crate) mod zstd_pre_split;
+pub(crate) mod zstdmt_compress;

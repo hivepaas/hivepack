@@ -1,0 +1,121 @@
+//! Writing under the destination by handle: each directory is opened from
+//! its parent's handle without following a symbolic link, and each file is
+//! created new, so nothing is written outside the destination, through a
+//! link that is there or that appears while extracting, or over what is
+//! there.
+//!
+//! cap-std does the opening, with `openat2` and `RESOLVE_BENEATH` on
+//! Linux, `openat` and `O_NOFOLLOW` a component at a time elsewhere on
+//! Unix, and handles relative to a directory's on Windows. It is the one
+//! dependency here with `unsafe` code (see the repository's
+//! `docs/safety.md`): the standard library's directory handles
+//! (`std::fs::Dir`) are not stable yet.
+
+use std::io;
+use std::path::Path;
+use std::time::SystemTime;
+
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, SystemTimeSpec};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, File, OpenOptions};
+
+use crate::error::ErrorKind;
+
+/// The destination, open.
+pub(crate) struct Destination {
+    root: Dir,
+}
+
+impl Destination {
+    /// Opens `path`, creating it first if it is not there. The path itself
+    /// is the caller's, and is followed as given.
+    pub(crate) fn open(path: &Path) -> io::Result<Destination> {
+        std::fs::create_dir_all(path)?;
+        let root = Dir::open_ambient_dir(path, ambient_authority())?;
+        Ok(Destination { root })
+    }
+
+    /// The directory at `components`, created where it is not there, each
+    /// opened from the one before without following a link.
+    pub(crate) fn directory(&self, components: &[String]) -> Result<Dir, ErrorKind> {
+        let mut dir = self.root.try_clone().map_err(ErrorKind::Io)?;
+        for component in components {
+            match dir.create_dir(component) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(ErrorKind::Io(e)),
+            }
+            dir = match dir.open_dir_nofollow(component) {
+                Ok(next) => next,
+                Err(e) => {
+                    // A link, or a file, where a directory was to be.
+                    return Err(match dir.symlink_metadata(component) {
+                        Ok(metadata) if !metadata.is_dir() => ErrorKind::NotADirectory,
+                        _ => ErrorKind::Io(e),
+                    });
+                }
+            };
+        }
+        Ok(dir)
+    }
+
+    /// Creates the file `name` in `dir`, which must not be there, not even
+    /// as a link; with `overwrite`, replaces one that is there if it is a
+    /// file, opened without following a link and emptied.
+    pub(crate) fn create_file(dir: &Dir, name: &str, overwrite: bool) -> Result<File, ErrorKind> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        options.follow(FollowSymlinks::No);
+        match dir.open_with(name, &options) {
+            Ok(file) => Ok(file),
+            // What is there decides, not the error: Windows says a
+            // directory is there as access denied.
+            Err(e) => match dir.symlink_metadata(name) {
+                Ok(metadata) if overwrite && metadata.is_file() => {
+                    let mut options = OpenOptions::new();
+                    options.write(true).truncate(true);
+                    options.follow(FollowSymlinks::No);
+                    dir.open_with(name, &options).map_err(ErrorKind::Io)
+                }
+                Ok(_) => Err(ErrorKind::Exists),
+                Err(_) => Err(ErrorKind::Io(e)),
+            },
+        }
+    }
+
+    /// Creates a symbolic link `name` in `dir` to `target`, relative, with
+    /// `/` for separator; `to_dir` says whether it leads to a directory,
+    /// which Windows needs to know.
+    pub(crate) fn symlink(
+        dir: &Dir,
+        name: &str,
+        target: &str,
+        to_dir: bool,
+    ) -> Result<(), ErrorKind> {
+        #[cfg(windows)]
+        let created = {
+            let target = target.replace('/', "\\");
+            if to_dir {
+                dir.symlink_dir(target, name)
+            } else {
+                dir.symlink_file(target, name)
+            }
+        };
+        #[cfg(not(windows))]
+        let created = {
+            let _ = to_dir;
+            dir.symlink(target, name)
+        };
+        created.map_err(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => ErrorKind::Exists,
+            _ => ErrorKind::Io(e),
+        })
+    }
+
+    /// Sets the time of `name` in `dir`, without following a link.
+    pub(crate) fn set_time(dir: &Dir, name: &str, mtime: SystemTime) -> Result<(), ErrorKind> {
+        let mtime = SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(mtime));
+        dir.set_symlink_times(name, None, Some(mtime))
+            .map_err(ErrorKind::Io)
+    }
+}

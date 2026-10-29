@@ -11,7 +11,7 @@ Read and write archives and compressed files in Rust: one library for many forma
 - **ZIP**: reading and writing, including split archives (`.z01`, `.z02`, …, `.zip`), its rules ported from [libzip](https://libzip.org) (see [docs/zip.md](docs/zip.md)).
 - **RAR**: reading through [rars](https://github.com/bitplane/rars).
 - **tar**, and tar inside zstd (`.tar.zst`).
-- **Safe extraction by default**: no writing outside the destination, through links, or past size limits set for archive bombs.
+- **Safe extraction by default**: no writing outside the destination, through links, or past size limits set for archive bombs (see [docs/extract.md](docs/extract.md)).
 
 ## 📦 Crates
 
@@ -19,10 +19,11 @@ Read and write archives and compressed files in Rust: one library for many forma
 |---|---|---|
 | [`hivepack-crypto`](crates/crypto) | AES, SHA-1, HMAC and PBKDF2 in safe Rust, ported from BearSSL 0.6: what ZIP's encryption needs | AES encrypts in constant time, as BearSSL's `aes_ct64`; all four checked against the published vectors, BearSSL's tests and nettle. `hivepack-zip` encrypts and decrypts WinZip AES with them |
 | [`hivepack-deflate`](crates/deflate) | Deflate, zlib and gzip in safe Rust, ported from zlib 1.3.2: the same output, at the same speed | Compresses with zlib's output, byte for byte, and decompresses with its results and messages, both at about its speed. Decodes Deflate64 as zlib's `contrib/infback9` does |
+| [`hivepack-extract`](crates/extract) | Extracting archives to disk, safe by default: nothing outside the destination, through links, over what is there, or past limits | Extracts ZIP archives, refusing unportable names, the same path twice, links and overlapping data, writing by handle and counting what is written. tar and RAR come later |
 | [`hivepack-zip`](crates/zip) | ZIP archives in safe Rust, the container logic ported from libzip 1.12.1 | Opens archives, reads their headers, and reads stored, deflated and Deflate64 entries with libzip's rules and errors; edits names, comments, times and attributes, deletes entries, adds and replaces data, stored or deflated, and writes the archive as libzip does, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES. All compared with libzip, and 163 of libzip's own tests pass through the port's `ziptool` |
-| [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | Decompresses, in one call or streaming, with the same output and errors as libzstd, at about 0.9× its speed. Compresses at every level, in one call or streaming, with dictionaries, with libzstd's frames |
+| [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | Decompresses, in one call or streaming, with the same output and errors as libzstd, at about 0.9× its speed. Compresses at every level, in one call or streaming, with dictionaries, on several threads, with libzstd's frames |
 
-Every crate forbids `unsafe` code; the one exception, `hivepack-zstd`'s `unsafe-fast` feature, is off by default (see [docs/unsafe.md](docs/unsafe.md)). The rules are in [docs/safety.md](docs/safety.md), and how the ports follow the official libraries is in [docs/porting.md](docs/porting.md) (zstd), [docs/deflate.md](docs/deflate.md) (zlib), [docs/zip.md](docs/zip.md) (libzip) and [docs/crypto.md](docs/crypto.md) (BearSSL).
+Every crate forbids `unsafe` code; the one exception, `hivepack-zstd`'s `unsafe-fast` feature, is off by default (see [docs/unsafe.md](docs/unsafe.md)). The one dependency with `unsafe` code, cap-std, is in `hivepack-extract`, until the standard library can open files from a directory's handle. The rules are in [docs/safety.md](docs/safety.md), and how the ports follow the official libraries is in [docs/porting.md](docs/porting.md) (zstd), [docs/deflate.md](docs/deflate.md) (zlib), [docs/zip.md](docs/zip.md) (libzip) and [docs/crypto.md](docs/crypto.md) (BearSSL).
 
 ## 🧪 Tests
 

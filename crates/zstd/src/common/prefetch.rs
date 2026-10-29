@@ -72,7 +72,15 @@ mod tests {
     #[test]
     fn prefetches_take_any_address() {
         let table = [7u32; 16];
-        for at in [0, 15, 16, 1 << 20, usize::MAX >> 12, usize::MAX / 8, usize::MAX] {
+        for at in [
+            0,
+            15,
+            16,
+            1 << 20,
+            usize::MAX >> 12,
+            usize::MAX / 8,
+            usize::MAX,
+        ] {
             prefetch_l1(&table, at);
         }
         prefetch_l1::<u8>(&[], 1 << 30);

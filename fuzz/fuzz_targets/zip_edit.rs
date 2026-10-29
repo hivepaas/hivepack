@@ -163,6 +163,12 @@ fn check_written(
         }
         if reencrypted {
             both &= stat::ENCRYPTION_METHOD;
+            // An entry whose flags have the strong encryption bit keeps it
+            // when encrypted, as in libzip, and reads back as encrypted
+            // with an unknown method.
+            if a.encryption_method == em::UNKNOWN {
+                both = 0;
+            }
         }
         for (field, x, y) in [
             (stat::SIZE, a.size, b.size),

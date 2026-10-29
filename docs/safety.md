@@ -25,6 +25,16 @@ These are the places in libzstd where safe Rust is known to fall short. Each one
 | Unchecked reads in hot loops | Bounds checks cost time | Buffers with slack and fixed-size arrays, so the checks fold away. Measured in the decoder (Apple M1 Pro, October 2026): the compiler cannot see that libzstd's fast-path condition keeps the sequence loop's copies in bounds. With them unchecked, decompression goes from 0.92× to 0.95× libzstd on average over Silesia in one call, and from 0.90× to 0.96× streaming: the `unsafe-fast` feature, approved (see [unsafe.md](unsafe.md)). The bitstreams' 8-byte reads stay checked. In the encoder's match finders (same machine, October 2026), measured on a scratch copy: with their input reads and hash table accesses unchecked, compression gains 4% to 40% (`sao` at level −1 the most, to 0.71× libzstd). Not proposed: the finders' loops reshaped in safe code since gained more (`sao` at level −1 at 0.76×; see [porting.md](porting.md#where-compression-stands)) |
 | Output buffers that are never initialised | Needs `unsafe` | Zero them first, which costs little |
 
+## Dependencies with unsafe code
+
+A library may depend on a crate that has `unsafe` code only where there is no other way: the standard library has nothing that does the job, and doing it in the library would take `unsafe` code of its own (a system call the standard library does not wrap, for one). HivePaaS settled this in October 2026. Each such dependency is listed here, with what it is for, why it is needed, and what would replace it; it stays out of every crate but the one that needs it.
+
+| Dependency | In | For | Why | Replaced by |
+|---|---|---|---|---|
+| `cap-std`, `cap-fs-ext` (Bytecode Alliance; with `rustix` on Unix, `windows-sys` and `winx` on Windows) | `hivepack-extract` | Opening each directory under the destination from its parent's handle without following a symbolic link, and creating files there: `openat2` with `RESOLVE_BENEATH` on Linux, `openat` with `O_NOFOLLOW` a component at a time elsewhere on Unix, handles relative to a directory's on Windows | The standard library's directory handles (`std::fs::Dir`, tracking issue rust-lang/rust#120426) are not stable. Without them, a path is checked and then opened again, and a link put in between is followed | `std::fs::Dir`, once stable |
+
+The rest of the repository, the codecs, the cryptography and the ZIP container among them, depends on nothing with `unsafe` code.
+
 ## Untrusted input never panics
 
 Library code returns errors and never panics, whatever the input:

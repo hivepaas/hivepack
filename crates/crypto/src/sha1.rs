@@ -1,12 +1,13 @@
 //! SHA-1: port of `sha1.c`.
 
 use crate::clear::clear;
+use crate::digest::Digest;
 
 /// The length of a SHA-1 digest, in bytes.
 pub const SHA1_LENGTH: usize = 20;
 
 /// The length of a block of SHA-1's input, in bytes.
-pub(crate) const BLOCK_LENGTH: usize = 64;
+const BLOCK_LENGTH: usize = 64;
 
 fn f(b: u32, c: u32, d: u32) -> u32 {
     ((c ^ d) & b) ^ d
@@ -163,9 +164,27 @@ impl Sha1 {
         clear(&mut val);
         dst
     }
+}
 
-    /// `br_sha1_state`: the state after whole blocks, and the length hashed.
-    pub(crate) fn state(&self) -> ([u8; SHA1_LENGTH], u64) {
+impl Digest for Sha1 {
+    type Output = [u8; SHA1_LENGTH];
+    const OUTPUT_LENGTH: usize = SHA1_LENGTH;
+    const BLOCK_LENGTH: usize = BLOCK_LENGTH;
+
+    fn new() -> Sha1 {
+        Sha1::new()
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.update(data);
+    }
+
+    fn out(&self) -> [u8; SHA1_LENGTH] {
+        self.out()
+    }
+
+    /// `br_sha1_state`.
+    fn state(&self) -> ([u8; SHA1_LENGTH], u64) {
         let mut dst = [0u8; SHA1_LENGTH];
         for (bytes, word) in dst.as_chunks_mut().0.iter_mut().zip(self.val) {
             *bytes = word.to_be_bytes();
@@ -173,9 +192,8 @@ impl Sha1 {
         (dst, self.count)
     }
 
-    /// `br_sha1_set_state`: a computation that goes on from a state that
-    /// [`Sha1::state`] gave after `count` bytes, a multiple of 64.
-    pub(crate) fn set_state(&mut self, stb: &[u8; SHA1_LENGTH], count: u64) {
+    /// `br_sha1_set_state`.
+    fn set_state(&mut self, stb: &[u8; SHA1_LENGTH], count: u64) {
         for (word, bytes) in self.val.iter_mut().zip(stb.as_chunks().0) {
             *word = u32::from_be_bytes(*bytes);
         }

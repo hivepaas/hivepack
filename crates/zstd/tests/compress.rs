@@ -29,7 +29,12 @@ fn sets() -> Vec<Set> {
         .filter(|set| set.present())
         // Benchmark inputs are too large for the tests; sources and tools
         // are not data.
-        .filter(|set| !matches!(set.kind, Kind::Bench | Kind::Source | Kind::Tool))
+        .filter(|set| {
+            !matches!(
+                set.kind,
+                Kind::Bench | Kind::Source | Kind::Tool | Kind::Archives
+            )
+        })
         .collect()
 }
 

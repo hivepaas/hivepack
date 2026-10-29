@@ -73,14 +73,23 @@ On an Apple M1 Pro (October 2026), the 12 files of the Silesia corpus, in one ca
 
 At negative levels the port does worst on data that hardly compresses: `sao` at level −1 runs at 0.76×, `dickens` at level −5 at 0.86×. Streaming, in the pieces the zstd command line uses and against libzstd streaming the same way, runs at 0.82–0.90× at level 1 (`dickens`, `mozilla`, `osdb`, `sao`, `xml`) and 0.86–1.00× at level 3 (eight files); once its buffer wraps around, it searches with the `extDict` finders.
 
-The stronger levels have had no speed work yet. On five of the files (`dickens`, `xml`, `sao`, `x-ray`, `ooffice`), in one call:
+Levels 5 to 12, the row match finder, on six of the files (`dickens`, `mozilla`, `ooffice`, `sao`, `x-ray`, `xml`), in one call, best of three rounds taken in turn (`zstd-bench`); with the `unsafe-fast` feature, the finder prefetches as libzstd does (see [unsafe.md](unsafe.md)):
+
+| Level | Strategy | Safe: mean | Range | `unsafe-fast`: mean | Range |
+|---|---|---|---|---|---|
+| 5 | `greedy` | 0.84× | 0.78–0.89× | 0.86× | 0.85–0.88× |
+| 6 | `lazy` | 0.83× | 0.79–0.87× | 0.85× | 0.82–0.88× |
+| 7 | `lazy` | 0.82× | 0.75–0.86× | 0.84× | 0.82–0.86× |
+| 8 | `lazy2` | 0.81× | 0.78–0.85× | 0.83× | 0.79–0.86× |
+| 9 | `lazy2` | 0.74× | 0.67–0.80× | 0.83× | 0.81–0.88× |
+| 10 | `lazy2` | 0.68× | 0.46–0.91× | 0.87× | 0.84–0.91× |
+| 11 | `lazy2` | 0.74× | 0.59–0.91× | 0.84× | 0.82–0.85× |
+| 12 | `lazy2` | 0.70× | 0.55–0.85× | 0.83× | 0.77–0.90× |
+
+The stronger levels, on five of the files (`dickens`, `xml`, `sao`, `x-ray`, `ooffice`), in one call:
 
 | Level | Match finder | Mean | Range |
 |---|---|---|---|
-| 5 | row (`greedy`) | 0.86× | 0.81–0.89× |
-| 7 | row (`lazy`) | 0.82× | 0.78–0.86× |
-| 9 | row (`lazy2`) | 0.75× | 0.67–0.84× |
-| 12 | row (`lazy2`) | 0.71× | 0.60–0.89× |
 | 13 and 15 | binary tree (`btlazy2`) | 1.00–1.05× | 1.00–1.14× |
 | 16 | optimal parser (`btopt`) | 0.89× | 0.83–0.92× |
 | 19 | optimal parser (`btultra2`) | 0.93× | 0.86–0.96× |
@@ -89,7 +98,9 @@ The stronger levels have had no speed work yet. On five of the files (`dickens`,
 
 \* On the first 4 MB of each file, with the block splitter after the sequences off on both sides, as the port does not have it yet.
 
-The row match finder falls behind as it searches more. Sampling shows its search taking about 1.6× libzstd's time; libzstd prefetches each row and candidate, which safe Rust cannot (see [safety.md](safety.md)), and a plain load ahead in its place made it slower.
+Without prefetching, the row match finder falls behind as it searches more and as its tables outgrow the caches; most of that is libzstd's prefetching. Built without it (`NO_PREFETCH`), libzstd is 13–21% slower at levels 7 to 12 (`dickens` at level 7 from 72 to 61 MB/s, at level 12 from 23.5 to 18.5; `mozilla` at level 9 from 86 to 74.5), and on inputs whose tables stay in the caches the port keeps up (the first 256 KB of `dickens` at level 12: 1.00×). Safe code has no prefetch on stable Rust, and what was tried in its place made the finder slower: each row read 8 positions ahead (−6% to +3%), the candidates' first bytes read as they are gathered (−3% to −22%), and gathering the candidates before comparing them, as libzstd does, without the prefetches (0 to −6%). The safe build keeps comparing each candidate as it finds it. Where the tables and the input stay in the caches and the rows hold many candidates, libzstd's order costs more than prefetching gives: `xml` at level 11 is 8% slower with the feature.
+
+What is left is code: the port runs 22% more instructions than libzstd at level 7 (on the first MB of `dickens`), at the same instructions per cycle; bounds checks cut by one per row access took 1.5% of them off, and no time.
 
 At levels 1 to 3, it was 0.69× and 0.76× before the speed work. What made the difference, the largest first:
 

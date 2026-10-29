@@ -56,7 +56,7 @@ fn c_string(name: &[u8]) -> &[u8] {
 
 /// The oracle's description of an open archive, or of the error.
 fn describe<R: ReadAt>(result: hivepack_zip::Result<Archive<R>>) -> String {
-    let mut za = match result {
+    let za = match result {
         Ok(za) => za,
         Err(e) => return error_text(e),
     };

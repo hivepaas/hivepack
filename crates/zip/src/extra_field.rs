@@ -1,5 +1,7 @@
 //! Extra fields: port of `zip_extra_field.c`, the reading half.
 
+use std::sync::OnceLock;
+
 use crate::buffer::Buffer;
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::io_util::read_data;
@@ -17,11 +19,13 @@ pub(crate) struct ExtraField {
     pub data: Vec<u8>,
 }
 
-/// `zip_extra_fields_t`: the fields of the local header and of the central
-/// directory.
+/// `zip_extra_fields_t`: the fields of the local header, once read (set
+/// when libzip sets `local_extra_fields_read`), and those of the central
+/// directory. Differs from libzip: the local fields are kept in a
+/// `OnceLock`, so that they can be read through `&Archive`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExtraFields {
-    pub local: Vec<ExtraField>,
+    pub local: OnceLock<Vec<ExtraField>>,
     pub central: Vec<ExtraField>,
 }
 
@@ -92,7 +96,11 @@ impl ExtraFields {
         flags: Flags,
     ) -> Result<&[u8]> {
         if flags.intersects(EF_LOCAL)
-            && let Some(data) = ef_get_by_id(&self.local, extra_field_id, extra_field_index)
+            && let Some(data) = ef_get_by_id(
+                self.local.get().map_or(&[][..], Vec::as_slice),
+                extra_field_id,
+                extra_field_index,
+            )
         {
             return Ok(data);
         }
@@ -108,7 +116,7 @@ impl ExtraFields {
     pub(crate) fn count(&self, id: i32, flags: Flags) -> i16 {
         let mut n = 0;
         if flags.intersects(EF_LOCAL) {
-            n += ef_count(&self.local, id);
+            n += ef_count(self.local.get().map_or(&[][..], Vec::as_slice), id);
         }
         if flags.intersects(EF_CENTRAL) {
             n += ef_count(&self.central, id);
@@ -119,43 +127,46 @@ impl ExtraFields {
 
 impl<R: ReadAt> Archive<R> {
     /// Reads the local header's extra fields of entry `idx`, if they were
-    /// not read yet: port of `_zip_read_local_ef`.
-    pub(crate) fn read_local_ef(&mut self, idx: u64) -> Result<()> {
+    /// not read yet: port of `_zip_read_local_ef`, through a view of the
+    /// source of its own.
+    pub(crate) fn read_local_ef(&self, idx: u64) -> Result<()> {
         if idx >= self.entry.len() as u64 {
             return Err(Error::new(ErrorCode::Inval, 0));
         }
-        let Some(orig) = self.entry[idx as usize].orig.as_mut() else {
+        let Some(orig) = self.entry[idx as usize].orig.as_deref() else {
             return Ok(());
         };
-        if orig.local_extra_fields_read {
+        if orig.extra_fields.local.get().is_some() {
             return Ok(());
         }
 
         if orig.offset + 26 > i64::MAX as u64 {
             return Err(Error::new(ErrorCode::Seek, EFBIG));
         }
-        self.src.seek((orig.offset + 26) as i64, Whence::Set)?;
-        let mut buffer = Buffer::from_source(&mut self.src, 4)?;
+        let mut src = self.src.view();
+        src.seek((orig.offset + 26) as i64, Whence::Set)?;
+        let mut buffer = Buffer::from_source(&mut src, 4)?;
         let fname_len = buffer.get_16();
         let ef_len = buffer.get_16();
         if !buffer.eof() {
             return Err(Error::new(ErrorCode::Internal, 0));
         }
 
+        let mut ef = Vec::new();
         if ef_len > 0 {
             // libzip reports ZIP_ER_SEEK with errno, which a seek past the
             // end of the source leaves at 0, as it fails before any system
             // call.
-            if self.src.seek(i64::from(fname_len), Whence::Cur).is_err() {
+            if src.seek(i64::from(fname_len), Whence::Cur).is_err() {
                 return Err(Error::new(ErrorCode::Seek, 0));
             }
-            let ef_raw = read_data(None, &mut self.src, usize::from(ef_len))?;
-            let mut ef = ef_parse(&ef_raw)?;
+            let ef_raw = read_data(None, &mut src, usize::from(ef_len))?;
+            ef = ef_parse(&ef_raw)?;
             ef_remove_internal(&mut ef);
-            orig.extra_fields.local = ef;
         }
 
-        orig.local_extra_fields_read = true;
+        // Another reader may have set them first, to the same fields.
+        let _ = orig.extra_fields.local.set(ef);
         Ok(())
     }
 }

@@ -11,10 +11,13 @@
 //! ([`CCtx::set_parameter`]), giving the frames libzstd gives; with
 //! dictionaries too ([`CCtx::load_dictionary`], [`CDict`],
 //! [`CCtx::ref_prefix`], [`CCtx::compress_using_dict`]), attached, copied
-//! in or loaded again as libzstd decides; and on several threads
-//! ([`CParameter::NbWorkers`]), as libzstd's `ZSTD_c_nbWorkers`. The plan,
-//! and the rules the port follows, are in the repository: `docs/porting.md`
-//! and `docs/safety.md`.
+//! in or loaded again as libzstd decides; on several threads
+//! ([`CParameter::NbWorkers`]), as libzstd's `ZSTD_c_nbWorkers`; and from
+//! sequences found outside the match finder, the caller's
+//! ([`CCtx::compress_sequences`], [`CCtx::compress_sequences_and_literals`])
+//! or those a match finder of the caller's gives for each block
+//! ([`CCtx::register_sequence_producer`]). The plan, and the rules the port
+//! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -93,6 +96,32 @@
 //! # }
 //! ```
 //!
+//! Compressing sequences found beforehand, with a block delimiter after
+//! each block's:
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_zstd::Error> {
+//! use hivepack_zstd::{CCtx, CParameter, Sequence, SequenceFormat};
+//!
+//! let data = b"abcabcabcabcabcabc and more";
+//! let seqs = [
+//!     // Three literals, then 15 bytes copied from 3 back.
+//!     Sequence { offset: 3, lit_length: 3, match_length: 15, rep: 0 },
+//!     // The end of the block, with its last literals.
+//!     Sequence { offset: 0, lit_length: 9, match_length: 0, rep: 0 },
+//! ];
+//! let mut cctx = CCtx::new();
+//! cctx.set_parameter(CParameter::BlockDelimiters(SequenceFormat::ExplicitBlockDelimiters))?;
+//! cctx.set_parameter(CParameter::ValidateSequences(true))?;
+//! let mut frame = vec![0; hivepack_zstd::compress_bound(data.len()).unwrap_or(0)];
+//! let size = cctx.compress_sequences(&mut frame, &seqs, data)?;
+//! let mut out = vec![0; data.len()];
+//! assert_eq!(hivepack_zstd::decompress(&mut out, &frame[..size])?, data.len());
+//! assert_eq!(&out, data);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Decompressing a frame:
 //!
 //! ```
@@ -165,12 +194,15 @@ mod decompress;
 mod oracle;
 #[cfg(test)]
 mod oracle_compress;
+#[cfg(test)]
+mod oracle_sequences;
 
 pub use common::error_private::{Error, ErrorCode, Result};
 pub use compress::zstd_cdict::CDict;
 pub use compress::zstd_compress::{
-    CCtx, CParameter, CParameterKind, EndDirective, compress, compress_bound, cstream_in_size,
-    cstream_out_size, default_c_level, max_c_level, min_c_level,
+    CCtx, CParameter, CParameterKind, EndDirective, SEQUENCE_PRODUCER_ERROR, Sequence,
+    SequenceFormat, SequenceProducer, compress, compress_bound, cstream_in_size, cstream_out_size,
+    default_c_level, max_c_level, merge_block_delimiters, min_c_level, sequence_bound,
 };
 pub use compress::zstd_compress_internal::{DictAttachPref, ParamSwitch, Strategy};
 pub use decompress::zstd_ddict::{DDict, DictContentType};

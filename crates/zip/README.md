@@ -2,7 +2,7 @@
 
 ZIP archives in safe Rust, the container logic ported from [libzip](https://libzip.org) 1.12.1.
 
-> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries, with libzip's rules and errors; edits entries' names, comments, times and attributes, deletes them, adds and replaces data, stored or deflated, and writes the archive as libzip writes it, byte for byte; decrypts ZipCrypto and WinZip AES entries. All compared with libzip itself. Encrypting comes next. This crate is not on crates.io.
+> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries, with libzip's rules and errors; edits entries' names, comments, times and attributes, deletes them, adds and replaces data, stored or deflated, and writes the archive as libzip writes it, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES entries. All compared with libzip itself. This crate is not on crates.io.
 
 ```rust
 use hivepack_zip::{Archive, Flags, OpenFlags};
@@ -28,6 +28,8 @@ Entries encrypted with ZipCrypto or WinZip AES are read with a password, the arc
 archive.set_default_password(Some(b"secret"));
 let mut file = archive.fopen(b"notes.txt", Flags::NONE)?;
 ```
+
+`file_set_encryption` encrypts an entry when the archive is written, with its password or the default one. The random bytes that takes come from `/dev/urandom` on Unix; elsewhere, give them with `set_random_source` (from the `getrandom` crate, for example).
 
 Changes are kept until the archive is written, to an output of the caller's:
 

@@ -1,0 +1,654 @@
+//! ziptool, with the commands libzip's tests add to it (ziptool_regress):
+//! port of libzip's `src/ziptool.c` and `regress/programs/ziptool_regress.c`,
+//! for the commands that read an archive. Those that change it come with
+//! writing; until then they are unknown commands. The output is libzip's,
+//! word for word, so that libzip's tests can run on the port.
+
+use std::io::Write;
+use std::process::ExitCode;
+
+use hivepack_zip::{Archive, ArchiveFlags, Error, ErrorCode, Flags, OpenFlags, ZipFile, stat};
+use ziptool::{Create, Getopt, Src, strtoull, zip_open, zip_open_in_memory};
+
+/// The state of the C program's globals.
+struct Tool {
+    za: &'static Archive<Src>,
+    stat_flags: Flags,
+    hex_encoded_filenames: bool,
+    /// the entries opened by `fopen`
+    z_files: Vec<ZipFile<'static, Src>>,
+    out: std::io::Stdout,
+}
+
+/// A command: its name, how many arguments it takes, and what it does.
+type Command = (
+    &'static str,
+    usize,
+    fn(&mut Tool, &[String]) -> Result<(), ()>,
+);
+
+/// `dispatch_table`, with `DISPATCH_REGRESS`: the reading commands.
+const DISPATCH_TABLE: &[Command] = &[
+    ("cat", 1, cat),
+    ("cat_partial", 3, cat_partial),
+    ("count_extra", 2, count_extra),
+    ("count_extra_by_id", 3, count_extra_by_id),
+    ("extract_as", 2, extract_as),
+    ("fopen", 1, regress_fopen),
+    ("fread", 2, regress_fread),
+    ("get_archive_comment", 0, get_archive_comment),
+    ("get_archive_flag", 1, get_archive_flag),
+    ("get_extra", 3, get_extra),
+    ("get_extra_by_id", 4, get_extra_by_id),
+    ("get_file_comment", 1, get_file_comment),
+    ("get_num_entries", 1, get_num_entries),
+    ("name_locate", 2, name_locate),
+    ("stat", 1, zstat),
+];
+
+/// A name as C sees it: up to its first NUL byte.
+fn c_string(name: &[u8]) -> &[u8] {
+    &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())]
+}
+
+impl Tool {
+    fn print(&mut self, bytes: &[u8]) {
+        let _ = self.out.write_all(bytes);
+    }
+
+    /// `encode_filename`: the name as a C string, without the `\r` of
+    /// `\r\n`, or in hexadecimal with `-x`.
+    fn encode_filename(&self, name: &[u8]) -> Vec<u8> {
+        let name = c_string(name);
+        if self.hex_encoded_filenames {
+            return name
+                .iter()
+                .flat_map(|b| format!("{b:02x}").into_bytes())
+                .collect();
+        }
+        let mut out = Vec::with_capacity(name.len());
+        let mut i = 0;
+        while i < name.len() {
+            if name[i] == b'\r' && name.get(i + 1) == Some(&b'\n') {
+                i += 1;
+                continue;
+            }
+            out.push(name[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// `decode_filename`: from hexadecimal with `-x`.
+    fn decode_filename(&self, name: &str) -> Vec<u8> {
+        if !self.hex_encoded_filenames {
+            return name.as_bytes().to_vec();
+        }
+        let hex2bin = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => c.wrapping_sub(b'a').wrapping_add(10),
+        };
+        name.as_bytes()
+            .chunks(2)
+            .map(|p| (hex2bin(p[0]) << 4) | hex2bin(*p.get(1).unwrap_or(&b'0')))
+            .collect()
+    }
+
+    /// `cat_impl_backend`: `len` bytes of entry `idx` from `start` (all of
+    /// it if `len` is 0, the rest if it is `None`), written to `out`.
+    fn cat_impl_backend(
+        &mut self,
+        idx: u64,
+        start: u64,
+        len: Option<u64>,
+        out: &mut dyn Write,
+    ) -> Result<(), ()> {
+        let mut len = len;
+        // we can't pass 0 as a len to zip_source_zip_create because it will
+        // try to give us compressed data
+        if len == Some(0) {
+            match self.za.stat_index(idx, self.stat_flags) {
+                Ok(sb) => len = Some(sb.size),
+                Err(e) => {
+                    eprintln!("zip_stat_index failed on '{idx}' failed: {e}");
+                    return Err(());
+                }
+            }
+        }
+        // zip_source_zip_file_create takes the length as a zip_int64_t:
+        // -1, as strtoull reads "-1", is the rest of the data.
+        let len = len.filter(|&l| l != u64::MAX);
+        let mut zf = match self.za.fopen_index_range(idx, Flags::NONE, start, len) {
+            Ok(zf) => zf,
+            Err(e) => {
+                // zip_source_zip_file_create leaves the error it is given
+                // unset when the method has no algorithm.
+                let e = if e.code() == ErrorCode::CompNotSupp {
+                    Error::new(ErrorCode::Ok, 0)
+                } else {
+                    e
+                };
+                eprintln!("can't open file at index '{idx}': {e}");
+                return Err(());
+            }
+        };
+        let mut buf = vec![0; 8192];
+        loop {
+            match zf.fread(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = out.write_all(&buf[..n]) {
+                        eprintln!("can't write file contents: {e}");
+                        return Err(());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("can't read file at index '{idx}': {e}");
+                    return Err(());
+                }
+            }
+        }
+        if let Err(e) = zf.fclose() {
+            eprintln!("can't close file at index '{idx}': {e}");
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+fn cat(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // output file contents to stdout
+    let idx = strtoull(&argv[0]);
+    let mut out = std::io::stdout();
+    t.cat_impl_backend(idx, 0, Some(0), &mut out)
+}
+
+fn cat_partial(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // output partial file contents to stdout
+    let idx = strtoull(&argv[0]);
+    let start = strtoull(&argv[1]);
+    let len = strtoull(&argv[2]);
+    let mut out = std::io::stdout();
+    t.cat_impl_backend(idx, start, Some(len), &mut out)
+}
+
+fn count_extra(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let ceflags = get_flags(&argv[1]);
+    match t.za.file_extra_fields_count(idx, ceflags) {
+        Ok(count) => {
+            t.print(format!("Extra field count: {count}\n").as_bytes());
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("can't get extra field count for file at index '{idx}': {e}");
+            Err(())
+        }
+    }
+}
+
+fn count_extra_by_id(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let eid = strtoull(&argv[1]) as u16;
+    let ceflags = get_flags(&argv[2]);
+    match t.za.file_extra_fields_count_by_id(idx, eid, ceflags) {
+        Ok(count) => {
+            t.print(format!("Extra field count: {count}\n").as_bytes());
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "can't get extra field count for file at index '{idx}' and for id '{eid}': {e}"
+            );
+            Err(())
+        }
+    }
+}
+
+fn extract_as(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let mut fp = match std::fs::File::create(&argv[1]) {
+        Ok(fp) => fp,
+        Err(e) => {
+            eprint!("can't open output file '{}': {e}", argv[1]);
+            return Err(());
+        }
+    };
+    t.cat_impl_backend(idx, 0, None, &mut fp)
+}
+
+fn regress_fopen(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    if t.z_files.len() >= 16 {
+        eprintln!("too many open files");
+        return Err(());
+    }
+    let name = t.decode_filename(&argv[0]);
+    match t.za.fopen(&name, Flags::NONE) {
+        Ok(zf) => {
+            t.print(format!("opened '{}' as file {}\n", argv[0], t.z_files.len()).as_bytes());
+            t.z_files.push(zf);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("can't open entry '{}' from input archive: {e}", argv[0]);
+            Err(())
+        }
+    }
+}
+
+fn regress_fread(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let file_idx = strtoull(&argv[0]);
+    let mut length = strtoull(&argv[1]);
+    let Some(f) = t.z_files.get_mut(file_idx as usize) else {
+        eprintln!("trying to read from invalid opened file");
+        return Err(());
+    };
+    let mut buf = vec![0; 8192];
+    while length > 0 {
+        let to_read = length.min(buf.len() as u64) as usize;
+        let n = match f.fread(&mut buf[..to_read]) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("can't read opened file {file_idx}: {e}");
+                return Err(());
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let _ = t.out.write_all(&buf[..n]);
+        length -= n as u64;
+    }
+    Ok(())
+}
+
+fn get_archive_comment(t: &mut Tool, _argv: &[String]) -> Result<(), ()> {
+    // get archive comment
+    let comment = t.za.get_archive_comment(Flags::NONE);
+    if comment.is_empty() {
+        t.print(b"No archive comment\n");
+    } else {
+        // printf("%.*s"): the encoded name, as long as the comment.
+        let mut line = b"Archive comment: ".to_vec();
+        let encoded = t.encode_filename(comment);
+        line.extend_from_slice(&encoded[..encoded.len().min(comment.len())]);
+        line.push(b'\n');
+        t.print(&line);
+    }
+    Ok(())
+}
+
+fn get_archive_flag(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let Some(flag) = parse_archive_flag(&argv[0]) else {
+        eprintln!("invalid archive flag '{}'", argv[0]);
+        return Err(());
+    };
+    let value = u8::from(t.za.get_archive_flag(flag, Flags::NONE));
+    t.print(format!("{value}\n").as_bytes());
+    Ok(())
+}
+
+/// The extra field line of `get_extra` and `get_extra_by_id`.
+fn extra_line(id: u16, data: &[u8]) -> Vec<u8> {
+    let mut line = format!("Extra field 0x{id:04x}: len {}", data.len());
+    if !data.is_empty() {
+        line.push_str(", data 0x");
+        for b in data {
+            line.push_str(&format!("{b:02x}"));
+        }
+    }
+    line.push('\n');
+    line.into_bytes()
+}
+
+fn get_extra(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // get extra field data
+    let idx = strtoull(&argv[0]);
+    let eidx = strtoull(&argv[1]) as u16;
+    let geflags = get_flags(&argv[2]);
+    match t.za.file_extra_field_get(idx, eidx, geflags) {
+        Ok((id, data)) => {
+            let line = extra_line(id, data);
+            t.print(&line);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "can't get extra field data for file at index {idx}, extra field {eidx}, flags {}: {e}",
+                geflags.0
+            );
+            Err(())
+        }
+    }
+}
+
+fn get_extra_by_id(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let eid = strtoull(&argv[1]) as u16;
+    let eidx = strtoull(&argv[2]) as u16;
+    let geflags = get_flags(&argv[3]);
+    match t.za.file_extra_field_get_by_id(idx, eid, eidx, geflags) {
+        Ok(data) => {
+            let line = extra_line(eid, data);
+            t.print(&line);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "can't get extra field data for file at index {idx}, extra field id {eid}, ef index {eidx}, flags {}: {e}",
+                geflags.0
+            );
+            Err(())
+        }
+    }
+}
+
+fn get_file_comment(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // get file comment
+    let idx = strtoull(&argv[0]);
+    let name =
+        t.za.get_name(idx, Flags::NONE)
+            .map(|n| c_string(n).to_vec())
+            .unwrap_or_else(|_| b"(null)".to_vec());
+    match t.za.file_get_comment(idx, Flags::NONE) {
+        Err(e) => {
+            eprintln!(
+                "can't get comment for '{}': {e}",
+                String::from_utf8_lossy(&name)
+            );
+            Err(())
+        }
+        Ok([]) => {
+            let mut line = b"No comment for '".to_vec();
+            line.extend_from_slice(&name);
+            line.extend_from_slice(b"'\n");
+            t.print(&line);
+            Ok(())
+        }
+        Ok(comment) => {
+            let mut line = b"File comment for '".to_vec();
+            line.extend_from_slice(&name);
+            line.extend_from_slice(b"': ");
+            line.extend_from_slice(comment);
+            line.push(b'\n');
+            t.print(&line);
+            Ok(())
+        }
+    }
+}
+
+fn get_num_entries(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // get number of entries in archive
+    let flags = get_flags(&argv[0]);
+    let count = t.za.get_num_entries(flags);
+    let entries = if count == 1 { "y" } else { "ies" };
+    t.print(format!("{count} entr{entries} in archive\n").as_bytes());
+    Ok(())
+}
+
+fn name_locate(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let flags = get_flags(&argv[1]);
+    let name = t.decode_filename(&argv[0]);
+    match t.za.name_locate(&name, flags) {
+        Ok(idx) => t.print(
+            format!(
+                "name '{}' using flags '{}' found at index {idx}\n",
+                argv[0], argv[1]
+            )
+            .as_bytes(),
+        ),
+        Err(_) => eprintln!(
+            "can't find entry with name '{}' using flags '{}'",
+            argv[0], argv[1]
+        ),
+    }
+    Ok(())
+}
+
+fn zstat(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let sb = match t.za.stat_index(idx, t.stat_flags) {
+        Ok(sb) => sb,
+        Err(e) => {
+            eprintln!("zip_stat_index failed on '{idx}' failed: {e}");
+            return Err(());
+        }
+    };
+
+    let mut text = Vec::new();
+    if sb.valid & stat::NAME != 0 {
+        text.extend_from_slice(b"name: '");
+        text.extend_from_slice(&t.encode_filename(sb.name.unwrap_or_default()));
+        text.extend_from_slice(b"'\n");
+    }
+    let mut line = |s: String| text.extend_from_slice(s.as_bytes());
+    if sb.valid & stat::INDEX != 0 {
+        line(format!("index: '{}'\n", sb.index));
+    }
+    if sb.valid & stat::SIZE != 0 {
+        line(format!("size: '{}'\n", sb.size));
+    }
+    if sb.valid & stat::COMP_SIZE != 0 {
+        line(format!("compressed size: '{}'\n", sb.comp_size));
+    }
+    if sb.valid & stat::MTIME != 0 {
+        line(format!("mtime: '{}'\n", strftime(sb.mtime)));
+    }
+    if sb.valid & stat::CRC != 0 {
+        line(format!("crc: '{:x}'\n", sb.crc));
+    }
+    if sb.valid & stat::COMP_METHOD != 0 {
+        line(format!("compression method: '{}'\n", sb.comp_method));
+    }
+    if sb.valid & stat::ENCRYPTION_METHOD != 0 {
+        line(format!("encryption method: '{}'\n", sb.encryption_method));
+    }
+    if sb.valid & stat::FLAGS != 0 {
+        line(format!("flags: '{}'\n", sb.flags));
+    }
+    line("\n".to_string());
+    t.print(&text);
+    Ok(())
+}
+
+/// `strftime("%a %b %d %Y %H:%M:%S", localtime(mtime))`, in UTC, the time
+/// zone hivepack-zip takes MS-DOS times in, so that the fields are those
+/// stored, as libzip's round trip through `mktime` and `localtime` gives
+/// them.
+fn strftime(mtime: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = mtime.div_euclid(86400);
+    let secs = mtime.rem_euclid(86400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{} {} {:02} {} {:02}:{:02}:{:02}",
+        DAYS[days.rem_euclid(7) as usize],
+        MONTHS[(month - 1) as usize],
+        day,
+        year,
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
+/// `get_flags`: the flags named by the letters of `arg`.
+fn get_flags(arg: &str) -> Flags {
+    let mut flags = Flags::NONE;
+    for (c, flag) in [
+        ('C', Flags::NOCASE),
+        ('c', Flags::CENTRAL),
+        ('d', Flags::NODIR),
+        ('l', Flags::LOCAL),
+        ('u', Flags::UNCHANGED),
+        ('8', Flags::ENC_UTF_8),
+        ('4', Flags::ENC_CP437),
+        ('r', Flags::ENC_RAW),
+        ('s', Flags::ENC_STRICT),
+    ] {
+        if arg.contains(c) {
+            flags = flags | flag;
+        }
+    }
+    flags
+}
+
+/// `parse_archive_flag`.
+fn parse_archive_flag(arg: &str) -> Option<ArchiveFlags> {
+    match arg.to_ascii_lowercase().as_str() {
+        "rdonly" => Some(ArchiveFlags::RDONLY),
+        "is-torrentzip" => Some(ArchiveFlags::IS_TORRENTZIP),
+        // ZIP_AFL_WANT_TORRENTZIP and
+        // ZIP_AFL_CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE, for writing.
+        "want-torrentzip" => Some(ArchiveFlags(8)),
+        "create-or-keep-file-for-empty-archive" => Some(ArchiveFlags(16)),
+        _ => None,
+    }
+}
+
+/// `dispatch`: runs the command at the start of `argv`, and returns how
+/// many arguments it took.
+fn dispatch(t: &mut Tool, argv: &[String]) -> Option<usize> {
+    let Some(&(name, count, function)) =
+        DISPATCH_TABLE.iter().find(|(name, _, _)| *name == argv[0])
+    else {
+        eprintln!("unknown command '{}'", argv[0]);
+        return None;
+    };
+    let args = &argv[1..];
+    if args.len() < count {
+        eprintln!(
+            "not enough arguments for command '{name}': {} available, {count} needed",
+            args.len()
+        );
+        return None;
+    }
+    function(t, &args[..count]).ok().map(|()| 1 + count)
+}
+
+fn usage(prg: &str, reason: &str) -> ExitCode {
+    eprintln!(
+        "usage: {prg} [-ceghnrst] [-Himx] [-F fragment-size] [-l len] [-o offset] archive command1 [args] [command2 [args] ...]"
+    );
+    eprintln!("{reason}");
+    ExitCode::from(1)
+}
+
+/// `get_stdin_commands`: the words of the first line of standard input.
+fn stdin_commands() -> Vec<String> {
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    line.split([' ', '\n'])
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().collect();
+    let prg = argv.first().cloned().unwrap_or_else(|| "ziptool".into());
+    let mut flags = OpenFlags(0);
+    let mut create = Create::default();
+    let mut stat_flags = Flags::NONE;
+    let mut hex_encoded_filenames = false;
+    let mut in_memory = false;
+    let mut commands_from_stdin = false;
+    let (mut len, mut offset) = (0, 0);
+
+    let mut getopt = Getopt::new(&argv);
+    while let Some(option) = getopt.next("ceghl:no:rstF:Himx") {
+        match option {
+            Ok(('c', _)) => flags = flags | OpenFlags::CHECKCONS,
+            Ok(('e', _)) => create.excl = true,
+            Ok(('g', _)) => stat_flags = Flags::ENC_GUESS,
+            Ok(('l', value)) => len = strtoull(&value.unwrap_or_default()),
+            Ok(('n', _)) => create.create = true,
+            Ok(('o', value)) => offset = strtoull(&value.unwrap_or_default()),
+            Ok(('r', _)) => stat_flags = Flags::ENC_RAW,
+            Ok(('s', _)) => stat_flags = Flags::ENC_STRICT,
+            Ok(('t', _)) => create.truncate = true,
+            Ok(('i', _)) => commands_from_stdin = true,
+            Ok(('m', _)) => in_memory = true,
+            Ok(('x', _)) => hex_encoded_filenames = true,
+            // The fragment size of in-memory archives makes no difference
+            // to reading.
+            Ok(('F', _)) => {}
+            Ok((c, _)) | Err(c) => return usage(&prg, &format!("invalid option -{c}")),
+        }
+    }
+
+    let mut arg = getopt.optind;
+    if arg + 1 >= argv.len() && !commands_from_stdin {
+        return usage(&prg, "too few arguments");
+    }
+    let Some(archive) = argv.get(arg).cloned() else {
+        return usage(&prg, "too few arguments");
+    };
+    arg += 1;
+
+    // if no flags were given, ZIP_CREATE
+    if flags.0 == 0 && !create.excl && !create.truncate && !create.create {
+        create.create = true;
+    }
+
+    let opened = if in_memory {
+        zip_open_in_memory(&archive, flags, create)
+    } else {
+        zip_open(&archive, flags, create, offset, len)
+    };
+    let za = match opened {
+        Ok(za) => za,
+        Err(e) => {
+            eprintln!("can't open zip archive '{archive}': {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let za: &'static Archive<Src> = Box::leak(Box::new(za));
+    let mut tool = Tool {
+        za,
+        stat_flags,
+        hex_encoded_filenames,
+        z_files: Vec::new(),
+        out: std::io::stdout(),
+    };
+
+    let commands = if commands_from_stdin {
+        stdin_commands()
+    } else {
+        argv[arg..].to_vec()
+    };
+    let mut err = false;
+    let mut at = 0;
+    while at < commands.len() {
+        match dispatch(&mut tool, &commands[at..]) {
+            Some(taken) => at += taken,
+            None => {
+                err = true;
+                break;
+            }
+        }
+    }
+
+    // PRECLOSE_REGRESS: the entries fopen opened are closed.
+    for zf in tool.z_files.drain(..) {
+        if zf.fclose().is_err() {
+            err = true;
+        }
+    }
+    let _ = tool.out.flush();
+    // zip_close of an archive that is not changed writes nothing.
+    ExitCode::from(u8::from(err))
+}

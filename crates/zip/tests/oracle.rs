@@ -682,18 +682,27 @@ fn buffer_can_clone(len: u64, fragment_size: u64, offset: u64) -> bool {
 
 /// Whether the data of each entry of `za`, as read, ends before the local
 /// header of the next.
-fn entries_apart<R: ReadAt>(za: &Archive<R>) -> bool {
+fn entries_apart<R: ReadAt>(za: &Archive<R>, data: &[u8]) -> bool {
+    let u16_at = |at: usize| u64::from(u16::from_le_bytes([data[at], data[at + 1]]));
     let mut spans: Vec<(u64, u64)> = Vec::new();
     for i in 0..za.get_num_entries(Flags::UNCHANGED) {
         let (Ok(start), Ok(st)) = (za.file_get_offset(i), za.stat_index(i, Flags::UNCHANGED))
         else {
             return false;
         };
-        spans.push((start, start + st.comp_size));
+        // Where the local header whose data starts there starts: its name
+        // and extra fields, as long as it says, come between.
+        let header = (0..data.len().saturating_sub(29)).find(|&h| {
+            data[h..h + 4] == *b"PK\x03\x04"
+                && h as u64 + 30 + u16_at(h + 26) + u16_at(h + 28) == start
+        });
+        let Some(header) = header else {
+            return false;
+        };
+        spans.push((header as u64, start + st.comp_size));
     }
     spans.sort_unstable();
-    // A local header takes 30 bytes at least.
-    spans.windows(2).all(|w| w[0].1 + 30 <= w[1].0)
+    spans.windows(2).all(|w| w[0].1 <= w[1].0)
 }
 
 /// [`edit_ops_and_state`], then the archive written to a buffer source in
@@ -708,7 +717,7 @@ fn edit_buffer(data: &[u8], flags: OpenFlags, fragment_size: u64, ops: &str) -> 
     let mut out = std::io::Cursor::new(Vec::new());
     let len = data.len() as u64;
     let expected = archive_state(&za, ops);
-    let apart = entries_apart(&za);
+    let apart = entries_apart(&za, data);
     za.set_random_source(Some(oracle_random(ops)));
     match za.close_to_cloning(&mut out, |offset| {
         buffer_can_clone(len, fragment_size, offset)
@@ -941,9 +950,23 @@ fn check_written(expected: &ArchiveState, written: &[u8]) {
             }
         }
         // Before it is written, new data is read with the method the entry
-        // had, as libzip reads it.
+        // had, as libzip reads it. An entry compressed again and encrypted
+        // with ZipCrypto from an MS-DOS time out of range cannot be read:
+        // the header keeps the time, but the check byte comes from the time
+        // of its stat, back in range, as in libzip.
+        let check_byte_moved = recompressed
+            && a.encryption_method == hivepack_zip::em::TRAD_PKWARE
+            && e.dos_time
+                .is_some_and(|(time, date)| !dos_time_in_range(time, date));
+        // A WinZip AES entry of AE-2 written as AE-1 (see below) has its CRC
+        // checked now, which AE-2 left as it was. And one encrypted with an
+        // unknown method (see above) is decrypted by nothing.
+        let crc_checked_now = a.valid & stat::CRC != 0 && b.valid & stat::CRC == 0;
         if let Some(data) = &e.data
             && e.dos_time.is_some()
+            && !check_byte_moved
+            && !crc_checked_now
+            && a.encryption_method != hivepack_zip::em::UNKNOWN
         {
             assert!(
                 reads_as(&new, j, &expected.passwords, data),
@@ -970,6 +993,25 @@ fn check_written(expected: &ArchiveState, written: &[u8]) {
     // written.
     let comment = new.get_archive_comment(Flags::ENC_RAW);
     assert!(comment.is_empty() || comment == expected.comment);
+}
+
+/// Whether an MS-DOS time and date name a moment as they are, which the
+/// conversions to and from a `time_t` leave as it was.
+fn dos_time_in_range(time: u16, date: u16) -> bool {
+    let (seconds, minutes, hours) = (time & 0x1f, (time >> 5) & 0x3f, time >> 11);
+    let (day, month, year) = (date & 0x1f, (date >> 5) & 0xf, 1980 + (date >> 9));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    seconds < 30
+        && minutes < 60
+        && hours < 24
+        && (1..=12).contains(&month)
+        && (1..=days).contains(&day)
 }
 
 /// A path for a temporary archive of this process.
@@ -1200,14 +1242,27 @@ fn deflated(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `plain` as a bzip2 stream, at a random block size.
+fn bzipped(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
+    let mut out = vec![0; plain.len() + plain.len() / 64 + 1024];
+    let len =
+        hivepack_bzip2::buff_to_buff_compress(&mut out, plain, 1 + rng.below(9) as i32, 0).unwrap();
+    out.truncate(len);
+    out
+}
+
 fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
     let name = name(rng, earlier);
     let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 99, 14, 93]);
     let plain = plain(rng);
     let data = match method {
         0 => plain.clone(),
-        8 => {
-            let mut data = deflated(rng, &plain);
+        8 | 12 => {
+            let mut data = if method == 8 {
+                deflated(rng, &plain)
+            } else {
+                bzipped(rng, &plain)
+            };
             match rng.below(12) {
                 // Cut short, garbage after it, or a byte changed.
                 0 => data.truncate(rng.below(data.len() as u64 + 1) as usize),
@@ -1905,9 +1960,9 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
                 _ => format!("P{}", hex(rng.pick(PASSWORDS))),
             },
             23 | 24 => {
-                // stored, deflated, the default, and methods there are no
-                // compressors for, or that wrap to deflate as a u16
-                let method: i64 = rng.pick(&[0, 8, 8, -1, -1, 9, 12, 14, 65544, 99]);
+                // stored, deflated, the default, bzip2, and methods there
+                // are no compressors for, or that wrap to deflate as a u16
+                let method: i64 = rng.pick(&[0, 8, 8, -1, -1, 12, 12, 9, 14, 65544, 99]);
                 let flags = rng.pick(&[0, 0, 1, 3, 6, 9, 10, 0xffff, 0x1_0005]);
                 format!("z{i}:{method}:{flags}")
             }
@@ -2009,9 +2064,10 @@ fn encrypting_ops(rng: &mut Rng, max_len: u64) -> (String, Vec<Vec<u8>>) {
         let kind = if rng.below(5) == 0 { "u" } else { "s" };
         let name = hex(format!("e{i}").as_bytes());
         ops.push(format!("+{name}:0:{mtime}:{}:{kind}", hex(&data)));
-        match rng.below(4) {
+        match rng.below(5) {
             0 => ops.push(format!("z{i}:0:0")),
             1 => ops.push(format!("z{i}:8:{}", rng.below(10))),
+            2 => ops.push(format!("z{i}:12:{}", rng.below(10))),
             _ => {}
         }
         let method = rng.pick(&[0u16, 1, 1, 257, 258, 259, 259]);
@@ -2067,7 +2123,7 @@ fn encrypt_requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max_len: u
                     format!("y{i}:{method}:{}", password(rng))
                 }
                 3 => format!("P{}", password(rng)),
-                4 => format!("z{i}:{}:{}", rng.pick(&[0, 8, -1]), rng.below(10)),
+                4 => format!("z{i}:{}:{}", rng.pick(&[0, 8, -1, 12]), rng.below(10)),
                 5 => format!("m{i}:{}", 1_000_000_000 + rng.below(500_000_000)),
                 6 => format!("u{i}"),
                 7 => format!("R{i}:{}:{}:s", new_mtime(rng), hex(&new_data(rng))),
@@ -2351,6 +2407,51 @@ fn regress_archives_edit_like_libzip() {
             let want = oracle.ask(&request);
             assert_edit(&request, &want, &format!("{name}: edit {ops}"));
         }
+    }
+}
+
+/// An entry stored at 24:14:18 (an MS-DOS hour out of range), compressed
+/// again and encrypted with ZipCrypto under the default password: libzip
+/// writes the time as it was in the header, but takes the check byte of
+/// its encryption header from the time of its stat, put back in range, so
+/// that the password it was encrypted with is refused. The port writes the
+/// same archive, and refuses the password the same way.
+#[test]
+fn zipcrypto_check_byte_of_a_time_out_of_range_moves() {
+    // "hello" as a.txt, stored, at 24:14:18 on 2003-07-17.
+    let archive = concat!(
+        "504b0304140000000000c9c1f12f86a61036050000000500000005000000612e74787468656c6c6f",
+        "504b01021400140000000000c9c1f12f86a610360500000005000000050000000000000000000000",
+        "000000000000612e747874504b0506000000000100010033000000280000000000",
+    );
+    let data = unhex(archive);
+    for method in [-1, 8, 12, 0] {
+        let ops = format!("z0:{method}:8,y0:1:-,P666f6f");
+        let request = format!("edit 0 {ops} {archive}");
+        if let Some(mut oracle) = Oracle::spawn() {
+            let want = oracle.ask(&request);
+            assert_edit(&request, &want, &request);
+        }
+        let mut za = Archive::open(data.as_slice(), OpenFlags(0)).unwrap();
+        assert_eq!(
+            za.file_get_dos_time(0, Flags::NONE).unwrap(),
+            (0xc1c9, 0x2ff1)
+        );
+        za.set_file_compression(0, method, 8).unwrap();
+        za.file_set_encryption(0, hivepack_zip::em::TRAD_PKWARE, None)
+            .unwrap();
+        za.set_default_password(Some(b"foo"));
+        za.set_random_source(Some(oracle_random(&ops)));
+        let mut out = std::io::Cursor::new(Vec::new());
+        assert_eq!(za.close_to(&mut out).unwrap(), Closed::Written);
+        let new = Archive::open(out.get_ref().as_slice(), OpenFlags(0)).unwrap();
+        assert_eq!(
+            new.file_get_dos_time(0, Flags::NONE).unwrap(),
+            (0xc1c9, 0x2ff1)
+        );
+        let read = new.fopen_index_encrypted(0, Flags::NONE, Some(b"foo"));
+        // Stored, the entry is not compressed again, and reads.
+        assert_eq!(read.is_ok(), method == 0, "method {method}");
     }
 }
 

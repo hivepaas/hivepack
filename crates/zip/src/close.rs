@@ -10,7 +10,6 @@
 use std::cmp::Ordering;
 use std::io::{Seek, Write};
 
-use crate::algorithm_deflate::maximum_compressed_size;
 use crate::buffer::Buffer;
 use crate::dirent::{Dirent, DosTime, cm_actual, u2d_time};
 use crate::error::{Error, ErrorCode, Result};
@@ -21,7 +20,7 @@ use crate::io_util::read;
 use crate::open::Archive;
 use crate::random::RandomSource;
 use crate::source::{ReadAt, Source, Whence};
-use crate::source_compress::{Compress, Decompress};
+use crate::source_compress::{Compress, Decompress, maximum_compressed_size};
 use crate::source_crc::Crc;
 use crate::source_data::time_now;
 use crate::source_stack::{Base, Layer, WriteStack};
@@ -388,10 +387,8 @@ fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
             let compression_method = cm_actual(de.comp_method);
             let max_compressed_size = if compression_method == cm::STORE {
                 st.size
-            } else if compression_method == cm::DEFLATE {
-                maximum_compressed_size(st.size)
             } else {
-                u64::MAX
+                maximum_compressed_size(compression_method, st.size).unwrap_or(u64::MAX)
             };
             if max_compressed_size > 0xffff_ffff {
                 // TODO in libzip: not valid for torrentzip

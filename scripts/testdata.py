@@ -220,11 +220,12 @@ def nettle_headers(nettle: Path, folder: Path) -> Path:
 
 
 # What lib/CMakeLists.txt adds to ZIP_SOURCES with HAVE_CRYPTO and
-# HAVE_GNUTLS.
+# HAVE_GNUTLS, and with HAVE_LIBBZ2.
 LIBZIP_CRYPTO_SOURCES = [
     "zip_crypto_gnutls.c", "zip_winzip_aes.c", "zip_source_winzip_aes_decode.c",
     "zip_source_winzip_aes_encode.c",
 ]
+LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
 
 
 def zip_err_str(lib: Path) -> str:
@@ -260,9 +261,10 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES.
     tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
     tools/zip-oracle is built with libzip's, its crypto backend for
-    GnuTLS among them, its own config.h and zipconf.h in place of those
-    libzip's CMake build writes, the part of GnuTLS that backend uses in
-    gnutls/, and zlib's and nettle's (the `extra` sets)."""
+    GnuTLS and its bzip2 algorithm among them, its own config.h and
+    zipconf.h in place of those libzip's CMake build writes, the part of
+    GnuTLS that backend uses in gnutls/, and zlib's, nettle's and
+    libbzip2's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
     libzip = next(source.glob("libzip-*"), None)
@@ -270,17 +272,21 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         lib = libzip / "lib"
         zlib = next(extra[0].glob("zlib-*"))
         nettle = next(extra[1].glob("nettle-*"))
+        bzip2 = next(extra[2].glob("bzip2-*"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
-        files += [str(lib / name) for name in libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES]
+        files += [str(lib / name) for name in
+                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES]
         files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(nettle / name) for name in NETTLE_SOURCES]
+        files += [str(bzip2 / name) for name in BZIP2_SOURCES]
         include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
         subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
-                        f"-I{include}", f"-I{nettle}", *files, "-o", str(folder / "oracle")], check=True)
+                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", *files, "-o", str(folder / "oracle")],
+                       check=True)
         return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:

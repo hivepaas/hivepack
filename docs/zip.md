@@ -62,7 +62,7 @@ These are hivepack's own, and each one has its own oracles.
 | Writing to a stream | `add_data` seeks back to rewrite the local header, and forces Zip64 when the size is unknown | A streaming writer with data descriptors | Every oracle reads what it writes |
 | Reading a stream | Needs a seekable source | An opt-in streaming reader that checks what it read against the central directory at the end | libarchive's streaming reader |
 | Parallel work | One thread | Entries decompressed in parallel through `ReaderAt`; compressed in parallel and written in order | The single-threaded output, byte for byte |
-| Extracting to disk | None: libzip is an archive library | `hivepack-extract`, shared with tar and RAR, safe by default | ZipDiff samples, David Fifield's zip bombs, the archives behind recent CVEs in other extractors |
+| Extracting to disk | None: libzip is an archive library | `hivepack-extract`, shared with tar and RAR, safe by default (see [extract.md](extract.md)) | ZipDiff samples, David Fifield's zip bombs, the archives behind recent CVEs in other extractors |
 
 ## Strict by default
 
@@ -160,7 +160,7 @@ libzip's ways that the port keeps, though they surprise:
 ## Questions to settle first
 
 - **Random numbers** (settled, October 2026). WinZip AES needs a random salt for each entry, and ZipCrypto random bytes for its header. libzip asks the operating system (`zip_random_*.c`). Rust's standard library has no stable API for it yet (`std::random` is nightly-only), and the `getrandom` crate uses `unsafe` and libc. So `hivepack-zip` reads `/dev/urandom` with the standard library on Unix, as `zip_random_unix.c` does, and takes the bytes from the caller elsewhere (`Archive::set_random_source`); an application can use `getrandom` for that.
-- **Unsafe code inside dependencies.** The rules in [safety.md](safety.md) bind hivepack's own crates; nothing says yet whether a library may depend on a crate that uses `unsafe`. Extracting without races needs `openat2`, `openat` with `O_NOFOLLOW`, or `NtCreateFile` relative to a directory handle, and the Rust crates that offer them (rustix, cap-std) use `unsafe` inside.
+- **Unsafe code inside dependencies** (settled, October 2026). Only where there is no other way, listed in [safety.md](safety.md#dependencies-with-unsafe-code). Extracting without races needs `openat2`, `openat` with `O_NOFOLLOW`, or `NtCreateFile` relative to a directory handle, which the standard library does not have yet: `hivepack-extract` takes them from cap-std (see [extract.md](extract.md)).
 - **Strictness.** Whether `ZIP_CHECKCONS` by default refuses too many real archives (it refuses, for example, an archive comment whose length is wrong) is measured on the test corpora before it is fixed.
 
 ## Licences

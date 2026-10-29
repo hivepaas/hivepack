@@ -1,43 +1,82 @@
-//! A part of another source, the entry's data in the archive: port of
-//! `zip_source_window.c`, for reading.
+//! A part of another source, the entry's data in the archive or its new
+//! data: port of `zip_source_window.c`, for reading.
+
+use std::sync::Arc;
 
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::file_get_offset::file_get_offset;
 use crate::source::{ReadAt, Source, Whence};
+use crate::source_data::{DataSource, FileAttributes};
 use crate::zip::{Stat, stat, stat_merge};
 
-/// What a window reads from: the archive, or the empty buffer libzip makes
-/// for an entry with no data.
+/// What a window reads from: the archive, the empty buffer libzip makes for
+/// an entry with no data, or an entry's new data.
 pub(crate) enum Lower<'a, R: ?Sized> {
     Archive(Source<&'a R>),
     Empty,
+    Data {
+        source: Arc<dyn DataSource>,
+        offset: u64,
+    },
 }
 
 impl<R: ReadAt + ?Sized> Lower<'_, R> {
-    /// The length the lower source's `zip_source_stat` gives.
-    pub(crate) fn size(&self) -> u64 {
+    /// The length the lower source's `zip_source_stat` gives, if it gives
+    /// one.
+    pub(crate) fn known_size(&self) -> Option<u64> {
         match self {
-            Lower::Archive(src) => src.size(),
-            Lower::Empty => 0,
+            Lower::Archive(src) => Some(src.size()),
+            Lower::Empty => Some(0),
+            Lower::Data { .. } => {
+                let st = self.stat();
+                (st.valid & stat::SIZE != 0).then_some(st.size)
+            }
         }
     }
 
-    /// `zip_source_stat` of the lower source: its length, for the window to
-    /// merge its own over. The buffer source tells more, but nothing the
-    /// window does not replace.
+    /// `zip_source_stat` of the lower source, for the window to merge its
+    /// own over: the length of the archive or empty buffer (the buffer
+    /// source tells more, but nothing the window does not replace), or
+    /// what the new data says, nothing if that fails.
     pub(crate) fn stat(&self) -> Stat<'static> {
-        Stat {
-            valid: stat::SIZE,
-            size: self.size(),
-            ..Stat::default()
+        match self {
+            Lower::Archive(src) => Stat {
+                valid: stat::SIZE,
+                size: src.size(),
+                ..Stat::default()
+            },
+            Lower::Empty => Stat {
+                valid: stat::SIZE,
+                ..Stat::default()
+            },
+            Lower::Data { source, .. } => source.stat().unwrap_or_default(),
         }
     }
 
-    fn seek(&mut self, offset: u64) -> Result<()> {
+    /// `zip_source_get_file_attributes` of the lower source: those of the
+    /// new data, none of the archive's.
+    pub(crate) fn file_attributes(&self) -> Result<FileAttributes> {
         match self {
-            Lower::Archive(src) => src.seek(offset as i64, Whence::Set),
-            Lower::Empty if offset == 0 => Ok(()),
+            Lower::Data { source, .. } => source.file_attributes(),
+            _ => Ok(FileAttributes::default()),
+        }
+    }
+
+    fn seek(&mut self, to: u64) -> Result<()> {
+        match self {
+            Lower::Archive(src) => src.seek(to as i64, Whence::Set),
+            Lower::Empty if to == 0 => Ok(()),
             Lower::Empty => Err(Error::new(ErrorCode::Inval, 0)),
+            Lower::Data { source, offset } => {
+                if let Ok(st) = source.stat()
+                    && st.valid & stat::SIZE != 0
+                    && to > st.size
+                {
+                    return Err(Error::new(ErrorCode::Inval, 0));
+                }
+                *offset = to;
+                Ok(())
+            }
         }
     }
 
@@ -45,6 +84,11 @@ impl<R: ReadAt + ?Sized> Lower<'_, R> {
         match self {
             Lower::Archive(src) => src.read(data),
             Lower::Empty => Ok(0),
+            Lower::Data { source, offset } => {
+                let n = source.read_at(*offset, data)?;
+                *offset += n as u64;
+                Ok(n)
+            }
         }
     }
 }
@@ -64,20 +108,27 @@ pub(crate) struct Window {
     offset: u64,
     stat: Stat<'static>,
     stat_invalid: u64,
+    attributes: FileAttributes,
+    /// the time as stored, which the window gives if set
+    dostime: Option<(u16, u16)>,
     pub(crate) error: Error,
 }
 
 impl Window {
     /// A window on `lower` from `start`, `length` bytes long (or to the end
-    /// if -1), with `st` as its stat but for `st_invalid`. With
-    /// `source_archive`, the local header at that offset is skipped when the
-    /// window opens. Port of `_zip_source_window_new`.
+    /// if -1), with `st` as its stat but for `st_invalid`, and the
+    /// `attributes` and DOS time it gives. With `source_archive`, the local
+    /// header at that offset is skipped when the window opens. Port of
+    /// `_zip_source_window_new`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<R: ReadAt + ?Sized>(
         lower: &Lower<'_, R>,
         start: u64,
         length: i64,
         st: &Stat<'_>,
         st_invalid: u64,
+        attributes: FileAttributes,
+        dostime: Option<(u16, u16)>,
         source_archive: Option<u64>,
     ) -> Result<Window> {
         if length < -1 {
@@ -87,8 +138,9 @@ impl Window {
             return Err(Error::new(ErrorCode::Inval, 0));
         }
 
-        let lower_size = lower.size();
-        if start > lower_size || (length > 0 && start + length as u64 > lower_size) {
+        if let Some(lower_size) = lower.known_size()
+            && (start > lower_size || (length > 0 && start + length as u64 > lower_size))
+        {
             return Err(Error::new(ErrorCode::Inval, 0));
         }
 
@@ -106,8 +158,20 @@ impl Window {
             offset: 0,
             stat,
             stat_invalid: st_invalid,
+            attributes,
+            dostime,
             error: Error::OK,
         })
+    }
+
+    /// `ZIP_SOURCE_GET_FILE_ATTRIBUTES`.
+    pub(crate) fn file_attributes(&self) -> FileAttributes {
+        self.attributes
+    }
+
+    /// `ZIP_SOURCE_GET_DOS_TIME`.
+    pub(crate) fn dos_time(&self) -> Option<(u16, u16)> {
+        self.dostime
     }
 
     /// `ZIP_SOURCE_OPEN`: past the local header, for an entry's data.
@@ -139,7 +203,7 @@ impl Window {
             self.start += offset;
             self.source_archive = None;
         }
-        // Both lower sources can seek, so nothing is skipped by reading.
+        // The lower sources can seek, so nothing is skipped by reading.
         self.offset = self.start;
         Ok(())
     }
@@ -223,8 +287,23 @@ pub(crate) struct UpperWindow {
 
 impl UpperWindow {
     /// Port of `_zip_source_window_new`, on a lower source of `lower_size`
-    /// bytes if it is known. Its stat is never asked for, so it keeps
-    /// none.
+    /// bytes if it is known, with no stat, attributes or DOS time of its
+    /// own.
+    /// `ZIP_SOURCE_STAT`, on the lower source's stat: the length of the
+    /// part, or what is left past the start.
+    pub(crate) fn stat(&self, st: &mut Stat<'_>) {
+        if self.end_valid {
+            st.valid |= stat::SIZE;
+            st.size = self.end - self.start;
+        } else if st.valid & stat::SIZE != 0 {
+            if st.size < self.start {
+                st.valid &= !stat::SIZE;
+            } else {
+                st.size -= self.start;
+            }
+        }
+    }
+
     pub(crate) fn new(lower_size: Option<u64>, start: u64, length: i64) -> Result<UpperWindow> {
         if length < -1 {
             return Err(Error::new(ErrorCode::Inval, 0));

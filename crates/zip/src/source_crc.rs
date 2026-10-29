@@ -1,5 +1,5 @@
 //! The layer that checks the CRC-32 and the length of what is read: port
-//! of `zip_source_crc.c`, for reading.
+//! of `zip_source_crc.c`; when writing, it computes them.
 
 use hivepack_deflate::crc32;
 
@@ -103,6 +103,31 @@ impl Crc {
             Ok(true) => self.validate_crc(lower_stat),
             Ok(false) => Ok(()),
         }
+    }
+
+    /// `ZIP_SOURCE_STAT`, on the lower source's stat: once the CRC is
+    /// complete, it and the length read, which must be the length the
+    /// lower source says (`ZIP_ER_DATA_LENGTH`).
+    pub(crate) fn stat(&self, st: &mut Stat<'_>) -> Result<()> {
+        if self.crc_complete {
+            if st.valid & stat::SIZE != 0 && st.size != self.size {
+                return Err(Error::new(ErrorCode::DataLength, 0));
+            }
+            // TODO in libzip: Set comp_size, comp_method,
+            // encryption_method? After all, this only works for
+            // uncompressed data.
+            st.size = self.size;
+            st.crc = self.crc;
+            st.comp_size = self.size;
+            st.comp_method = crate::zip::cm::STORE;
+            st.encryption_method = crate::zip::em::NONE;
+            st.valid |= stat::SIZE
+                | stat::CRC
+                | stat::COMP_SIZE
+                | stat::COMP_METHOD
+                | stat::ENCRYPTION_METHOD;
+        }
+        Ok(())
     }
 
     /// Port of `validate_crc`.

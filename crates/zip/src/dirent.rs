@@ -17,6 +17,7 @@ use crate::extra_field::{
 };
 use crate::io_util::{read_data, read_string};
 use crate::source::{ReadAt, Source, Whence};
+use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK, file_attributes};
 use crate::source_write::Output;
 use crate::string::{ZipString, guess_encoding, string_crc32, string_equal, string_length};
 use crate::zip::{Flags, cm, em, opsys};
@@ -734,6 +735,90 @@ impl Dirent {
         self.uncomp_size >= u64::from(u32::MAX)
             || self.comp_size >= u64::from(u32::MAX)
             || (flags.intersects(Flags::CENTRAL) && self.offset >= u64::from(u32::MAX))
+    }
+
+    /// Takes what a source says about the file: the general purpose bits
+    /// it may set, ASCII, the external attributes and host system unless
+    /// they were set, and the version needed for the method, encryption
+    /// and sizes; whether that changed the entry. Port of
+    /// `_zip_dirent_apply_attributes`.
+    pub(crate) fn apply_attributes(
+        &mut self,
+        attributes: &FileAttributes,
+        force_zip64: bool,
+    ) -> bool {
+        let mut has_changed = false;
+
+        if attributes.valid & file_attributes::GENERAL_PURPOSE_BIT_FLAGS != 0 {
+            let mask = attributes.general_purpose_bit_mask & GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK;
+            let bitflags = (self.bitflags & !mask) | (attributes.general_purpose_bit_flags & mask);
+            if self.bitflags != bitflags {
+                self.bitflags = bitflags;
+                has_changed = true;
+            }
+        }
+        if attributes.valid & file_attributes::ASCII != 0 {
+            let int_attrib = (self.int_attrib & !1) | u16::from(attributes.ascii);
+            if self.int_attrib != int_attrib {
+                self.int_attrib = int_attrib;
+                has_changed = true;
+            }
+        }
+        // manually set attributes are preferred over attributes provided by
+        // source
+        if self.changed & changed::ATTRIBUTES == 0
+            && attributes.valid & file_attributes::EXTERNAL_FILE_ATTRIBUTES != 0
+            && self.ext_attrib != attributes.external_file_attributes
+        {
+            self.ext_attrib = attributes.external_file_attributes;
+            has_changed = true;
+        }
+
+        let is_dir = self
+            .filename
+            .as_ref()
+            .is_some_and(|name| name.raw().last() == Some(&b'/'));
+        let mut version_needed: u16 = if self.comp_method == i32::from(cm::LZMA) {
+            63
+        } else if matches!(
+            self.encryption_method,
+            em::AES_128 | em::AES_192 | em::AES_256
+        ) {
+            51
+        } else if self.comp_method == i32::from(cm::BZIP2) {
+            46
+        } else if force_zip64 || self.needs_zip64(Flags::NONE) {
+            45
+        } else if self.comp_method == i32::from(cm::DEFLATE)
+            || self.encryption_method == em::TRAD_PKWARE
+            || is_dir
+        {
+            20
+        } else {
+            10
+        };
+
+        if attributes.valid & file_attributes::VERSION_NEEDED != 0 {
+            version_needed = version_needed.max(u16::from(attributes.version_needed));
+        }
+
+        if self.version_needed != version_needed {
+            self.version_needed = version_needed;
+            has_changed = true;
+        }
+
+        let mut version_madeby = 63 | (self.version_madeby & 0xff00);
+        if self.changed & changed::ATTRIBUTES == 0
+            && attributes.valid & file_attributes::HOST_SYSTEM != 0
+        {
+            version_madeby = (version_madeby & 0xff) | (u16::from(attributes.host_system) << 8);
+        }
+        if self.version_madeby != version_madeby {
+            self.version_madeby = version_madeby;
+            has_changed = true;
+        }
+
+        has_changed
     }
 
     /// Sets what torrentzip has the same in every entry: port of

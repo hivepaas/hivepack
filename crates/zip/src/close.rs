@@ -10,18 +10,24 @@
 use std::cmp::Ordering;
 use std::io::{Seek, Write};
 
+use crate::algorithm_deflate::maximum_compressed_size;
 use crate::buffer::Buffer;
-use crate::dirent::Dirent;
+use crate::dirent::{Dirent, DosTime, cm_actual, u2d_time};
 use crate::error::{Error, ErrorCode, Result};
 use crate::file_get_offset::file_get_offset;
 use crate::hash::c_string;
 use crate::io_util::read;
 use crate::open::Archive;
 use crate::source::{ReadAt, Source, Whence};
+use crate::source_compress::{Compress, Decompress};
+use crate::source_crc::Crc;
+use crate::source_data::time_now;
+use crate::source_stack::{Base, Layer, WriteStack};
 use crate::source_write::Output;
-use crate::zip::{ArchiveFlags, Flags, OpenFlags, em};
+use crate::zip::{ArchiveFlags, Flags, OpenFlags, cm, em, stat};
 use crate::zipint::{
-    BUFSIZE, DATADES_MAGIC, Entry, GPBF_DATA_DESCRIPTOR, MAX_DATA_DESCRIPTOR_LENGTH, changed,
+    BUFSIZE, DATADES_MAGIC, Entry, FL_FORCE_ZIP64, GPBF_DATA_DESCRIPTOR,
+    MAX_DATA_DESCRIPTOR_LENGTH, changed,
 };
 
 /// What [`Archive::close_to`] did: what libzip's `zip_close` does to the
@@ -56,9 +62,6 @@ impl<R: ReadAt> Archive<R> {
     /// - The archive stays open. libzip discards it once written; on
     ///   failure, both leave it as it was then, and `out` has what was
     ///   written up to the error.
-    /// - Recompressing, which writing in torrentzip format needs
-    ///   ([`ArchiveFlags::WANT_TORRENTZIP`]), fails with
-    ///   `ZIP_ER_OPNOTSUPP`, for now.
     pub fn close_to<W: Write + Seek>(&mut self, out: W) -> Result<Closed> {
         self.close_impl(out, None::<fn(u64) -> bool>)
     }
@@ -229,6 +232,33 @@ impl<R: ReadAt> Archive<R> {
             changes.torrentzip_normalize();
         }
 
+        if new_data {
+            // The dirent is changed apart, and put back: the entry's
+            // source is read through the archive meanwhile.
+            let Some(mut de) = self.entry[i].changes.as_deref().cloned() else {
+                return Err(Error::new(ErrorCode::Internal, 0));
+            };
+            de.offset = out.tell_write()?;
+
+            let base = match &self.entry[i].source {
+                Some(source) => Base::data(source.clone()),
+                None => Base::Entry(Box::new(self.source_zip_file_create(
+                    i as u64,
+                    Flags::UNCHANGED,
+                    0,
+                    -1,
+                    None,
+                )?)),
+            };
+            let check_consistency = self.open_flags.intersects(OpenFlags::CHECKCONS);
+            // add_data writes dirent
+            let added = add_data(base, &mut de, out, want_torrentzip, check_consistency);
+            if let Some(changes) = self.entry[i].changes.as_deref_mut() {
+                *changes = de;
+            }
+            return added;
+        }
+
         let Archive { src, entry, .. } = self;
         let Entry { orig, changes, .. } = &mut entry[i];
         let Some(de) = changes.as_deref_mut() else {
@@ -236,11 +266,6 @@ impl<R: ReadAt> Archive<R> {
         };
 
         de.offset = out.tell_write()?;
-
-        if new_data {
-            // Differs from libzip, for now: recompressing comes later.
-            return Err(Error::new(ErrorCode::OpNotSupp, 0));
-        }
 
         if de.encryption_method != em::TRAD_PKWARE {
             // when copying data, all sizes are known -> no data descriptor
@@ -295,6 +320,259 @@ fn torrentzip_compare_names(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>) -> Orderin
             .map(u8::to_ascii_lowercase)
             .cmp(b.iter().map(u8::to_ascii_lowercase)),
     }
+}
+
+/// Writes the local header of `de`, the data of `src` through the layers
+/// that decompress, compute the CRC and compress it as `de` asks, and the
+/// data descriptor if it has one, and fills in what the data tells: port
+/// of `add_data`. The header is written again once the sizes are known, if
+/// they changed it.
+fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
+    src: Base<'_, R>,
+    de: &mut Dirent,
+    out: &mut Output<W>,
+    want_torrentzip: bool,
+    check_consistency: bool,
+) -> Result<()> {
+    let mut st = src.stat()?;
+
+    de.bitflags &= !GPBF_DATA_DESCRIPTOR;
+
+    if st.valid & stat::COMP_METHOD == 0 {
+        st.valid |= stat::COMP_METHOD;
+        st.comp_method = cm::STORE;
+    }
+
+    if de.changed & changed::COMP_METHOD == 0 && st.comp_method != cm::STORE {
+        de.comp_method = i32::from(st.comp_method);
+    } else if de.comp_method == i32::from(cm::STORE) && st.valid & stat::SIZE != 0 {
+        st.valid |= stat::COMP_SIZE;
+        st.comp_size = st.size;
+    } else {
+        // we'll recompress
+        st.valid &= !stat::COMP_SIZE;
+    }
+
+    if st.valid & stat::ENCRYPTION_METHOD == 0 {
+        st.valid |= stat::ENCRYPTION_METHOD;
+        st.encryption_method = em::NONE;
+    }
+
+    let mut flags = Flags::LOCAL;
+
+    if st.valid & stat::CRC != 0 {
+        de.crc = st.crc;
+    }
+
+    if st.valid & stat::SIZE == 0 {
+        // TODO in libzip: not valid for torrentzip
+        flags = flags | FL_FORCE_ZIP64;
+    } else {
+        de.uncomp_size = st.size;
+
+        if st.valid & stat::COMP_SIZE == 0 {
+            let compression_method = cm_actual(de.comp_method);
+            let max_compressed_size = if compression_method == cm::STORE {
+                st.size
+            } else if compression_method == cm::DEFLATE {
+                maximum_compressed_size(st.size)
+            } else {
+                u64::MAX
+            };
+            if max_compressed_size > 0xffff_ffff {
+                // TODO in libzip: not valid for torrentzip
+                flags = flags | FL_FORCE_ZIP64;
+            }
+        } else {
+            de.comp_size = st.comp_size;
+        }
+    }
+
+    let mut have_dos_time = false;
+    let mut mtime_before_copy = 0;
+    if de.changed & changed::LAST_MOD == 0 {
+        match src.dos_time()? {
+            Some((time, date)) => {
+                de.last_mod = DosTime { time, date };
+                have_dos_time = true;
+            }
+            None => {
+                mtime_before_copy = if st.valid & stat::MTIME != 0 {
+                    st.mtime
+                } else {
+                    time_now()
+                };
+                de.last_mod = u2d_time(mtime_before_copy)?;
+            }
+        }
+    }
+
+    let offstart = out.tell_write()?;
+
+    let needs_recompress = want_torrentzip || st.comp_method != cm_actual(de.comp_method);
+    let needs_decompress = needs_recompress && st.comp_method != cm::STORE;
+    // in these cases we can compute the CRC ourselves, so we do
+    let needs_crc = st.comp_method == cm::STORE || needs_decompress;
+    let needs_compress = needs_recompress && de.comp_method != i32::from(cm::STORE);
+
+    let needs_reencrypt = needs_recompress || de.encryption_method != st.encryption_method;
+    let needs_decrypt = needs_reencrypt && st.encryption_method != em::NONE;
+    let needs_encrypt = needs_reencrypt && de.encryption_method != em::NONE;
+
+    if !needs_decrypt
+        && st.encryption_method == em::TRAD_PKWARE
+        && de.changed & changed::LAST_MOD != 0
+    {
+        // PKWare encryption uses the last modification time for password
+        // verification, therefore we can't change it without
+        // re-encrypting. Ignoring the requested modification time change
+        // seems more sensible than failing to close the archive.
+        de.changed &= !changed::LAST_MOD;
+    }
+
+    if needs_decrypt {
+        // Differs from libzip, for now: encryption comes with step 4, as in
+        // a libzip built without it.
+        return Err(Error::new(ErrorCode::EncrNotSupp, 0));
+    }
+    let decompress = match needs_decompress {
+        true => Some(Layer::new(Decompress::new(
+            st.comp_method,
+            check_consistency,
+        )?)),
+        false => None,
+    };
+    let crc = needs_crc.then(|| Layer::new(Crc::new(false)));
+    let compress = match needs_compress {
+        true => Some(Layer::new(Compress::new(
+            de.comp_method,
+            de.compression_level,
+        )?)),
+        false => None,
+    };
+    if needs_encrypt {
+        return Err(Error::new(ErrorCode::EncrNotSupp, 0));
+    }
+
+    let mut src_final = WriteStack {
+        base: src,
+        decompress,
+        crc,
+        compress,
+    };
+
+    let force_zip64 = flags.intersects(FL_FORCE_ZIP64);
+    if !want_torrentzip {
+        let attributes = src_final.file_attributes()?;
+        de.apply_attributes(&attributes, force_zip64);
+    }
+
+    // as long as we don't support non-seekable output, clear data
+    // descriptor bit
+    let is_zip64 = de.write(out, flags, want_torrentzip)?;
+
+    let offdata = out.tell_write()?;
+
+    let mut ret = copy_source(&mut src_final, out);
+
+    let st = src_final.stat();
+    if let Err(e) = st {
+        ret = Err(e);
+    }
+
+    let attributes = if want_torrentzip {
+        None
+    } else {
+        match src_final.file_attributes() {
+            Ok(attributes) => Some(attributes),
+            Err(e) => {
+                ret = Err(e);
+                None
+            }
+        }
+    };
+
+    drop(src_final);
+    ret?;
+    let st = st?;
+
+    let offend = out.tell_write()?;
+
+    if st.valid & (stat::COMP_METHOD | stat::CRC | stat::SIZE)
+        != stat::COMP_METHOD | stat::CRC | stat::SIZE
+    {
+        return Err(Error::new(ErrorCode::Internal, 0));
+    }
+
+    let mut dirent_changed = cm_actual(de.comp_method) != st.comp_method
+        || de.crc != st.crc
+        || de.uncomp_size != st.size
+        || de.comp_size != offend - offdata;
+    de.comp_method = i32::from(st.comp_method);
+    de.crc = st.crc;
+    de.uncomp_size = st.size;
+    de.comp_size = offend - offdata;
+
+    if let Some(attributes) = attributes {
+        dirent_changed |= de.apply_attributes(&attributes, force_zip64);
+
+        if de.changed & changed::LAST_MOD == 0
+            && !have_dos_time
+            && st.valid & stat::MTIME != 0
+            && st.mtime != mtime_before_copy
+        {
+            de.last_mod = u2d_time(st.mtime)?;
+            dirent_changed = true;
+        }
+    }
+
+    if dirent_changed {
+        out.seek_write(offstart)?;
+
+        if de.write(out, flags, want_torrentzip)? != is_zip64 {
+            // Zip64 mismatch between preliminary file header written
+            // before data and final file header written afterwards
+            return Err(Error::new(ErrorCode::Internal, 0));
+        }
+
+        out.seek_write(offend)?;
+    }
+
+    if de.bitflags & GPBF_DATA_DESCRIPTOR != 0 {
+        write_data_descriptor(out, de, is_zip64)?;
+    }
+
+    Ok(())
+}
+
+/// Reads all of `src` into `out`, opening and closing it: port of
+/// `copy_source`. Closing fails nothing.
+fn copy_source<R: ReadAt + ?Sized, W: Write + Seek>(
+    src: &mut WriteStack<'_, R>,
+    out: &mut Output<W>,
+) -> Result<()> {
+    src.open()?;
+
+    let mut buf = vec![0; BUFSIZE];
+    let mut ret = Ok(());
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Err(e) = out.write(&buf[..n]) {
+                    ret = Err(e);
+                    break;
+                }
+            }
+            Err(e) => {
+                ret = Err(e);
+                break;
+            }
+        }
+    }
+
+    let _ = src.close();
+    ret
 }
 
 /// Copies `len` bytes from `src` to `out`: port of `copy_data`.

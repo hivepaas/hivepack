@@ -6,7 +6,7 @@ use std::collections::hash_map::RandomState;
 use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Cursor, Write};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use hivepack_zip::{Archive, Closed, Error, ErrorCode, OpenFlags, ReadAt};
 
@@ -21,11 +21,11 @@ const ENOENT: i32 = 2;
 #[derive(Clone)]
 pub enum Src {
     File {
-        file: Rc<File>,
+        file: Arc<File>,
         start: u64,
         len: u64,
     },
-    Memory(Rc<Vec<u8>>),
+    Memory(Arc<Vec<u8>>),
     /// Its length fails with `ENOENT`, as libzip's file source's does, so
     /// that `ZIP_CREATE` makes an empty archive.
     Missing,
@@ -101,7 +101,7 @@ pub fn zip_open(path: &str, flags: OpenFlags, start: u64, len: u64) -> Result<Ar
     let len = if len == 0 { size - start } else { len };
     Archive::open(
         Src::File {
-            file: Rc::new(file),
+            file: Arc::new(file),
             start,
             len,
         },
@@ -115,14 +115,14 @@ pub fn zip_open(path: &str, flags: OpenFlags, start: u64, len: u64) -> Result<Ar
 pub fn zip_open_in_memory(
     path: &str,
     flags: OpenFlags,
-) -> Result<(Archive<Src>, Rc<Vec<u8>>), Error> {
+) -> Result<(Archive<Src>, Arc<Vec<u8>>), Error> {
     let data = match std::fs::read(path) {
         Ok(data) => data,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(Error::new(ErrorCode::Open, errno(&e))),
     };
-    let data = Rc::new(data);
-    let za = Archive::open(Src::Memory(Rc::clone(&data)), flags)?;
+    let data = Arc::new(data);
+    let za = Archive::open(Src::Memory(Arc::clone(&data)), flags)?;
     Ok((za, data))
 }
 

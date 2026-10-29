@@ -1,10 +1,10 @@
 //! Where a closed archive is written: the writing commands of a source as
-//! `zip_close` uses them (`zip_source_write.c`,
-//! `zip_source_tell_write.c` and `zip_source_commit_write.c`, with the
+//! `zip_close` uses them (`zip_source_write.c`, `zip_source_tell_write.c`,
+//! `zip_source_seek_write.c` and `zip_source_commit_write.c`, with the
 //! errors of libzip's file sources), on a [`Write`] and [`Seek`], and
 //! `_zip_write` of `zip_io_util.c`.
 
-use std::io::{self, Seek, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 
 use hivepack_deflate::crc32;
 
@@ -32,6 +32,14 @@ impl<W: Write + Seek> Output<W> {
         self.w
             .stream_position()
             .map_err(|e| Error::new(ErrorCode::Tell, errno(&e)))
+    }
+
+    /// Moves to `offset`: `zip_source_seek_write` with `SEEK_SET`.
+    pub(crate) fn seek_write(&mut self, offset: u64) -> Result<()> {
+        self.w
+            .seek(SeekFrom::Start(offset))
+            .map(|_| ())
+            .map_err(|e| Error::new(ErrorCode::Seek, errno(&e)))
     }
 
     /// Writes all of `data`: port of `_zip_write`.

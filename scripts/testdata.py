@@ -191,11 +191,19 @@ NETTLE_SOURCES = [
 ]
 
 
+# What nettle's C files need of the config.h its configure writes: alloca,
+# which every system the oracles are built on has. Without it, nettle's
+# temporary arrays are local to the block that declares them, and
+# hmac_set_key keeps a pointer to the digest of a key longer than a block
+# past its block: gcc happens to leave it there, clang does not.
+NETTLE_FLAGS = ["-DHAVE_ALLOCA=1", "-include", "alloca.h"]
+
+
 def nettle_headers(nettle: Path, folder: Path) -> Path:
     """A folder with nettle's headers in nettle/, as an installed nettle has
     them, for `#include <nettle/aes.h>`. Without config.h (HAVE_CONFIG_H
-    unset), nettle's C files assume a little-endian machine, which the
-    oracles are built on."""
+    unset, NETTLE_FLAGS in its place), nettle's C files assume a
+    little-endian machine, which the oracles are built on."""
     include = folder / "include"
     (include / "nettle").mkdir(parents=True)
     for header in nettle.glob("*.h"):
@@ -263,7 +271,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     if nettle is not None:
         include = nettle_headers(nettle, folder)
         files += [str(nettle / name) for name in NETTLE_SOURCES]
-        subprocess.run([compiler, "-O2", f"-I{include}", f"-I{nettle}", *files,
+        subprocess.run([compiler, "-O2", *NETTLE_FLAGS, f"-I{include}", f"-I{nettle}", *files,
                         "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))

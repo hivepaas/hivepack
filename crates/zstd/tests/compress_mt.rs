@@ -449,7 +449,10 @@ fn frames_do_not_depend_on_the_number_of_workers() {
     }
 
     // Up to 512 KB, a known size takes no workers: the frames are those
-    // without; just over, they are not.
+    // without; just over, they are not, here. On big-endian machines, whose
+    // libzstd hashes 2 bytes otherwise in its block splitter, the frames
+    // just over come out the same with and without, in libzstd as in the
+    // port: both are compared with libzstd's.
     for len in [0, 1, 1000, JOBSIZE_MIN - 1, JOBSIZE_MIN, JOBSIZE_MIN + 1] {
         let src = data(&mut rng, len);
         let mut frames = Vec::new();
@@ -469,7 +472,11 @@ fn frames_do_not_depend_on_the_number_of_workers() {
                 }
             }
         }
-        if frames.len() == 2 && (frames[0] == frames[1]) != (len <= JOBSIZE_MIN) {
+        let differ_over = cfg!(target_endian = "little");
+        if frames.len() == 2
+            && (len <= JOBSIZE_MIN || differ_over)
+            && (frames[0] == frames[1]) != (len <= JOBSIZE_MIN)
+        {
             problems.add(format!(
                 "{len} bytes: the frames with and without workers are the same: {}",
                 frames[0] == frames[1]

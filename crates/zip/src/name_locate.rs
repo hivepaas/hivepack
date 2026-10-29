@@ -57,6 +57,6 @@ impl<R: ReadAt> Archive<R> {
             return Err(Error::new(ErrorCode::NoEntry, 0));
         }
 
-        self.names.lookup(fname)
+        self.names.lookup(fname, flags)
     }
 }

@@ -73,6 +73,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "zip_edit"
+path = "fuzz_targets/zip_edit.rs"
+test = false
+doc = false
+bench = false
+
 # Not in the main workspace: cargo-fuzz builds it with nightly and its own
 # flags.
 [workspace]

@@ -1,5 +1,5 @@
 //! File names and comments, with the encoding they are known or guessed to
-//! have: port of `zip_string.c`, the reading half.
+//! have: port of `zip_string.c`.
 
 use std::sync::OnceLock;
 
@@ -59,6 +59,12 @@ impl ZipString {
         self.encoding
     }
 
+    /// Takes the string to be UTF-8, as libzip does with a name or comment
+    /// it is given that is guessed to be.
+    pub(crate) fn set_utf8_known(&mut self) {
+        self.encoding = Encoding::Utf8Known;
+    }
+
     /// The encoding as `_zip_string_get` finds it: the one known, or the
     /// guess without an expectation. Differs from libzip, which keeps that
     /// guess in the string: it depends only on the bytes.
@@ -72,6 +78,15 @@ impl ZipString {
     /// Whether every byte is ASCII: `_zip_string_is_ascii`.
     pub(crate) fn is_ascii(&self) -> bool {
         self.encoding == Encoding::Ascii || self.raw.iter().all(|&b| b < 0x80)
+    }
+}
+
+/// The encoding of `str`, guessed if it is not known yet, and kept; ASCII
+/// for no string: port of `_zip_guess_encoding`.
+pub(crate) fn guess_encoding(str: Option<&mut ZipString>, expected: Encoding) -> Encoding {
+    match str {
+        Some(s) => s.guess_encoding(expected),
+        None => Encoding::Ascii,
     }
 }
 

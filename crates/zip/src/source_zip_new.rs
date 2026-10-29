@@ -90,7 +90,11 @@ impl<R: ReadAt> Archive<R> {
             return Err(Error::new(ErrorCode::NoPasswd, 0));
         }
 
-        let de = self.get_dirent(srcidx, flags)?;
+        self.get_dirent(srcidx, flags)?;
+        // Where the local header is, from the entry as read, as
+        // `_zip_file_get_offset` finds it when the window opens: an entry
+        // with changes has the offset it is written at once closed.
+        let header = self.entry[srcidx as usize].orig.as_ref().map(|o| o.offset);
 
         let have_comp_size = st.valid & stat::COMP_SIZE != 0;
         let empty_data = if needs_decrypt || needs_decompress {
@@ -125,7 +129,10 @@ impl<R: ReadAt> Archive<R> {
                 st2.mtime = st.mtime;
                 st2.valid |= stat::MTIME;
             }
-            let source_archive = (!changed_data).then_some(de.offset);
+            let source_archive = match changed_data {
+                false => Some(header.ok_or(Error::new(ErrorCode::Internal, 0))?),
+                true => None,
+            };
             Window::new(&lower, start, data_len, &st2, stat::NAME, source_archive)?
         } else if !changed_data {
             // this branch is executed only for archive sources; we know that
@@ -140,7 +147,7 @@ impl<R: ReadAt> Archive<R> {
                 st.comp_size as i64,
                 &st,
                 stat::NAME,
-                Some(de.offset),
+                Some(header.ok_or(Error::new(ErrorCode::Internal, 0))?),
             )?
         } else {
             // reading from a zero-sized source buffer created above

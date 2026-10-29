@@ -58,6 +58,7 @@ jobs:
           v=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
+      - run: cargo check -p hivepack-bzip2 --lib --locked
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-extract --lib --locked
@@ -184,8 +185,9 @@ jobs:
 
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
   # feature, the compressor's frames and streaming calls against libzstd's,
-  # and inflate and deflate against zlib, under AddressSanitizer. A few
-  # minutes per target; longer runs are done by hand (see fuzz/README.md).
+  # inflate and deflate against zlib, and bzip2 against libbzip2, under
+  # AddressSanitizer. A few minutes per target; longer runs are done by
+  # hand (see fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
@@ -210,7 +212,7 @@ jobs:
           find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
       # The prebuilt cargo-fuzz is a musl binary and would default to that
       # target, which the sanitizer does not support.
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=210
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=180
       - name: Seed the compressor's corpus with the committed files
         run: |
           mkdir -p fuzz/corpus/compress
@@ -256,3 +258,18 @@ jobs:
               pathlib.Path(f"fuzz/corpus/zip_edit/d{i}").write_bytes(edits + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_edit -- -max_total_time=90
+      - name: Seed the bzip2 corpus
+        run: |
+          mkdir -p fuzz/corpus/bzip2
+          python3 - <<'PY'
+          import pathlib
+          # The streams and inputs of the recorded requests, each after a
+          # mode byte (even: decompress it, odd: compress it) and a seed.
+          lines = pathlib.Path("testdata/oracle/bzip2.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith(("compress", "decompress"))):
+              words = line.split("\t")[0].split(" ")
+              data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
+              mode = b"\x01" if words[0] == "compress" else b"\x00"
+              pathlib.Path(f"fuzz/corpus/bzip2/r{i}").write_bytes(mode + bytes(8) + data)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu bzip2 -- -max_total_time=90

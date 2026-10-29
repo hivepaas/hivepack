@@ -428,7 +428,7 @@ impl<'a> Buffers<'a> {
 /// the match state and the `CDict` are then borrowed apart. It gives the
 /// same match state.
 ///
-/// For the `dictMatchState` block compressors (phase 1): the dictionary's
+/// For the `dictMatchState` block compressors: the dictionary's
 /// tables are `ms.hash_table`, `ms.chain_table` and `ms.tag_table`, its
 /// parameters `ms.c_params` (`fast` and `dfast` tables hold indices tagged
 /// with `ZSTD_SHORT_CACHE_TAG_BITS`: see [`zstd_write_tagged_index`]),

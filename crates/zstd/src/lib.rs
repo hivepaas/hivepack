@@ -10,10 +10,9 @@
 //! ([`CCtx::compress_stream2`]), with libzstd's parameters
 //! ([`CCtx::set_parameter`]), giving the frames libzstd gives; with
 //! dictionaries too ([`CCtx::load_dictionary`], [`CDict`],
-//! [`CCtx::ref_prefix`], [`CCtx::compress_using_dict`]), but for frames
-//! that attach a [`CDict`] (see [`CCtx`]), which come next. The plan, and
-//! the rules the port follows, are in the repository: `docs/porting.md` and
-//! `docs/safety.md`.
+//! [`CCtx::ref_prefix`], [`CCtx::compress_using_dict`]), attached, copied
+//! in or loaded again as libzstd decides. The plan, and the rules the port
+//! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {

@@ -1185,27 +1185,6 @@ pub(crate) fn zstd_frame_ported(_params: &CCtxParams) -> bool {
     true
 }
 
-/// Whether the port has the `dictMatchState` block compressors a frame
-/// with `params`, attached to a `CDict` (see
-/// [`BlockCompressor::compress_dict_match_state`]), needs; `dedicated` for
-/// a `CDict` with a dedicated dictionary search. The context refuses the
-/// others with `ParameterUnsupported`, when it attaches the `CDict`.
-///
-/// Phase 1 ports them, in three groups: one line each.
-pub(crate) fn zstd_dict_match_state_ported(params: &CCtxParams, dedicated: bool) -> bool {
-    let _ = (params.use_row_match_finder, dedicated);
-    match params.c_params.strategy {
-        // ZSTD_compressBlock_fast_dictMatchState and
-        // ZSTD_compressBlock_doubleFast_dictMatchState.
-        Strategy::Fast | Strategy::Dfast => true,
-        // Greedy, lazy and lazy2: the hash chain, the row match finder,
-        // and the dedicated dictionary search.
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => true,
-        // btlazy2 and the optimal parser.
-        Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => true,
-    }
-}
-
 /// Whether the port has what `ZSTD_compressCCtx` takes at `level` for
 /// `src_size` bytes.
 #[cfg(test)]
@@ -1992,10 +1971,6 @@ impl BlockCompressor<'_> {
     /// lazy strategies): the sequences of `src[istart..iend]`, with matches
     /// in the window and in `dms`, the attached `CDict`'s match state; for
     /// the optimal parser, `ldm` as in [`BlockCompressor::compress_opt`].
-    ///
-    /// Phase 1 ports them, a group of strategies each, and
-    /// [`zstd_dict_match_state_ported`] with them; until then the frames
-    /// that would need them are refused at their start, and these fail.
     #[allow(clippy::too_many_arguments)]
     fn compress_dict_match_state(
         &self,
@@ -2727,12 +2702,8 @@ impl CCtx {
     /// attached to `cdict`: its tables sized for the input only (the
     /// `CDict` has its own), its match state attached to the `CDict`'s
     /// (`dictMatchState`), its window starting where the `CDict`'s ends,
-    /// and the `CDict`'s block state as the block before.
-    ///
-    /// The `dictMatchState` block compressors are phase 1's: until then the
-    /// frames that would use them fail here with `ParameterUnsupported`
-    /// ([`zstd_dict_match_state_ported`]). A `CDict` with no content (of
-    /// under 8 bytes) is not attached, and those frames compress.
+    /// and the `CDict`'s block state as the block before. A `CDict` with no
+    /// content (of under 8 bytes) is not attached.
     fn reset_cctx_by_attaching_cdict(
         &mut self,
         cdict: &CDict,
@@ -2780,13 +2751,6 @@ impl CCtx {
             }
             // In the frame's indices.
             ms.loaded_dict_end = ms.window.dict_limit;
-            // Phase 1 ports the dictMatchState block compressors.
-            if !zstd_dict_match_state_ported(
-                &self.applied_params,
-                cdict.match_state.dedicated_dict_search,
-            ) {
-                return error!(ParameterUnsupported);
-            }
         }
 
         self.dict_id = cdict.dict_id;

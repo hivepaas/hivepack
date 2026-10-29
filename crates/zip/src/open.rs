@@ -43,6 +43,8 @@ pub struct Archive<R> {
     pub(crate) entry: Vec<Entry>,
     /// hash table for name lookup
     pub(crate) names: Names,
+    /// password used when no other supplied
+    pub(crate) default_password: Option<Vec<u8>>,
 }
 
 /// What `_zip_read_eocd64` found.
@@ -163,6 +165,7 @@ impl<R: ReadAt> Archive<R> {
             comment_changed: false,
             entry: Vec::new(),
             names: Names::default(),
+            default_password: None,
         };
         if flags.intersects(OpenFlags::RDONLY) {
             za.flags = za.flags | ArchiveFlags::RDONLY;

@@ -2,7 +2,7 @@
 
 AES, SHA-1, HMAC and PBKDF2 in safe Rust, ported from [BearSSL](https://bearssl.org) 0.6: what ZIP's encryption needs.
 
-> **Status:** AES-128, AES-192 and AES-256 encryption (constant-time, BearSSL's `aes_ct64`), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, checked against the published vectors, BearSSL's own tests and nettle. `hivepack-zip` will build WinZip AES on it. This crate is not on crates.io.
+> **Status:** AES-128, AES-192 and AES-256 encryption (constant-time, BearSSL's `aes_ct64`), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, checked against the published vectors, BearSSL's own tests and nettle. `hivepack-zip` decrypts WinZip AES with it. This crate is not on crates.io.
 
 ```rust
 use hivepack_crypto::{Aes, Hmac, HmacKey, pbkdf2_hmac_sha1};

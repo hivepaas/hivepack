@@ -211,6 +211,14 @@ def nettle_headers(nettle: Path, folder: Path) -> Path:
     return include
 
 
+# What lib/CMakeLists.txt adds to ZIP_SOURCES with HAVE_CRYPTO and
+# HAVE_GNUTLS.
+LIBZIP_CRYPTO_SOURCES = [
+    "zip_crypto_gnutls.c", "zip_winzip_aes.c", "zip_source_winzip_aes_decode.c",
+    "zip_source_winzip_aes_encode.c",
+]
+
+
 def zip_err_str(lib: Path) -> str:
     """zip_err_str.c, as libzip's cmake/GenerateZipErrorStrings.cmake writes
     it from the comments in zip.h and zipint.h."""
@@ -241,23 +249,28 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
     Deflate64. tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
-    tools/zip-oracle is built with libzip's, its own config.h and
-    zipconf.h in place of those libzip's CMake build writes, and zlib's
-    (the `extra` set)."""
+    tools/zip-oracle is built with libzip's, its crypto backend for
+    GnuTLS among them, its own config.h and zipconf.h in place of those
+    libzip's CMake build writes, the part of GnuTLS that backend uses in
+    gnutls/, and zlib's and nettle's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
     libzip = next(source.glob("libzip-*"), None)
     if libzip is not None:
         lib = libzip / "lib"
         zlib = next(extra[0].glob("zlib-*"))
+        nettle = next(extra[1].glob("nettle-*"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
-        files += [str(lib / name) for name in libzip_sources(lib)] + [str(generated / "zip_err_str.c")]
+        files += [str(lib / name) for name in libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES]
+        files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+        files += [str(nettle / name) for name in NETTLE_SOURCES]
+        include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
-        subprocess.run([compiler, "-O2", "-w", f"-I{config}", f"-I{lib}", f"-I{zlib}", *files,
-                        "-o", str(folder / "oracle")], check=True)
+        subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
+                        f"-I{include}", f"-I{nettle}", *files, "-o", str(folder / "oracle")], check=True)
         return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:

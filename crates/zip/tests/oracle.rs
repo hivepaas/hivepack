@@ -44,6 +44,10 @@ fn recorded_read_path() -> PathBuf {
     repository().join("testdata/oracle/zip-read.txt")
 }
 
+fn recorded_decrypt_path() -> PathBuf {
+    repository().join("testdata/oracle/zip-decrypt.txt")
+}
+
 fn recorded_range_path() -> PathBuf {
     repository().join("testdata/oracle/zip-range.txt")
 }
@@ -178,14 +182,19 @@ fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
 /// `chunks`, up to `limit` bytes, then closed.
 fn read_entries<R: ReadAt>(
     result: hivepack_zip::Result<Archive<R>>,
+    how: &str,
+    password: &[u8],
     fflags: u32,
     chunks: &str,
     limit: i64,
 ) -> String {
-    let za = match result {
+    let mut za = match result {
         Ok(za) => za,
         Err(e) => return error_text(e),
     };
+    if how == "d" || how == "x" {
+        za.set_default_password(Some(password));
+    }
     let chunks: Vec<i64> = chunks.split(',').map(|c| c.parse().unwrap()).collect();
     let n = za.get_num_entries(Flags::NONE);
     let mut text = format!("ok {n}");
@@ -201,7 +210,12 @@ fn read_entries<R: ReadAt>(
             && za
                 .stat_index(i, Flags::NONE)
                 .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
-        let mut zf = match za.fopen_index(i, Flags(fflags)) {
+        let opened = match how {
+            "e" => za.fopen_index_encrypted(i, Flags(fflags), Some(password)),
+            "x" => za.fopen_index_encrypted(i, Flags(fflags), Some(b"")),
+            _ => za.fopen_index(i, Flags(fflags)),
+        };
+        let mut zf = match opened {
             Ok(zf) => zf,
             Err(e) if deflate64 && !matches!(e.code(), ErrorCode::Inval | ErrorCode::NoPasswd) => {
                 text.push_str("e16/0");
@@ -331,8 +345,18 @@ fn respond<R: ReadAt>(words: &[&str], result: hivepack_zip::Result<Archive<R>>) 
     match words[0] {
         "open" => describe(result),
         "range" => range_entries(result, words[3].parse().unwrap(), words[4].parse().unwrap()),
+        "decrypt" => read_entries(
+            result,
+            words[3],
+            &unhex(words[4]),
+            words[5].parse().unwrap(),
+            words[6],
+            words[7].parse().unwrap(),
+        ),
         _ => read_entries(
             result,
+            "n",
+            b"",
             words[3].parse().unwrap(),
             words[4],
             words[5].parse().unwrap(),
@@ -887,6 +911,7 @@ fn answer(request: &str) -> String {
     let (flags, kind, data) = match words[..] {
         ["open", flags, kind, data] => (flags, kind, data),
         ["read", flags, kind, _, _, _, data] => (flags, kind, data),
+        ["decrypt", flags, kind, _, _, _, _, _, data] => (flags, kind, data),
         ["range", flags, kind, _, _, data] => (flags, kind, data),
         _ => panic!("{request:.100}"),
     };
@@ -1821,6 +1846,116 @@ fn read_parameters(rng: &mut Rng) -> String {
     format!("{flags} {kind} {fflags} {chunks} {limit}")
 }
 
+/// The passwords the encrypted archives are written and read with: short,
+/// past a block of SHA-1, with bytes past ASCII, and with a NUL byte, where
+/// libzip's C string ends.
+const PASSWORDS: &[&[u8]] = &[
+    b"foo",
+    b"p",
+    b"correct horse battery staple, and some more words to pass 64 bytes",
+    b"\xe9t\xe9",
+    b"pass\0word",
+];
+
+/// An archive libzip writes from an empty buffer, through the oracle's
+/// `editb` request: entries with data of each kind, up to `max_len` bytes,
+/// some stored and some deflated, most encrypted with ZipCrypto or WinZip
+/// AES, each with its password or the default one; with the passwords
+/// they were written with. `None` if libzip did not write it.
+fn encrypted_archive(
+    oracle: &mut Oracle,
+    rng: &mut Rng,
+    max_len: u64,
+) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut ops = Vec::new();
+    let mut passwords = Vec::new();
+    let default = (rng.below(4) == 0).then(|| rng.pick(PASSWORDS));
+    if let Some(password) = default {
+        ops.push(format!("P{}", hex(password)));
+    }
+    for i in 0..1 + rng.below(4) {
+        let len = match rng.below(4) {
+            0 => rng.pick(&[0, 1, 10, 11, 12, 13, 16, 20, 64, 65]),
+            1 => rng.below(200),
+            2 => rng.below(max_len),
+            _ => rng.pick(&[8191, 8192, 8193, 16384, 20000]),
+        }
+        .min(max_len) as usize;
+        let data: Vec<u8> = match rng.below(3) {
+            0 => (0..len).map(|i| b"encrypted zip data "[i % 19]).collect(),
+            1 => (0..len).map(|_| rng.next() as u8).collect(),
+            _ => vec![rng.next() as u8; len],
+        };
+        let mtime = 1_000_000_000 + rng.below(500_000_000);
+        let kind = if rng.below(5) == 0 { "u" } else { "s" };
+        let name = hex(format!("e{i}").as_bytes());
+        ops.push(format!("+{name}:0:{mtime}:{}:{kind}", hex(&data)));
+        match rng.below(4) {
+            0 => ops.push(format!("z{i}:0:0")),
+            1 => ops.push(format!("z{i}:8:{}", rng.below(10))),
+            _ => {}
+        }
+        let method = rng.pick(&[0u16, 1, 1, 257, 258, 259, 259]);
+        if method != 0 {
+            let password = match default {
+                Some(_) if rng.below(3) == 0 => None,
+                _ => Some(rng.pick(PASSWORDS)),
+            };
+            ops.push(format!(
+                "y{i}:{method}:{}",
+                password.map_or("-".into(), hex)
+            ));
+            if let Some(password) = password.or(default) {
+                passwords.push(password.to_vec());
+            }
+        }
+    }
+    let reply = oracle.ask(&format!("editb 0 0 {} -", ops.join(",")));
+    let (_, written) = written_part(&reply)?;
+    Some((unhex(written), passwords))
+}
+
+/// `count` decrypt requests on archives libzip encrypted, some damaged:
+/// with each way of giving the password, the right one, wrong ones, none,
+/// and one cut at its NUL byte.
+fn decrypt_requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max_len: u64) -> Vec<String> {
+    let mut requests = Vec::new();
+    while requests.len() < count {
+        let Some((mut zip, passwords)) = encrypted_archive(oracle, rng, max_len) else {
+            continue;
+        };
+        if rng.below(4) == 0 {
+            zip = damage(rng, &zip);
+        }
+        for _ in 0..3 {
+            let how = rng.pick(&["n", "d", "e", "x", "d", "e"]);
+            let password: Vec<u8> = match rng.below(6) {
+                0..=2 if !passwords.is_empty() => {
+                    passwords[rng.below(passwords.len() as u64) as usize].clone()
+                }
+                3 => b"wrong".to_vec(),
+                4 => Vec::new(),
+                _ => rng.pick(PASSWORDS).to_vec(),
+            };
+            let flags = rng.pick(&[0, 4]);
+            let kind = if rng.below(8) == 0 { "f" } else { "b" };
+            // 0, ZIP_FL_COMPRESSED, ZIP_FL_ENCRYPTED
+            let fflags = rng.pick(&[0, 0, 0, 4, 32]);
+            let chunks = rng.pick(&["8192", "1", "7,100", "65536", "3,5000,1"]);
+            let limit = match rng.below(6) {
+                0 => rng.below(100) as i64,
+                _ => -1,
+            };
+            requests.push(format!(
+                "decrypt {flags} {kind} {how} {} {fflags} {chunks} {limit} {}",
+                hex(&password),
+                hex(&zip)
+            ));
+        }
+    }
+    requests
+}
+
 /// libzip's test archives, where the libzip sources are fetched.
 fn regress_archives() -> Vec<(String, Vec<u8>)> {
     let cache = std::env::var_os("HIVEPACK_TESTDATA")
@@ -1963,6 +2098,18 @@ fn generated_archives_read_like_libzip() {
     };
     let mut rng = Rng(0x2400_0002);
     for request in read_requests(&mut rng, 800) {
+        let want = oracle.ask(&request);
+        assert_eq!(answer(&request), want, "{request:.400}");
+    }
+}
+
+#[test]
+fn encrypted_archives_read_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x4000_0001);
+    for request in decrypt_requests(&mut oracle, &mut rng, 1200, 9000) {
         let want = oracle.ask(&request);
         assert_eq!(answer(&request), want, "{request:.400}");
     }
@@ -2307,6 +2454,27 @@ fn record_read_answers() {
         "record_read_answers",
         read_requests(&mut rng, 2500),
         5_000,
+        5,
+    );
+}
+
+#[test]
+fn port_decrypts_as_recorded() {
+    replay(&recorded_decrypt_path(), 300);
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/zip-decrypt.txt from the oracle"]
+fn record_decrypt_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut rng = Rng(0x4000_0002);
+    let requests = decrypt_requests(&mut oracle, &mut rng, 450, 300);
+    record(
+        &recorded_decrypt_path(),
+        "Decryption",
+        "record_decrypt_answers",
+        requests,
+        6_000,
         5,
     );
 }

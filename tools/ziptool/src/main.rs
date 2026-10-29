@@ -1,7 +1,7 @@
 //! ziptool, with the commands libzip's tests add to it (ziptool_regress):
 //! port of libzip's `src/ziptool.c` and `regress/programs/ziptool_regress.c`,
-//! but for encryption, which comes later: until then its commands are
-//! unknown. The output is libzip's, word for word,
+//! but for encrypting, which comes later: until then
+//! `set_file_encryption` is unknown. The output is libzip's, word for word,
 //! so that libzip's tests can run on the port.
 
 use std::io::Write;
@@ -69,6 +69,7 @@ const DISPATCH_TABLE: &[Command] = &[
     ("set_file_dostime", 3, set_file_dostime),
     ("set_file_mtime", 2, set_file_mtime),
     ("set_file_mtime_all", 1, set_file_mtime_all),
+    ("set_password", 1, set_password),
     ("stat", 1, zstat),
     ("add_nul", 2, add_nul),
     ("extract_as", 2, extract_as),
@@ -159,8 +160,9 @@ impl Tool {
             Ok(zf) => zf,
             Err(e) => {
                 // zip_source_zip_file_create leaves the error it is given
-                // unset when the method has no algorithm.
-                let e = if e.code() == ErrorCode::CompNotSupp {
+                // unset when the method has no algorithm, or the
+                // encrypted data is shorter than its header.
+                let e = if matches!(e.code(), ErrorCode::CompNotSupp | ErrorCode::OpNotSupp) {
                     Error::new(ErrorCode::Ok, 0)
                 } else {
                     e
@@ -551,6 +553,12 @@ fn set_archive_comment(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
     t.za.set_archive_comment(argv[0].as_bytes()).map_err(|e| {
         eprintln!("can't set archive comment to '{}': {e}", argv[0]);
     })
+}
+
+fn set_password(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // set default password
+    t.za.set_default_password(Some(argv[0].as_bytes()));
+    Ok(())
 }
 
 fn set_archive_flag(t: &mut Tool, argv: &[String]) -> Result<(), ()> {

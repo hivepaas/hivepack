@@ -7,14 +7,16 @@
 //!
 //! Differs from libzip: a stack is a struct, not a chain of callbacks. To
 //! read, it is always a window on the archive, on an empty buffer or on
-//! new data, then the decompressing layer if the data is compressed, then
-//! the CRC layer if the CRC is to be checked; to write, the data or an
-//! entry's stack, then layers to decompress, compute the CRC and compress.
+//! new data, then the decrypting layer if the data is encrypted, the
+//! decompressing layer if it is compressed, then the CRC layer if the CRC
+//! is to be checked; to write, the data or an entry's stack, then layers to
+//! decompress, compute the CRC and compress.
 //! Each layer keeps the state libzip keeps in its `zip_source_t`.
 
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::get_encryption_implementation::Decrypt;
 use crate::source::ReadAt;
 use crate::source_compress::{Compress, Decompress};
 use crate::source_crc::Crc;
@@ -101,6 +103,7 @@ impl<T> Layer<T> {
 pub(crate) struct Stack<'a, R: ?Sized> {
     pub(crate) lower: Lower<'a, R>,
     pub(crate) window: Layer<Window>,
+    pub(crate) decrypt: Option<Layer<Decrypt>>,
     pub(crate) decompress: Option<Layer<Decompress>>,
     pub(crate) crc: Option<Layer<Crc>>,
     /// the window on the decompressed data, for part of an entry
@@ -124,66 +127,118 @@ fn stat_window<R: ReadAt + ?Sized>(window: &Layer<Window>, lower: &Lower<'_, R>)
     st
 }
 
+/// The source under the decompressing layer: the decrypting one, or the
+/// window.
+fn read_below_decompress<R: ReadAt + ?Sized>(
+    decrypt: &mut Option<Layer<Decrypt>>,
+    window: &mut Layer<Window>,
+    lower: &mut Lower<'_, R>,
+    data: &mut [u8],
+) -> Result<usize> {
+    match decrypt {
+        Some(decrypt) => decrypt.read(data, &mut |ctx, buf| {
+            ctx.read(buf, &mut |b| read_window(window, lower, b))
+        }),
+        None => read_window(window, lower, data),
+    }
+}
+
+fn stat_below_decompress<R: ReadAt + ?Sized>(
+    decrypt: &Option<Layer<Decrypt>>,
+    window: &Layer<Window>,
+    lower: &Lower<'_, R>,
+) -> Stat<'static> {
+    let mut st = stat_window(window, lower);
+    if let Some(decrypt) = decrypt {
+        // It cannot fail: the decrypting layer is made only on a window
+        // whose compressed size holds what it takes away.
+        let _ = decrypt.ctx.stat(&mut st);
+    }
+    st
+}
+
 fn read_decompress<R: ReadAt + ?Sized>(
     decompress: &mut Layer<Decompress>,
+    decrypt: &mut Option<Layer<Decrypt>>,
     window: &mut Layer<Window>,
     lower: &mut Lower<'_, R>,
     data: &mut [u8],
 ) -> Result<usize> {
     decompress.read(data, &mut |ctx, buf| {
-        ctx.read(buf, &mut |b| read_window(window, lower, b))
+        ctx.read(buf, &mut |b| {
+            read_below_decompress(decrypt, window, lower, b)
+        })
     })
 }
 
-/// The source under the CRC layer: the decompressing one, or the window.
+/// The source under the CRC layer: the decompressing one, or what is under
+/// it.
 fn read_below_crc<R: ReadAt + ?Sized>(
     decompress: &mut Option<Layer<Decompress>>,
+    decrypt: &mut Option<Layer<Decrypt>>,
     window: &mut Layer<Window>,
     lower: &mut Lower<'_, R>,
     data: &mut [u8],
 ) -> Result<usize> {
     match decompress {
-        Some(decompress) => read_decompress(decompress, window, lower, data),
-        None => read_window(window, lower, data),
+        Some(decompress) => read_decompress(decompress, decrypt, window, lower, data),
+        None => read_below_decompress(decrypt, window, lower, data),
     }
 }
 
 fn stat_below_crc<R: ReadAt + ?Sized>(
     decompress: &Option<Layer<Decompress>>,
+    decrypt: &Option<Layer<Decrypt>>,
     window: &Layer<Window>,
     lower: &Lower<'_, R>,
 ) -> Stat<'static> {
-    let mut st = stat_window(window, lower);
+    let mut st = stat_below_decompress(decrypt, window, lower);
     if let Some(decompress) = decompress {
         decompress.ctx.stat(&mut st);
     }
     st
 }
 
+/// Whether the window is at its end: a window on an entry's data always
+/// has one.
+fn window_at_eof(window: &mut Layer<Window>) -> bool {
+    if !window.eof && window.ctx.at_eof() == Some(true) {
+        window.eof = true;
+    }
+    window.eof
+}
+
 /// Whether the source under the CRC layer is at its end: port of
-/// `zip_source_at_eof`. The window knows; the decompressing source does
-/// not, and cannot seek, so a byte is read and kept for the next read.
+/// `zip_source_at_eof`. The window knows, and so does the layer that
+/// decrypts WinZip AES; ZipCrypto's asks the window. The decompressing
+/// source does not know, and cannot seek, so a byte is read and kept for
+/// the next read.
 fn at_eof_below_crc<R: ReadAt + ?Sized>(
     decompress: &mut Option<Layer<Decompress>>,
+    decrypt: &mut Option<Layer<Decrypt>>,
     window: &mut Layer<Window>,
     lower: &mut Lower<'_, R>,
 ) -> Result<bool> {
-    match decompress {
-        None => {
-            if !window.eof {
-                match window.ctx.at_eof() {
-                    Some(true) => window.eof = true,
-                    Some(false) => {}
-                    // A window on an entry's data always has an end.
-                    None => {}
+    match (decompress, decrypt) {
+        (None, None) => Ok(window_at_eof(window)),
+        (None, Some(layer)) => {
+            if !layer.eof {
+                // ZipCrypto passes ZIP_SOURCE_AT_EOF to the window's
+                // callback.
+                let at_eof = match layer.ctx.at_eof() {
+                    Some(at_eof) => at_eof,
+                    None => window.ctx.at_eof() == Some(true),
+                };
+                if at_eof {
+                    layer.eof = true;
                 }
             }
-            Ok(window.eof)
+            Ok(layer.eof)
         }
-        Some(layer) => {
+        (Some(layer), decrypt) => {
             if !layer.eof {
                 let mut d = [0];
-                let n = read_decompress(layer, window, lower, &mut d)?;
+                let n = read_decompress(layer, decrypt, window, lower, &mut d)?;
                 if n > 0 {
                     layer.next_byte = Some(d[0]);
                 }
@@ -193,21 +248,24 @@ fn at_eof_below_crc<R: ReadAt + ?Sized>(
     }
 }
 
-/// The source under the partial window: the CRC layer, the decompressing
-/// one, or the window on the archive.
+/// The source under the partial window: the CRC layer, or what is under
+/// it.
 fn read_below_partial<R: ReadAt + ?Sized>(
     crc: &mut Option<Layer<Crc>>,
     decompress: &mut Option<Layer<Decompress>>,
+    decrypt: &mut Option<Layer<Decrypt>>,
     window: &mut Layer<Window>,
     lower: &mut Lower<'_, R>,
     data: &mut [u8],
 ) -> Result<usize> {
     match crc {
         Some(crc) => crc.read(data, &mut |ctx, buf| {
-            let n = read_below_crc(decompress, window, lower, buf);
-            ctx.read(buf, n, || stat_below_crc(decompress, window, lower))
+            let n = read_below_crc(decompress, decrypt, window, lower, buf);
+            ctx.read(buf, n, || {
+                stat_below_crc(decompress, decrypt, window, lower)
+            })
         }),
-        None => read_below_crc(decompress, window, lower, data),
+        None => read_below_crc(decompress, decrypt, window, lower, data),
     }
 }
 
@@ -215,7 +273,7 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
     /// The size the stack below the partial window gives in its stat, if
     /// it gives one.
     pub(crate) fn size_below_partial(&self) -> Option<u64> {
-        let st = stat_below_crc(&self.decompress, &self.window, &self.lower);
+        let st = stat_below_crc(&self.decompress, &self.decrypt, &self.window, &self.lower);
         (st.valid & crate::zip::stat::SIZE != 0).then_some(st.size)
     }
 
@@ -226,6 +284,20 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
             return Err(e);
         }
         self.window.opened();
+
+        if let Some(layer) = self.decrypt.as_mut() {
+            let st = stat_window(&self.window, &self.lower);
+            let dostime = self.window.ctx.dos_time();
+            let (window, lower) = (&mut self.window, &mut self.lower);
+            if let Err(e) = layer
+                .ctx
+                .open(&mut |b| read_window(window, lower, b), &st, dostime)
+            {
+                layer.error = e;
+                return Err(e);
+            }
+            layer.opened();
+        }
 
         if let Some(decompress) = self.decompress.as_mut() {
             if let Err(e) = decompress.ctx.open() {
@@ -243,6 +315,7 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
         let Stack {
             lower,
             window,
+            decrypt,
             decompress,
             crc,
             partial,
@@ -251,7 +324,7 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
         if let Some(partial) = partial {
             if let Err(e) = partial
                 .ctx
-                .open(&mut |b| read_below_partial(crc, decompress, window, lower, b))
+                .open(&mut |b| read_below_partial(crc, decompress, decrypt, window, lower, b))
             {
                 partial.error = e;
                 return Err(e);
@@ -266,6 +339,7 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
         let Stack {
             lower,
             window,
+            decrypt,
             decompress,
             crc,
             partial,
@@ -274,10 +348,10 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
         match partial {
             Some(partial) => partial.read(data, &mut |ctx, buf| {
                 ctx.read(buf, &mut |b| {
-                    read_below_partial(crc, decompress, window, lower, b)
+                    read_below_partial(crc, decompress, decrypt, window, lower, b)
                 })
             }),
-            None => read_below_partial(crc, decompress, window, lower, data),
+            None => read_below_partial(crc, decompress, decrypt, window, lower, data),
         }
     }
 
@@ -287,17 +361,17 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
         let Stack {
             lower,
             window,
+            decrypt,
             decompress,
             crc,
             ..
         } = self;
         let mut ret = Ok(());
         if let Some(crc) = crc {
-            let at_eof = at_eof_below_crc(decompress, window, lower);
-            if let Err(e) = crc
-                .ctx
-                .close(at_eof, || stat_below_crc(decompress, window, lower))
-            {
+            let at_eof = at_eof_below_crc(decompress, decrypt, window, lower);
+            if let Err(e) = crc.ctx.close(at_eof, || {
+                stat_below_crc(decompress, decrypt, window, lower)
+            }) {
                 crc.error = e;
                 ret = Err(e);
             }
@@ -310,6 +384,14 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
                 ret = Err(e);
             }
         }
+        if let Some(layer) = decrypt
+            && let Err(e) = layer.ctx.close(&mut |b| read_window(window, lower, b))
+        {
+            layer.error = e;
+            if ret.is_ok() {
+                ret = Err(e);
+            }
+        }
         ret
     }
 }
@@ -317,7 +399,7 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
 impl<R: ReadAt + ?Sized> Stack<'_, R> {
     /// `zip_source_stat` of the top layer.
     pub(crate) fn stat(&self) -> Result<Stat<'static>> {
-        let mut st = stat_below_crc(&self.decompress, &self.window, &self.lower);
+        let mut st = stat_below_crc(&self.decompress, &self.decrypt, &self.window, &self.lower);
         if let Some(crc) = &self.crc {
             crc.ctx.stat(&mut st)?;
         }
@@ -342,11 +424,11 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
     }
 
     /// `zip_source_get_dos_time` of the top layer: the window's, which the
-    /// CRC layer passes on and the decompressing one does not; none for a
-    /// part of the data, whose window has none.
+    /// CRC layer passes on and the decrypting and decompressing ones do
+    /// not; none for a part of the data, whose window has none.
     pub(crate) fn dos_time(&self) -> Option<(u16, u16)> {
-        match (&self.decompress, &self.partial) {
-            (None, None) => self.window.ctx.dos_time(),
+        match (&self.decrypt, &self.decompress, &self.partial) {
+            (None, None, None) => self.window.ctx.dos_time(),
             _ => None,
         }
     }
@@ -427,48 +509,68 @@ impl<R: ReadAt + ?Sized> Base<'_, R> {
 }
 
 /// The sources `add_data` stacks on an entry's data, from the bottom up.
+/// The decrypting layer passes the attributes of the source under it on.
 pub(crate) struct WriteStack<'a, R: ?Sized> {
     pub(crate) base: Base<'a, R>,
+    pub(crate) decrypt: Option<Layer<Decrypt>>,
     pub(crate) decompress: Option<Layer<Decompress>>,
     pub(crate) crc: Option<Layer<Crc>>,
     pub(crate) compress: Option<Layer<Compress>>,
 }
 
+/// Reads from the base, through the decrypting layer if there is one.
+fn read_decrypted<R: ReadAt + ?Sized>(
+    base: &mut Base<'_, R>,
+    decrypt: &mut Option<Layer<Decrypt>>,
+    data: &mut [u8],
+) -> Result<usize> {
+    match decrypt {
+        Some(decrypt) => decrypt.read(data, &mut |ctx, buf| ctx.read(buf, &mut |b| base.read(b))),
+        None => base.read(data),
+    }
+}
+
 /// Reads from the layers under the compressing one.
 fn read_below_compress<R: ReadAt + ?Sized>(
     base: &mut Base<'_, R>,
+    decrypt: &mut Option<Layer<Decrypt>>,
     decompress: &mut Option<Layer<Decompress>>,
     crc: &mut Option<Layer<Crc>>,
     data: &mut [u8],
 ) -> Result<usize> {
     let read_below_crc = |base: &mut Base<'_, R>,
+                          decrypt: &mut Option<Layer<Decrypt>>,
                           decompress: &mut Option<Layer<Decompress>>,
                           data: &mut [u8]|
      -> Result<usize> {
         match decompress {
-            Some(decompress) => {
-                decompress.read(data, &mut |ctx, buf| ctx.read(buf, &mut |b| base.read(b)))
-            }
-            None => base.read(data),
+            Some(decompress) => decompress.read(data, &mut |ctx, buf| {
+                ctx.read(buf, &mut |b| read_decrypted(base, decrypt, b))
+            }),
+            None => read_decrypted(base, decrypt, data),
         }
     };
     match crc {
         Some(crc) => crc.read(data, &mut |ctx, buf| {
-            let n = read_below_crc(base, decompress, buf);
+            let n = read_below_crc(base, decrypt, decompress, buf);
             // A CRC layer that computes the CRC never asks for the stat.
             ctx.read(buf, n, Stat::default)
         }),
-        None => read_below_crc(base, decompress, data),
+        None => read_below_crc(base, decrypt, decompress, data),
     }
 }
 
 /// `zip_source_stat` under the compressing layer.
 fn stat_below_compress<R: ReadAt + ?Sized>(
     base: &Base<'_, R>,
+    decrypt: &Option<Layer<Decrypt>>,
     decompress: &Option<Layer<Decompress>>,
     crc: &Option<Layer<Crc>>,
 ) -> Result<Stat<'static>> {
     let mut st = base.stat()?;
+    if let Some(decrypt) = decrypt {
+        decrypt.ctx.stat(&mut st)?;
+    }
     if let Some(decompress) = decompress {
         decompress.ctx.stat(&mut st);
     }
@@ -496,6 +598,16 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
     /// Opens the layers, the lowest first: port of `zip_source_open`.
     pub(crate) fn open(&mut self) -> Result<()> {
         self.base.open()?;
+        if let Some(layer) = self.decrypt.as_mut() {
+            let st = self.base.stat()?;
+            let dostime = self.base.dos_time()?;
+            let base = &mut self.base;
+            if let Err(e) = layer.ctx.open(&mut |b| base.read(b), &st, dostime) {
+                layer.error = e;
+                return Err(e);
+            }
+            layer.opened();
+        }
         if let Some(decompress) = self.decompress.as_mut() {
             if let Err(e) = decompress.ctx.open() {
                 decompress.error = e;
@@ -510,7 +622,7 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
         if self.compress.is_some() {
             // The compressing layer asks for the stat and attributes of the
             // source below it when it opens.
-            stat_below_compress(&self.base, &self.decompress, &self.crc)?;
+            stat_below_compress(&self.base, &self.decrypt, &self.decompress, &self.crc)?;
             attributes_below_compress(&self.base, &self.decompress)?;
         }
         if let Some(compress) = self.compress.as_mut() {
@@ -527,15 +639,18 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
     pub(crate) fn read(&mut self, data: &mut [u8]) -> Result<usize> {
         let WriteStack {
             base,
+            decrypt,
             decompress,
             crc,
             compress,
         } = self;
         match compress {
             Some(compress) => compress.read(data, &mut |ctx, buf| {
-                ctx.read(buf, &mut |b| read_below_compress(base, decompress, crc, b))
+                ctx.read(buf, &mut |b| {
+                    read_below_compress(base, decrypt, decompress, crc, b)
+                })
             }),
-            None => read_below_compress(base, decompress, crc, data),
+            None => read_below_compress(base, decrypt, decompress, crc, data),
         }
     }
 
@@ -556,6 +671,15 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
                 ret = Err(e);
             }
         }
+        let base = &mut self.base;
+        if let Some(layer) = self.decrypt.as_mut()
+            && let Err(e) = layer.ctx.close(&mut |b| base.read(b))
+        {
+            layer.error = e;
+            if ret.is_ok() {
+                ret = Err(e);
+            }
+        }
         if let Err(e) = self.base.close()
             && ret.is_ok()
         {
@@ -566,7 +690,7 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
 
     /// `zip_source_stat` of the top layer.
     pub(crate) fn stat(&self) -> Result<Stat<'static>> {
-        let mut st = stat_below_compress(&self.base, &self.decompress, &self.crc)?;
+        let mut st = stat_below_compress(&self.base, &self.decrypt, &self.decompress, &self.crc)?;
         if let Some(compress) = &self.compress {
             compress.ctx.stat(&mut st);
         }

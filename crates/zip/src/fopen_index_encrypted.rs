@@ -1,6 +1,7 @@
 //! Port of `zip_fopen_index_encrypted.c`, with `zip_file_t`.
 
 use crate::error::{Error, Result};
+use crate::hash::c_string;
 use crate::open::Archive;
 use crate::source::ReadAt;
 use crate::source_stack::Stack;
@@ -45,18 +46,24 @@ impl<R: ReadAt> Archive<R> {
         })
     }
 
-    /// Opens entry `index` for reading with a password: port of
-    /// `zip_fopen_index_encrypted`. An empty password is none.
+    /// Opens entry `index` for reading, decrypted with `password`: port of
+    /// `zip_fopen_index_encrypted`. ZipCrypto and WinZip AES (AES-128,
+    /// AES-192 and AES-256) are decrypted; a wrong password fails with
+    /// [`ErrorCode::WrongPasswd`](crate::ErrorCode::WrongPasswd) where the
+    /// method can tell, and a WinZip AES entry whose authentication code
+    /// does not match with [`ErrorCode::Crc`](crate::ErrorCode::Crc) at its
+    /// end. Without a password, or with an empty one, the default password
+    /// is used.
     ///
-    /// Differs from libzip: decryption comes later; an encrypted entry is
-    /// refused (see [`Archive::fopen_index`]).
+    /// The password is taken up to its first NUL byte, as libzip takes a C
+    /// string.
     pub fn fopen_index_encrypted(
         &self,
         index: u64,
         flags: Flags,
         password: Option<&[u8]>,
     ) -> Result<ZipFile<'_, R>> {
-        let password = password.filter(|p| !p.is_empty());
+        let password = password.map(c_string).filter(|p| !p.is_empty());
         let mut src = self.source_zip_file_create(index, flags, 0, -1, password)?;
         src.open()?;
         Ok(ZipFile {

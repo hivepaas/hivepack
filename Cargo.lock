@@ -81,6 +81,7 @@ dependencies = [
 name = "hivepack-zip"
 version = "0.0.0"
 dependencies = [
+ "hivepack-crypto",
  "hivepack-deflate",
 ]
 

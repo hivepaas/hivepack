@@ -63,6 +63,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-crypto"
+version = "0.0.0"
+
+[[package]]
 name = "hivepack-deflate"
 version = "0.0.0"
 
@@ -83,6 +87,7 @@ dependencies = [
 name = "hivepack-zip"
 version = "0.0.0"
 dependencies = [
+ "hivepack-crypto",
  "hivepack-deflate",
 ]
 

@@ -2179,6 +2179,58 @@ fn regress_archives_match_libzip() {
     }
 }
 
+/// ZipDiff's archives (`testdata/zipdiff`), which ZIP parsers read
+/// differently, read from the one archive they are kept in.
+fn zipdiff_archives() -> Vec<(String, Vec<u8>)> {
+    let data = std::fs::read(repository().join("testdata/zipdiff/constructions.zip")).unwrap();
+    let za = Archive::open(data.as_slice(), OpenFlags::CHECKCONS).unwrap();
+    let archives: Vec<(String, Vec<u8>)> = (0..za.get_num_entries(Flags::NONE))
+        .map(|i| {
+            let name = za.get_name(i, Flags::NONE).unwrap();
+            (
+                String::from_utf8_lossy(name).into_owned(),
+                entry_data(&za, i).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(archives.len(), 5927);
+    archives
+}
+
+/// ZipDiff's archives open, and read, as libzip opens and reads them:
+/// where parsers disagree, the port agrees with libzip.
+#[test]
+fn zipdiff_archives_match_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut compared = 0;
+    for (name, data) in &zipdiff_archives() {
+        // c3-8, whose 65,536 entries take the oracle's line too long.
+        if data.len() > 1 << 20 {
+            continue;
+        }
+        compared += 1;
+        for flags in [0, 4] {
+            for kind in ["b", "f"] {
+                let request = format!("open {flags} {kind} {}", hex(data));
+                let want = oracle.ask(&request);
+                assert_eq!(
+                    answer(&request),
+                    want,
+                    "{name} with flags {flags}, source {kind}"
+                );
+            }
+        }
+        for parameters in ["0 b 0 8192 -1", "4 b 0 8192 -1", "0 f 4 100 -1"] {
+            let request = format!("read {parameters} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_eq!(answer(&request), want, "{name}: read {parameters}");
+        }
+    }
+    assert_eq!(compared, 5926);
+}
+
 #[test]
 fn regress_archives_read_like_libzip() {
     let Some(mut oracle) = Oracle::spawn() else {

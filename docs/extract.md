@@ -4,7 +4,7 @@
 
 Extractors no longer break on memory, which safe Rust settles, but on logic, and memory-safe code gets that wrong as often as C: writing through a link (the `zip` crate's CVE-2025-29787, adm-zip's CVE-2026-76845), keeping setuid bits or chmod through a link (RUSTSEC-2026-0367 and 0369), links that point outside (RUSTSEC-2026-0368), alternate data streams on Windows (WinRAR's CVE-2025-8088, exploited), and Python's tarfile filter, which took five CVEs in June 2025 for checking strings and `realpath`. The rules below answer those, and come from the research behind this repository's ZIP plan.
 
-> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, the options that relax them, a time limit, cancelling and progress: done, for ZIP, checked on libzip's test archives and fuzzed. Next: marks of origin, Unicode normalization, tar and RAR (see [What comes next](#what-comes-next)).
+> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, the options that relax them, a time limit, cancelling and progress, and names compared as file systems compare them: done, for ZIP, checked on libzip's test archives, Fifield's bombs and Unicode's own tests, and fuzzed. Next: marks of origin, tar and RAR (see [What comes next](#what-comes-next)).
 
 ## Refuse, do not repair
 
@@ -25,7 +25,11 @@ A name is refused (`check_name`, `NameError`) when it:
 | a component ending in a space or a dot | Windows drops them, so `a.` and `a` are one file |
 | a component longer than 255 bytes | file systems refuse it |
 
-Two entries may not name the same path either: compared with case folded (`str::to_lowercase`), as a case-insensitive file system sees them, which stops a file and a directory of one name (WinRAR's CVE-2023-38831) and a path written through another's case. A directory entry may follow the files in it. Unicode normalization (`é` as one code point or two, which macOS takes for one name) comes next.
+Two entries may not name the same path either: compared as a case-insensitive file system, and macOS, compare them, which stops a file and a directory of one name (WinRAR's CVE-2023-38831), a path written through another's case, and one name written two ways. A directory entry may follow the files in it.
+
+Names are compared by their key, Unicode's canonical caseless match with simple case folding: NFD(fold(NFD(name))), the canonical decomposition of the case folding of the canonical decomposition. So `é` as one character (U+00E9) and as `e` and a combining accent (U+0065 U+0301), which macOS takes for one name and Linux for two, are one name here; and so are the Kelvin sign and `K`, one by canonical decomposition as macOS takes them, and `σ` and `ς`, one by case folding as NTFS takes them. Compatibility forms stay apart (the ligature `ﬁ` is not `fi`), as no file system takes them for one, and so does `ß` and `ss`, which full case folding would join but NTFS keeps apart. Without the check, a second name written another way stops the extraction at its write, as `Exists` on macOS, after the first is written; with it, the archive extracts the same everywhere or not at all.
+
+The tables are this crate's own, in safe Rust, for one Unicode version on every system (`UNICODE_VERSION`, 18.0.0), rather than the standard library's, whose version moves with Rust, or `unicode-normalization`, which has `unsafe` code. `scripts/unicode.py` makes them from the Unicode Character Database (`UnicodeData.txt` and `CaseFolding.txt`, the `unicode-18.0.0` test data set); the tests check them against the same files for every character, run Unicode's own `NormalizationTest.txt` (20,171 lines, and every character it does not list decomposing to itself), and check that a key is its own key. Raising the version is changing it in the script and the manifest, and running the script.
 
 ## Links and special files
 
@@ -106,7 +110,6 @@ The `extract` fuzz target (see [fuzz/README.md](../fuzz/README.md)) extracts its
 
 ## What comes next
 
-- **Unicode normalization** of names before they are compared, which needs Unicode's tables.
 - **Marks of origin**: the archive's `Zone.Identifier` on Windows and `com.apple.quarantine` on macOS, carried to every file written, a failure to write one being a failure to extract. The macOS one takes a system call the standard library does not wrap.
 - **tar and RAR**, through the same checks and writing.
 - **Corpora**: ZipDiff's archives (made by its own program, which would have to be built and run) and the archives behind recent CVEs.

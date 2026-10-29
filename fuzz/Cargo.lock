@@ -21,6 +21,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "bzip2-sys",
+]
+
+[[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "cap-fs-ext"
 version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -138,6 +157,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-bzip2"
+version = "0.0.0"
+
+[[package]]
 name = "hivepack-crypto"
 version = "0.0.0"
 
@@ -158,7 +181,9 @@ dependencies = [
 name = "hivepack-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bzip2",
  "flate2",
+ "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
  "hivepack-zip",

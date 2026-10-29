@@ -1,0 +1,15 @@
+[package]
+name = "bzip2-bench"
+version = "0.0.0"
+description = "Times hivepack-bzip2 against libbzip2 on the same inputs"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hivepack-bzip2.workspace = true
+bzip2.workspace = true

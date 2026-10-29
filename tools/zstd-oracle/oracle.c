@@ -162,8 +162,8 @@ static int hex_value(int c)
     return -1;
 }
 
-/* Reads a hex string into `input`; returns its length, or -1. */
-static long parse_hex(const char* text)
+/* Reads a hex string into `bytes`, of MAX_BYTES; returns its length, or -1. */
+static long parse_hex_into(const char* text, unsigned char* bytes)
 {
     size_t n = strlen(text), i;
     if (strcmp(text, "-") == 0) return 0;
@@ -171,9 +171,15 @@ static long parse_hex(const char* text)
     for (i = 0; i < n / 2; i++) {
         int hi = hex_value(text[2 * i]), lo = hex_value(text[2 * i + 1]);
         if (hi < 0 || lo < 0) return -1;
-        input[i] = (unsigned char)(hi * 16 + lo);
+        bytes[i] = (unsigned char)(hi * 16 + lo);
     }
     return (long)(n / 2);
+}
+
+/* Reads a hex string into `input`; returns its length, or -1. */
+static long parse_hex(const char* text)
+{
+    return parse_hex_into(text, input);
 }
 
 static void print_hex(const unsigned char* bytes, size_t n)
@@ -869,19 +875,33 @@ static unsigned long long fnv64(const unsigned char* bytes, size_t n);
  *   9: ZSTD_CCtx_setPledgedSrcSize(a, or unknown if a < 0);
  *   10: ZSTD_compressStream2 with ZSTD_e_continue, the input up to a more
  *       bytes, its position moved b further, and all the room left.
- * Answers each step's result (s for success of 7 to 9) with the positions,
- * then a hash of the output. After an error of a compression call, the
- * session is reset, as a context must be before it is used again; but for
- * buffers not as stable as promised, which is found before anything
- * changes. */
+ * With the dictionary bytes <dicthex>, an optional fourth argument, the
+ * steps that set a dictionary, from the b bytes at a of them (cut to them):
+ *   11, 12, 13: ZSTD_CCtx_loadDictionary_advanced, by copy, as
+ *       ZSTD_dct_auto, _rawContent, _fullDict;
+ *   14: ZSTD_CCtx_refPrefix; 15: ZSTD_CCtx_refPrefix_advanced, ZSTD_dct_auto;
+ * and from the first a bytes of them:
+ *   16: ZSTD_CCtx_refCDict of ZSTD_createCDict at level b;
+ *   17: ZSTD_CCtx_refCDict of ZSTD_createCDict_advanced2, by copy, with the
+ *       context's requested parameters, as ZSTD_dct_auto, _rawContent,
+ *       _fullDict for b 0, 1, 2;
+ *   18: ZSTD_CCtx_refCDict(NULL).
+ * Answers each step's result (s for success of 7 to 9 and 11 to 18, n for a
+ * CDict not made) with the positions, then a hash of the output. After an
+ * error of a compression call, the session is reset, as a context must be
+ * before it is used again; but for buffers not as stable as promised,
+ * which is found before anything changes. */
 static void cstream(char** args, int nargs)
 {
     static long long steps[3 * 4096];
+    static unsigned char dict[MAX_BYTES];
+    static ZSTD_CDict* cdicts[4096];
     ZSTD_CCtx* cctx;
     size_t cap, r, inPos = 0, outPos = 0;
-    long n, nsteps, i;
+    long n, nsteps, i, dictSize = 0, ncdicts = 0;
     char text[80];
-    if (nargs != 3 || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    if ((nargs != 3 && nargs != 4) || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    if (nargs == 4 && (dictSize = parse_hex_into(args[3], dict)) < 0) { puts("bad"); return; }
     cap = strtoul(args[0], NULL, 10);
     nsteps = parse_list(args[1], steps, 3 * 4096);
     if (cap > MAX_BYTES || nsteps < 0 || nsteps % 3) { puts("bad"); return; }
@@ -892,6 +912,10 @@ static void cstream(char** args, int nargs)
         long long const op = steps[i], a = steps[i + 1], b = steps[i + 2];
         size_t const inEnd = inPos + (size_t)(a < 0 ? 0 : a);
         size_t const outEnd = outPos + (size_t)(b < 0 ? 0 : b);
+        /* The dictionary's bytes: b at a, or the first a. */
+        size_t const dictAt = (size_t)(a < 0 ? 0 : a) < (size_t)dictSize ? (size_t)(a < 0 ? 0 : a) : (size_t)dictSize;
+        size_t const dictLen = (size_t)(b < 0 ? 0 : b) < (size_t)dictSize - dictAt ? (size_t)(b < 0 ? 0 : b) : (size_t)dictSize - dictAt;
+        int noCDict = 0;
         ZSTD_inBuffer in;
         ZSTD_outBuffer out;
         in.src = input;
@@ -923,7 +947,30 @@ static void cstream(char** args, int nargs)
             r = ZSTD_CCtx_setPledgedSrcSize(cctx, a < 0 ? ZSTD_CONTENTSIZE_UNKNOWN
                                                         : (unsigned long long)a);
             break;
-        default: ZSTD_freeCCtx(cctx); puts("bad"); return;
+        case 11: case 12: case 13:
+            r = ZSTD_CCtx_loadDictionary_advanced(cctx, dict + dictAt, dictLen, ZSTD_dlm_byCopy,
+                    op == 11 ? ZSTD_dct_auto : op == 12 ? ZSTD_dct_rawContent : ZSTD_dct_fullDict);
+            break;
+        case 14: r = ZSTD_CCtx_refPrefix(cctx, dict + dictAt, dictLen); break;
+        case 15: r = ZSTD_CCtx_refPrefix_advanced(cctx, dict + dictAt, dictLen, ZSTD_dct_auto); break;
+        case 16: case 17: {
+            size_t const len = (size_t)(a < 0 ? 0 : a) < (size_t)dictSize ? (size_t)(a < 0 ? 0 : a) : (size_t)dictSize;
+            ZSTD_CDict* const cdict = op == 16
+                ? ZSTD_createCDict(dict, len, (int)b)
+                : ZSTD_createCDict_advanced2(dict, len, ZSTD_dlm_byCopy,
+                      b == 1 ? ZSTD_dct_rawContent : b == 2 ? ZSTD_dct_fullDict : ZSTD_dct_auto,
+                      &cctx->requestedParams, ZSTD_defaultCMem);
+            if (cdict == NULL) { noCDict = 1; r = 0; break; }
+            cdicts[ncdicts++] = cdict;
+            r = ZSTD_CCtx_refCDict(cctx, cdict);
+            break;
+        }
+        case 18: r = ZSTD_CCtx_refCDict(cctx, NULL); break;
+        default:
+            ZSTD_freeCCtx(cctx);
+            while (ncdicts > 0) ZSTD_freeCDict(cdicts[--ncdicts]);
+            puts("bad");
+            return;
         }
         inPos = in.pos;
         outPos = out.pos;
@@ -933,7 +980,9 @@ static void cstream(char** args, int nargs)
         if (ZSTD_isError(r))
             snprintf(text, sizeof(text), " e%d/%u/%u", (int)ERR_getErrorCode(r),
                      (unsigned)inPos, (unsigned)outPos);
-        else if (op >= 7 && op <= 9)
+        else if (noCDict)
+            snprintf(text, sizeof(text), " n");
+        else if ((op >= 7 && op <= 9) || op >= 11)
             snprintf(text, sizeof(text), " s");
         else
             snprintf(text, sizeof(text), " %u/%u/%u", (unsigned)r, (unsigned)inPos,
@@ -941,6 +990,7 @@ static void cstream(char** args, int nargs)
         line_append(text, strlen(text));
     }
     ZSTD_freeCCtx(cctx);
+    while (ncdicts > 0) ZSTD_freeCDict(cdicts[--ncdicts]);
     snprintf(text, sizeof(text), " %016llx", fnv64(output, outPos));
     line_append(text, strlen(text));
     puts(line_out);

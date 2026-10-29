@@ -4,13 +4,19 @@
 //! uses one context again for every frame. The test data is compressed in
 //! `tests/compress.rs`.
 
+use std::sync::Arc;
+
+use crate::compress::zstd_cdict::CDict;
 use crate::compress::zstd_compress::{
     CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_level_ported, zstd_level_strategy,
 };
-use crate::compress::zstd_compress_internal::{OVERFLOW_CORRECT_FREQUENTLY, ParamSwitch, Strategy};
+use crate::compress::zstd_compress_internal::{
+    DictAttachPref, OVERFLOW_CORRECT_FREQUENTLY, ParamSwitch, Strategy,
+};
 use crate::compress::zstd_lazy::row_get_match_mask;
 use crate::decompress::zstd_decompress::decompress;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer};
+use crate::decompress::zstd_decompress_internal::DCtx;
 use crate::oracle::Rng;
 use zstd::zstd_safe;
 
@@ -494,6 +500,211 @@ fn lowering_the_indices_changes_no_frame() {
     assert!(
         opt_corrections > 20,
         "only {opt_corrections} corrections with the optimal parser"
+    );
+}
+
+/// How [`lowering_the_indices_with_a_dictionary_changes_no_frame`] gives a
+/// frame its dictionary.
+#[derive(Clone, Copy, Debug)]
+enum DictWay {
+    /// A prefix: loaded for the frame.
+    Prefix,
+    /// Loaded into the context, its CDict copied in.
+    LoadCopy,
+    /// A CDict referenced, loaded again (long distance matching then takes
+    /// a raw dictionary's content too).
+    RefLoad,
+}
+
+/// [`lowering_the_indices_changes_no_frame`], with a dictionary: raw
+/// content, or a zstd dictionary libzstd trains, before the input. libzstd
+/// invalidates a dictionary when it lowers the indices
+/// (`ZSTD_overflowCorrectIfNeeded`), and only lowers them as soon as it can
+/// once the dictionary is out of the window (`ZSTD_window_canOverflowCorrect`),
+/// where the window's checks drop it anyway; so the frames come out the
+/// same. Every strategy, in one call and streaming, some with long
+/// distance matching. The frames without the lowering are also libzstd's.
+#[test]
+fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
+    let mut rng = Rng::new(0x5EED_0203);
+    let mut corrections = 0;
+    let mut ldm_corrections = 0;
+    let mut lowered_frames = 0;
+    let mut problems = Vec::new();
+    for i in 0..48 {
+        let strategy = [
+            Strategy::Fast,
+            Strategy::Dfast,
+            Strategy::Greedy,
+            Strategy::Lazy2,
+            Strategy::Btlazy2,
+            Strategy::Btultra,
+        ][i % 6];
+        let way = [DictWay::Prefix, DictWay::LoadCopy, DictWay::RefLoad][i / 6 % 3];
+        let one_call = (i / 18 + i / 3) % 2 == 0;
+        let slow = strategy >= Strategy::Btlazy2 && cfg!(debug_assertions);
+        let len = if slow {
+            rng.range(100_000, 250_000)
+        } else {
+            rng.range(100_000, 900_000)
+        } as usize;
+        // The dictionary and the input, from the same data.
+        let all = rng.lz_data(len + 200_000);
+        let data = all[200_000..].to_vec();
+        let dict = if i % 4 == 1 {
+            let samples: Vec<&[u8]> = all[..200_000].chunks(500).collect();
+            zstd::dict::from_samples(&samples, 8 << 10).unwrap_or_else(|_| all[..9000].to_vec())
+        } else {
+            let at = rng.range(0, 100_000) as usize;
+            all[at..at + rng.range(8, 90_000) as usize].to_vec()
+        };
+        let window_log = rng.range(10, 17) as u32;
+        let level = rng.range(1, 19) as i32;
+        let row_mode = [ParamSwitch::Enable, ParamSwitch::Disable][i / 3 % 2];
+        let ldm = i % 5 == 2;
+        let seed = rng.next();
+        let parameters = [
+            CParameter::CompressionLevel(level),
+            CParameter::Strategy(Some(strategy)),
+            CParameter::WindowLog(window_log),
+            CParameter::UseRowMatchFinder(row_mode),
+            CParameter::EnableLongDistanceMatching(if ldm {
+                ParamSwitch::Enable
+            } else {
+                ParamSwitch::Disable
+            }),
+            CParameter::LdmMinMatch(16),
+            CParameter::LdmHashRateLog(4),
+            CParameter::ForceAttachDict(match way {
+                DictWay::RefLoad => DictAttachPref::ForceLoad,
+                _ => DictAttachPref::ForceCopy,
+            }),
+        ];
+        let frames: Vec<Result<Lowered, String>> = [false, true]
+            .into_iter()
+            .map(|frequently| {
+                OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(frequently));
+                let mut cctx = CCtx::new();
+                for parameter in parameters {
+                    cctx.set_parameter(parameter)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+                let set = match way {
+                    DictWay::Prefix => cctx.ref_prefix(&dict),
+                    DictWay::LoadCopy => cctx.load_dictionary(&dict),
+                    DictWay::RefLoad => cctx.ref_cdict(Some(Arc::new(
+                        CDict::new(&dict, level).map_err(|error| format!("{error:?}"))?,
+                    ))),
+                };
+                set.map_err(|error| format!("{error:?}"))?;
+                let frame = if one_call {
+                    let mut dst = vec![0u8; zstd_compress_bound(len).unwrap_or(0)];
+                    let size = cctx
+                        .compress2(&mut dst, &data)
+                        .map_err(|error| format!("{error:?}"))?;
+                    dst.truncate(size);
+                    dst
+                } else {
+                    stream(&mut cctx, &data, seed)?
+                };
+                Ok((
+                    frame,
+                    cctx.nb_overflow_corrections(),
+                    cctx.nb_ldm_overflow_corrections(),
+                ))
+            })
+            .collect();
+        OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(false));
+        let what = format!(
+            "{len} bytes, a dictionary of {} bytes {way:?}, level {level}, {strategy:?}, window \
+             log {window_log}, long distance matching {ldm}, {}",
+            dict.len(),
+            if one_call { "one call" } else { "streaming" }
+        );
+        match (&frames[0], &frames[1]) {
+            (Ok((want, 0, 0)), Ok((got, lowered, ldm_lowered))) => {
+                corrections += lowered;
+                ldm_corrections += ldm_lowered;
+                lowered_frames += usize::from(*lowered > 0);
+                if want != got {
+                    problems.push(format!(
+                        "{what}: the frames differ after {lowered} corrections, {ldm_lowered} \
+                         of long distance matching"
+                    ));
+                }
+                let mut back = vec![0u8; len];
+                if DCtx::new()
+                    .decompress_using_dict(&mut back, got, &dict)
+                    .ok()
+                    != Some(len)
+                    || back != data
+                {
+                    problems.push(format!("{what}: does not decode back"));
+                }
+                // And libzstd's frame, in one call; on big-endian machines
+                // not for the strategies whose block splitter differs there
+                // (see `is_ported`).
+                let big_endian = cfg!(target_endian = "big") && strategy >= Strategy::Greedy;
+                if one_call && !big_endian {
+                    let c_cdict = zstd_safe::CDict::create(&dict, level);
+                    let mut c = zstd_safe::CCtx::create();
+                    let set = |c: &mut zstd_safe::CCtx<'_>| -> Result<(), usize> {
+                        use zstd_safe::CParameter as C;
+                        c.set_parameter(C::CompressionLevel(level))?;
+                        c.set_parameter(C::Strategy(match strategy {
+                            Strategy::Fast => zstd_safe::Strategy::ZSTD_fast,
+                            Strategy::Dfast => zstd_safe::Strategy::ZSTD_dfast,
+                            Strategy::Greedy => zstd_safe::Strategy::ZSTD_greedy,
+                            Strategy::Lazy2 => zstd_safe::Strategy::ZSTD_lazy2,
+                            Strategy::Btlazy2 => zstd_safe::Strategy::ZSTD_btlazy2,
+                            _ => zstd_safe::Strategy::ZSTD_btultra,
+                        }))?;
+                        c.set_parameter(C::WindowLog(window_log))?;
+                        c.set_parameter(C::UseRowMatchFinder(match row_mode {
+                            ParamSwitch::Enable => zstd_safe::ParamSwitch::Enable,
+                            _ => zstd_safe::ParamSwitch::Disable,
+                        }))?;
+                        c.set_parameter(C::EnableLongDistanceMatching(ldm))?;
+                        c.set_parameter(C::LdmMinMatch(16))?;
+                        c.set_parameter(C::LdmHashRateLog(4))?;
+                        c.set_parameter(C::ForceAttachDict(match way {
+                            DictWay::RefLoad => zstd_safe::DictAttachPref::ForceLoad,
+                            _ => zstd_safe::DictAttachPref::ForceCopy,
+                        }))?;
+                        Ok(())
+                    };
+                    let mut out = vec![0u8; zstd_compress_bound(len).unwrap_or(0)];
+                    let result = set(&mut c).and_then(|()| {
+                        match way {
+                            DictWay::Prefix => c.ref_prefix(&dict)?,
+                            DictWay::LoadCopy => c.load_dictionary(&dict)?,
+                            DictWay::RefLoad => c.ref_cdict(&c_cdict)?,
+                        };
+                        c.compress2(&mut out[..], &data)
+                    });
+                    match result {
+                        Ok(size) if out[..size] == want[..] => {}
+                        other => problems.push(format!(
+                            "{what}: not libzstd's frame ({:?}, {} bytes)",
+                            other,
+                            want.len()
+                        )),
+                    }
+                }
+            }
+            other => problems.push(format!("{what}: {other:?}")),
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    eprintln!(
+        "{corrections} corrections in {lowered_frames} frames, {ldm_corrections} of long \
+         distance matching"
+    );
+    assert!(lowered_frames > 20, "only {lowered_frames} frames lowered");
+    assert!(corrections > 50, "only {corrections} corrections");
+    assert!(
+        ldm_corrections > 10,
+        "only {ldm_corrections} corrections of long distance matching"
     );
 }
 

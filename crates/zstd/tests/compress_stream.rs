@@ -3,7 +3,9 @@
 //! pieces, with the same directives and the same room for output, and
 //! compares every call: what it returns, how far it reads and writes, and
 //! what it writes. Contexts are used for several frames, with parameters
-//! changed between them (and tried while streaming). Then `compress2`.
+//! changed between them (and tried while streaming), and dictionaries
+//! loaded, referenced as `CDict`s or prefixes, changed between them too.
+//! Then `compress2`.
 //!
 //! The data has repeats near and far, and the windows are small: the input
 //! buffer wraps around, and matches reach into the window's older segment.
@@ -15,8 +17,11 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use hivepack_zstd::{
-    CCtx, CParameter as P, EndDirective, Format, ParamSwitch, ResetDirective, Strategy,
+    CCtx, CDict, CParameter as P, DCtx, DictAttachPref, EndDirective, Format, ParamSwitch,
+    ResetDirective, Strategy,
 };
 use support::{Problems, Rng};
 use zstd::zstd_safe::{self, CParameter as C, FrameFormat, zstd_sys::ZSTD_EndDirective};
@@ -258,6 +263,9 @@ enum Ended {
     Frame(Vec<u8>),
     /// Both failed the same way.
     Failed,
+    /// The port refused the frame as it started, where libzstd attaches a
+    /// `CDict` (the `dictMatchState` block compressors, not ported yet).
+    Refused,
 }
 
 /// One frame of `data` through both contexts, in the same calls.
@@ -358,6 +366,13 @@ fn stream_frame(
             };
             (result, input.pos, output.pos)
         };
+        if call == 0
+            && got
+                .as_ref()
+                .is_err_and(|error| error.code() == hivepack_zstd::ErrorCode::ParameterUnsupported)
+        {
+            return Ok(Ended::Refused);
+        }
         let got = got.map_err(message);
 
         if (&want, ci, co) != (&got, pi, po) {
@@ -391,12 +406,86 @@ fn stream_frame(
     Err(format!("no end after {MAX_CALLS} calls"))
 }
 
-/// Contexts used for several frames, compared call by call.
-fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
+/// Dictionaries for the streaming comparisons: pieces of a corpus, raw
+/// content, and zstd dictionaries libzstd trains on it; the frames' data
+/// is drawn from it too. With `CDict`s of them, made by both.
+struct Dicts {
+    corpus: Vec<u8>,
+    dicts: Vec<Vec<u8>>,
+    c_cdicts: Vec<zstd_safe::CDict<'static>>,
+    p_cdicts: Vec<Arc<CDict>>,
+}
+
+impl Dicts {
+    fn new(rng: &mut Rng) -> Self {
+        let corpus = data(rng, 400_000);
+        let mut dicts = Vec::new();
+        for _ in 0..4 {
+            if let Some(dict) = rng.trained_dict(&corpus) {
+                dicts.push(dict);
+            }
+        }
+        for len in [8, 1000, 20_000, 70_000] {
+            let at = rng.range(0, (corpus.len() - len) as u64) as usize;
+            dicts.push(corpus[at..at + len].to_vec());
+        }
+        let mut c_cdicts = Vec::new();
+        let mut p_cdicts = Vec::new();
+        for (i, dict) in dicts.iter().enumerate() {
+            let level = [1, 3, 5, 19, -2, 9, 0, 16][i % 8];
+            c_cdicts.push(zstd_safe::CDict::create(dict, level));
+            p_cdicts.push(Arc::new(CDict::new(dict, level).expect("a CDict")));
+        }
+        Dicts {
+            corpus,
+            dicts,
+            c_cdicts,
+            p_cdicts,
+        }
+    }
+
+    /// Data with pieces of the corpus, and of its own.
+    fn data(&self, rng: &mut Rng, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 70_000);
+        while out.len() < len {
+            if rng.chance(2) {
+                let n = rng.range(10, 5000) as usize;
+                let at = rng.range(0, (self.corpus.len() - n) as u64) as usize;
+                out.extend_from_slice(&self.corpus[at..at + n]);
+            } else {
+                let n = rng.range(10, 20_000) as usize;
+                out.extend(data(rng, n));
+            }
+        }
+        out.truncate(len);
+        out
+    }
+}
+
+/// The dictionary the frames of a context use, as the decoder needs it.
+#[derive(Clone, Copy)]
+enum Active<'a> {
+    None,
+    Dict(&'a [u8]),
+    Prefix(&'a [u8]),
+}
+
+/// Contexts used for several frames, compared call by call; with `dicts`,
+/// a dictionary loaded, a `CDict` referenced or a prefix for some frames,
+/// changed between them. Returns the frames compared; the frames the port
+/// refuses go to `refused`.
+#[allow(clippy::too_many_lines)]
+fn compare_contexts(
+    problems: &mut Problems,
+    seed: u64,
+    dicts: Option<&Dicts>,
+    refused: &mut usize,
+) -> usize {
     let mut rng = Rng(seed);
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();
     let mut frames = 0;
+    let mut active = Active::None;
     for round in 0..rng.range(1, 4) {
         let tag = format!("seed {seed}, frame {round}");
         if rng.chance(4) {
@@ -417,6 +506,8 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
                 problems.add(format!("{tag}: resetting: libzstd {want:?}, port {got:?}"));
                 return frames;
             }
+            // Resetting the parameters drops the dictionaries.
+            active = Active::None;
         }
         for parameter in parameters(&mut rng) {
             if let Err(problem) = set_both(&mut c, &mut p, parameter) {
@@ -436,6 +527,79 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
             problems.add(format!("{tag}: {problem}"));
             return frames;
         }
+        if let Some(dicts) = dicts {
+            // Mostly copied in or loaded again: the port does not attach a
+            // CDict yet.
+            let (pp, cp) = match rng.range(0, 9) {
+                0 => (
+                    DictAttachPref::DefaultAttach,
+                    zstd_safe::DictAttachPref::DefaultAttach,
+                ),
+                1 => (
+                    DictAttachPref::ForceAttach,
+                    zstd_safe::DictAttachPref::ForceAttach,
+                ),
+                2..=5 => (
+                    DictAttachPref::ForceCopy,
+                    zstd_safe::DictAttachPref::ForceCopy,
+                ),
+                _ => (
+                    DictAttachPref::ForceLoad,
+                    zstd_safe::DictAttachPref::ForceLoad,
+                ),
+            };
+            if let Err(problem) = set_both(
+                &mut c,
+                &mut p,
+                (P::ForceAttachDict(pp), C::ForceAttachDict(cp)),
+            ) {
+                problems.add(format!("{tag}: {problem}"));
+                return frames;
+            }
+            // A dictionary for this frame and the next, a prefix for this
+            // one, or as before.
+            if round == 0 || rng.chance(2) {
+                let i = rng.range(0, dicts.dicts.len() as u64 - 1) as usize;
+                let dict = &dicts.dicts[i];
+                let (want, got) = match rng.range(0, 4) {
+                    0 => {
+                        active = Active::Dict(dict);
+                        (
+                            c.load_dictionary(dict).map(|_| ()).map_err(name),
+                            p.load_dictionary(dict).map_err(message),
+                        )
+                    }
+                    1 | 2 => {
+                        active = Active::Dict(dict);
+                        (
+                            c.ref_cdict(&dicts.c_cdicts[i]).map(|_| ()).map_err(name),
+                            p.ref_cdict(Some(dicts.p_cdicts[i].clone()))
+                                .map_err(message),
+                        )
+                    }
+                    3 => {
+                        active = Active::Prefix(dict);
+                        (
+                            c.ref_prefix(dict).map(|_| ()).map_err(name),
+                            p.ref_prefix(dict).map_err(message),
+                        )
+                    }
+                    _ => {
+                        active = Active::None;
+                        (
+                            c.disable_dictionary().map(|_| ()).map_err(name),
+                            p.load_dictionary(&[]).map_err(message),
+                        )
+                    }
+                };
+                if want != got {
+                    problems.add(format!(
+                        "{tag}: setting the dictionary: libzstd {want:?}, port {got:?}"
+                    ));
+                    return frames;
+                }
+            }
+        }
 
         let len = match rng.range(0, 5) {
             0 => rng.range(0, 300),
@@ -443,7 +607,10 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
             3 => rng.range(100_000, 600_000),
             _ => rng.range(0, 1_500_000),
         } as usize;
-        let content = data(&mut rng, len);
+        let content = match dicts {
+            Some(dicts) => dicts.data(&mut rng, len),
+            None => data(&mut rng, len),
+        };
         if rng.chance(4) {
             // A pledged size, sometimes wrong.
             let size = match rng.range(0, 4) {
@@ -459,6 +626,11 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
             }
         }
 
+        let frame_dict = active;
+        if let Active::Prefix(_) = active {
+            // For this frame only.
+            active = Active::None;
+        }
         match stream_frame(&mut c, &mut p, &content, &mut rng, stable_out) {
             Err(problem) => {
                 problems.add(format!(
@@ -466,8 +638,12 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
                 ));
                 return frames;
             }
-            Ok(Ended::Failed) => {
-                // libzstd's context waits for a reset after an error.
+            Ok(ended @ (Ended::Failed | Ended::Refused)) => {
+                if let Ended::Refused = ended {
+                    *refused += 1;
+                }
+                // libzstd's context waits for a reset after an error; the
+                // port's after refusing, and libzstd's frame was started.
                 c.reset(zstd_safe::ResetDirective::SessionOnly)
                     .expect("libzstd resets");
                 p.reset(ResetDirective::SessionOnly).expect("port resets");
@@ -477,7 +653,15 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
                 // libzstd decodes it, and so does the port, but magicless.
                 if p.get_parameter(hivepack_zstd::CParameterKind::Format) == 0 {
                     let mut back = vec![0u8; content.len()];
-                    match hivepack_zstd::decompress(&mut back, &frame) {
+                    let mut dctx = DCtx::new();
+                    let decoded = match frame_dict {
+                        Active::None => dctx.decompress(&mut back, &frame),
+                        Active::Dict(dict) => dctx.decompress_using_dict(&mut back, &frame, dict),
+                        Active::Prefix(prefix) => dctx
+                            .ref_prefix(prefix)
+                            .and_then(|()| dctx.decompress(&mut back, &frame)),
+                    };
+                    match decoded {
                         Ok(size) if back[..size] == content[..] => {}
                         other => problems
                             .add(format!("{tag}: the frame does not decode back: {other:?}")),
@@ -485,7 +669,6 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
                 }
             }
         }
-
         // A parameter set while no frame is open, or right after one.
         if rng.chance(3) {
             let parameter = if rng.chance(2) {
@@ -506,11 +689,32 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
 fn streaming_compresses_as_libzstd_does() {
     let mut problems = Problems::default();
     let mut frames = 0;
+    let mut refused = 0;
     for seed in 0..150 {
-        frames += compare_contexts(&mut problems, seed);
+        frames += compare_contexts(&mut problems, seed, None, &mut refused);
     }
+    assert_eq!(refused, 0, "frames refused without a dictionary");
     println!("{frames} frames compared");
     assert!(frames > 150, "too few frames compared: {frames}");
+    problems.check();
+}
+
+/// As [`streaming_compresses_as_libzstd_does`], with dictionaries: loaded,
+/// referenced as `CDict`s, prefixes, mostly copied in or loaded again. The
+/// frames that would attach a `CDict` (with the default preference, small
+/// or of unknown size) the port refuses for now: they are counted apart.
+#[test]
+fn streaming_with_dictionaries_compresses_as_libzstd_does() {
+    let mut problems = Problems::default();
+    let dicts = Dicts::new(&mut Rng(0xD1C7));
+    let mut frames = 0;
+    let mut refused = 0;
+    for seed in 0..150 {
+        frames += compare_contexts(&mut problems, 1_000_000 + seed, Some(&dicts), &mut refused);
+    }
+    println!("{frames} frames compared, {refused} refused");
+    assert!(frames > 150, "too few frames compared: {frames}");
+    assert!(refused > 5, "only {refused} frames refused");
     problems.check();
 }
 

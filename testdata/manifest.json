@@ -221,6 +221,13 @@
       "kind": "tool"
     },
     {
+      "name": "age-oracle",
+      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
+      "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: golang.org/x/crypto v0.55.0, the release age v1.3.2 requires",
+      "license": "MIT (the program) and BSD-3-Clause (golang.org/x/crypto)",
+      "kind": "tool"
+    },
+    {
       "name": "libzip-1.12.1-source",
       "fetch": { "group": "generated", "files": [{ "url": "https://github.com/nih-at/libzip/releases/download/v1.12.1/libzip-1.12.1.tar.gz", "sha256": "3b66fe92cbc768d8d4d16e1427bfb7399e15d9c2795c2fc482e7b30a6332a422", "unpack": "tar.gz" }] },
       "source": "https://github.com/nih-at/libzip/releases/tag/v1.12.1 (commit 8e037534ccd62f444abbe4ce265443ee74bbfeb3)",

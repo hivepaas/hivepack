@@ -16,8 +16,6 @@
 //! Speeds are the range over rounds in MB/s of uncompressed data (10^6 bytes
 //! per second), and the output is a Markdown table.
 //!
-//! hivepack-zstd compresses at the levels up to 3 so far; its compression
-//! column is empty for the others.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -166,10 +164,6 @@ impl Codec for Hivepack {
         } else {
             "hivepack-zstd".into()
         }
-    }
-
-    fn compresses(&self, level: i32) -> bool {
-        level <= 3
     }
 
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {

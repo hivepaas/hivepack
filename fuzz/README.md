@@ -26,6 +26,11 @@ find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
 cargo fuzz run --features unsafe-fast decompress -- -max_total_time=3600
 ```
 
+`compress` and `compress_stream` take the feature too: with it, the row
+match finder gathers its candidates and prefetches them, as libzstd does,
+so fuzz them both ways (CI runs `compress` with it, `compress_stream`
+without).
+
 The `inflate`, `deflate` and `inflate9` targets start from an empty
 corpus:
 

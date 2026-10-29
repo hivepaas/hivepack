@@ -107,15 +107,19 @@
 //!
 //! - `unsafe-fast`, off by default: the decoder's main sequence loop copies
 //!   without a bounds check per piece, as libzstd does, once per block it
-//!   has checked that its buffers allow it. Decompression is a few percent
-//!   faster; the crate then has some `unsafe` code, which without the
-//!   feature it forbids. It changes nothing on 32-bit machines.
+//!   has checked that its buffers allow it, which changes nothing on 32-bit
+//!   machines; and the encoder's row match finder (levels 5 to 12)
+//!   prefetches its rows and candidates as libzstd does, on aarch64 and
+//!   x86-64. Decompression is a few percent faster, and compression at
+//!   those levels faster still; the output is the same. The crate then has
+//!   some `unsafe` code, which without the feature it forbids.
 //!   [`UNSAFE_FAST`] says whether a build has it. See `docs/unsafe.md` in
 //!   the repository.
 
 // No unsafe code at all, unless the `unsafe-fast` feature is on: then only
-// in `decompress/unchecked.rs`, and the one block of the main sequence loop
-// that turns it on (see `docs/unsafe.md`).
+// in `decompress/unchecked.rs`, the one block of the main sequence loop
+// that turns it on, and the prefetch of `common/prefetch.rs` (see
+// `docs/unsafe.md`).
 #![cfg_attr(not(feature = "unsafe-fast"), forbid(unsafe_code))]
 // The common files are ported whole, with what only parts still to come or
 // the tests use.
@@ -157,6 +161,7 @@ pub use decompress::zstd_decompress_internal::{
 pub const UPSTREAM_VERSION: &str = "1.5.7";
 
 /// Whether this build has the `unsafe-fast` feature: the decoder's copies
-/// without per-piece bounds checks. Cargo turns a feature on for the whole
+/// without per-piece bounds checks, and the row match finder's prefetching.
+/// Cargo turns a feature on for the whole
 /// build when any crate asks for it, so this says which one a program got.
 pub const UNSAFE_FAST: bool = cfg!(feature = "unsafe-fast");

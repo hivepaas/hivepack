@@ -10,7 +10,30 @@ use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
     HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
     mem_read32, mem_read32_within, offset_to_offbase, zstd_count, zstd_count_2segments,
+    zstd_hash_ptr,
 };
+
+/// `ZSTD_fillHashTable` for a context (`ZSTD_fillHashTableForCCtx`), with
+/// `ZSTD_dtlm_fast`, the only way libzstd calls it for one: every third
+/// position from `nextToUpdate` into the hash table, while 8 bytes from the
+/// next one fit before `end`, a position of `src`, the prefix's buffer.
+/// `nextToUpdate` stays.
+pub(crate) fn zstd_fill_hash_table(ms: &mut MatchState, src: &[u8], end: usize) {
+    const FAST_HASH_FILL_STEP: i64 = 3;
+    let h_bits = ms.c_params.hash_log;
+    let mls = ms.c_params.min_match;
+    let base = ms.window.base;
+    let mut ip = i64::from(ms.next_to_update) - base;
+    debug_assert!(ip >= 0);
+    // libzstd's iend, end - HASH_READ_SIZE, which can be before the buffer.
+    let iend = end as i64 - HASH_READ_SIZE as i64;
+    while ip + FAST_HASH_FILL_STEP < iend + 2 {
+        let curr = (ip + base) as u32;
+        let hash0 = zstd_hash_ptr(src, ip as usize, h_bits, mls);
+        ms.hash_table[hash0] = curr;
+        ip += FAST_HASH_FILL_STEP;
+    }
+}
 
 /// `ZSTD_compressBlock_fast_noDict_generic`: the sequences of the block
 /// `src[istart..iend]` into `seq_store`. Returns the size of the literals

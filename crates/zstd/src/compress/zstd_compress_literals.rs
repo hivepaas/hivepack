@@ -12,7 +12,7 @@ use crate::compress::zstd_compress_internal::{HufCTables, Strategy, zstd_min_gai
 
 /// `HUF_OPTIMAL_DEPTH_THRESHOLD`: from this strategy on, Huffman tables are
 /// built at their best depth.
-const HUF_OPTIMAL_DEPTH_THRESHOLD: Strategy = Strategy::Btultra;
+pub(crate) const HUF_OPTIMAL_DEPTH_THRESHOLD: Strategy = Strategy::Btultra;
 
 /// `ZSTD_noCompressLiterals`: the literals stored raw.
 pub(crate) fn zstd_no_compress_literals(dst: &mut [u8], src: &[u8]) -> Result<usize> {

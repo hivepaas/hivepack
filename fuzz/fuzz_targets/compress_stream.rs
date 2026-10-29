@@ -6,7 +6,7 @@
 
 #![no_main]
 
-use hivepack_zstd::{CCtx, CParameter as P, EndDirective, ErrorCode, ParamSwitch, Strategy};
+use hivepack_zstd::{CCtx, CParameter as P, EndDirective, ParamSwitch, Strategy};
 use libfuzzer_sys::fuzz_target;
 use zstd::zstd_safe::{self, CParameter as C, zstd_sys::ZSTD_EndDirective};
 
@@ -47,11 +47,12 @@ fuzz_target!(|input: &[u8]| {
     }
     let (head, src) = input.split_at(8);
     let level =
-        [-100, -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][usize::from(head[0]) % 16];
+        [-100, -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 10, 13, 16, 19, 22][usize::from(head[0]) % 16];
     let window_log = 10 + u32::from(head[1] % 12);
     let stable_out = head[2] & 1 != 0;
     let checksum = head[2] & 2 != 0;
     let max_block = [0, 1024, 4096, 65_536][usize::from(head[2] >> 2) % 4];
+    let ldm = head[2] & 16 != 0;
     let mut rng = Rng(u64::from(u32::from_le_bytes([head[3], head[4], head[5], head[6]])) | 1);
 
     let mut parameters = vec![
@@ -63,8 +64,32 @@ fuzz_target!(|input: &[u8]| {
         ),
         (P::MaxBlockSize(max_block), C::MaxBlockSize(max_block)),
     ];
-    if head[7] & 1 != 0 {
+    // Long distance matching needs a window set: it would take 2^27 bytes.
+    if head[7] & 1 != 0 || ldm {
         parameters.push((P::WindowLog(window_log), C::WindowLog(window_log)));
+    }
+    if ldm {
+        // Small parameters, so that it finds matches in small inputs; some
+        // left to the library.
+        parameters.push((
+            P::EnableLongDistanceMatching(ParamSwitch::Enable),
+            C::EnableLongDistanceMatching(true),
+        ));
+        let pick = head[2] >> 5;
+        if pick & 1 != 0 {
+            let value = 4 + (rng.next() % 61) as u32;
+            parameters.push((P::LdmMinMatch(value), C::LdmMinMatch(value)));
+        }
+        if pick & 2 != 0 {
+            let value = (rng.next() % 5) as u32;
+            parameters.push((P::LdmHashRateLog(value), C::LdmHashRateLog(value)));
+        }
+        if pick & 4 != 0 {
+            let value = 6 + (rng.next() % 15) as u32;
+            parameters.push((P::LdmHashLog(value), C::LdmHashLog(value)));
+            let value = 1 + (rng.next() % 8) as u32;
+            parameters.push((P::LdmBucketSizeLog(value), C::LdmBucketSizeLog(value)));
+        }
     }
     {
         use zstd_safe::Strategy as S;
@@ -75,18 +100,32 @@ fuzz_target!(|input: &[u8]| {
             (Strategy::Lazy, S::ZSTD_lazy),
             (Strategy::Lazy2, S::ZSTD_lazy2),
             (Strategy::Btlazy2, S::ZSTD_btlazy2),
+            (Strategy::Btopt, S::ZSTD_btopt),
+            (Strategy::Btultra, S::ZSTD_btultra),
+            (Strategy::Btultra2, S::ZSTD_btultra2),
         ];
-        let pick = usize::from(head[7] >> 1 & 7);
+        let pick = usize::from(head[7] >> 1 & 7) + 8 * usize::from(head[2] >> 7);
         if let Some(&(p, c)) = strategies.get(pick) {
             parameters.push((P::Strategy(Some(p)), C::Strategy(c)));
         }
     }
-    let (p_row, c_row) = [
+    if rng.next() % 4 == 0 {
+        // The optimal parser's 3-byte hash table.
+        parameters.push((P::MinMatch(3), C::MinMatch(3)));
+    }
+    let switches = [
         (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
         (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
         (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
-    ][usize::from(head[7] >> 4) % 3];
+    ];
+    let (p_row, c_row) = switches[usize::from(head[7] >> 4) % 3];
     parameters.push((P::UseRowMatchFinder(p_row), C::UseRowMatchFinder(c_row)));
+    // The block splitter after the sequences.
+    let (p_split, c_split) = switches[usize::from(head[2] >> 4) % 3];
+    parameters.push((
+        P::SplitAfterSequences(p_split),
+        C::UseBlockSplitter(c_split),
+    ));
 
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();
@@ -153,12 +192,6 @@ fuzz_target!(|input: &[u8]| {
             let result = p.compress_stream2(&mut output, &mut input, directive);
             (result, input.pos, output.pos)
         };
-        if let Err(error) = &got
-            && error.code() == ErrorCode::ParameterUnsupported
-        {
-            // A strategy the port does not have yet.
-            return;
-        }
         let got = got.map_err(|error| error.code().message().to_string());
         assert!(
             (&want, ci, co) == (&got, pi, po),

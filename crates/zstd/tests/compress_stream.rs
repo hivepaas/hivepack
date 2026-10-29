@@ -7,9 +7,6 @@
 //!
 //! The data has repeats near and far, and the windows are small: the input
 //! buffer wraps around, and matches reach into the window's older segment.
-//! When the port refuses a frame with `ParameterUnsupported`, a strategy it
-//! does not have yet, that context is left, whatever libzstd answers: the
-//! port refuses when the frame starts, before libzstd can fail.
 //!
 //! The `zstd` crate does not let the input buffer be stable, nor set the
 //! block splitter level; the oracle tests those (`src/oracle_compress.rs`).
@@ -19,7 +16,7 @@
 mod support;
 
 use hivepack_zstd::{
-    CCtx, CParameter as P, EndDirective, ErrorCode, Format, ParamSwitch, ResetDirective, Strategy,
+    CCtx, CParameter as P, EndDirective, Format, ParamSwitch, ResetDirective, Strategy,
 };
 use support::{Problems, Rng};
 use zstd::zstd_safe::{self, CParameter as C, FrameFormat, zstd_sys::ZSTD_EndDirective};
@@ -72,8 +69,9 @@ fn piece(rng: &mut Rng) -> usize {
 /// Random parameters, the same for both; some out of bounds.
 fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
     let mut list = Vec::new();
-    let level =
-        [-7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 19][rng.range(0, 16) as usize];
+    let level = [
+        -7, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 15, 16, 17, 18, 19, 20, 22,
+    ][rng.range(0, 21) as usize];
     list.push((P::CompressionLevel(level), C::CompressionLevel(level)));
     if rng.chance(2) {
         let value = rng.range(9, 20) as u32;
@@ -92,7 +90,12 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         list.push((P::SearchLog(value), C::SearchLog(value)));
     }
     if rng.chance(3) {
-        let value = rng.range(2, 8) as u32;
+        // Often 3, for the optimal parser's 3-byte hash table.
+        let value = if rng.chance(2) {
+            3
+        } else {
+            rng.range(2, 8) as u32
+        };
         list.push((P::MinMatch(value), C::MinMatch(value)));
     }
     if rng.chance(4) {
@@ -108,8 +111,22 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
             (Strategy::Lazy, S::ZSTD_lazy),
             (Strategy::Lazy2, S::ZSTD_lazy2),
             (Strategy::Btlazy2, S::ZSTD_btlazy2),
-        ][rng.range(0, 5) as usize];
+            (Strategy::Btopt, S::ZSTD_btopt),
+            (Strategy::Btultra, S::ZSTD_btultra),
+            (Strategy::Btultra2, S::ZSTD_btultra2),
+        ][rng.range(0, 8) as usize];
         list.push((P::Strategy(Some(p)), C::Strategy(c)));
+    }
+    // The block splitter after the sequences, which the optimal parser's
+    // strategies use with windows of 128 KB or more: the port refuses it
+    // for now, so mostly off.
+    if !rng.chance(8) {
+        let (p, c) = if rng.chance(8) {
+            (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto)
+        } else {
+            (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable)
+        };
+        list.push((P::SplitAfterSequences(p), C::UseBlockSplitter(c)));
     }
     if rng.chance(2) {
         let (p, c) = match rng.range(0, 2) {
@@ -118,6 +135,16 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
             _ => (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
         };
         list.push((P::UseRowMatchFinder(p), C::UseRowMatchFinder(c)));
+    }
+    if rng.chance(2) {
+        // The block splitter after the sequences; `Auto` is off below
+        // btopt.
+        let (p, c) = match rng.range(0, 2) {
+            0 => (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),
+            1 => (ParamSwitch::Enable, zstd_safe::ParamSwitch::Enable),
+            _ => (ParamSwitch::Disable, zstd_safe::ParamSwitch::Disable),
+        };
+        list.push((P::SplitAfterSequences(p), C::UseBlockSplitter(c)));
     }
     if rng.chance(2) {
         let flag = rng.chance(2);
@@ -154,6 +181,43 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
     if rng.chance(4) {
         let value = [0, 1000, 1024, 5000, 65_536, 131_072, 131_073][rng.range(0, 6) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
+    }
+    if rng.chance(3) {
+        // Long distance matching, with small parameters, so that it finds
+        // matches in these inputs, some of them out of bounds. zstd-safe
+        // sets it on (1) or to 0, auto in libzstd, which is off below btopt.
+        let on = !rng.chance(4);
+        let p = if on {
+            ParamSwitch::Enable
+        } else {
+            ParamSwitch::Auto
+        };
+        list.push((
+            P::EnableLongDistanceMatching(p),
+            C::EnableLongDistanceMatching(on),
+        ));
+        if rng.chance(2) {
+            let value = rng.range(3, 100) as u32;
+            list.push((P::LdmMinMatch(value), C::LdmMinMatch(value)));
+        }
+        if rng.chance(2) {
+            let value = rng.range(0, 4) as u32;
+            list.push((P::LdmHashRateLog(value), C::LdmHashRateLog(value)));
+        }
+        if rng.chance(3) {
+            let value = rng.range(5, 20) as u32;
+            list.push((P::LdmHashLog(value), C::LdmHashLog(value)));
+        }
+        if rng.chance(3) {
+            let value = rng.range(0, 9) as u32;
+            list.push((P::LdmBucketSizeLog(value), C::LdmBucketSizeLog(value)));
+        }
+        // A small window: the input buffer then wraps around, and matches
+        // reach into the window's older segment. Without one set, long
+        // distance matching takes 2^27 bytes, and its hash table, from a
+        // small hash rate log, up to 2^26 entries.
+        let value = rng.range(10, 20) as u32;
+        list.push((P::WindowLog(value), C::WindowLog(value)));
     }
     // On big-endian machines libzstd's block splitter, which the strategies
     // from `greedy` up use on full blocks, hashes pairs of bytes in the
@@ -194,8 +258,6 @@ enum Ended {
     Frame(Vec<u8>),
     /// Both failed the same way.
     Failed,
-    /// The port refused the strategy.
-    Unsupported,
 }
 
 /// One frame of `data` through both contexts, in the same calls.
@@ -296,11 +358,6 @@ fn stream_frame(
             };
             (result, input.pos, output.pos)
         };
-        if let Err(error) = &got
-            && error.code() == ErrorCode::ParameterUnsupported
-        {
-            return Ok(Ended::Unsupported);
-        }
         let got = got.map_err(message);
 
         if (&want, ci, co) != (&got, pi, po) {
@@ -335,11 +392,11 @@ fn stream_frame(
 }
 
 /// Contexts used for several frames, compared call by call.
-fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
+fn compare_contexts(problems: &mut Problems, seed: u64) -> usize {
     let mut rng = Rng(seed);
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();
-    let (mut frames, mut unsupported) = (0, 0);
+    let mut frames = 0;
     for round in 0..rng.range(1, 4) {
         let tag = format!("seed {seed}, frame {round}");
         if rng.chance(4) {
@@ -358,13 +415,13 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             let got = p.reset(reset.0).map_err(message);
             if want != got {
                 problems.add(format!("{tag}: resetting: libzstd {want:?}, port {got:?}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
         for parameter in parameters(&mut rng) {
             if let Err(problem) = set_both(&mut c, &mut p, parameter) {
                 problems.add(format!("{tag}: {problem}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
         let stable_out = rng.chance(4);
@@ -377,7 +434,7 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             ),
         ) {
             problems.add(format!("{tag}: {problem}"));
-            return (frames, unsupported);
+            return frames;
         }
 
         let len = match rng.range(0, 5) {
@@ -398,7 +455,7 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             let got = p.set_pledged_src_size(size).map_err(message);
             if want != got {
                 problems.add(format!("{tag}: pledging: libzstd {want:?}, port {got:?}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
 
@@ -407,11 +464,7 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
                 problems.add(format!(
                     "{tag} ({len} bytes, stable output {stable_out}): {problem}"
                 ));
-                return (frames, unsupported);
-            }
-            Ok(Ended::Unsupported) => {
-                unsupported += 1;
-                return (frames, unsupported);
+                return frames;
             }
             Ok(Ended::Failed) => {
                 // libzstd's context waits for a reset after an error.
@@ -442,23 +495,21 @@ fn compare_contexts(problems: &mut Problems, seed: u64) -> (usize, usize) {
             };
             if let Err(problem) = set_both(&mut c, &mut p, parameter) {
                 problems.add(format!("{tag}: after the frame, {problem}"));
-                return (frames, unsupported);
+                return frames;
             }
         }
     }
-    (frames, unsupported)
+    frames
 }
 
 #[test]
 fn streaming_compresses_as_libzstd_does() {
     let mut problems = Problems::default();
-    let (mut frames, mut unsupported) = (0, 0);
+    let mut frames = 0;
     for seed in 0..150 {
-        let (f, u) = compare_contexts(&mut problems, seed);
-        frames += f;
-        unsupported += u;
+        frames += compare_contexts(&mut problems, seed);
     }
-    println!("{frames} frames compared, {unsupported} contexts left at an unsupported strategy");
+    println!("{frames} frames compared");
     assert!(frames > 150, "too few frames compared: {frames}");
     problems.check();
 }
@@ -541,13 +592,7 @@ fn compress2_compresses_as_libzstd_does() {
             let mut c_out = vec![0u8; room];
             let mut p_out = vec![0u8; room];
             let want = c.compress2(&mut c_out[..], &content).map_err(name);
-            let got = p.compress2(&mut p_out, &content);
-            if let Err(error) = &got
-                && error.code() == ErrorCode::ParameterUnsupported
-            {
-                break;
-            }
-            let got = got.map_err(message);
+            let got = p.compress2(&mut p_out, &content).map_err(message);
             if want != got {
                 problems.add(format!(
                     "seed {seed}, {len} bytes into {room}: libzstd {want:?}, port {got:?}"
@@ -571,29 +616,35 @@ fn compress2_compresses_as_libzstd_does() {
 }
 
 /// More than 4 GiB in one frame, past `ZSTD_CURRENT_MAX` (3.5 GB), where
-/// both lower the window's indices for real; compared call by call. Slow:
-/// run it in release, by hand.
+/// both lower the window's indices for real; compared call by call. The
+/// last frame has long distance matching, whose window lowers its own
+/// indices. Slow: run it in release, by hand.
 #[test]
 #[ignore = "streams 4.5 GiB; run with --release"]
 fn streams_past_4_gib_as_libzstd_does() {
     const ROUNDS: usize = 72;
     let mut rng = Rng(99);
     let base = data(&mut rng, 64 << 20);
-    for (level, window_log) in [(1, 0), (3, 12)] {
+    for (level, window_log, ldm) in [(1, 0, false), (3, 12, false), (2, 20, true)] {
         let mut c = zstd_safe::CCtx::create();
         let mut p = CCtx::new();
-        set_both(
-            &mut c,
-            &mut p,
+        let mut parameters = vec![
             (P::CompressionLevel(level), C::CompressionLevel(level)),
-        )
-        .expect("both set it");
-        set_both(
-            &mut c,
-            &mut p,
             (P::WindowLog(window_log), C::WindowLog(window_log)),
-        )
-        .expect("both set it");
+        ];
+        if ldm {
+            parameters.extend([
+                (
+                    P::EnableLongDistanceMatching(ParamSwitch::Enable),
+                    C::EnableLongDistanceMatching(true),
+                ),
+                (P::LdmMinMatch(16), C::LdmMinMatch(16)),
+                (P::LdmHashRateLog(4), C::LdmHashRateLog(4)),
+            ]);
+        }
+        for parameter in parameters {
+            set_both(&mut c, &mut p, parameter).expect("both set it");
+        }
         let mut c_out = vec![0u8; hivepack_zstd::cstream_out_size()];
         let mut p_out = vec![0u8; hivepack_zstd::cstream_out_size()];
         let mut written = 0u64;
@@ -647,7 +698,7 @@ fn streams_past_4_gib_as_libzstd_does() {
             }
         }
         println!(
-            "level {level}: {written} bytes for {} GiB",
+            "level {level}, long distance matching {ldm}: {written} bytes for {} GiB",
             ROUNDS as f64 / 16.0
         );
     }

@@ -514,6 +514,10 @@ enum DictWay {
     /// A CDict referenced, loaded again (long distance matching then takes
     /// a raw dictionary's content too).
     RefLoad,
+    /// Loaded into the context, its CDict attached: the frame searches the
+    /// CDict's tables where they are (`dictMatchState`), until the window
+    /// moves past it.
+    Attach,
 }
 
 /// [`lowering_the_indices_changes_no_frame`], with a dictionary: raw
@@ -523,24 +527,33 @@ enum DictWay {
 /// once the dictionary is out of the window (`ZSTD_window_canOverflowCorrect`),
 /// where the window's checks drop it anyway; so the frames come out the
 /// same. Every strategy, in one call and streaming, some with long
-/// distance matching. The frames without the lowering are also libzstd's.
+/// distance matching; a CDict attached with the strategies whose
+/// `dictMatchState` block compressors the port has. The frames without the
+/// lowering are also libzstd's.
 #[test]
 fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
     let mut rng = Rng::new(0x5EED_0203);
     let mut corrections = 0;
     let mut ldm_corrections = 0;
     let mut lowered_frames = 0;
+    let mut attached_lowered_frames = 0;
     let mut problems = Vec::new();
-    for i in 0..48 {
-        let strategy = [
-            Strategy::Fast,
-            Strategy::Dfast,
-            Strategy::Greedy,
-            Strategy::Lazy2,
-            Strategy::Btlazy2,
-            Strategy::Btultra,
-        ][i % 6];
-        let way = [DictWay::Prefix, DictWay::LoadCopy, DictWay::RefLoad][i / 6 % 3];
+    for i in 0..64 {
+        let (strategy, way) = if i < 48 {
+            (
+                [
+                    Strategy::Fast,
+                    Strategy::Dfast,
+                    Strategy::Greedy,
+                    Strategy::Lazy2,
+                    Strategy::Btlazy2,
+                    Strategy::Btultra,
+                ][i % 6],
+                [DictWay::Prefix, DictWay::LoadCopy, DictWay::RefLoad][i / 6 % 3],
+            )
+        } else {
+            ([Strategy::Fast, Strategy::Dfast][i % 2], DictWay::Attach)
+        };
         let one_call = (i / 18 + i / 3) % 2 == 0;
         let slow = strategy >= Strategy::Btlazy2 && cfg!(debug_assertions);
         let len = if slow {
@@ -577,6 +590,7 @@ fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
             CParameter::LdmHashRateLog(4),
             CParameter::ForceAttachDict(match way {
                 DictWay::RefLoad => DictAttachPref::ForceLoad,
+                DictWay::Attach => DictAttachPref::ForceAttach,
                 _ => DictAttachPref::ForceCopy,
             }),
         ];
@@ -591,7 +605,7 @@ fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
                 }
                 let set = match way {
                     DictWay::Prefix => cctx.ref_prefix(&dict),
-                    DictWay::LoadCopy => cctx.load_dictionary(&dict),
+                    DictWay::LoadCopy | DictWay::Attach => cctx.load_dictionary(&dict),
                     DictWay::RefLoad => cctx.ref_cdict(Some(Arc::new(
                         CDict::new(&dict, level).map_err(|error| format!("{error:?}"))?,
                     ))),
@@ -626,6 +640,9 @@ fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
                 corrections += lowered;
                 ldm_corrections += ldm_lowered;
                 lowered_frames += usize::from(*lowered > 0);
+                if let DictWay::Attach = way {
+                    attached_lowered_frames += usize::from(*lowered > 0);
+                }
                 if want != got {
                     problems.push(format!(
                         "{what}: the frames differ after {lowered} corrections, {ldm_lowered} \
@@ -669,6 +686,7 @@ fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
                         c.set_parameter(C::LdmHashRateLog(4))?;
                         c.set_parameter(C::ForceAttachDict(match way {
                             DictWay::RefLoad => zstd_safe::DictAttachPref::ForceLoad,
+                            DictWay::Attach => zstd_safe::DictAttachPref::ForceAttach,
                             _ => zstd_safe::DictAttachPref::ForceCopy,
                         }))?;
                         Ok(())
@@ -677,7 +695,7 @@ fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
                     let result = set(&mut c).and_then(|()| {
                         match way {
                             DictWay::Prefix => c.ref_prefix(&dict)?,
-                            DictWay::LoadCopy => c.load_dictionary(&dict)?,
+                            DictWay::LoadCopy | DictWay::Attach => c.load_dictionary(&dict)?,
                             DictWay::RefLoad => c.ref_cdict(&c_cdict)?,
                         };
                         c.compress2(&mut out[..], &data)
@@ -697,10 +715,14 @@ fn lowering_the_indices_with_a_dictionary_changes_no_frame() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     eprintln!(
-        "{corrections} corrections in {lowered_frames} frames, {ldm_corrections} of long \
-         distance matching"
+        "{corrections} corrections in {lowered_frames} frames ({attached_lowered_frames} \
+         attached), {ldm_corrections} of long distance matching"
     );
     assert!(lowered_frames > 20, "only {lowered_frames} frames lowered");
+    assert!(
+        attached_lowered_frames > 8,
+        "only {attached_lowered_frames} frames lowered attached"
+    );
     assert!(corrections > 50, "only {corrections} corrections");
     assert!(
         ldm_corrections > 10,

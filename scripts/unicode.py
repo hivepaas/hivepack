@@ -6,7 +6,8 @@ Database: the tables hivepack-extract compares names with.
 - Full canonical decompositions, from UnicodeData.txt, each expanded until
   nothing in it decomposes further. Hangul syllables are left out: their
   decompositions are computed.
-- Simple case folding, the mappings of status C and S in CaseFolding.txt.
+- Full case folding, the mappings of status C and F in CaseFolding.txt
+  (`ß` to `ss`, `ﬁ` to `fi`), as macOS's file system folds names.
 
 The database files are the `unicode-<VERSION>` set of testdata/manifest.json:
 
@@ -65,7 +66,7 @@ def full(cp: int, mappings: dict) -> list:
     return [d for part in mappings[cp] for d in full(part, mappings)]
 
 
-def simple_folding(folder: Path) -> dict:
+def full_folding(folder: Path) -> dict:
     folding = {}
     with (folder / "CaseFolding.txt").open(encoding="utf-8") as f:
         for line in f:
@@ -73,9 +74,8 @@ def simple_folding(folder: Path) -> dict:
             if not line:
                 continue
             code, status, mapping = [part.strip() for part in line.split(";")[:3]]
-            if status in ("C", "S"):
-                (to,) = code_points(mapping)
-                folding[int(code, 16)] = to
+            if status in ("C", "F"):
+                folding[int(code, 16)] = code_points(mapping)
     return folding
 
 
@@ -97,7 +97,7 @@ def ranges(classes: dict) -> list:
 def main() -> None:
     folder = database()
     classes, mappings = unicode_data(folder)
-    folding = simple_folding(folder)
+    folding = full_folding(folder)
 
     decompositions = [(cp, full(cp, mappings)) for cp in sorted(mappings)]
 
@@ -122,9 +122,9 @@ def main() -> None:
         *(f"    ({char(cp)}, &[{', '.join(map(char, d))}])," for cp, d in decompositions),
         "];",
         "",
-        "/// Simple case folding: each character that folds, and what to.",
-        "pub(crate) static FOLDING: &[(char, char)] = &[",
-        *(f"    ({char(a)}, {char(b)})," for a, b in sorted(folding.items())),
+        "/// Full case folding: each character that folds, and what to.",
+        "pub(crate) static FOLDING: &[(char, &[char])] = &[",
+        *(f"    ({char(a)}, &[{', '.join(map(char, b))}])," for a, b in sorted(folding.items())),
         "];",
         "",
     ]

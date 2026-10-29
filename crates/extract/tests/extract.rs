@@ -273,6 +273,10 @@ fn one_name_written_two_ways_is_the_same_path() {
         ("caf\u{e9}.txt", "cafe\u{301}.txt"),
         ("\u{212a}.txt", "k.txt"),
         ("\u{3c3}.txt", "\u{3c2}.txt"),
+        // Full case folding, as macOS folds names: it takes `fi` for the
+        // ligature, and refuses the second.
+        ("stra\u{df}e.txt", "strasse.txt"),
+        ("\u{fb01}", "fi"),
         // A directory one way, then on the way of another entry.
         ("caf\u{e9}/a", "cafe\u{301}/b"),
     ] {
@@ -288,14 +292,6 @@ fn one_name_written_two_ways_is_the_same_path() {
         );
         assert!(!scratch.out().exists());
     }
-    // Compatibility forms are other names, on every system.
-    let scratch = Scratch::new();
-    let data = zip(&[
-        Entry::File("\u{fb01}".as_bytes(), b"1"),
-        Entry::File(b"fi", b"2"),
-    ]);
-    extract(&data, &scratch.out(), &Options::default()).unwrap();
-    assert_eq!(listing(&scratch.out()), ["fi", "\u{fb01}"]);
     assert_eq!(hivepack_extract::UNICODE_VERSION, (18, 0, 0));
 }
 

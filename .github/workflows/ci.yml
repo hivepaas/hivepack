@@ -127,7 +127,9 @@ jobs:
   cross:
     name: Test (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The encoder's tests are slow under emulation: s390x takes about half
+    # an hour for the first run.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -147,8 +149,14 @@ jobs:
       # matter, the port's results do.
       - run: cross test --workspace --locked --target ${{ matrix.target }}
       # On 32-bit the feature changes nothing; on s390x it is a 64-bit,
-      # big-endian machine with the unchecked copies.
-      - run: cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
+      # big-endian machine with the unchecked copies. It changes only the
+      # decoder, so only the decoder's tests run again with it.
+      - run: >-
+          cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
+          --test decompress --test stream --test dctx --test testdata --test unchecked
+      - run: >-
+          cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
+          --lib -- decompress:: oracle::
 
   # The `unsafe-fast` feature's unsafe code under Miri, which fails on any
   # access out of bounds: the copies against the checked ones, and the

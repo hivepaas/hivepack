@@ -1382,7 +1382,9 @@ fn parameters_follow_libzstd_rules() {
         assert_eq!(p.get_parameter(kind), value, "{param:?}");
     }
     // While a frame is streamed, none can be set; but the compression
-    // parameters.
+    // parameters. Jobs of the default size: one of 1 GB asks for that
+    // much room for its output, more than a 32-bit machine may give.
+    p.set_parameter(P::JobSize(0)).expect("set");
     p.set_parameter(P::NbWorkers(2)).expect("set");
     let mut out = vec![0u8; 1000];
     let mut output = OutBuffer::new(&mut out);

@@ -184,16 +184,31 @@ impl BufferPool {
 
     /// `ZSTDMT_getBuffer`: a buffer of at least `size` bytes: one kept, if
     /// large enough but not more than 8 times so, or a new one. What it
-    /// holds is not to be read before it is written.
-    fn get_buffer(&self, size: usize) -> Vec<u8> {
+    /// holds is not to be read before it is written. Fails with
+    /// `MemoryAllocation` where a 32-bit machine has not the room.
+    fn get_buffer(&self, size: usize) -> Result<Vec<u8>> {
         let kept = lock(&self.state).buffers.pop();
         if let Some(buffer) = kept
             && buffer.len() >= size
             && buffer.len() >> 3 <= size
         {
-            return buffer;
+            return Ok(buffer);
         }
-        vec![0; size]
+        // On 64-bit machines, taken zeroed: its pages are mapped only as
+        // they are written, as libzstd's are, and a job sized for more
+        // input than it gets costs only what it writes. On 32-bit machines,
+        // where jobs of up to 1 GB may not find the room, reserved first,
+        // so that the job fails as libzstd's does rather than abort; then
+        // zeroed.
+        if cfg!(target_pointer_width = "64") {
+            return Ok(vec![0; size]);
+        }
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(size).is_err() {
+            return error!(MemoryAllocation);
+        }
+        buffer.resize(size, 0);
+        Ok(buffer)
     }
 
     /// `ZSTDMT_releaseBuffer`: `buffer` kept for later, up to the pool's
@@ -575,11 +590,18 @@ fn zstdmt_compression_job(mut job: JobDescription, mut ticket: BusyTicket<JobDes
     let progress = job.progress.clone();
     let shared = job.shared.clone();
     let src_size = job.data.len() - job.prefix_size;
-    let mut dst = shared.buf_pool.get_buffer(job.dst_capacity);
+    // Without room for its output, the job fails
+    // (JOB_ERROR(memory_allocation)).
+    let (mut dst, room) = match shared.buf_pool.get_buffer(job.dst_capacity) {
+        Ok(dst) => (dst, Ok(())),
+        Err(error) => (Vec::new(), Err(error)),
+    };
+    let had_room = room.is_ok();
     let mut cctx = shared.cctx_pool.get_cctx();
     // A panic is a bug; it fails the job rather than leave the caller
     // waiting for it.
     let result = catch_unwind(AssertUnwindSafe(|| {
+        room?;
         zstdmt_compress_job(&job, &mut cctx, &mut dst[..job.dst_capacity], &progress)
     }));
     // _endJob: the job's turn of the serial state taken, if it failed
@@ -619,7 +641,9 @@ fn zstdmt_compression_job(mut job: JobDescription, mut ticket: BusyTicket<JobDes
         state.consumed = src_size;
     }
     progress.cond.notify_all();
-    shared.buf_pool.release_buffer(dst);
+    if had_room {
+        shared.buf_pool.release_buffer(dst);
+    }
 }
 
 /// The work of `ZSTDMT_compressionJob`: the job's input into `dst`, by

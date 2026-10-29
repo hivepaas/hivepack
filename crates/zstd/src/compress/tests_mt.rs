@@ -51,10 +51,9 @@ fn lowering_the_indices_with_workers_changes_no_frame() {
     ];
     for (i, (level, strategy)) in strategies.into_iter().enumerate() {
         // On big-endian machines libzstd's block splitter, which the
-        // strategies from greedy up use, splits elsewhere.
-        if cfg!(target_endian = "big") && i >= 2 {
-            continue;
-        }
+        // strategies from greedy up use, splits elsewhere: their frames are
+        // compared with the port's own only.
+        let like_libzstd = !(cfg!(target_endian = "big") && i >= 2);
         let opt = strategy.is_some_and(|strategy| strategy >= Strategy::Btopt);
         let len = if cfg!(debug_assertions) && opt {
             rng.range(600_000, 800_000)
@@ -115,7 +114,7 @@ fn lowering_the_indices_with_workers_changes_no_frame() {
         OVERFLOW_CORRECT_FREQUENTLY.with(|flag| flag.set(false));
 
         // libzstd's frame, without.
-        let want = {
+        let want = like_libzstd.then(|| {
             use zstd_safe::CParameter as C;
             let mut c = zstd_safe::CCtx::create();
             let mut list = vec![
@@ -149,10 +148,10 @@ fn lowering_the_indices_with_workers_changes_no_frame() {
                 .expect("libzstd compresses");
             dst.truncate(size);
             dst
-        };
+        });
         match (&frames[0], &frames[1]) {
             (Ok(without), Ok(with)) => {
-                if *without != want {
+                if want.as_ref().is_some_and(|want| without != want) {
                     problems.push(format!("level {level}, {strategy:?}: not libzstd's frame"));
                 }
                 if without != with {

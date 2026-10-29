@@ -9,13 +9,16 @@
 //! torrentzip, and, with [`OpenFlags::CHECKCONS`], the comparison of every
 //! local header with the central directory. It reads stored and deflated
 //! entries, and checks the CRC-32 and length of an entry read to its end,
-//! as libzip does. The rules the port follows are in the repository's
-//! `docs/zip.md`.
+//! as libzip does. It edits archives as libzip does too: entries are
+//! deleted, renamed, and given comments, times and attributes, the archive
+//! a comment, and [`Archive::close_to`] writes the archive with its changes,
+//! the data of each entry copied as it is, byte for byte as libzip writes
+//! it. The rules the port follows are in the repository's `docs/zip.md`.
 //!
 //! ```
 //! use std::io::Read;
 //!
-//! use hivepack_zip::{Archive, Flags, OpenFlags};
+//! use hivepack_zip::{Archive, Closed, Flags, OpenFlags};
 //!
 //! // An archive with one stored file, "hi.txt".
 //! let zip: &[u8] = &[
@@ -37,6 +40,15 @@
 //! file.read_to_string(&mut text)?;
 //! assert_eq!(text, "hello, zip\n");
 //! file.fclose()?;
+//!
+//! // Renamed, and written with the change.
+//! let mut archive = Archive::open(zip, OpenFlags::CHECKCONS)?;
+//! archive.file_rename(0, b"hello.txt", Flags::NONE)?;
+//! let mut out = std::io::Cursor::new(Vec::new());
+//! assert_eq!(archive.close_to(&mut out)?, Closed::Written);
+//! let written = out.into_inner();
+//! let archive = Archive::open(written.as_slice(), OpenFlags::CHECKCONS)?;
+//! assert_eq!(archive.get_name(0, Flags::NONE)?, b"hello.txt");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -44,6 +56,8 @@
 
 mod algorithm_deflate;
 mod buffer;
+mod close;
+mod delete;
 mod dirent;
 mod error;
 mod extra_field;
@@ -52,6 +66,10 @@ mod fclose;
 mod file_get_comment;
 mod file_get_external_attributes;
 mod file_get_offset;
+mod file_rename;
+mod file_set_comment;
+mod file_set_external_attributes;
+mod file_set_mtime;
 mod fopen;
 mod fopen_index;
 mod fopen_index_encrypted;
@@ -64,18 +82,26 @@ mod hash;
 mod io_util;
 mod name_locate;
 mod open;
+mod set_archive_comment;
+mod set_archive_flag;
+mod set_name;
 mod source;
 mod source_compress;
 mod source_crc;
 mod source_stack;
 mod source_window;
+mod source_write;
 mod source_zip_new;
 mod stat_index;
 mod string;
+mod unchange;
+mod unchange_all;
+mod unchange_archive;
 mod utf_8;
 mod zip;
 mod zipint;
 
+pub use close::Closed;
 pub use error::{Detail, Error, ErrorCode, Result, SystemType};
 pub use fopen_index_encrypted::ZipFile;
 pub use open::Archive;

@@ -21,7 +21,7 @@ use crate::zipint::{
     MAGIC_LEN, TORRENTZIP_CRC_LENGTH, TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH,
 };
 
-/// An open archive: `struct zip`, for reading.
+/// An open archive: `struct zip`.
 pub struct Archive<R> {
     /// data source for archive
     pub(crate) src: Source<R>,
@@ -33,6 +33,10 @@ pub struct Archive<R> {
     pub(crate) ch_flags: ArchiveFlags,
     /// archive comment
     pub(crate) comment_orig: Option<ZipString>,
+    /// changed archive comment
+    pub(crate) comment_changes: Option<ZipString>,
+    /// whether archive comment was changed
+    pub(crate) comment_changed: bool,
     /// entries
     pub(crate) entry: Vec<Entry>,
     /// hash table for name lookup
@@ -56,14 +60,15 @@ enum Search {
 
 impl<R: ReadAt> Archive<R> {
     /// Opens the archive in `src`: port of `zip_open_from_source` and
-    /// `_zip_open`, for reading. With [`OpenFlags::CHECKCONS`], every local
-    /// header is compared with the central directory, and more is checked.
+    /// `_zip_open`. With [`OpenFlags::CHECKCONS`], every local header is
+    /// compared with the central directory, and more is checked. Unless
+    /// [`OpenFlags::RDONLY`] is given, the archive can be changed, and
+    /// [`Archive::close_to`] writes it.
     ///
-    /// Differs from libzip: the archive is always read-only, so
-    /// `ZIP_CREATE`, `ZIP_EXCL` and `ZIP_TRUNCATE` have no flags yet.
+    /// Differs from libzip: the source is only read, as the archive is
+    /// written elsewhere, and `ZIP_CREATE`, `ZIP_EXCL` and `ZIP_TRUNCATE`
+    /// have no flags yet.
     pub fn open(src: R, flags: OpenFlags) -> Result<Archive<R>> {
-        // A source that cannot be written is opened read-only.
-        let flags = flags | OpenFlags::RDONLY;
         let src = match Source::new(src) {
             Ok(src) => src,
             // _zip_file_exists: a file that is not there.
@@ -114,7 +119,7 @@ impl<R: ReadAt> Archive<R> {
                 entry.orig.as_ref().and_then(|de| de.filename.as_ref()),
                 Flags::NONE,
             );
-            if let Err(e) = za.names.add(name, idx as u64)
+            if let Err(e) = za.names.add(name, idx as u64, Flags::UNCHANGED)
                 && (e.code() != ErrorCode::Exists || flags.intersects(OpenFlags::CHECKCONS))
             {
                 return Err(e);
@@ -133,6 +138,8 @@ impl<R: ReadAt> Archive<R> {
             flags: ArchiveFlags(0),
             ch_flags: ArchiveFlags(0),
             comment_orig: None,
+            comment_changes: None,
+            comment_changed: false,
             entry: Vec::new(),
             names: Names::default(),
         };

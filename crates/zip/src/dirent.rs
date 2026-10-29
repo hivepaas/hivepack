@@ -1,24 +1,33 @@
-//! Central and local headers: port of `zip_dirent.c`, the reading half.
+//! Central and local headers: port of `zip_dirent.c`.
 //!
 //! `read` keeps libzip's error out-parameter: on some failures (a data
 //! descriptor that cannot be reached), libzip returns without setting the
 //! error, so what the caller reports is what the error held before, and the
 //! port reports the same.
 
+use std::io::{Seek, Write};
 use std::sync::OnceLock;
+
+use hivepack_deflate::crc32;
 
 use crate::buffer::Buffer;
 use crate::error::{Detail, Error, ErrorCode};
-use crate::extra_field::{EFBIG, ExtraFields, ef_parse, ef_remove_internal};
+use crate::extra_field::{
+    EFBIG, ExtraField, ExtraFields, ef_parse, ef_remove_internal, ef_size, ef_write,
+};
 use crate::io_util::{read_data, read_string};
 use crate::source::{ReadAt, Source, Whence};
-use crate::string::{ZipString, string_crc32, string_equal};
-use crate::zip::{Flags, em, opsys};
+use crate::source_write::Output;
+use crate::string::{ZipString, guess_encoding, string_crc32, string_equal, string_length};
+use crate::zip::{Flags, cm, em, opsys};
 use crate::zipint::{
     CDENTRYSIZE, CENTRAL_MAGIC, CM_WINZIP_AES, DATADES_MAGIC, EF_BOTH, EF_CENTRAL, EF_LOCAL,
-    EF_UTF_8_COMMENT, EF_UTF_8_NAME, EF_WINZIP_AES, EF_ZIP64, EXT_ATTRIB_DEFAULT, Encoding,
-    GPBF_DATA_DESCRIPTOR, GPBF_ENCODING_UTF_8, GPBF_ENCRYPTED, GPBF_STRONG_ENCRYPTION, LENTRYSIZE,
-    LOCAL_MAGIC, MAGIC_LEN, MAX_DATA_DESCRIPTOR_LENGTH,
+    EF_UTF_8_COMMENT, EF_UTF_8_NAME, EF_WINZIP_AES, EF_WINZIP_AES_SIZE, EF_ZIP64, EFZIP64SIZE,
+    EOCD_MAGIC, EOCD64_MAGIC, EOCD64LEN, EOCD64LOC_MAGIC, EOCD64LOCLEN, EOCDLEN,
+    EXT_ATTRIB_DEFAULT, Encoding, FL_FORCE_ZIP64, GPBF_DATA_DESCRIPTOR, GPBF_ENCODING_UTF_8,
+    GPBF_ENCRYPTED, GPBF_STRONG_ENCRYPTION, LENTRYSIZE, LOCAL_MAGIC, MAGIC_LEN,
+    MAX_DATA_DESCRIPTOR_LENGTH, TORRENTZIP_COMPRESSION_FLAGS, TORRENTZIP_CRC_LENGTH,
+    TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH, changed,
 };
 
 /// `zip_dostime_t`: a time as MS-DOS keeps it.
@@ -31,10 +40,17 @@ pub(crate) struct DosTime {
 /// `ZIP_CM_DEFAULT`: better of deflate or store.
 pub(crate) const CM_DEFAULT: i32 = -1;
 
-/// `zip_dirent_t`: a central directory entry or local header, as read.
-/// The editor will add the fields libzip uses for changes.
+/// `zip_dirent_t`: a central directory entry or local header, as read, or
+/// an entry's changes.
+///
+/// Differs from libzip: a dirent of changes owns its strings and extra
+/// fields, where libzip shares those it has not changed with the original
+/// (`cloned`), and whether the local extra fields were read is whether
+/// [`ExtraFields::local`] is set (`local_extra_fields_read`).
 #[derive(Clone, Debug)]
 pub(crate) struct Dirent {
+    /// which fields are changed, in a dirent of changes (`ZIP_DIRENT_*`)
+    pub changed: u32,
     /// if CRC is valid (sometimes not for encrypted archives)
     pub crc_valid: bool,
     /// (c) version of creator
@@ -69,12 +85,17 @@ pub(crate) struct Dirent {
     pub offset: u64,
     /// encryption method, computed from other fields
     pub encryption_method: u16,
+    /// level of compression to use (never valid in orig)
+    pub compression_level: u32,
+    /// cached last_mod in Unix time format, if valid
+    pub last_mod_mtime: Option<i64>,
 }
 
 impl Default for Dirent {
     /// Port of `_zip_dirent_init`.
     fn default() -> Dirent {
         Dirent {
+            changed: 0,
             crc_valid: true,
             version_madeby: 63 | (u16::from(opsys::DEFAULT) << 8),
             version_needed: 10, // 1.0
@@ -92,6 +113,8 @@ impl Default for Dirent {
             ext_attrib: EXT_ATTRIB_DEFAULT,
             offset: 0,
             encryption_method: em::NONE,
+            compression_level: 0,
+            last_mod_mtime: None,
         }
     }
 }
@@ -637,16 +660,495 @@ pub(crate) fn check_consistency(dirent: &Dirent) -> Option<Detail> {
 }
 
 impl<R: ReadAt> crate::open::Archive<R> {
-    /// The entry `idx` as read: port of `_zip_get_dirent`.
-    pub(crate) fn get_dirent(&self, idx: u64, _flags: Flags) -> Result<&Dirent, Error> {
-        match self
-            .entry
-            .get(usize::try_from(idx).unwrap_or(usize::MAX))
-            .and_then(|e| e.orig.as_deref())
-        {
-            Some(orig) => Ok(orig),
-            None => Err(Error::new(ErrorCode::Inval, 0)),
+    /// The entry `idx` with its changes, or as read with
+    /// [`Flags::UNCHANGED`]: port of `_zip_get_dirent`.
+    pub(crate) fn get_dirent(&self, idx: u64, flags: Flags) -> Result<&Dirent, Error> {
+        let Some(entry) = self.entry.get(usize::try_from(idx).unwrap_or(usize::MAX)) else {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        };
+        match entry.changes.as_deref() {
+            Some(changes) if !flags.intersects(Flags::UNCHANGED) => Ok(changes),
+            _ => {
+                let Some(orig) = entry.orig.as_deref() else {
+                    return Err(Error::new(ErrorCode::Inval, 0));
+                };
+                if entry.deleted && !flags.intersects(Flags::UNCHANGED) {
+                    return Err(Error::new(ErrorCode::Deleted, 0));
+                }
+                Ok(orig)
+            }
         }
+    }
+}
+
+impl Dirent {
+    /// A dirent to keep the changes of an entry in, a copy of `sde` (the
+    /// entry as read) or, for none, a new one: port of `_zip_dirent_clone`.
+    pub(crate) fn clone_changes(sde: Option<&Dirent>) -> Dirent {
+        let mut tde = sde.cloned().unwrap_or_default();
+        tde.changed = 0;
+        tde
+    }
+
+    /// Takes the fields that are not changed from `de_orig`, the entry as
+    /// read; with `replacing_data`, the compression and encryption methods
+    /// are those for new data instead. Port of `_zip_dirent_merge`.
+    pub(crate) fn merge(&mut self, de_orig: &Dirent, replacing_data: bool) {
+        if self.changed & changed::ATTRIBUTES == 0 {
+            self.ext_attrib = de_orig.ext_attrib;
+            self.int_attrib = de_orig.int_attrib;
+        }
+        if self.changed & changed::COMMENT == 0 {
+            self.comment.clone_from(&de_orig.comment);
+        }
+        if self.changed & changed::COMP_METHOD == 0 {
+            if replacing_data {
+                self.comp_method = CM_DEFAULT;
+                self.compression_level = 0;
+            } else {
+                self.comp_method = de_orig.comp_method;
+                self.compression_level = de_orig.compression_level;
+            }
+        }
+        if self.changed & changed::ENCRYPTION_METHOD == 0 {
+            if replacing_data {
+                self.encryption_method = em::NONE;
+            } else {
+                self.encryption_method = de_orig.encryption_method;
+            }
+        }
+        if self.changed & changed::EXTRA_FIELD == 0 {
+            self.extra_fields.clone_from(&de_orig.extra_fields);
+        }
+        if self.changed & changed::FILENAME == 0 {
+            self.filename.clone_from(&de_orig.filename);
+        }
+        if self.changed & changed::LAST_MOD == 0 {
+            self.last_mod = de_orig.last_mod;
+        }
+    }
+
+    /// Whether the sizes, or in the central directory the offset, need the
+    /// Zip64 extra field: port of `_zip_dirent_needs_zip64`.
+    pub(crate) fn needs_zip64(&self, flags: Flags) -> bool {
+        self.uncomp_size >= u64::from(u32::MAX)
+            || self.comp_size >= u64::from(u32::MAX)
+            || (flags.intersects(Flags::CENTRAL) && self.offset >= u64::from(u32::MAX))
+    }
+
+    /// Sets what torrentzip has the same in every entry: port of
+    /// `zip_dirent_torrentzip_normalize`.
+    pub(crate) fn torrentzip_normalize(&mut self) {
+        self.version_madeby = 0;
+        self.version_needed = 20; // 2.0
+        self.bitflags = 2; // maximum compression
+        self.comp_method = i32::from(cm::DEFLATE);
+        self.compression_level = TORRENTZIP_COMPRESSION_FLAGS;
+        self.disk_number = 0;
+        self.int_attrib = 0;
+        self.ext_attrib = 0;
+
+        // last_mod, extra_fields, and comment are normalized in
+        // zip_dirent_write() directly
+    }
+
+    /// The modification time in seconds since 1970, from the cache:
+    /// `zip_dirent_get_last_mod_mtime`. Differs from libzip: the time
+    /// computed is not kept, as it depends only on `last_mod`.
+    pub(crate) fn get_last_mod_mtime(&self) -> i64 {
+        self.last_mod_mtime
+            .unwrap_or_else(|| d2u_time(self.last_mod))
+    }
+
+    /// Writes the entry as a local header ([`Flags::LOCAL`]) or a central
+    /// directory entry ([`Flags::CENTRAL`]), and whether it has the Zip64
+    /// extra field; with [`FL_FORCE_ZIP64`], a local header has it in any
+    /// case. With `want_torrentzip`, as torrentzip has it: no time, extra
+    /// fields or comment. The UTF-8 flag and the Info-ZIP UTF-8 extra
+    /// fields are set from the encodings of the name and comment. Port of
+    /// `_zip_dirent_write`.
+    pub(crate) fn write<W: Write + Seek>(
+        &mut self,
+        out: &mut Output<W>,
+        flags: Flags,
+        want_torrentzip: bool,
+    ) -> Result<bool, Error> {
+        let local = flags.intersects(Flags::LOCAL);
+        // The extra fields written before the entry's own, in order.
+        let mut ef: Vec<ExtraField> = Vec::new();
+
+        let name_enc = guess_encoding(self.filename.as_mut(), Encoding::Unknown);
+        let com_enc = guess_encoding(self.comment.as_mut(), Encoding::Unknown);
+
+        if (name_enc == Encoding::Utf8Known && com_enc == Encoding::Ascii)
+            || (name_enc == Encoding::Ascii && com_enc == Encoding::Utf8Known)
+            || (name_enc == Encoding::Utf8Known && com_enc == Encoding::Utf8Known)
+        {
+            self.bitflags |= GPBF_ENCODING_UTF_8;
+        } else {
+            self.bitflags &= !GPBF_ENCODING_UTF_8;
+            if name_enc == Encoding::Utf8Known
+                && let Some(filename) = &self.filename
+            {
+                ef.push(ef_utf8(EF_UTF_8_NAME, filename)?);
+            }
+            if !local
+                && com_enc == Encoding::Utf8Known
+                && let Some(comment) = &self.comment
+            {
+                ef.insert(0, ef_utf8(EF_UTF_8_COMMENT, comment)?);
+            }
+        }
+
+        if self.encryption_method == em::NONE {
+            self.bitflags &= !GPBF_ENCRYPTED;
+        } else {
+            self.bitflags |= GPBF_ENCRYPTED;
+        }
+
+        let is_really_zip64 = self.needs_zip64(flags);
+        let is_zip64 = (local && flags.intersects(FL_FORCE_ZIP64)) || is_really_zip64;
+        let winzip_aes_version: u16 = match self.encryption_method {
+            // TODO in libzip: WinZip also uses AE-2 for bzip compressed
+            // files and maybe others?
+            em::AES_128 | em::AES_192 | em::AES_256 if self.uncomp_size < 20 => 2,
+            em::AES_128 | em::AES_192 | em::AES_256 => 1,
+            _ => 0,
+        };
+
+        if is_zip64 {
+            let mut ef_buffer = Buffer::with_size(EFZIP64SIZE);
+            let max = u64::from(u32::MAX);
+            if local {
+                if flags.intersects(FL_FORCE_ZIP64)
+                    || self.comp_size > max
+                    || self.uncomp_size > max
+                {
+                    ef_buffer.put_64(self.uncomp_size);
+                    ef_buffer.put_64(self.comp_size);
+                }
+            } else if flags.intersects(FL_FORCE_ZIP64)
+                || self.comp_size > max
+                || self.uncomp_size > max
+                || self.offset > max
+            {
+                if self.uncomp_size >= max {
+                    ef_buffer.put_64(self.uncomp_size);
+                }
+                if self.comp_size >= max {
+                    ef_buffer.put_64(self.comp_size);
+                }
+                if self.offset >= max {
+                    ef_buffer.put_64(self.offset);
+                }
+            }
+            if !ef_buffer.ok() {
+                return Err(Error::new(ErrorCode::Internal, 0));
+            }
+            let len = ef_buffer.offset() as usize;
+            ef.insert(
+                0,
+                ExtraField {
+                    id: EF_ZIP64,
+                    data: ef_buffer.data()[..len].to_vec(),
+                },
+            );
+        }
+
+        if winzip_aes_version > 0 {
+            let mut ef_buffer = Buffer::with_size(EF_WINZIP_AES_SIZE);
+            ef_buffer.put_16(winzip_aes_version);
+            ef_buffer.put(b"AE");
+            ef_buffer.put_8((self.encryption_method & 0xff) as u8);
+            ef_buffer.put_16(self.comp_method as u16);
+            if !ef_buffer.ok() {
+                return Err(Error::new(ErrorCode::Internal, 0));
+            }
+            ef.insert(
+                0,
+                ExtraField {
+                    id: EF_WINZIP_AES,
+                    data: ef_buffer.data().to_vec(),
+                },
+            );
+        }
+
+        let mut buffer = Buffer::with_size(CDENTRYSIZE as usize);
+
+        buffer.put(if local { LOCAL_MAGIC } else { CENTRAL_MAGIC });
+
+        if !local {
+            buffer.put_16(self.version_madeby);
+        }
+        buffer.put_16(
+            self.version_needed
+                .max(if is_really_zip64 { 45 } else { 0 }),
+        );
+        buffer.put_16(self.bitflags);
+        if winzip_aes_version > 0 {
+            buffer.put_16(CM_WINZIP_AES);
+        } else {
+            buffer.put_16(cm_actual(self.comp_method));
+        }
+
+        let dostime = if want_torrentzip {
+            DosTime {
+                time: 0xbc00,
+                date: 0x2198,
+            }
+        } else {
+            self.last_mod
+        };
+        buffer.put_16(dostime.time);
+        buffer.put_16(dostime.date);
+
+        if winzip_aes_version == 2 {
+            buffer.put_32(0);
+        } else {
+            buffer.put_32(self.crc);
+        }
+
+        let max = u64::from(u32::MAX);
+        if local && (self.comp_size >= max || self.uncomp_size >= max) {
+            // In local headers, if a ZIP64 EF is written, it MUST contain
+            // both compressed and uncompressed sizes (even if one of the
+            // two is smaller than 0xFFFFFFFF); on the other hand, those
+            // may only appear when the corresponding standard entry is
+            // 0xFFFFFFFF. (appnote.txt 4.5.3)
+            buffer.put_32(u32::MAX);
+            buffer.put_32(u32::MAX);
+        } else {
+            buffer.put_32(self.comp_size.min(max) as u32);
+            buffer.put_32(self.uncomp_size.min(max) as u32);
+        }
+
+        buffer.put_16(string_length(self.filename.as_ref()));
+
+        let own_ef: &[ExtraField] = if local {
+            self.extra_fields.local.get().map_or(&[], Vec::as_slice)
+        } else {
+            &self.extra_fields.central
+        };
+        let ef_len = ef_size(&ef);
+        let de_ef_len = if want_torrentzip {
+            Some(0)
+        } else {
+            ef_size(own_ef)
+        };
+        let total = match (ef_len, de_ef_len) {
+            (Some(a), Some(b)) if u32::from(a) + u32::from(b) <= 0xffff => a + b,
+            _ => return Err(Error::new(ErrorCode::EfTooLarge, 0)),
+        };
+        buffer.put_16(total);
+
+        if !local {
+            buffer.put_16(if want_torrentzip {
+                0
+            } else {
+                string_length(self.comment.as_ref())
+            });
+            buffer.put_16(self.disk_number as u16);
+            buffer.put_16(self.int_attrib);
+            buffer.put_32(self.ext_attrib);
+            buffer.put_32(self.offset.min(max) as u32);
+        }
+
+        if !buffer.ok() {
+            return Err(Error::new(ErrorCode::Internal, 0));
+        }
+
+        let len = buffer.offset() as usize;
+        out.write(&buffer.data()[..len])?;
+
+        if let Some(filename) = &self.filename {
+            out.write(filename.raw())?;
+        }
+
+        ef_write(out, &ef)?;
+        if !want_torrentzip {
+            ef_write(out, own_ef)?;
+        }
+
+        if !local
+            && !want_torrentzip
+            && let Some(comment) = &self.comment
+        {
+            out.write(comment.raw())?;
+        }
+
+        Ok(is_zip64)
+    }
+}
+
+/// Info-ZIP's extra field `id` for the UTF-8 name or comment `str`: version
+/// 1, the CRC-32 of the string and the string. Port of `_zip_ef_utf8`.
+fn ef_utf8(id: u16, str: &ZipString) -> Result<ExtraField, Error> {
+    let raw = str.raw();
+    if raw.len() + 5 > 0xffff {
+        // TODO in libzip: better error code?
+        return Err(Error::new(ErrorCode::Inval, 0));
+    }
+    let mut buffer = Buffer::with_size(raw.len() + 5);
+    buffer.put_8(1);
+    buffer.put_32(string_crc32(Some(str)));
+    buffer.put(raw);
+    if !buffer.ok() {
+        return Err(Error::new(ErrorCode::Internal, 0));
+    }
+    let len = buffer.offset() as usize;
+    Ok(ExtraField {
+        id,
+        data: buffer.data()[..len].to_vec(),
+    })
+}
+
+/// `ZIP_CM_ACTUAL`: deflate for the default method.
+pub(crate) fn cm_actual(method: i32) -> u16 {
+    if method == CM_DEFAULT {
+        cm::DEFLATE
+    } else {
+        method as u16
+    }
+}
+
+/// `EOVERFLOW` on Linux, which `localtime_r` sets for a year past what an
+/// `int` holds.
+const EOVERFLOW: i32 = 75;
+
+/// A time in seconds since 1970 as MS-DOS keeps it, taken as UTC: port of
+/// `_zip_u2d_time`. Years before 1980 are taken as 1980, with the same
+/// day, and years past 2107 wrap around in the 7 bits of the year, as in
+/// libzip. A year that does not fit in an `int` fails with `ZIP_ER_INVAL`
+/// and `EOVERFLOW`, as `localtime_r` refuses it.
+///
+/// Differs from libzip, which calls `localtime_r` and so takes the time in
+/// the machine's time zone: the two agree where it is UTC.
+pub(crate) fn u2d_time(intime: i64) -> Result<DosTime, Error> {
+    let days = intime.div_euclid(86400);
+    let secs = intime.rem_euclid(86400);
+    let (year, month, mday) = civil_from_days(days);
+    let tm_year = year - 1900;
+    if i32::try_from(tm_year).is_err() {
+        return Err(Error::new(ErrorCode::Inval, EOVERFLOW));
+    }
+    let tm_year = tm_year.max(80);
+
+    let (hour, min, sec) = (secs / 3600, secs / 60 % 60, secs % 60);
+    Ok(DosTime {
+        date: (((tm_year + 1900 - 1980) << 9) + (month << 5) + mday) as u16,
+        time: ((hour << 11) + (min << 5) + (sec >> 1)) as u16,
+    })
+}
+
+/// The year, month (1 to 12) and day of a count of days since 1970-01-01
+/// in the proleptic Gregorian calendar (Howard Hinnant's
+/// `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+impl<R: ReadAt> crate::open::Archive<R> {
+    /// Writes the central directory of the entries `filelist`, by index,
+    /// and the end of central directory records, with the archive comment,
+    /// and gives the size of the directory: port of `_zip_cdir_write`.
+    pub(crate) fn cdir_write<W: Write + Seek>(
+        &mut self,
+        filelist: &[usize],
+        out: &mut Output<W>,
+    ) -> Result<u64, Error> {
+        let want_torrentzip = self.want_torrentzip();
+        let offset = out.tell_write()?;
+
+        if want_torrentzip {
+            out.write_crc = Some(crc32(0, &[]));
+        }
+
+        for &i in filelist {
+            let entry = &mut self.entry[i];
+            let de = match (entry.changes.as_deref_mut(), entry.orig.as_deref_mut()) {
+                (Some(changes), _) => changes,
+                (None, Some(orig)) => orig,
+                (None, None) => {
+                    out.write_crc = None;
+                    return Err(Error::new(ErrorCode::Internal, 0));
+                }
+            };
+            if let Err(e) = de.write(out, Flags::CENTRAL, want_torrentzip) {
+                out.write_crc = None;
+                return Err(e);
+            }
+        }
+
+        let cdir_crc = out.write_crc.take().unwrap_or(0);
+
+        let size = out.tell_write()? - offset;
+        let survivors = filelist.len() as u64;
+
+        let mut buffer = Buffer::with_size((EOCDLEN + EOCD64LEN + EOCD64LOCLEN) as usize);
+
+        let max16 = u64::from(u16::MAX);
+        let max32 = u64::from(u32::MAX);
+        if survivors > max16 || offset > max32 || size > max32 {
+            buffer.put(EOCD64_MAGIC);
+            buffer.put_64(EOCD64LEN - 12);
+            buffer.put_16(45);
+            buffer.put_16(45);
+            buffer.put_32(0);
+            buffer.put_32(0);
+            buffer.put_64(survivors);
+            buffer.put_64(survivors);
+            buffer.put_64(size);
+            buffer.put_64(offset);
+            buffer.put(EOCD64LOC_MAGIC);
+            buffer.put_32(0);
+            buffer.put_64(offset + size);
+            buffer.put_32(1);
+        }
+
+        buffer.put(EOCD_MAGIC);
+        buffer.put_32(0);
+        buffer.put_16(survivors.min(max16) as u16);
+        buffer.put_16(survivors.min(max16) as u16);
+        buffer.put_32(size.min(max32) as u32);
+        buffer.put_32(offset.min(max32) as u32);
+
+        let comment = if self.comment_changed {
+            self.comment_changes.as_ref()
+        } else {
+            self.comment_orig.as_ref()
+        };
+
+        if want_torrentzip {
+            buffer.put_16((TORRENTZIP_SIGNATURE_LENGTH + TORRENTZIP_CRC_LENGTH) as u16);
+        } else {
+            buffer.put_16(string_length(comment));
+        }
+
+        if !buffer.ok() {
+            return Err(Error::new(ErrorCode::Internal, 0));
+        }
+
+        let len = buffer.offset() as usize;
+        out.write(&buffer.data()[..len])?;
+
+        if want_torrentzip {
+            let mut torrentzip_comment = TORRENTZIP_SIGNATURE.to_vec();
+            torrentzip_comment.extend_from_slice(format!("{cdir_crc:08X}").as_bytes());
+            out.write(&torrentzip_comment)?;
+        } else if let Some(comment) = comment {
+            out.write(comment.raw())?;
+        }
+
+        Ok(size)
     }
 }
 

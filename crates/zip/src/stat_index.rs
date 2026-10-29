@@ -1,13 +1,15 @@
 //! Port of `zip_stat_index.c`.
 
-use crate::dirent::d2u_time;
+use crate::dirent::{DosTime, d2u_time};
 use crate::error::Result;
 use crate::open::Archive;
 use crate::source::ReadAt;
-use crate::zip::{Flags, Stat, stat};
+use crate::zip::{Flags, Stat, cm, stat};
+use crate::zipint::changed;
 
 impl<R: ReadAt> Archive<R> {
-    /// What the central directory says about entry `index`: port of
+    /// What the central directory says about entry `index`, with its
+    /// changes unless [`Flags::UNCHANGED`] is given: port of
     /// `zip_stat_index`. The CRC is not valid for WinZip AES entries of
     /// version 2 (AE-2). The time is taken as UTC (see
     /// [`Archive::file_get_dos_time`] for the time as stored).
@@ -18,7 +20,7 @@ impl<R: ReadAt> Archive<R> {
         let mut st = Stat {
             crc: de.crc,
             size: de.uncomp_size,
-            mtime: d2u_time(de.last_mod),
+            mtime: de.get_last_mod_mtime(),
             comp_size: de.comp_size,
             comp_method: de.comp_method as u16,
             encryption_method: de.encryption_method,
@@ -30,6 +32,19 @@ impl<R: ReadAt> Archive<R> {
                 | stat::ENCRYPTION_METHOD,
             ..Stat::default()
         };
+        if self.entry[index as usize].changed(changed::COMP_METHOD) {
+            st.valid &= !stat::COMP_SIZE;
+        }
+
+        if self.want_torrentzip() && !flags.intersects(Flags::UNCHANGED) {
+            st.comp_method = cm::DEFLATE;
+            st.mtime = d2u_time(DosTime {
+                time: 0xbc00,
+                date: 0x2198,
+            });
+            st.valid |= stat::MTIME | stat::COMP_METHOD;
+            st.valid &= !stat::COMP_SIZE;
+        }
 
         st.index = index;
         st.name = Some(name);

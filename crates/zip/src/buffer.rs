@@ -1,8 +1,8 @@
-//! Bounds-checked reads from a byte array: port of `zip_buffer.c`, the
-//! reading half (the writer will need `_zip_buffer_put*`).
+//! Bounds-checked reads from and writes to a byte array: port of
+//! `zip_buffer.c`.
 //!
-//! A read past the end returns nothing and clears `ok`; later reads then
-//! fail too, until `set_offset` moves the buffer back in bounds, as in
+//! A read or write past the end does nothing and clears `ok`; later ones
+//! then fail too, until `set_offset` moves the buffer back in bounds, as in
 //! libzip. Reading a number past the end gives 0.
 
 use std::borrow::Cow;
@@ -47,6 +47,16 @@ impl<'a> Buffer<'a> {
         })
     }
 
+    /// A buffer of `size` zero bytes to write into: `_zip_buffer_new`
+    /// without data.
+    pub(crate) fn with_size(size: usize) -> Buffer<'static> {
+        Buffer {
+            ok: true,
+            data: Cow::Owned(vec![0; size]),
+            offset: 0,
+        }
+    }
+
     /// All the data: `_zip_buffer_data`.
     pub(crate) fn data(&self) -> &[u8] {
         &self.data
@@ -81,6 +91,33 @@ impl<'a> Buffer<'a> {
         self.get(8).map_or(0, |d| {
             u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
         })
+    }
+
+    /// Writes `src` at the position and moves past it, or clears `ok` if it
+    /// does not fit: `_zip_buffer_put`.
+    pub(crate) fn put(&mut self, src: &[u8]) -> bool {
+        let Some(start) = self.peek_start(src.len() as u64) else {
+            return false;
+        };
+        self.offset += src.len() as u64;
+        self.data.to_mut()[start..start + src.len()].copy_from_slice(src);
+        true
+    }
+
+    pub(crate) fn put_8(&mut self, i: u8) -> bool {
+        self.put(&[i])
+    }
+
+    pub(crate) fn put_16(&mut self, i: u16) -> bool {
+        self.put(&i.to_le_bytes())
+    }
+
+    pub(crate) fn put_32(&mut self, i: u32) -> bool {
+        self.put(&i.to_le_bytes())
+    }
+
+    pub(crate) fn put_64(&mut self, i: u64) -> bool {
+        self.put(&i.to_le_bytes())
     }
 
     /// The bytes left, or 0 once a read failed: `_zip_buffer_left`.
@@ -166,5 +203,18 @@ mod tests {
         assert_eq!(buffer.get_8(), 7);
         assert!(buffer.eof());
         assert!(!buffer.skip(u64::MAX));
+    }
+
+    #[test]
+    fn writes_little_endian_until_full() {
+        let mut buffer = Buffer::with_size(7);
+        assert!(buffer.put_16(0x0201));
+        assert!(buffer.put_32(0x0605_0403));
+        assert!(!buffer.put_16(0x0807));
+        assert!(!buffer.ok());
+        assert!(buffer.set_offset(6));
+        assert!(buffer.put_8(7));
+        assert_eq!(buffer.data(), &[1, 2, 3, 4, 5, 6, 7]);
+        assert!(!buffer.put_64(0));
     }
 }

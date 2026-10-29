@@ -223,3 +223,14 @@ jobs:
               pathlib.Path(f"fuzz/corpus/zip_open/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_open -- -max_total_time=120
+      - name: Seed the editing corpus with the same archives, behind a few edits
+        run: |
+          mkdir -p fuzz/corpus/zip_edit
+          python3 - <<'PY'
+          import pathlib
+          for i, path in enumerate(sorted(pathlib.Path("fuzz/corpus/zip_open").glob("r*"))):
+              # Two edits: delete entry i, rename entry 7i.
+              edits = bytes([2, 0, i % 256, 1, 7 * i % 256])
+              pathlib.Path(f"fuzz/corpus/zip_edit/r{i}").write_bytes(edits + path.read_bytes())
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_edit -- -max_total_time=90

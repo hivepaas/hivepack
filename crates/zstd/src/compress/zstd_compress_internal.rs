@@ -1700,6 +1700,31 @@ impl SeqStore {
     }
 }
 
+/// `ZSTD_SequenceLength`: the lengths of a sequence, as it decodes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SequenceLength {
+    pub(crate) lit_length: u32,
+    pub(crate) match_length: u32,
+}
+
+/// `ZSTD_getSequenceLength`: the lengths of the sequence `idx` of `seqs`,
+/// with the 0x10000 more of the one with a long length.
+pub(crate) fn zstd_get_sequence_length(seqs: &SeqStoreView<'_>, idx: usize) -> SequenceLength {
+    let seq = &seqs.sequences[idx];
+    let mut seq_len = SequenceLength {
+        lit_length: u32::from(seq.lit_length),
+        match_length: u32::from(seq.ml_base) + crate::common::zstd_internal::MINMATCH,
+    };
+    if seqs.long_length_pos as usize == idx {
+        match seqs.long_length_type {
+            LongLengthType::LiteralLength => seq_len.lit_length += 0x10000,
+            LongLengthType::MatchLength => seq_len.match_length += 0x10000,
+            LongLengthType::None => {}
+        }
+    }
+    seq_len
+}
+
 /// `WILDCOPY_OVERLENGTH`: how far past their end copies in pieces may
 /// write.
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;

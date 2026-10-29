@@ -21,11 +21,11 @@ hivepack-zstd = { path = "crates/zstd" }
 # ports. The legacy formats (v0.1 to v0.7) are left out, as the port does not
 # read them.
 zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "experimental"] }
-# libz-sys 1.1.30 bundles zlib 1.3.2, the release hivepack-deflate ports, and
+# libz-sys 1.1.31 bundles zlib 1.3.2, the release hivepack-deflate ports, and
 # its `static` feature builds that rather than linking the system's zlib,
 # which may be another version. flate2, with its zlib backend, is the safe
 # interface to it.
-libz-sys = { version = "=1.1.30", features = ["static"] }
+libz-sys = { version = "=1.1.31", features = ["static"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 # Directories opened by handle, where nothing resolves outside them or
 # through a symbolic link: hivepack-extract's way to write, until the

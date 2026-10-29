@@ -874,12 +874,23 @@ fn progress_counts_what_is_written() {
     assert_eq!(summary.bytes, total_bytes);
 }
 
+/// Where `scripts/testdata.py` puts what it fetches.
+fn testdata() -> PathBuf {
+    std::env::var_os("HIVEPACK_TESTDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/testdata"))
+}
+
+/// Whether a missing set of `group` fails the test, as in CI, rather than
+/// skips it.
+fn required(group: &str) -> bool {
+    let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
+    required.split(',').any(|g| g == "all" || g == group)
+}
+
 /// The archives of libzip's tests, where the libzip sources are fetched.
 fn regress_archives() -> Vec<(String, Vec<u8>)> {
-    let cache = std::env::var_os("HIVEPACK_TESTDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/testdata"));
-    let regress = cache.join("libzip-1.12.1-source/libzip-1.12.1/regress");
+    let regress = testdata().join("libzip-1.12.1-source/libzip-1.12.1/regress");
     let mut files = Vec::new();
     for folder in [regress.clone(), regress.join("data")] {
         let Ok(dir) = std::fs::read_dir(&folder) else {
@@ -904,9 +915,8 @@ fn regress_archives() -> Vec<(String, Vec<u8>)> {
 fn libzip_archives_extract_or_stop_cleanly() {
     let archives = regress_archives();
     if archives.is_empty() {
-        let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
         assert!(
-            !required.split(',').any(|g| g == "all" || g == "generated"),
+            !required("generated"),
             "libzip's archives are missing: run `python3 scripts/testdata.py fetch --group generated`"
         );
         eprintln!("skipping: libzip's archives are not fetched");
@@ -950,4 +960,69 @@ fn libzip_archives_extract_or_stop_cleanly() {
         eprintln!("{outcome}: {} ({})", names.len(), names.join(" "));
     }
     assert!(opened > 100, "only {opened} archives open");
+}
+
+/// David Fifield's zip bombs, whose entries share one stream, stop before
+/// anything is written: with the default limits, on the data they share
+/// (zbsm, whose 5.5 GB pass the limits), on what they say of their sizes
+/// (zblg) or on their number of entries (zbxl); and with those lifted, on
+/// the data they share. A ratio of ten to one, checked only while writing,
+/// is set throughout, so that a bomb let through stops within its first
+/// entry rather than fill the disk: without the overlap check, zbsm writes
+/// 5.5 GB under the default limits.
+#[test]
+fn fifield_zip_bombs_write_nothing() {
+    let folder = testdata().join("fifield-zipbombs");
+    if !folder.join("zbsm.zip").exists() {
+        assert!(
+            !required("core"),
+            "Fifield's zip bombs are missing: run `python3 scripts/testdata.py fetch`"
+        );
+        eprintln!("skipping: Fifield's zip bombs are not fetched");
+        return;
+    }
+    let bombs = [
+        ("zbsm.zip", 250, "Overlap"),
+        ("zblg.zip", 65_534, "TotalTooLarge"),
+        ("zbxl.zip", 190_023, "TooManyEntries"),
+    ];
+    for (name, entries, stops_by_default) in bombs {
+        let data = std::fs::read(folder.join(name)).unwrap();
+        for flags in [OpenFlags::CHECKCONS, OpenFlags(0)] {
+            let archive = match Archive::open(data.as_slice(), flags) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    eprintln!("{name}, {flags:?}: not opened: {error}");
+                    continue;
+                }
+            };
+            assert_eq!(archive.get_num_entries(Flags::NONE), entries, "{name}");
+            let scratch = Scratch::new();
+            let outcome = |options: &Options| {
+                let error = extract_zip(&archive, &scratch.out(), options).unwrap_err();
+                assert!(!scratch.out().exists(), "{name}: {error}");
+                error.kind
+            };
+            let net = |limits: &mut Limits| {
+                limits.max_ratio = 10;
+                limits.ratio_threshold = 64 << 10;
+            };
+            let by_default = outcome(&limits(net));
+            let lifted = outcome(&options(|o| {
+                net(&mut o.limits);
+                o.limits.max_entries = entries;
+                o.limits.max_entry_size = u64::MAX;
+                o.limits.max_total_size = u64::MAX;
+                o.on_refused = OnRefused::Skip;
+            }));
+            assert!(
+                format!("{by_default:?}").starts_with(stops_by_default),
+                "{name}: {by_default}"
+            );
+            assert!(
+                matches!(lifted, ErrorKind::Overlap { .. }),
+                "{name}: {lifted}"
+            );
+        }
+    }
 }

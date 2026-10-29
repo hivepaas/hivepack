@@ -6,7 +6,8 @@ testdata/manifest.json lists every set:
 - Sets with "fetch" are downloaded, checked against their SHA-256 and unpacked
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
-  by the oracles in tools/, built from the pinned zstd and zlib releases.
+  by the oracles in tools/, built from the pinned zstd, zlib, libzip and
+  nettle releases.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -178,6 +179,30 @@ def libzip_sources(lib: Path) -> list:
     return names + ["zip_source_file_stdio_named.c", "zip_random_unix.c"]
 
 
+# nettle's AES (encryption only), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, in
+# C: what the oracles call, without the assembly versions or the fat
+# builds that choose between them.
+NETTLE_SOURCES = [
+    "aes-set-encrypt-key.c", "aes128-set-encrypt-key.c", "aes192-set-encrypt-key.c",
+    "aes256-set-encrypt-key.c", "aes-set-key-internal.c", "aes-encrypt-internal.c",
+    "aes-encrypt-table.c", "aes128-encrypt.c", "aes192-encrypt.c", "aes256-encrypt.c",
+    "sha1.c", "sha1-compress.c", "sha1-meta.c", "hmac.c", "hmac-sha1.c", "pbkdf2.c",
+    "pbkdf2-hmac-sha1.c", "memxor.c", "write-be32.c",
+]
+
+
+def nettle_headers(nettle: Path, folder: Path) -> Path:
+    """A folder with nettle's headers in nettle/, as an installed nettle has
+    them, for `#include <nettle/aes.h>`. Without config.h (HAVE_CONFIG_H
+    unset), nettle's C files assume a little-endian machine, which the
+    oracles are built on."""
+    include = folder / "include"
+    (include / "nettle").mkdir(parents=True)
+    for header in nettle.glob("*.h"):
+        shutil.copy(header, include / "nettle" / header.name)
+    return include
+
+
 def zip_err_str(lib: Path) -> str:
     """zip_err_str.c, as libzip's cmake/GenerateZipErrorStrings.cmake writes
     it from the comments in zip.h and zipint.h."""
@@ -207,7 +232,8 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     out, as the oracle includes them itself to reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
-    Deflate64. tools/zip-oracle is built with libzip's, its own config.h and
+    Deflate64. tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
+    tools/zip-oracle is built with libzip's, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, and zlib's
     (the `extra` set)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
@@ -231,6 +257,13 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(infback9 / "infback9.c"), str(infback9 / "inftree9.c")]
         subprocess.run([compiler, "-O2", f"-I{zlib}", f"-I{infback9}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
+    nettle = next(source.glob("nettle-*"), None)
+    if nettle is not None:
+        include = nettle_headers(nettle, folder)
+        files += [str(nettle / name) for name in NETTLE_SOURCES]
+        subprocess.run([compiler, "-O2", f"-I{include}", f"-I{nettle}", *files,
                         "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))

@@ -1,5 +1,6 @@
 //! Extracting a ZIP archive that `hivepack-zip` opened.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
@@ -8,27 +9,32 @@ use hivepack_zip::{Archive, Flags, ReadAt, opsys, stat};
 
 use crate::destination::Destination;
 use crate::error::{Error, ErrorKind};
-use crate::name::check_name;
-use crate::plan::{Item, Kind, Options, check};
+use crate::name::{NameError, check_name, link_target, prepare};
+use crate::plan::{Item, Kind, Links, Names, OnRefused, Options, Permissions, check, fold};
 
 /// What was extracted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct Summary {
     pub files: u64,
     pub directories: u64,
+    pub links: u64,
     /// Bytes written.
     pub bytes: u64,
+    /// The entries left out with [`OnRefused::Skip`], and why.
+    pub skipped: Vec<Error>,
 }
 
 /// The type bits of a Unix mode.
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
-const S_IFREG: u32 = 0o100_000;
 const S_IFLNK: u32 = 0o120_000;
 
+/// The longest link target read, as Linux's `PATH_MAX`.
+const MAX_LINK_TARGET: usize = 4096;
+
 /// What the archive says of entry `i`.
-fn item<R: ReadAt>(archive: &Archive<R>, i: u64) -> Result<Item, Error> {
+fn item<R: ReadAt>(archive: &Archive<R>, i: u64, options: &Options) -> Result<Item, Error> {
     let archive_error = |e| Error {
         index: Some(i),
         name: None,
@@ -41,33 +47,43 @@ fn item<R: ReadAt>(archive: &Archive<R>, i: u64) -> Result<Item, Error> {
         .get_name(i, Flags::ENC_RAW)
         .map_err(archive_error)?
         .to_vec();
-    let name_error = |e| Error::new(i, &raw_name, ErrorKind::Name(e));
-    if raw_name.iter().any(u8::is_ascii_control) {
-        return Err(name_error(crate::NameError::Control));
-    }
     // The name as it is written: UTF-8, or decoded from CP437.
     let decoded = archive.get_name(i, Flags::NONE).map_err(archive_error)?;
-    let name = check_name(decoded).map_err(name_error)?;
-    let st = archive
-        .stat_index(i, Flags::NONE)
-        .map_err(|e| Error::new(i, &raw_name, ErrorKind::Archive(e)))?;
+    let name = if raw_name.iter().any(u8::is_ascii_control) {
+        Err(NameError::Control)
+    } else {
+        match std::str::from_utf8(decoded) {
+            Ok(decoded) => {
+                let prepared = prepare(
+                    decoded,
+                    options.backslash_separator,
+                    options.names == Names::Sanitize,
+                );
+                check_name(prepared.as_bytes())
+            }
+            Err(_) => Err(NameError::NotUtf8),
+        }
+    };
+    let error = |e| Error::new(i, &raw_name, ErrorKind::Archive(e));
+    let st = archive.stat_index(i, Flags::NONE).map_err(error)?;
     let (system, attributes) = archive
         .file_get_external_attributes(i, Flags::NONE)
-        .map_err(|e| Error::new(i, &raw_name, ErrorKind::Archive(e)))?;
+        .map_err(error)?;
 
     // Unix keeps the mode in the high half of the external attributes.
     let unix_mode = (system == opsys::UNIX).then_some(attributes >> 16);
+    let named_dir = name.as_ref().is_ok_and(|name| name.is_dir);
+    // A device, FIFO or socket in a ZIP archive is only its mode with
+    // data, as Info-ZIP's zip records what it reads from a pipe: it is
+    // written as a file, never created as what the mode says.
     let kind = match unix_mode.map(|mode| mode & S_IFMT) {
         Some(S_IFLNK) => Kind::Link,
         Some(S_IFDIR) => Kind::Dir,
-        Some(0 | S_IFREG) | None if name.is_dir => Kind::Dir,
-        Some(0 | S_IFREG) | None => Kind::File,
-        Some(_) => Kind::Special,
+        _ if named_dir => Kind::Dir,
+        _ => Kind::File,
     };
     let data = if st.valid & stat::COMP_SIZE != 0 && st.comp_size > 0 {
-        let start = archive
-            .file_get_offset(i)
-            .map_err(|e| Error::new(i, &raw_name, ErrorKind::Archive(e)))?;
+        let start = archive.file_get_offset(i).map_err(error)?;
         Some(start..start.saturating_add(st.comp_size))
     } else {
         None
@@ -96,23 +112,132 @@ fn item<R: ReadAt>(archive: &Archive<R>, i: u64) -> Result<Item, Error> {
     })
 }
 
+/// A link to create, once every other entry is written.
+struct Link<'a> {
+    item: &'a Item,
+    target: String,
+    to_dir: bool,
+}
+
+/// Reads the data of `item` with `f`, a piece at a time, checked as any
+/// entry's data is: what `f` returns, or why it stopped.
+fn read_entry<R: ReadAt>(
+    archive: &Archive<R>,
+    item: &Item,
+    options: &Options,
+    mut f: impl FnMut(&[u8]) -> Result<(), ErrorKind>,
+) -> Result<(), ErrorKind> {
+    let mut zf = archive
+        .fopen_index_encrypted(item.index, Flags::NONE, options.password.as_deref())
+        .map_err(ErrorKind::Archive)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let n = match zf.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                return Err(match zf.fclose() {
+                    Err(error) => ErrorKind::Archive(error),
+                    Ok(()) => ErrorKind::Io(e),
+                });
+            }
+        };
+        f(&buffer[..n])?;
+    }
+    zf.fclose().map_err(ErrorKind::Archive)
+}
+
+/// The data of a link entry: its target, at most [`MAX_LINK_TARGET`]
+/// bytes.
+fn read_target<R: ReadAt>(
+    archive: &Archive<R>,
+    item: &Item,
+    options: &Options,
+) -> Result<Vec<u8>, ErrorKind> {
+    let mut target = Vec::new();
+    read_entry(archive, item, options, |piece| {
+        target.extend_from_slice(piece);
+        if target.len() > MAX_LINK_TARGET {
+            return Err(ErrorKind::LinkTarget(NameError::TooLong));
+        }
+        Ok(())
+    })?;
+    Ok(target)
+}
+
+/// The links to create, with [`Links::Inside`]: their targets read, and
+/// checked to stay inside the destination and not to pass through another
+/// link of the archive. Those refused and skipped go to `skipped`.
+fn links<'a, R: ReadAt>(
+    archive: &Archive<R>,
+    kept: &[&'a Item],
+    options: &Options,
+    skipped: &mut Vec<Error>,
+) -> Result<Vec<Link<'a>>, Error> {
+    let fold_of = |kind: Kind| {
+        kept.iter()
+            .filter(move |item| item.kind == kind)
+            .filter_map(|item| {
+                item.name
+                    .as_ref()
+                    .ok()
+                    .map(|name| (fold(&name.components), item.index))
+            })
+    };
+    let paths: HashMap<String, u64> = fold_of(Kind::Link).collect();
+    let dirs: HashMap<String, u64> = fold_of(Kind::Dir).collect();
+    let mut links = Vec::new();
+    for &item in kept.iter().filter(|item| item.kind == Kind::Link) {
+        let Ok(name) = &item.name else {
+            continue;
+        };
+        let parent = &name.components[..name.components.len().saturating_sub(1)];
+        let checked = read_target(archive, item, options).and_then(|target| {
+            let resolved = link_target(&target, parent).map_err(ErrorKind::LinkTarget)?;
+            // A link on the way, which the system would follow.
+            for end in 1..resolved.len() {
+                if let Some(&other) = paths.get(&fold(&resolved[..end])) {
+                    return Err(ErrorKind::LinkChain { other });
+                }
+            }
+            let to_dir = dirs.contains_key(&fold(&resolved));
+            // It was resolved, so it is UTF-8.
+            let target = String::from_utf8_lossy(&target).into_owned();
+            Ok((target, to_dir))
+        });
+        match (checked, options.on_refused) {
+            (Ok((target, to_dir)), _) => links.push(Link {
+                item,
+                target,
+                to_dir,
+            }),
+            (
+                Err(kind @ (ErrorKind::LinkTarget(_) | ErrorKind::LinkChain { .. })),
+                OnRefused::Skip,
+            ) => skipped.push(item.error(kind)),
+            (Err(kind), _) => return Err(item.error(kind)),
+        }
+    }
+    Ok(links)
+}
+
 /// Extracts `archive` into `destination`, which is created if it is not
 /// there, with `options`.
 ///
 /// Every entry is checked before anything is written: its name (see
 /// [`check_name`]), that no two entries name the same path (ignoring
-/// case), that none is a link or a special file, that no two share
+/// case), links (refused unless [`Options::links`] says otherwise, their
+/// targets read and checked first), that no two share
 /// compressed data, and what the archive says of the sizes against the
 /// limits. Then each is written, its data counted against the limits as it
 /// comes and checked when it ends (the CRC-32, or WinZip AES's
 /// authentication code); a file whose data fails is removed, and the
-/// extraction stops there. Nothing is overwritten, and nothing is written
-/// through a link.
+/// extraction stops there. Links are created last, then the directories
+/// get their times. Nothing is overwritten unless [`Options::overwrite`]
+/// says so, and nothing is written through a link.
 ///
-/// Files get the time the archive has, and on Unix its permission bits,
-/// masked: no setuid, setgid or sticky bit, no writing by group or others,
-/// and reading and writing by the owner. Directories get the system's
-/// defaults.
+/// Files and directories get the time the archive has, and files on Unix
+/// their permission bits, as [`Options::permissions`] says.
 ///
 /// Open the archive with
 /// [`OpenFlags::CHECKCONS`](hivepack_zip::OpenFlags::CHECKCONS), so that
@@ -128,28 +253,42 @@ pub fn extract_zip<R: ReadAt>(
         return Err(Error::global(ErrorKind::TooManyEntries));
     }
     let items = (0..n)
-        .map(|i| item(archive, i))
+        .map(|i| item(archive, i, options))
         .collect::<Result<Vec<Item>, Error>>()?;
-    check(&items, limits)?;
+    let (kept, mut skipped) = check(&items, options)?;
+    let links = match options.links {
+        Links::Inside => links(archive, &kept, options, &mut skipped)?,
+        _ => Vec::new(),
+    };
 
     let destination =
         Destination::open(destination).map_err(|e| Error::global(ErrorKind::Io(e)))?;
-    let mut summary = Summary::default();
-    for item in &items {
-        let error = |kind| Error::new(item.index, &item.raw_name, kind);
-        let components = &item.name.components;
-        if item.kind == Kind::Dir {
-            destination.directory(components).map_err(error)?;
-            summary.directories += 1;
+    let mut summary = Summary {
+        skipped,
+        ..Summary::default()
+    };
+    for &item in &kept {
+        let Ok(name) = &item.name else {
             continue;
+        };
+        let error = |kind| item.error(kind);
+        let components = &name.components;
+        match (item.kind, options.links) {
+            (Kind::Dir, _) => {
+                destination.directory(components).map_err(error)?;
+                summary.directories += 1;
+                continue;
+            }
+            (Kind::Link, Links::Inside) => continue,
+            _ => {}
         }
         let (last, parents) = components
             .split_last()
-            .ok_or_else(|| error(ErrorKind::Name(crate::NameError::Empty)))?;
+            .ok_or_else(|| error(ErrorKind::Name(NameError::Empty)))?;
         let dir = destination.directory(parents).map_err(error)?;
-        let file = Destination::create_file(&dir, last).map_err(error)?;
+        let file = Destination::create_file(&dir, last, options.overwrite).map_err(error)?;
         let remaining = limits.max_total_size.saturating_sub(summary.bytes);
-        match write_data(archive, item, file, limits, remaining, options) {
+        match write_file(archive, item, file, remaining, options) {
             Ok(written) => {
                 summary.files += 1;
                 summary.bytes += written;
@@ -161,37 +300,57 @@ pub fn extract_zip<R: ReadAt>(
             }
         }
     }
+
+    for link in &links {
+        let error = |kind| link.item.error(kind);
+        let Ok(name) = &link.item.name else {
+            continue;
+        };
+        let (last, parents) = name
+            .components
+            .split_last()
+            .ok_or_else(|| error(ErrorKind::Name(NameError::Empty)))?;
+        let dir = destination.directory(parents).map_err(error)?;
+        Destination::symlink(&dir, last, &link.target, link.to_dir).map_err(error)?;
+        summary.links += 1;
+    }
+
+    // The directories' times, the deepest first, once nothing more is
+    // written in them.
+    let mut dirs: Vec<(&[String], std::time::SystemTime, &Item)> = kept
+        .iter()
+        .filter(|item| item.kind == Kind::Dir)
+        .filter_map(|&item| match (&item.name, item.mtime) {
+            (Ok(name), Some(mtime)) => Some((name.components.as_slice(), mtime, item)),
+            _ => None,
+        })
+        .collect();
+    dirs.sort_by_key(|(components, _, _)| std::cmp::Reverse(components.len()));
+    for (components, mtime, item) in dirs {
+        let Some((last, parents)) = components.split_last() else {
+            continue;
+        };
+        let error = |kind| item.error(kind);
+        let dir = destination.directory(parents).map_err(error)?;
+        Destination::set_time(&dir, last, mtime).map_err(error)?;
+    }
     Ok(summary)
 }
 
 /// Writes the data of `item` into `file`, at most `remaining` bytes in
 /// all, then its time and permissions: the bytes written.
-fn write_data<R: ReadAt>(
+fn write_file<R: ReadAt>(
     archive: &Archive<R>,
     item: &Item,
     file: cap_std::fs::File,
-    limits: &crate::Limits,
     remaining: u64,
     options: &Options,
 ) -> Result<u64, ErrorKind> {
-    let mut zf = archive
-        .fopen_index_encrypted(item.index, Flags::NONE, options.password.as_deref())
-        .map_err(ErrorKind::Archive)?;
+    let limits = &options.limits;
     let mut file = file.into_std();
-    let mut buffer = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
-    loop {
-        let n = match zf.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                return Err(match zf.fclose() {
-                    Err(error) => ErrorKind::Archive(error),
-                    Ok(()) => ErrorKind::Io(e),
-                });
-            }
-        };
-        written += n as u64;
+    read_entry(archive, item, options, |piece| {
+        written += piece.len() as u64;
         if written > limits.max_entry_size {
             return Err(ErrorKind::EntryTooLarge);
         }
@@ -206,9 +365,8 @@ fn write_data<R: ReadAt>(
         {
             return Err(ErrorKind::Ratio);
         }
-        file.write_all(&buffer[..n]).map_err(ErrorKind::Io)?;
-    }
-    zf.fclose().map_err(ErrorKind::Archive)?;
+        file.write_all(piece).map_err(ErrorKind::Io)
+    })?;
     if written != item.size {
         return Err(ErrorKind::SizeMismatch);
     }
@@ -217,15 +375,36 @@ fn write_data<R: ReadAt>(
         file.set_times(std::fs::FileTimes::new().set_modified(mtime))
             .map_err(ErrorKind::Io)?;
     }
-    #[cfg(unix)]
-    if let Some(mode) = item.mode {
-        use std::os::unix::fs::PermissionsExt;
-        // No setuid, setgid or sticky bit, no writing by group or others,
-        // and reading and writing by the owner.
-        let mode = (mode & 0o755) | 0o600;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))
-            .map_err(ErrorKind::Io)?;
-    }
+    set_permissions(&file, item.mode, options.permissions)?;
     file.flush().map_err(ErrorKind::Io)?;
     Ok(written)
+}
+
+/// The permission bits of `mode`, as `permissions` says, on Unix.
+#[cfg(unix)]
+fn set_permissions(
+    file: &std::fs::File,
+    mode: Option<u32>,
+    permissions: Permissions,
+) -> Result<(), ErrorKind> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match (mode, permissions) {
+        // No setuid, setgid or sticky bit, no writing by group or others,
+        // and reading and writing by the owner.
+        (Some(mode), Permissions::Masked) => (mode & 0o755) | 0o600,
+        (Some(mode), Permissions::Preserve) => mode & 0o777,
+        (None, _) | (_, Permissions::Ignore) => return Ok(()),
+    };
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(ErrorKind::Io)
+}
+
+/// Windows has no permission bits.
+#[cfg(not(unix))]
+fn set_permissions(
+    _file: &std::fs::File,
+    _mode: Option<u32>,
+    _permissions: Permissions,
+) -> Result<(), ErrorKind> {
+    Ok(())
 }

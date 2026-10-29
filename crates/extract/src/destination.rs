@@ -13,8 +13,9 @@
 
 use std::io;
 use std::path::Path;
+use std::time::SystemTime;
 
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, SystemTimeSpec};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
@@ -59,14 +60,62 @@ impl Destination {
     }
 
     /// Creates the file `name` in `dir`, which must not be there, not even
-    /// as a link.
-    pub(crate) fn create_file(dir: &Dir, name: &str) -> Result<File, ErrorKind> {
+    /// as a link; with `overwrite`, replaces one that is there if it is a
+    /// file, opened without following a link and emptied.
+    pub(crate) fn create_file(dir: &Dir, name: &str, overwrite: bool) -> Result<File, ErrorKind> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         options.follow(FollowSymlinks::No);
-        dir.open_with(name, &options).map_err(|e| match e.kind() {
+        match dir.open_with(name, &options) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && overwrite => {
+                match dir.symlink_metadata(name) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    _ => return Err(ErrorKind::Exists),
+                }
+                let mut options = OpenOptions::new();
+                options.write(true).truncate(true);
+                options.follow(FollowSymlinks::No);
+                dir.open_with(name, &options).map_err(ErrorKind::Io)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(ErrorKind::Exists),
+            Err(e) => Err(ErrorKind::Io(e)),
+            Ok(file) => Ok(file),
+        }
+    }
+
+    /// Creates a symbolic link `name` in `dir` to `target`, relative, with
+    /// `/` for separator; `to_dir` says whether it leads to a directory,
+    /// which Windows needs to know.
+    pub(crate) fn symlink(
+        dir: &Dir,
+        name: &str,
+        target: &str,
+        to_dir: bool,
+    ) -> Result<(), ErrorKind> {
+        #[cfg(windows)]
+        let created = {
+            let target = target.replace('/', "\\");
+            if to_dir {
+                dir.symlink_dir(target, name)
+            } else {
+                dir.symlink_file(target, name)
+            }
+        };
+        #[cfg(not(windows))]
+        let created = {
+            let _ = to_dir;
+            dir.symlink(target, name)
+        };
+        created.map_err(|e| match e.kind() {
             io::ErrorKind::AlreadyExists => ErrorKind::Exists,
             _ => ErrorKind::Io(e),
         })
+    }
+
+    /// Sets the time of `name` in `dir`, without following a link.
+    pub(crate) fn set_time(dir: &Dir, name: &str, mtime: SystemTime) -> Result<(), ErrorKind> {
+        let mtime = SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(mtime));
+        dir.set_symlink_times(name, None, Some(mtime))
+            .map_err(ErrorKind::Io)
     }
 }

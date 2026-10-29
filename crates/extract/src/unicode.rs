@@ -3,13 +3,14 @@
 //! `scripts/unicode.py`), the same on every system. So `é` written as one
 //! character and as `e` with a combining accent are one name, as macOS
 //! takes them, and so are the Kelvin sign and `K`, also one by
-//! decomposition, and `σ` and `ς`, as a case-insensitive file system
-//! takes them.
+//! decomposition, `σ` and `ς`, as a case-insensitive file system takes
+//! them, and `ß` and `ss`, or the ligature `ﬁ` and `fi`, as macOS folds
+//! them.
 //!
-//! This is Unicode's canonical caseless match (section 3.13) with simple
-//! case folding: NFD(fold(NFD(name))). Composing again (NFC) is not needed
-//! to compare. Compatibility forms stay apart: the ligature `ﬁ` is not
-//! `fi`, as no file system takes it for it.
+//! This is Unicode's canonical caseless match (definition D145): NFD of
+//! the full case folding of NFD(name). Composing again (NFC) is not needed
+//! to compare. Compatibility forms that do not fold stay apart: the
+//! fullwidth `Ａ` is not `A`.
 
 mod tables;
 
@@ -60,11 +61,11 @@ fn decompose(c: char, out: &mut Vec<char>) {
     }
 }
 
-/// The simple case folding of `c`.
-pub(crate) fn fold_char(c: char) -> char {
+/// Appends the full case folding of `c` to `out`.
+fn fold(c: char, out: &mut Vec<char>) {
     match tables::FOLDING.binary_search_by_key(&c, |&(c, _)| c) {
-        Ok(i) => tables::FOLDING[i].1,
-        Err(_) => c,
+        Ok(i) => out.extend_from_slice(tables::FOLDING[i].1),
+        Err(_) => out.push(c),
     }
 }
 
@@ -108,8 +109,11 @@ pub(crate) fn key(s: &str) -> String {
 
 /// [`key`], the whole way.
 fn full_key(s: &str) -> String {
-    let folded = nfd_chars(s.chars()).into_iter().map(fold_char);
-    nfd_chars(folded).into_iter().collect()
+    let mut folded = Vec::new();
+    for c in nfd_chars(s.chars()) {
+        fold(c, &mut folded);
+    }
+    nfd_chars(folded.into_iter()).into_iter().collect()
 }
 
 #[cfg(test)]
@@ -131,6 +135,10 @@ mod tests {
             ("\u{3a3}\u{3c2}", "\u{3c3}\u{3c3}"),
             // İ is I with a dot above, which folds to i with it.
             ("\u{130}", "i\u{307}"),
+            // Full case folding, as macOS's.
+            ("stra\u{df}e", "strasse"),
+            ("\u{fb01}", "fi"),
+            ("\u{1e9e}", "ss"),
             // A Hangul syllable, and its jamo.
             ("\u{d55c}", "\u{1112}\u{1161}\u{11ab}"),
             // Marks of different classes, in either order.
@@ -139,11 +147,9 @@ mod tests {
             assert_eq!(key(a), key(b), "{a:?} {b:?}");
         }
         for (a, b) in [
-            // Compatibility forms, which no file system folds.
-            ("\u{fb01}", "fi"),
+            // Compatibility forms that do not fold.
             ("\u{ff21}", "a"),
-            // Full case folding would make these one.
-            ("stra\u{df}e", "strasse"),
+            ("\u{2460}", "1"),
             // Marks of one class keep their order.
             ("a\u{301}\u{300}", "a\u{300}\u{301}"),
         ] {
@@ -225,7 +231,7 @@ mod tests {
     }
 
     /// The tables hold what the database says, for every character: its
-    /// combining class, its full decomposition, and its simple case
+    /// combining class, its full decomposition, and its full case
     /// folding.
     #[test]
     fn tables_hold_the_database() {
@@ -256,19 +262,17 @@ mod tests {
         let mut folding = HashMap::new();
         for line in folding_text.lines() {
             let fields: Vec<&str> = line.split('#').next().unwrap().split(';').collect();
-            if fields.len() >= 3 && matches!(fields[1].trim(), "C" | "S") {
-                folding.insert(chars(fields[0])[0], chars(fields[2])[0]);
+            if fields.len() >= 3 && matches!(fields[1].trim(), "C" | "F") {
+                folding.insert(chars(fields[0])[0], chars(fields[2]));
             }
         }
         for c in all_chars() {
             let class = classes.get(&c).copied().unwrap_or(0);
             assert_eq!(combining_class(c), class, "U+{:04X}", u32::from(c));
-            assert_eq!(
-                fold_char(c),
-                *folding.get(&c).unwrap_or(&c),
-                "U+{:04X}",
-                u32::from(c)
-            );
+            let mut folded = Vec::new();
+            fold(c, &mut folded);
+            let want = folding.get(&c).cloned().unwrap_or_else(|| vec![c]);
+            assert_eq!(folded, want, "U+{:04X}", u32::from(c));
             let hangul = u32::from(c).wrapping_sub(S_BASE) < S_COUNT;
             if !hangul {
                 let (mut want, mut got) = (Vec::new(), Vec::new());

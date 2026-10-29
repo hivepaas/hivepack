@@ -62,7 +62,7 @@ These are hivepack's own, and each one has its own oracles.
 | Writing to a stream | `add_data` seeks back to rewrite the local header, and forces Zip64 when the size is unknown | A streaming writer with data descriptors | Every oracle reads what it writes |
 | Reading a stream | Needs a seekable source | An opt-in streaming reader that checks what it read against the central directory at the end | libarchive's streaming reader |
 | Parallel work | One thread | Entries decompressed in parallel through `ReaderAt`; compressed in parallel and written in order | The single-threaded output, byte for byte |
-| Extracting to disk | None: libzip is an archive library | `hivepack-extract`, shared with tar and RAR, safe by default | ZipDiff samples, David Fifield's zip bombs, the archives behind recent CVEs in other extractors |
+| Extracting to disk | None: libzip is an archive library | `hivepack-extract`, shared with tar and RAR, safe by default (see [extract.md](extract.md)) | ZipDiff samples, David Fifield's zip bombs, the archives behind recent CVEs in other extractors |
 
 ## Strict by default
 
@@ -145,6 +145,7 @@ libzip's ways that the port keeps, though they surprise:
 - Until the archive is written, an entry whose data was replaced has the method it had in its stat, and is read with it; one whose method is set to `ZIP_CM_DEFAULT` has 65,535, the method as a `zip_uint16_t`. An entry compressed again takes the length it decompresses to, which its header may have wrong, and its time from its stat, so an MS-DOS date out of range comes back in range.
 - An entry deleted and then given changes (`zip_set_file_compression` and others do not check) has its name again, though it is not written.
 - An entry encrypted anew is read through the layers that decrypt and decompress it, and the layer that encrypts stops reading at the first short read, so the data is never read to its end: its CRC is never checked (and `zip_close` ignores what closing the source says), and it is written with the CRC and length of its data, and the time of its stat.
+- An entry whose general purpose flags have the strong encryption bit (6) without the encryption bit (0) keeps bit 6 when it is encrypted, so it reads back as encrypted with an unknown method (`ZIP_EM_UNKNOWN`), which nothing decrypts.
 - ZipCrypto encrypts with an empty password, which `zip_file_set_encryption` takes, but reading takes an empty password for none, so such an entry cannot be read; WinZip AES refuses it with `ZIP_ER_INVAL` when writing.
 - An encrypted entry whose compression method is changed is decrypted with its compressed size unknown, as `zip_stat_index` leaves it out once the method changes: from a file, which does not tell it, that fails with `ZIP_ER_OPNOTSUPP`; from a buffer, which gives its own length, ZipCrypto works and WinZip AES reads past the entry and fails with `ZIP_ER_EOF`.
 
@@ -160,7 +161,7 @@ libzip's ways that the port keeps, though they surprise:
 ## Questions to settle first
 
 - **Random numbers** (settled, October 2026). WinZip AES needs a random salt for each entry, and ZipCrypto random bytes for its header. libzip asks the operating system (`zip_random_*.c`). Rust's standard library has no stable API for it yet (`std::random` is nightly-only), and the `getrandom` crate uses `unsafe` and libc. So `hivepack-zip` reads `/dev/urandom` with the standard library on Unix, as `zip_random_unix.c` does, and takes the bytes from the caller elsewhere (`Archive::set_random_source`); an application can use `getrandom` for that.
-- **Unsafe code inside dependencies.** The rules in [safety.md](safety.md) bind hivepack's own crates; nothing says yet whether a library may depend on a crate that uses `unsafe`. Extracting without races needs `openat2`, `openat` with `O_NOFOLLOW`, or `NtCreateFile` relative to a directory handle, and the Rust crates that offer them (rustix, cap-std) use `unsafe` inside.
+- **Unsafe code inside dependencies** (settled, October 2026). Only where there is no other way, listed in [safety.md](safety.md#dependencies-with-unsafe-code). Extracting without races needs `openat2`, `openat` with `O_NOFOLLOW`, or `NtCreateFile` relative to a directory handle, which the standard library does not have yet: `hivepack-extract` takes them from cap-std (see [extract.md](extract.md)).
 - **Strictness.** Whether `ZIP_CHECKCONS` by default refuses too many real archives (it refuses, for example, an archive comment whose length is wrong) is measured on the test corpora before it is fixed.
 
 ## Licences

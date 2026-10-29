@@ -60,6 +60,7 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
+      - run: cargo check -p hivepack-extract --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast

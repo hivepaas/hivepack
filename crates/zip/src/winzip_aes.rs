@@ -97,6 +97,13 @@ impl WinzipAes {
         ))
     }
 
+    /// `_zip_winzip_aes_encrypt`: encrypts `data` in place, and takes it
+    /// into the HMAC.
+    pub(crate) fn encrypt(&mut self, data: &mut [u8]) {
+        self.aes_crypt(data);
+        self.hmac.update(data);
+    }
+
     /// `_zip_winzip_aes_decrypt`: takes `data` into the HMAC, and decrypts
     /// it in place.
     pub(crate) fn decrypt(&mut self, data: &mut [u8]) {

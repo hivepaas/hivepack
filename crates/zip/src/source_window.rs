@@ -35,11 +35,24 @@ impl<R: ReadAt + ?Sized> Lower<'_, R> {
     }
 
     /// `zip_source_stat` of the lower source, for the window to merge its
-    /// own over: the length of the archive or empty buffer (the buffer
-    /// source tells more, but nothing the window does not replace), or
-    /// what the new data says, nothing if that fails.
+    /// own over: the length of the archive or empty buffer, or what the new
+    /// data says, nothing if that fails. A buffer source, which takes an
+    /// empty buffer for an empty archive (`ZIP_SOURCE_ACCEPT_EMPTY`), gives
+    /// its length as the compressed size too, stored and not encrypted; a
+    /// file source only its length. The window replaces them all but where
+    /// the entry's compression method was changed, which leaves its
+    /// compressed size unknown: a layer that decrypts then takes the
+    /// buffer's length (the time either gives is always replaced).
     pub(crate) fn stat(&self) -> Stat<'static> {
         match self {
+            Lower::Archive(src) if src.accept_empty() => Stat {
+                valid: stat::SIZE | stat::COMP_SIZE | stat::COMP_METHOD | stat::ENCRYPTION_METHOD,
+                size: src.size(),
+                comp_size: src.size(),
+                comp_method: crate::zip::cm::STORE,
+                encryption_method: crate::zip::em::NONE,
+                ..Stat::default()
+            },
             Lower::Archive(src) => Stat {
                 valid: stat::SIZE,
                 size: src.size(),

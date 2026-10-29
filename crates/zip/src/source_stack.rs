@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::get_encryption_implementation::Decrypt;
+use crate::get_encryption_implementation::{Decrypt, Encrypt};
 use crate::source::ReadAt;
 use crate::source_compress::{Compress, Decompress};
 use crate::source_crc::Crc;
@@ -516,6 +516,7 @@ pub(crate) struct WriteStack<'a, R: ?Sized> {
     pub(crate) decompress: Option<Layer<Decompress>>,
     pub(crate) crc: Option<Layer<Crc>>,
     pub(crate) compress: Option<Layer<Compress>>,
+    pub(crate) encrypt: Option<Layer<Encrypt>>,
 }
 
 /// Reads from the base, through the decrypting layer if there is one.
@@ -632,6 +633,13 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
             }
             compress.opened();
         }
+        if let Some(encrypt) = self.encrypt.as_mut() {
+            if let Err(e) = encrypt.ctx.open() {
+                encrypt.error = e;
+                return Err(e);
+            }
+            encrypt.opened();
+        }
         Ok(())
     }
 
@@ -643,20 +651,30 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
             decompress,
             crc,
             compress,
+            encrypt,
         } = self;
-        match compress {
+        let mut read_below_encrypt = |data: &mut [u8]| match compress {
             Some(compress) => compress.read(data, &mut |ctx, buf| {
                 ctx.read(buf, &mut |b| {
                     read_below_compress(base, decrypt, decompress, crc, b)
                 })
             }),
             None => read_below_compress(base, decrypt, decompress, crc, data),
+        };
+        match encrypt {
+            Some(encrypt) => {
+                encrypt.read(data, &mut |ctx, buf| ctx.read(buf, &mut read_below_encrypt))
+            }
+            None => read_below_encrypt(data),
         }
     }
 
     /// Closes the layers, the top first: port of `zip_source_close`.
     pub(crate) fn close(&mut self) -> Result<()> {
         let mut ret = Ok(());
+        if let Some(encrypt) = self.encrypt.as_mut() {
+            encrypt.ctx.close();
+        }
         if let Some(compress) = self.compress.as_mut()
             && let Err(e) = compress.ctx.close()
         {
@@ -688,8 +706,8 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
         ret
     }
 
-    /// `zip_source_stat` of the top layer.
-    pub(crate) fn stat(&self) -> Result<Stat<'static>> {
+    /// `zip_source_stat` under the encrypting layer.
+    pub(crate) fn stat_below_encrypt(&self) -> Result<Stat<'static>> {
         let mut st = stat_below_compress(&self.base, &self.decrypt, &self.decompress, &self.crc)?;
         if let Some(compress) = &self.compress {
             compress.ctx.stat(&mut st);
@@ -697,11 +715,34 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
         Ok(st)
     }
 
+    /// `zip_source_stat` of the top layer.
+    pub(crate) fn stat(&self) -> Result<Stat<'static>> {
+        let mut st = self.stat_below_encrypt()?;
+        if let Some(encrypt) = &self.encrypt {
+            encrypt.ctx.stat(&mut st);
+        }
+        Ok(st)
+    }
+
+    /// `zip_source_get_dos_time` under the encrypting layer: the base's,
+    /// which only the CRC layer passes on.
+    pub(crate) fn dos_time_below_encrypt(&self) -> Result<Option<(u16, u16)>> {
+        if self.decrypt.is_some() || self.decompress.is_some() || self.compress.is_some() {
+            return Ok(None);
+        }
+        self.base.dos_time()
+    }
+
     /// `zip_source_get_file_attributes` of the top layer.
     pub(crate) fn file_attributes(&self) -> Result<FileAttributes> {
         let mut attributes = attributes_below_compress(&self.base, &self.decompress)?;
         if let Some(compress) = &self.compress {
             let mut upper = compress.ctx.file_attributes();
+            upper.merge_lower(&attributes);
+            attributes = upper;
+        }
+        if let Some(encrypt) = &self.encrypt {
+            let mut upper = encrypt.ctx.file_attributes();
             upper.merge_lower(&attributes);
             attributes = upper;
         }

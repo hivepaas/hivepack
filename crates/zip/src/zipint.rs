@@ -48,6 +48,41 @@ pub(crate) const TORRENTZIP_SIGNATURE_LENGTH: usize = 14;
 pub(crate) const TORRENTZIP_CRC_LENGTH: usize = 8;
 pub(crate) const TORRENTZIP_COMPRESSION_FLAGS: u32 = u16::MAX as u32;
 
+/// A password, of an entry or the archive's default one, up to its first
+/// NUL byte as libzip keeps a C string. It is overwritten when it is
+/// dropped, as `_zip_crypto_clear` clears it (best effort).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Password(Vec<u8>);
+
+impl Password {
+    /// `password` up to its first NUL byte, which may leave it empty: an
+    /// empty password is not none.
+    pub(crate) fn new(password: &[u8]) -> Password {
+        Password(crate::hash::c_string(password).to_vec())
+    }
+}
+
+impl std::ops::Deref for Password {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Password {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+    }
+}
+
+/// Shows nothing of the password.
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(..)")
+    }
+}
+
 /// `ZIP_CM_WINZIP_AES`: WinZip AES encrypted.
 pub(crate) const CM_WINZIP_AES: u16 = 99;
 
@@ -140,6 +175,7 @@ pub(crate) mod changed {
     pub const ATTRIBUTES: u32 = 0x0010;
     pub const LAST_MOD: u32 = 0x0020;
     pub const ENCRYPTION_METHOD: u32 = 0x0040;
+    pub const PASSWORD: u32 = 0x0080;
     pub const ALL: u32 = u32::MAX;
 }
 

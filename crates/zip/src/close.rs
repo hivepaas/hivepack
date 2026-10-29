@@ -15,10 +15,11 @@ use crate::buffer::Buffer;
 use crate::dirent::{Dirent, DosTime, cm_actual, u2d_time};
 use crate::error::{Error, ErrorCode, Result};
 use crate::file_get_offset::file_get_offset;
-use crate::get_encryption_implementation::Decrypt;
+use crate::get_encryption_implementation::{Decrypt, Encrypt, encryption_method_supported};
 use crate::hash::c_string;
 use crate::io_util::read;
 use crate::open::Archive;
+use crate::random::RandomSource;
 use crate::source::{ReadAt, Source, Whence};
 use crate::source_compress::{Compress, Decompress};
 use crate::source_crc::Crc;
@@ -260,6 +261,7 @@ impl<R: ReadAt> Archive<R> {
                 want_torrentzip,
                 check_consistency,
                 self.default_password.as_deref(),
+                self.random.as_ref(),
             );
             if let Some(changes) = self.entry[i].changes.as_deref_mut() {
                 *changes = de;
@@ -331,10 +333,12 @@ fn torrentzip_compare_names(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>) -> Orderin
 }
 
 /// Writes the local header of `de`, the data of `src` through the layers
-/// that decrypt (with `default_password`), decompress, compute the CRC and
-/// compress it as `de` asks, and the data descriptor if it has one, and
-/// fills in what the data tells: port of `add_data`. The header is written
-/// again once the sizes are known, if they changed it.
+/// that decrypt (with `default_password`), decompress, compute the CRC,
+/// compress and encrypt it (with the entry's password or the default one,
+/// and random bytes from `random`) as `de` asks, and the data descriptor
+/// if it has one, and fills in what the data tells: port of `add_data`.
+/// The header is written again once the sizes are known, if they changed
+/// it.
 fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
     src: Base<'_, R>,
     de: &mut Dirent,
@@ -342,6 +346,7 @@ fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
     want_torrentzip: bool,
     check_consistency: bool,
     default_password: Option<&[u8]>,
+    random: Option<&RandomSource>,
 ) -> Result<()> {
     let mut st = src.stat()?;
 
@@ -424,7 +429,9 @@ fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
     let needs_crc = st.comp_method == cm::STORE || needs_decompress;
     let needs_compress = needs_recompress && de.comp_method != i32::from(cm::STORE);
 
-    let needs_reencrypt = needs_recompress || de.encryption_method != st.encryption_method;
+    let needs_reencrypt = needs_recompress
+        || de.changed & changed::PASSWORD != 0
+        || de.encryption_method != st.encryption_method;
     let needs_decrypt = needs_reencrypt && st.encryption_method != em::NONE;
     let needs_encrypt = needs_reencrypt && de.encryption_method != em::NONE;
 
@@ -462,18 +469,46 @@ fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
         )?)),
         false => None,
     };
-    if needs_encrypt {
-        // Differs from libzip, for now: encrypting comes later.
-        return Err(Error::new(ErrorCode::EncrNotSupp, 0));
-    }
-
     let mut src_final = WriteStack {
         base: src,
         decrypt,
         decompress,
         crc,
         compress,
+        encrypt: None,
     };
+
+    if needs_encrypt {
+        let password = de.password.as_deref().or(default_password);
+        if !encryption_method_supported(de.encryption_method, true) {
+            return Err(Error::new(ErrorCode::EncrNotSupp, 0));
+        }
+        let mut dostime = None;
+        if de.encryption_method == em::TRAD_PKWARE {
+            de.bitflags |= GPBF_DATA_DESCRIPTOR;
+            // PKWare encryption uses last_mod, make sure it gets the right
+            // value.
+            if de.changed & changed::LAST_MOD != 0 {
+                dostime = Some(de.last_mod);
+            }
+        }
+        // zip_source_get_dos_time failing is as if there were no time.
+        let dostime = dostime.or_else(|| {
+            src_final
+                .dos_time_below_encrypt()
+                .ok()
+                .flatten()
+                .map(|(time, date)| DosTime { time, date })
+        });
+        let encrypt = Encrypt::new(
+            de.encryption_method,
+            password,
+            dostime,
+            || src_final.stat_below_encrypt(),
+            random.cloned(),
+        )?;
+        src_final.encrypt = Some(Layer::new(encrypt));
+    }
 
     let force_zip64 = flags.intersects(FL_FORCE_ZIP64);
     if !want_torrentzip {

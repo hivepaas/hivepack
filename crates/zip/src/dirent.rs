@@ -21,6 +21,7 @@ use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK,
 use crate::source_write::Output;
 use crate::string::{ZipString, guess_encoding, string_crc32, string_equal, string_length};
 use crate::zip::{Flags, cm, em, opsys};
+use crate::zipint::Password;
 use crate::zipint::{
     CDENTRYSIZE, CENTRAL_MAGIC, CM_WINZIP_AES, DATADES_MAGIC, EF_BOTH, EF_CENTRAL, EF_LOCAL,
     EF_UTF_8_COMMENT, EF_UTF_8_NAME, EF_WINZIP_AES, EF_WINZIP_AES_SIZE, EF_ZIP64, EFZIP64SIZE,
@@ -86,6 +87,8 @@ pub(crate) struct Dirent {
     pub offset: u64,
     /// encryption method, computed from other fields
     pub encryption_method: u16,
+    /// file specific encryption password
+    pub password: Option<Password>,
     /// level of compression to use (never valid in orig)
     pub compression_level: u32,
     /// cached last_mod in Unix time format, if valid
@@ -114,6 +117,7 @@ impl Default for Dirent {
             ext_attrib: EXT_ATTRIB_DEFAULT,
             offset: 0,
             encryption_method: em::NONE,
+            password: None,
             compression_level: 0,
             last_mod_mtime: None,
         }
@@ -726,6 +730,9 @@ impl Dirent {
         }
         if self.changed & changed::LAST_MOD == 0 {
             self.last_mod = de_orig.last_mod;
+        }
+        if self.changed & changed::PASSWORD == 0 {
+            self.password.clone_from(&de_orig.password);
         }
     }
 

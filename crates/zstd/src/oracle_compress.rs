@@ -543,6 +543,11 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         401 => CParameter::JobSize(unsigned()),
         402 => CParameter::OverlapLog(value as i32),
         500 => CParameter::Rsyncable(flag),
+        // ZSTD_c_forceMaxWindow, ZSTD_c_deterministicRefPrefix,
+        // ZSTD_c_prefetchCDictTables
+        1000 => CParameter::ForceMaxWindow(flag),
+        1012 => CParameter::DeterministicRefPrefix(flag),
+        1013 => CParameter::PrefetchCDictTables(switch()),
         // ZSTD_c_forceAttachDict
         1001 => CParameter::ForceAttachDict(match value {
             0 => DictAttachPref::DefaultAttach,

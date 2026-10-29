@@ -497,6 +497,7 @@ pub(crate) fn zstd_load_dictionary_content(
     } else {
         ms.window.index(iend)
     };
+    ms.force_non_contiguous = params.deterministic_ref_prefix;
     if src_size == 0 {
         // Differs from libzstd: there the window, left as it was, makes
         // these indices from an unrelated pointer. A dictionary without

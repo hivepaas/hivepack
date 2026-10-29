@@ -1722,10 +1722,16 @@ pub(crate) struct CCtxParams {
     pub(crate) rsyncable: bool,
     /// `forceWindow` (`ZSTD_c_forceMaxWindow`): whether a dictionary's
     /// content is part of the window, its matches no farther than the
-    /// window's size, rather than reached whole. Not a parameter the port
-    /// offers: only the jobs of multithreaded compression after the first
-    /// set it, for the content of the job before that they load.
+    /// window's size, rather than reached whole. The jobs of multithreaded
+    /// compression after the first set it, for the content of the job
+    /// before that they load.
     pub(crate) force_window: bool,
+    /// `deterministicRefPrefix` (`ZSTD_c_deterministicRefPrefix`): whether
+    /// a dictionary's content is a segment of its own, apart from the
+    /// input, even where the input follows it in memory.
+    pub(crate) deterministic_ref_prefix: bool,
+    /// `prefetchCDictTables` (`ZSTD_c_prefetchCDictTables`).
+    pub(crate) prefetch_cdict_tables: ParamSwitch,
 }
 
 impl CCtxParams {
@@ -1757,6 +1763,8 @@ impl CCtxParams {
             overlap_log: 0,
             rsyncable: false,
             force_window: false,
+            deterministic_ref_prefix: false,
+            prefetch_cdict_tables: ParamSwitch::Auto,
         }
     }
 
@@ -2263,6 +2271,25 @@ pub enum CParameter {
     /// input changes, which helps `rsync`, at a small cost in compression.
     /// Off by default.
     Rsyncable(bool),
+    /// Whether a dictionary's matches, like the input's, are no farther
+    /// back than the window's size (`ZSTD_c_forceMaxWindow`): its content
+    /// then is part of the window rather than reached whole, and the parts
+    /// of it more than a window behind are not searched. Off by default.
+    ForceMaxWindow(bool),
+    /// Whether a prefix ([`CCtx::ref_prefix`]) or a dictionary loaded is a
+    /// segment of its own even where the input follows it in memory
+    /// (`ZSTD_c_deterministicRefPrefix`), so that the frames do not depend
+    /// on where the two are. Off by default: then a prefix that ends where
+    /// the input starts makes one segment with it, as libzstd does.
+    DeterministicRefPrefix(bool),
+    /// Whether frames attached to a [`CDict`] at `fast` and `dfast`
+    /// prefetch its hash tables first (`ZSTD_c_prefetchCDictTables`), which
+    /// helps where few blocks search a large `CDict`. Off by default
+    /// ([`ParamSwitch::Auto`] is off).
+    ///
+    /// Differs from libzstd: the port takes the parameter, but does not
+    /// prefetch the tables. It changes no frame.
+    PrefetchCDictTables(ParamSwitch),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -2299,6 +2326,9 @@ pub enum CParameterKind {
     JobSize,
     OverlapLog,
     Rsyncable,
+    ForceMaxWindow,
+    DeterministicRefPrefix,
+    PrefetchCDictTables,
 }
 
 impl CParameter {
@@ -2336,6 +2366,9 @@ impl CParameter {
             CParameter::JobSize(_) => CParameterKind::JobSize,
             CParameter::OverlapLog(_) => CParameterKind::OverlapLog,
             CParameter::Rsyncable(_) => CParameterKind::Rsyncable,
+            CParameter::ForceMaxWindow(_) => CParameterKind::ForceMaxWindow,
+            CParameter::DeterministicRefPrefix(_) => CParameterKind::DeterministicRefPrefix,
+            CParameter::PrefetchCDictTables(_) => CParameterKind::PrefetchCDictTables,
         }
     }
 }
@@ -2504,6 +2537,11 @@ pub(crate) fn set_cctx_parameter(
         // libzstd clamps the value to the overlap log's bounds and keeps
         // it; any but 0 is on.
         CParameter::Rsyncable(rsyncable) => params.rsyncable = rsyncable,
+        CParameter::ForceMaxWindow(force) => params.force_window = force,
+        CParameter::DeterministicRefPrefix(deterministic) => {
+            params.deterministic_ref_prefix = deterministic;
+        }
+        CParameter::PrefetchCDictTables(prefetch) => params.prefetch_cdict_tables = prefetch,
     }
     Ok(())
 }
@@ -3778,7 +3816,11 @@ impl CCtx {
         }
 
         let ms = &mut self.match_state;
-        if !ms.window.update(which, start, end - start, false) {
+        if !ms
+            .window
+            .update(which, start, end - start, ms.force_non_contiguous)
+        {
+            ms.force_non_contiguous = false;
             ms.next_to_update = ms.window.dict_limit;
         }
         if !zstd_window_in_buffers(&ms.window, &bufs) {
@@ -4120,6 +4162,9 @@ impl CCtx {
             CParameterKind::JobSize => params.job_size as i32,
             CParameterKind::OverlapLog => params.overlap_log,
             CParameterKind::Rsyncable => i32::from(params.rsyncable),
+            CParameterKind::ForceMaxWindow => i32::from(params.force_window),
+            CParameterKind::DeterministicRefPrefix => i32::from(params.deterministic_ref_prefix),
+            CParameterKind::PrefetchCDictTables => params.prefetch_cdict_tables as i32,
         }
     }
 

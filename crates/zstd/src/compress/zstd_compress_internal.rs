@@ -864,6 +864,11 @@ pub(crate) struct MatchState {
     /// `lazySkipping`: the lazy strategies, over input without matches,
     /// insert only the positions they search.
     pub(crate) lazy_skipping: bool,
+    /// `forceNonContiguous`: whether the next window update starts a new
+    /// segment even where the input follows the one before in memory: set
+    /// by a dictionary's loading with `deterministicRefPrefix`, cleared by
+    /// the update it makes.
+    pub(crate) force_non_contiguous: bool,
     pub(crate) c_params: CompressionParameters,
 
     // The row match finder.
@@ -920,6 +925,7 @@ impl MatchState {
             next_to_update: 0,
             loaded_dict_end: 0,
             lazy_skipping: false,
+            force_non_contiguous: false,
             c_params,
             row_hash_log: 0,
             tag_table: Vec::new(),

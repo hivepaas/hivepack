@@ -1,8 +1,10 @@
-//! The internal constants and types of `zipint.h`, with `zip_entry.c`.
+//! The internal constants, types and macros of `zipint.h`, with
+//! `zip_entry.c`.
 
 use crate::dirent::Dirent;
+use crate::open::Archive;
 use crate::string::ZipString;
-use crate::zip::Flags;
+use crate::zip::{ArchiveFlags, Flags};
 
 pub(crate) const CENTRAL_MAGIC: &[u8; 4] = b"PK\x01\x02";
 pub(crate) const LOCAL_MAGIC: &[u8; 4] = b"PK\x03\x04";
@@ -19,10 +21,14 @@ pub(crate) const EOCD64LOCLEN: u64 = 20;
 pub(crate) const EOCD64LEN: u64 = 56;
 pub(crate) const CDBUFSIZE: u64 = MAXCOMLEN + EOCDLEN + EOCD64LOCLEN;
 pub(crate) const MAX_DATA_DESCRIPTOR_LENGTH: u64 = 24;
+pub(crate) const BUFSIZE: usize = 8192;
+pub(crate) const EFZIP64SIZE: usize = 28;
+pub(crate) const EF_WINZIP_AES_SIZE: usize = 7;
 
 pub(crate) const TORRENTZIP_SIGNATURE: &[u8; 14] = b"TORRENTZIPPED-";
 pub(crate) const TORRENTZIP_SIGNATURE_LENGTH: usize = 14;
 pub(crate) const TORRENTZIP_CRC_LENGTH: usize = 8;
+pub(crate) const TORRENTZIP_COMPRESSION_FLAGS: u32 = u16::MAX as u32;
 
 /// `ZIP_CM_WINZIP_AES`: WinZip AES encrypted.
 pub(crate) const CM_WINZIP_AES: u16 = 99;
@@ -48,6 +54,9 @@ pub(crate) const GPBF_ENCODING_UTF_8: u16 = 0x0800;
 pub(crate) const EF_LOCAL: Flags = Flags::LOCAL;
 pub(crate) const EF_CENTRAL: Flags = Flags::CENTRAL;
 pub(crate) const EF_BOTH: Flags = Flags(Flags::LOCAL.0 | Flags::CENTRAL.0);
+
+/// `ZIP_FL_FORCE_ZIP64`: force the Zip64 extra field (`_zip_dirent_write`).
+pub(crate) const FL_FORCE_ZIP64: Flags = Flags(1024);
 
 /// `ZIP_FL_ENCODING_ALL`.
 pub(crate) const FL_ENCODING_ALL: Flags =
@@ -96,10 +105,67 @@ pub(crate) struct Cdir {
     pub is_zip64: bool,
 }
 
-/// `zip_entry_t`: an entry of the archive, boxed as libzip keeps a
-/// pointer, so that a directory sized from a large count of entries is
-/// small until the entries are read. The editor will add its changes.
+/// `ZIP_DIRENT_*`: which fields of a dirent of changes are changed
+/// (`ZIP_DIRENT_PASSWORD` comes with encryption).
+pub(crate) mod changed {
+    pub const COMP_METHOD: u32 = 0x0001;
+    pub const FILENAME: u32 = 0x0002;
+    pub const COMMENT: u32 = 0x0004;
+    pub const EXTRA_FIELD: u32 = 0x0008;
+    pub const ATTRIBUTES: u32 = 0x0010;
+    pub const LAST_MOD: u32 = 0x0020;
+    pub const ENCRYPTION_METHOD: u32 = 0x0040;
+    pub const ALL: u32 = u32::MAX;
+}
+
+/// `zip_entry_t`: an entry of the archive as read, its changes, and
+/// whether it is deleted. Boxed as libzip keeps pointers, so that a
+/// directory sized from a large count of entries is small until the
+/// entries are read.
 #[derive(Default)]
 pub(crate) struct Entry {
     pub orig: Option<Box<Dirent>>,
+    pub changes: Option<Box<Dirent>>,
+    pub deleted: bool,
+}
+
+impl Entry {
+    /// `ZIP_ENTRY_CHANGED`.
+    pub(crate) fn changed(&self, f: u32) -> bool {
+        self.changes.as_ref().is_some_and(|c| c.changed & f != 0)
+    }
+
+    /// `ZIP_ENTRY_DATA_CHANGED`: whether the entry has new data, which
+    /// comes with adding data.
+    pub(crate) fn data_changed(&self) -> bool {
+        false
+    }
+
+    /// `ZIP_ENTRY_HAS_CHANGES`.
+    pub(crate) fn has_changes(&self) -> bool {
+        self.data_changed() || self.deleted || self.changed(changed::ALL)
+    }
+
+    /// Drops the new data, and undeletes the entry: port of
+    /// `_zip_unchange_data` (`zip_unchange_data.c`).
+    pub(crate) fn unchange_data(&mut self) {
+        self.deleted = false;
+    }
+}
+
+impl<R> Archive<R> {
+    /// `ZIP_IS_RDONLY`.
+    pub(crate) fn is_rdonly(&self) -> bool {
+        self.ch_flags.intersects(ArchiveFlags::RDONLY)
+    }
+
+    /// `ZIP_IS_TORRENTZIP`.
+    pub(crate) fn is_torrentzip(&self) -> bool {
+        self.flags.intersects(ArchiveFlags::IS_TORRENTZIP)
+    }
+
+    /// `ZIP_WANT_TORRENTZIP`.
+    pub(crate) fn want_torrentzip(&self) -> bool {
+        self.ch_flags.intersects(ArchiveFlags::WANT_TORRENTZIP)
+    }
 }

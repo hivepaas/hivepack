@@ -30,7 +30,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hivepack_deflate::{
     Deflate, Flush as DeflateFlush, InBuffer, OutBuffer, Status as DeflateStatus, crc32,
 };
-use hivepack_zip::{Archive, ArchiveFlags, Error, ErrorCode, Flags, OpenFlags, ReadAt};
+use hivepack_zip::{
+    Archive, ArchiveFlags, Closed, Detail, Error, ErrorCode, Flags, OpenFlags, ReadAt,
+};
 use support::{Oracle, Rng, damage, hex, recorded_form, repository, unhex};
 
 fn recorded_path() -> PathBuf {
@@ -39,6 +41,14 @@ fn recorded_path() -> PathBuf {
 
 fn recorded_read_path() -> PathBuf {
     repository().join("testdata/oracle/zip-read.txt")
+}
+
+fn recorded_range_path() -> PathBuf {
+    repository().join("testdata/oracle/zip-range.txt")
+}
+
+fn recorded_edit_path() -> PathBuf {
+    repository().join("testdata/oracle/zip-edit.txt")
 }
 
 fn error_text(e: Error) -> String {
@@ -52,7 +62,7 @@ fn c_string(name: &[u8]) -> &[u8] {
 
 /// The oracle's description of an open archive, or of the error.
 fn describe<R: ReadAt>(result: hivepack_zip::Result<Archive<R>>) -> String {
-    let mut za = match result {
+    let za = match result {
         Ok(za) => za,
         Err(e) => return error_text(e),
     };
@@ -246,10 +256,79 @@ fn read_entries<R: ReadAt>(
     text
 }
 
+/// The oracle's answer to a `range` request: part of every entry read, as
+/// ziptool's cat_partial reads it.
+fn range_entries<R: ReadAt>(
+    result: hivepack_zip::Result<Archive<R>>,
+    start: u64,
+    len: i64,
+) -> String {
+    let za = match result {
+        Ok(za) => za,
+        Err(e) => return error_text(e),
+    };
+    let n = za.get_num_entries(Flags::NONE);
+    let mut text = format!("ok {n}");
+    let mut buffer = vec![0u8; 8192];
+    let len = u64::try_from(len).ok();
+    for i in 0..n {
+        text.push_str(" |");
+        let deflate64 = za
+            .stat_index(i, Flags::NONE)
+            .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
+        // zip_source_zip_file_create sets ZIP_ER_COMPNOTSUPP on the archive's
+        // error, not on the one it is given, which stays ZIP_ER_OK; the port
+        // returns the error. libzip has no Deflate64 (see read_entries).
+        let mut zf = match za.fopen_index_range(i, Flags::NONE, start, len) {
+            Err(e) if e.code() == ErrorCode::CompNotSupp => {
+                text.push_str("e0/0");
+                continue;
+            }
+            Err(e) if deflate64 && !matches!(e.code(), ErrorCode::Inval | ErrorCode::NoPasswd) => {
+                text.push_str("e0/0");
+                continue;
+            }
+            Ok(_) if deflate64 => {
+                text.push_str("e0/0");
+                continue;
+            }
+            Ok(zf) => zf,
+            Err(e) => {
+                text.push_str(&error_text(e));
+                continue;
+            }
+        };
+        let (mut hash, mut total) = (0xcbf2_9ce4_8422_2325, 0u64);
+        let end = loop {
+            match zf.fread(&mut buffer) {
+                Ok(0) => break None,
+                Ok(got) => {
+                    hash = fnv(hash, &buffer[..got]);
+                    total += got as u64;
+                }
+                Err(e) => break Some(e),
+            }
+        };
+        let _ = write!(text, "{total}/{hash:016x}/");
+        match end {
+            Some(e) => {
+                text.push_str(&error_text(e));
+                text.push_str("/-");
+            }
+            None => match zf.fclose() {
+                Ok(()) => text.push_str("eof/0"),
+                Err(e) => text.push_str(&format!("eof/{}", error_text(e))),
+            },
+        }
+    }
+    text
+}
+
 /// The port's answer to a request, in the oracle's format.
 fn respond<R: ReadAt>(words: &[&str], result: hivepack_zip::Result<Archive<R>>) -> String {
     match words[0] {
         "open" => describe(result),
+        "range" => range_entries(result, words[3].parse().unwrap(), words[4].parse().unwrap()),
         _ => read_entries(
             result,
             words[3].parse().unwrap(),
@@ -259,24 +338,245 @@ fn respond<R: ReadAt>(words: &[&str], result: hivepack_zip::Result<Archive<R>>) 
     }
 }
 
-/// The port's answer to an `open` or `read` request, in the oracle's
-/// format.
+/// The port's answer to an `edit` request: the edits made to the archive
+/// opened from a file, as the oracle opens it, then the archive written.
+fn edit_archive<R: ReadAt>(za: &mut Archive<R>, ops: &str) -> String {
+    let mut text = String::from("ok");
+    for op in ops.split(',').filter(|&op| op != "-") {
+        let fields: Vec<&str> = op[1..].splitn(3, ':').collect();
+        let index = || fields[0].parse::<u64>().unwrap();
+        let number = |k: usize| fields[k].parse::<i64>().unwrap();
+        let flags = |k: usize| Flags(fields[k].parse().unwrap());
+        let result = match op.as_bytes()[0] {
+            b'd' => za.delete(index()),
+            b'r' => za.file_rename(index(), &unhex(fields[1]), flags(2)),
+            b'c' => za.file_set_comment(index(), &unhex(fields[1]), flags(2)),
+            b'a' => za.set_archive_comment(&unhex(fields[0])),
+            b't' => za.file_set_dostime(index(), number(1) as u16, number(2) as u16, Flags::NONE),
+            b'm' => za.file_set_mtime(index(), number(1), Flags::NONE),
+            b'x' => za.file_set_external_attributes(
+                index(),
+                Flags::NONE,
+                number(1) as u8,
+                number(2) as u32,
+            ),
+            b'u' => za.unchange(index()),
+            b'U' => {
+                za.unchange_all();
+                Ok(())
+            }
+            b'A' => {
+                za.unchange_archive();
+                Ok(())
+            }
+            b'f' => za.set_archive_flag(ArchiveFlags(fields[0].parse().unwrap()), fields[1] != "0"),
+            _ => panic!("unknown op {op}"),
+        };
+        match result {
+            Ok(()) => text.push_str(" 0"),
+            Err(e) => text.push_str(&format!(" {}", error_text(e))),
+        }
+    }
+
+    let _ = write!(
+        text,
+        " |{} {}",
+        hex(za.get_archive_comment(Flags::NONE)),
+        hex(za.get_archive_comment(Flags::UNCHANGED))
+    );
+    for i in 0..za.get_num_entries(Flags::NONE) {
+        let name = |za: &Archive<R>, flags| match za.get_name(i, flags) {
+            Ok(name) => hex(c_string(name)),
+            Err(e) => error_text(e),
+        };
+        let comment = match za.file_get_comment(i, Flags::NONE) {
+            Ok(comment) => hex(comment),
+            Err(e) => error_text(e),
+        };
+        let attributes = match za.file_get_external_attributes(i, Flags::NONE) {
+            Ok((opsys, attributes)) => format!("{opsys}:{attributes}"),
+            Err(e) => error_text(e),
+        };
+        let mtime = match za.stat_index(i, Flags::NONE) {
+            Ok(st) => st.mtime.to_string(),
+            Err(e) => error_text(e),
+        };
+        let found = match za.get_name(i, Flags::NONE) {
+            Ok(name) => match za.name_locate(c_string(name), Flags::NONE) {
+                Ok(index) => index.to_string(),
+                Err(e) => error_text(e),
+            },
+            Err(e) => error_text(e),
+        };
+        let _ = write!(
+            text,
+            " |{}/{}/{comment}/{attributes}/{mtime}/{found}",
+            name(za, Flags::NONE),
+            name(za, Flags::UNCHANGED)
+        );
+    }
+
+    text.push_str(" |");
+    let mut out = std::io::Cursor::new(Vec::new());
+    match za.close_to(&mut out) {
+        Ok(Closed::Unchanged) => text.push_str("unchanged"),
+        Ok(Closed::Removed) => text.push_str("removed"),
+        Ok(Closed::Written) => {
+            if !za.get_archive_flag(ArchiveFlags::WANT_TORRENTZIP, Flags::NONE) {
+                check_written(za, out.get_ref());
+            }
+            let _ = write!(text, "written {}", hex(out.get_ref()));
+        }
+        Err(e) => text.push_str(&error_text(e)),
+    }
+    text
+}
+
+/// Whether the archive libzip wrote, in its answer to an edit request,
+/// does not read back for want of a value in a Zip64 extra field: libzip
+/// writes a size or offset of exactly 0xffffffff, or a disk number of
+/// 0xffff or more, without one, where the port writes it.
+fn writes_invalid_zip64(want: &str) -> bool {
+    want.rsplit_once(" |written ").is_some_and(|(_, written)| {
+        Archive::open(unhex(written).as_slice(), OpenFlags(0))
+            .err()
+            .and_then(|e| e.detail())
+            .is_some_and(|(detail, _)| detail == Detail::InvalidZip64Ef)
+    })
+}
+
+/// Checks the port's answer to an edit request against libzip's: the same,
+/// but for the archive written where libzip's does not read back (see
+/// [`writes_invalid_zip64`]); the port's is checked by [`check_written`].
+fn assert_edit(request: &str, want: &str, context: &str) {
+    let got = answer(request);
+    if got != want && writes_invalid_zip64(want) {
+        let head = |answer: &str| {
+            answer
+                .rsplit_once(" |written ")
+                .map(|(head, _)| head.to_string())
+        };
+        assert_eq!(head(&got), head(want), "{context}");
+        return;
+    }
+    assert_eq!(got, want, "{context}");
+}
+
+/// The raw data of entry `i`, as stored.
+fn raw_data<R: ReadAt>(za: &Archive<R>, i: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut zf = za.fopen_index(i, Flags::ENCRYPTED).ok()?;
+    let mut data = Vec::new();
+    zf.read_to_end(&mut data).ok()?;
+    Some(data)
+}
+
+/// That the archive `written` from `za` has its entries that are not
+/// deleted, in order, as they are now: their names, comments, attributes,
+/// times, sizes and data.
+fn check_written<R: ReadAt>(za: &Archive<R>, written: &[u8]) {
+    let kept: Vec<u64> = (0..za.get_num_entries(Flags::NONE))
+        .filter(|&i| za.get_name(i, Flags::NONE).is_ok())
+        .collect();
+    // Something that looks like an end of central directory record, or a
+    // Zip64 one or its locator, in a name, a comment, an extra field or the
+    // data may be taken for the real one: libzip does not check that what
+    // it writes reads back.
+    let count = |signature: &[u8]| written.windows(4).filter(|&w| w == signature).count();
+    let (eocd64, locator) = (count(b"PK\x06\x06"), count(b"PK\x06\x07"));
+    if count(b"PK\x05\x06") > 1 || eocd64 > 1 || locator != eocd64 {
+        return;
+    }
+    let new = match Archive::open(written, OpenFlags(0)) {
+        Ok(new) => new,
+        Err(e) => panic!("the written archive does not open: {e} ({:?})", e.detail()),
+    };
+    assert_eq!(new.get_num_entries(Flags::NONE), kept.len() as u64);
+    for (j, &i) in kept.iter().enumerate() {
+        let j = j as u64;
+        assert_eq!(
+            new.get_name(j, Flags::ENC_RAW).unwrap(),
+            za.get_name(i, Flags::ENC_RAW).unwrap()
+        );
+        assert_eq!(
+            new.file_get_comment(j, Flags::ENC_RAW).unwrap(),
+            za.file_get_comment(i, Flags::ENC_RAW).unwrap()
+        );
+        assert_eq!(
+            new.file_get_external_attributes(j, Flags::NONE).unwrap(),
+            za.file_get_external_attributes(i, Flags::NONE).unwrap()
+        );
+        assert_eq!(
+            new.file_get_dos_time(j, Flags::NONE).unwrap(),
+            za.file_get_dos_time(i, Flags::NONE).unwrap()
+        );
+        let (a, b) = (
+            new.stat_index(j, Flags::NONE).unwrap(),
+            za.stat_index(i, Flags::NONE).unwrap(),
+        );
+        assert_eq!(
+            (a.size, a.comp_size, a.comp_method, a.encryption_method),
+            (b.size, b.comp_size, b.comp_method, b.encryption_method)
+        );
+        if a.valid & b.valid & hivepack_zip::stat::CRC != 0 {
+            assert_eq!(a.crc, b.crc);
+        }
+        // A WinZip AES entry of AE-2, without a CRC, is written as AE-1 if
+        // it has 20 bytes or more, and its CRC is then checked on reading,
+        // on the encrypted data.
+        let same_crc_check = a.valid & hivepack_zip::stat::CRC == b.valid & hivepack_zip::stat::CRC;
+        if let Some(data) = raw_data(za, i)
+            && same_crc_check
+        {
+            assert_eq!(
+                raw_data(&new, j).as_ref(),
+                Some(&data),
+                "entry {i}: {:?} in {}",
+                new.fopen_index(j, Flags::ENCRYPTED).err(),
+                hex(written)
+            );
+        }
+    }
+    // As in libzip, a comment removed is still given until the archive is
+    // written.
+    let comment = new.get_archive_comment(Flags::ENC_RAW);
+    assert!(comment.is_empty() || comment == za.get_archive_comment(Flags::ENC_RAW));
+}
+
+/// A path for a temporary archive of this process.
+fn temporary_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "hivepack-zip-{}-{}.zip",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// The port's answer to a request, in the oracle's format.
 fn answer(request: &str) -> String {
     let words: Vec<&str> = request.split(' ').collect();
+    if let ["edit", flags, ops, data] = words[..] {
+        let path = temporary_path();
+        std::fs::write(&path, unhex(data)).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let text = match Archive::open(file, OpenFlags(flags.parse().unwrap())) {
+            Ok(mut za) => edit_archive(&mut za, ops),
+            Err(e) => error_text(e),
+        };
+        let _ = std::fs::remove_file(&path);
+        return text;
+    }
     let (flags, kind, data) = match words[..] {
         ["open", flags, kind, data] => (flags, kind, data),
         ["read", flags, kind, _, _, _, data] => (flags, kind, data),
+        ["range", flags, kind, _, _, data] => (flags, kind, data),
         _ => panic!("{request:.100}"),
     };
     let flags = OpenFlags(flags.parse().unwrap());
     let data = unhex(data);
     if kind == "f" {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "hivepack-zip-{}-{}.zip",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = temporary_path();
         std::fs::write(&path, &data).unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let text = respond(&words, Archive::open(file, flags));
@@ -908,6 +1208,186 @@ fn read_requests(rng: &mut Rng, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// `count` range requests on generated archives, some damaged.
+fn range_requests(rng: &mut Rng, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            let mut zip = archive(rng);
+            if rng.below(6) == 0 {
+                zip = damage(rng, &zip);
+            }
+            format!("range {} {}", range_parameters(rng), hex(&zip))
+        })
+        .collect()
+}
+
+/// `count` edit requests on generated archives, some damaged: a few edits
+/// of every kind, to entries that are there and some that are not, with
+/// names and comments taken from the archive or made up.
+fn edit_requests(rng: &mut Rng, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            let flags = rng.pick(&[0, 0, 0, 0, 0, 0, 4, 4, 16]);
+            let mut zip = archive(rng);
+            if rng.below(8) == 0 {
+                zip = damage(rng, &zip);
+            } else {
+                // Mostly archives libzip opens, with entries, so that the
+                // edits are made and the archive written.
+                for _ in 0..50 {
+                    if Archive::open(zip.as_slice(), OpenFlags(flags))
+                        .is_ok_and(|za| za.get_num_entries(Flags::NONE) > 0)
+                    {
+                        break;
+                    }
+                    zip = archive(rng);
+                }
+            }
+            let ops = edit_ops(rng, &zip);
+            format!("edit {flags} {ops} {}", hex(&zip))
+        })
+        .collect()
+}
+
+/// The edits of an edit request on `zip`.
+fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
+    let mut names = Vec::new();
+    let mut comments = Vec::new();
+    let mut attributes = Vec::new();
+    let mut torrentzip = false;
+    if let Ok(za) = Archive::open(zip, OpenFlags(0)) {
+        torrentzip = za.get_archive_flag(ArchiveFlags::IS_TORRENTZIP, Flags::NONE);
+        for i in 0..za.get_num_entries(Flags::NONE) {
+            names.push(za.get_name(i, Flags::ENC_RAW).unwrap().to_vec());
+            comments.push(za.file_get_comment(i, Flags::ENC_RAW).unwrap().to_vec());
+            attributes.push(za.file_get_external_attributes(i, Flags::NONE).unwrap());
+        }
+    }
+    let n = names.len() as u64;
+    let some = |rng: &mut Rng, of: &[Vec<u8>]| -> Vec<u8> {
+        if of.is_empty() {
+            Vec::new()
+        } else {
+            of[rng.below(of.len() as u64) as usize].clone()
+        }
+    };
+    let made_up = |rng: &mut Rng| -> Vec<u8> {
+        match rng.below(8) {
+            0 => Vec::new(),
+            1 => b"a\0b".to_vec(),
+            2 => "naïve/".as_bytes().to_vec(),
+            3 => b"caf\xe9".to_vec(),
+            _ => {
+                let len = 1 + rng.below(12) as usize;
+                text(rng, len)
+            }
+        }
+    };
+    let encoding = |rng: &mut Rng| rng.pick(&[0, 0, 0, 64, 2048, 4096, 6144]);
+
+    let mut ops = Vec::new();
+    let count = match rng.below(10) {
+        0 => 0,
+        _ => 1 + rng.below(6),
+    };
+    for _ in 0..count {
+        let i = match rng.below(10) {
+            0 => n + rng.below(3),
+            _ => rng.below(n.max(1)),
+        };
+        let op = match rng.below(15) {
+            0..=2 => format!("d{i}"),
+            3..=5 => {
+                let name = match rng.below(5) {
+                    0 => some(rng, &names),
+                    1 => {
+                        let mut name = some(rng, &names);
+                        name.push(b'/');
+                        name
+                    }
+                    _ => made_up(rng),
+                };
+                format!("r{i}:{}:{}", hex(&name), encoding(rng))
+            }
+            6 | 7 => {
+                let comment = match rng.below(4) {
+                    0 => some(rng, &comments),
+                    1 => some(rng, &names),
+                    _ => made_up(rng),
+                };
+                format!("c{i}:{}:{}", hex(&comment), encoding(rng))
+            }
+            8 => {
+                let comment = match rng.below(3) {
+                    0 => Vec::new(),
+                    _ => made_up(rng),
+                };
+                format!("a{}", hex(&comment))
+            }
+            9 => format!("t{i}:{}:{}", rng.below(65536), rng.below(65536)),
+            10 => {
+                let mtime: i64 = match rng.below(3) {
+                    0 => rng.next() as i64 >> rng.below(64),
+                    _ => rng.pick(&[
+                        0,
+                        -1,
+                        315_532_800,
+                        1_000_000_001,
+                        1_793_277_296,
+                        4_102_444_800,
+                        4_354_819_200,
+                        -2_208_988_800,
+                        1 << 40,
+                        67_767_976_233_532_799,
+                        67_768_036_191_676_800,
+                        -67_768_040_609_740_800,
+                        i64::MAX,
+                        i64::MIN,
+                    ]),
+                };
+                format!("m{i}:{mtime}")
+            }
+            11 => {
+                let (opsys, attr) = match attributes.get(i as usize) {
+                    Some(&(opsys, attr)) if rng.below(2) == 0 => (opsys, attr),
+                    _ => (rng.below(21) as u8, rng.next() as u32),
+                };
+                format!("x{i}:{opsys}:{attr}")
+            }
+            12 => format!("u{i}"),
+            13 => rng.pick(&["U", "A"]).to_string(),
+            _ => {
+                let flag = match rng.below(4) {
+                    0 => 4,
+                    1 if torrentzip => 8,
+                    1 | 2 => 16,
+                    _ => 2,
+                };
+                format!("f{flag}:{}", rng.below(2))
+            }
+        };
+        ops.push(op);
+    }
+    if ops.is_empty() {
+        "-".to_string()
+    } else {
+        ops.join(",")
+    }
+}
+
+/// The flags, source, start and length of a range request.
+fn range_parameters(rng: &mut Rng) -> String {
+    let flags = rng.pick(&[0, 4]);
+    let kind = if rng.below(10) == 0 { "f" } else { "b" };
+    let start = rng.pick(&[0, 0, 1, 3, 10, 100, 2000]);
+    let len: i64 = match rng.below(4) {
+        0 => -1,
+        1 => 0,
+        _ => rng.pick(&[1, 2, 5, 40, 300, 5000]),
+    };
+    format!("{flags} {kind} {start} {len}")
+}
+
 /// The flags, source, file flags, pieces and limit of a read request.
 fn read_parameters(rng: &mut Rng) -> String {
     let flags = rng.pick(&[0, 4]);
@@ -1006,6 +1486,59 @@ fn regress_archives_read_like_libzip() {
 }
 
 #[test]
+fn regress_archives_read_in_ranges_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x2800_0001);
+    for (name, data) in &regress_archives() {
+        if data.len() > 1 << 20 {
+            continue;
+        }
+        for parameters in ["0 b 2 3", "4 b 0 -1"]
+            .map(String::from)
+            .into_iter()
+            .chain([range_parameters(&mut rng)])
+        {
+            let request = format!("range {parameters} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_eq!(answer(&request), want, "{name}: range {parameters}");
+        }
+    }
+}
+
+#[test]
+fn generated_archives_read_in_ranges_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x2800_0002);
+    for request in range_requests(&mut rng, 500) {
+        let want = oracle.ask(&request);
+        assert_eq!(answer(&request), want, "{request:.400}");
+    }
+}
+
+#[test]
+fn port_reads_ranges_as_recorded() {
+    replay(&recorded_range_path(), 200);
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/zip-range.txt from the oracle"]
+fn record_range_answers() {
+    let mut rng = Rng(0x2800_0003);
+    record(
+        &recorded_range_path(),
+        "Ranges",
+        "record_range_answers",
+        range_requests(&mut rng, 1500),
+        4_000,
+        5,
+    );
+}
+
+#[test]
 fn generated_archives_read_like_libzip() {
     let Some(mut oracle) = Oracle::spawn() else {
         return;
@@ -1029,6 +1562,248 @@ fn generated_archives_match_libzip() {
     }
 }
 
+#[test]
+fn generated_archives_edit_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x3000_0001);
+    for request in edit_requests(&mut rng, 3000) {
+        let want = oracle.ask(&request);
+        assert_edit(&request, &want, &format!("{request:.400}"));
+    }
+}
+
+#[test]
+fn regress_archives_edit_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x3000_0002);
+    for (name, data) in &regress_archives() {
+        if data.len() > 1 << 20 {
+            continue;
+        }
+        for ops in [
+            "-".to_string(),
+            "d0".to_string(),
+            "a6869".to_string(),
+            edit_ops(&mut rng, data),
+        ] {
+            let request = format!("edit 0 {ops} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_edit(&request, &want, &format!("{name}: edit {ops}"));
+        }
+    }
+}
+
+/// An archive of `count` empty stored files, with the Zip64 end of central
+/// directory record when the count needs it.
+fn many_entries(count: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for i in 0..count {
+        let name = format!("f{i}");
+        let offset = out.len() as u32;
+        out.extend_from_slice(b"PK\x03\x04");
+        for v in [10, 0, 0, 0, 0x21] {
+            put16(&mut out, v);
+        }
+        for _ in 0..3 {
+            put32(&mut out, 0);
+        }
+        put16(&mut out, name.len() as u16);
+        put16(&mut out, 0);
+        out.extend_from_slice(name.as_bytes());
+
+        central.extend_from_slice(b"PK\x01\x02");
+        for v in [0x031e, 10, 0, 0, 0, 0x21] {
+            put16(&mut central, v);
+        }
+        for _ in 0..3 {
+            put32(&mut central, 0);
+        }
+        for v in [name.len() as u16, 0, 0, 0, 0] {
+            put16(&mut central, v);
+        }
+        put32(&mut central, 0);
+        put32(&mut central, offset);
+        central.extend_from_slice(name.as_bytes());
+    }
+    let cd_offset = out.len() as u64;
+    let cd_size = central.len() as u64;
+    out.extend_from_slice(&central);
+    if count > 0xffff {
+        let eocd64_offset = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x06");
+        put64(&mut out, 44);
+        put16(&mut out, 45);
+        put16(&mut out, 45);
+        put32(&mut out, 0);
+        put32(&mut out, 0);
+        put64(&mut out, u64::from(count));
+        put64(&mut out, u64::from(count));
+        put64(&mut out, cd_size);
+        put64(&mut out, cd_offset);
+        out.extend_from_slice(b"PK\x06\x07");
+        put32(&mut out, 0);
+        put64(&mut out, eocd64_offset);
+        put32(&mut out, 1);
+    }
+    out.extend_from_slice(b"PK\x05\x06");
+    put32(&mut out, 0);
+    put16(&mut out, count.min(0xffff) as u16);
+    put16(&mut out, count.min(0xffff) as u16);
+    put32(&mut out, cd_size as u32);
+    put32(&mut out, cd_offset as u32);
+    put16(&mut out, 0);
+    out
+}
+
+/// More than 65,535 entries take the Zip64 end of central directory
+/// records, and 65,535 exactly do not, but fill the count fields.
+#[test]
+fn many_entries_edit_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let zip = hex(&many_entries(0x1_0003));
+    for ops in ["d7", "d0,d1,d2,d3", "d0,d1,d2,d3,d4", "a6869,r5:6e6577:0"] {
+        let request = format!("edit 0 {ops} {zip}");
+        let want = oracle.ask(&request);
+        assert!(want.contains("|written 504b"), "{:.200}", want);
+        assert_edit(&request, &want, &format!("edit {ops}"));
+    }
+}
+
+/// Two deflated entries of 10 bytes whose Zip64 fields libzip writes
+/// short: "a", whose size is exactly 0xffffffff, and "b", larger, on disk
+/// 0xffff.
+fn zip64_edge_archive() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, size, disk) in [(b'a', 0xffff_ffff_u64, 0u32), (b'b', 0x1_0000_0000, 0xffff)] {
+        let offset = out.len() as u32;
+        out.extend_from_slice(b"PK\x03\x04");
+        for v in [45, 0, 8, 0, 0x21] {
+            put16(&mut out, v);
+        }
+        put32(&mut out, 0);
+        put32(&mut out, 10);
+        put32(&mut out, 0xffff_ffff);
+        put16(&mut out, 1);
+        put16(&mut out, 20);
+        out.push(name);
+        put16(&mut out, 1);
+        put16(&mut out, 16);
+        put64(&mut out, size);
+        put64(&mut out, 10);
+        out.extend_from_slice(&[0x55; 10]);
+
+        central.extend_from_slice(b"PK\x01\x02");
+        for v in [0x031e, 45, 0, 8, 0, 0x21] {
+            put16(&mut central, v);
+        }
+        put32(&mut central, 0);
+        put32(&mut central, 10);
+        put32(&mut central, 0xffff_ffff);
+        let ef_len = if disk == 0 { 12 } else { 16 };
+        for v in [1, ef_len, 0, disk as u16, 0] {
+            put16(&mut central, v);
+        }
+        put32(&mut central, 0);
+        put32(&mut central, offset);
+        central.push(name);
+        put16(&mut central, 1);
+        put16(&mut central, ef_len - 4);
+        put64(&mut central, size);
+        if disk != 0 {
+            put32(&mut central, disk);
+        }
+    }
+    let cd_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    for v in [0, 0, 2, 2] {
+        put16(&mut out, v);
+    }
+    put32(&mut out, central.len() as u32);
+    put32(&mut out, cd_offset);
+    put16(&mut out, 0);
+    out
+}
+
+/// Differs from libzip, which writes these Zip64 fields without the value
+/// and then refuses the archive: the port writes one that reads back.
+#[test]
+fn zip64_edge_values_read_back() {
+    let zip = zip64_edge_archive();
+    let mut za = Archive::open(zip.as_slice(), OpenFlags(0)).unwrap();
+    za.set_archive_comment(b"hi").unwrap();
+    let mut out = std::io::Cursor::new(Vec::new());
+    assert_eq!(za.close_to(&mut out).unwrap(), Closed::Written);
+    check_written(&za, out.get_ref());
+    let written = Archive::open(out.get_ref().as_slice(), OpenFlags(0)).unwrap();
+    assert_eq!(
+        written.stat_index(0, Flags::NONE).unwrap().size,
+        0xffff_ffff
+    );
+    assert_eq!(
+        written.stat_index(1, Flags::NONE).unwrap().size,
+        0x1_0000_0000
+    );
+
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let request = format!("edit 0 a6869 {}", hex(&zip));
+    let want = oracle.ask(&request);
+    assert!(writes_invalid_zip64(&want), "{want:.300}");
+    assert_edit(&request, &want, "a6869");
+}
+
+#[test]
+fn port_edits_as_recorded() {
+    replay(&recorded_edit_path(), 500);
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/zip-edit.txt from the oracle"]
+fn record_edit_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut rng = Rng(0x3000_0003);
+    // Not those where the port writes differently, as the recorded answer
+    // may be a hash.
+    let requests = edit_requests(&mut rng, 1000)
+        .into_iter()
+        .filter(|request| !writes_invalid_zip64(&oracle.ask(request)))
+        .collect();
+    record(
+        &recorded_edit_path(),
+        "Edits",
+        "record_edit_answers",
+        requests,
+        2_500,
+        5,
+    );
+}
+
+/// The port's answer as it is on Linux, where the answers are recorded:
+/// `zip_file_set_mtime` fails with the platform's `EOVERFLOW`, which is
+/// 75 there.
+fn as_on_linux(answer: String) -> String {
+    let empty: &[u8] = &[];
+    let mut za = Archive::open(empty, OpenFlags(0)).unwrap();
+    let eoverflow = za
+        .file_set_mtime(0, i64::MAX, Flags::NONE)
+        .unwrap_err()
+        .system();
+    if eoverflow == 75 {
+        return answer;
+    }
+    answer.replace(&format!("e18/{eoverflow}"), "e18/75")
+}
+
 /// Replays the answers recorded in `path`.
 fn replay(path: &PathBuf, at_least: usize) {
     let text = std::fs::read_to_string(path).expect("the recorded answers");
@@ -1038,7 +1813,11 @@ fn replay(path: &PathBuf, at_least: usize) {
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
         let (request, want) = line.split_once('\t').expect("request, tab, answer");
-        assert_eq!(recorded_form(&answer(request)), want, "{request:.300}");
+        assert_eq!(
+            recorded_form(&as_on_linux(answer(request))),
+            want,
+            "{request:.300}"
+        );
         checked += 1;
     }
     assert!(checked > at_least, "only {checked} recorded answers");

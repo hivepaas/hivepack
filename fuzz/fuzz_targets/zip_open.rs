@@ -27,7 +27,7 @@ fn read_all<R: ReadAt>(za: &Archive<R>, i: u64, flags: Flags) {
 
 fuzz_target!(|data: &[u8]| {
     for flags in [OpenFlags(0), OpenFlags::CHECKCONS] {
-        let Ok(mut za) = Archive::open(data, flags) else { continue };
+        let Ok(za) = Archive::open(data, flags) else { continue };
         let _ = za.get_archive_flag(ArchiveFlags::IS_TORRENTZIP, Flags::NONE);
         let _ = za.get_archive_comment(Flags::NONE);
         let _ = za.get_archive_comment(Flags::ENC_STRICT);

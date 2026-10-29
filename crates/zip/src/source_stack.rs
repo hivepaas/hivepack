@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::source::ReadAt;
 use crate::source_compress::Decompress;
 use crate::source_crc::Crc;
-use crate::source_window::{Lower, Window};
+use crate::source_window::{Lower, UpperWindow, Window};
 use crate::zip::Stat;
 
 /// A layer: its callback's context, and what `zip_source_t` keeps.
@@ -97,6 +97,8 @@ pub(crate) struct Stack<'a, R: ?Sized> {
     pub(crate) window: Layer<Window>,
     pub(crate) decompress: Option<Layer<Decompress>>,
     pub(crate) crc: Option<Layer<Crc>>,
+    /// the window on the decompressed data, for part of an entry
+    pub(crate) partial: Option<Layer<UpperWindow>>,
     /// the entry, for the window's errors
     pub(crate) index: u64,
 }
@@ -185,7 +187,32 @@ fn at_eof_below_crc<R: ReadAt + ?Sized>(
     }
 }
 
+/// The source under the partial window: the CRC layer, the decompressing
+/// one, or the window on the archive.
+fn read_below_partial<R: ReadAt + ?Sized>(
+    crc: &mut Option<Layer<Crc>>,
+    decompress: &mut Option<Layer<Decompress>>,
+    window: &mut Layer<Window>,
+    lower: &mut Lower<'_, R>,
+    data: &mut [u8],
+) -> Result<usize> {
+    match crc {
+        Some(crc) => crc.read(data, &mut |ctx, buf| {
+            let n = read_below_crc(decompress, window, lower, buf);
+            ctx.read(buf, n, || stat_below_crc(decompress, window, lower))
+        }),
+        None => read_below_crc(decompress, window, lower, data),
+    }
+}
+
 impl<R: ReadAt + ?Sized> Stack<'_, R> {
+    /// The size the stack below the partial window gives in its stat, if
+    /// it gives one.
+    pub(crate) fn size_below_partial(&self) -> Option<u64> {
+        let st = stat_below_crc(&self.decompress, &self.window, &self.lower);
+        (st.valid & crate::zip::stat::SIZE != 0).then_some(st.size)
+    }
+
     /// Opens the layers, the lowest first: port of `zip_source_open`.
     pub(crate) fn open(&mut self) -> Result<()> {
         if let Err(e) = self.window.ctx.open(&mut self.lower, self.index) {
@@ -206,6 +233,25 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
             crc.ctx.open();
             crc.opened();
         }
+
+        let Stack {
+            lower,
+            window,
+            decompress,
+            crc,
+            partial,
+            ..
+        } = self;
+        if let Some(partial) = partial {
+            if let Err(e) = partial
+                .ctx
+                .open(&mut |b| read_below_partial(crc, decompress, window, lower, b))
+            {
+                partial.error = e;
+                return Err(e);
+            }
+            partial.opened();
+        }
         Ok(())
     }
 
@@ -216,14 +262,16 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
             window,
             decompress,
             crc,
+            partial,
             ..
         } = self;
-        match crc {
-            Some(crc) => crc.read(data, &mut |ctx, buf| {
-                let n = read_below_crc(decompress, window, lower, buf);
-                ctx.read(buf, n, || stat_below_crc(decompress, window, lower))
+        match partial {
+            Some(partial) => partial.read(data, &mut |ctx, buf| {
+                ctx.read(buf, &mut |b| {
+                    read_below_partial(crc, decompress, window, lower, b)
+                })
             }),
-            None => read_below_crc(decompress, window, lower, data),
+            None => read_below_partial(crc, decompress, window, lower, data),
         }
     }
 

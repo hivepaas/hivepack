@@ -2,7 +2,7 @@
 
 ZIP archives in safe Rust, the container logic ported from [libzip](https://libzip.org) 1.12.1.
 
-> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries, with libzip's rules and errors, compared with libzip itself. `ziptool` and libzip's own tests come next, then writing. This crate is not on crates.io.
+> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries, with libzip's rules and errors; edits entries' names, comments, times and attributes, deletes them, and writes the archive as libzip writes it, byte for byte. All compared with libzip itself. Adding data comes next. This crate is not on crates.io.
 
 ```rust
 use hivepack_zip::{Archive, Flags, OpenFlags};
@@ -21,6 +21,22 @@ file.fclose()?;
 ```
 
 `OpenFlags::CHECKCONS` compares every local header with the central directory and checks more strictly, as libzip's `ZIP_CHECKCONS` does. Without it, the archive opens as libzip opens it by default.
+
+Changes are kept until the archive is written, to an output of the caller's:
+
+```rust
+use hivepack_zip::{Archive, Closed, Flags, OpenFlags};
+
+let mut archive = Archive::open(std::fs::File::open("archive.zip")?, OpenFlags::CHECKCONS)?;
+let index = archive.name_locate(b"old.txt", Flags::NONE)?;
+archive.file_rename(index, b"new.txt", Flags::NONE)?;
+archive.set_archive_comment(b"renamed")?;
+let mut out = std::fs::File::create("archive.zip.new")?;
+if archive.close_to(&mut out)? == Closed::Written {
+    drop(archive);
+    std::fs::rename("archive.zip.new", "archive.zip")?;
+}
+```
 
 The goals:
 

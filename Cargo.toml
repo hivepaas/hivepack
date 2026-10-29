@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deflate", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/zstd-bench"]
+members = ["crates/deflate", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"

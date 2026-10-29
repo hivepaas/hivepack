@@ -92,6 +92,11 @@ impl ArchiveFlags {
     pub const RDONLY: ArchiveFlags = ArchiveFlags(2);
     /// `ZIP_AFL_IS_TORRENTZIP`: the archive is torrentzipped.
     pub const IS_TORRENTZIP: ArchiveFlags = ArchiveFlags(4);
+    /// `ZIP_AFL_WANT_TORRENTZIP`: write the archive in torrentzip format.
+    pub const WANT_TORRENTZIP: ArchiveFlags = ArchiveFlags(8);
+    /// `ZIP_AFL_CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE`: write an archive
+    /// with no entries, instead of removing it.
+    pub const CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE: ArchiveFlags = ArchiveFlags(16);
 }
 
 /// Compression methods: `ZIP_CM_*`.

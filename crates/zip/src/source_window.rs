@@ -206,3 +206,98 @@ impl Window {
         self.end_valid.then_some(self.offset == self.end)
     }
 }
+
+/// `BUFSIZE`: the pieces a window that cannot seek skips in.
+const BUFSIZE: usize = 8192;
+
+/// A window on the decompressed data, for part of an entry: the same
+/// `struct window` on a source that cannot seek, which skips to the start
+/// by reading.
+pub(crate) struct UpperWindow {
+    start: u64,
+    end: u64,
+    end_valid: bool,
+    offset: u64,
+    pub(crate) error: Error,
+}
+
+impl UpperWindow {
+    /// Port of `_zip_source_window_new`, on a lower source of `lower_size`
+    /// bytes if it is known. Its stat is never asked for, so it keeps
+    /// none.
+    pub(crate) fn new(lower_size: Option<u64>, start: u64, length: i64) -> Result<UpperWindow> {
+        if length < -1 {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+        if length > 0 && start.checked_add(length as u64).is_none() {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+        if let Some(size) = lower_size
+            && (start > size || (length > 0 && start + length as u64 > size))
+        {
+            return Err(Error::new(ErrorCode::Inval, 0));
+        }
+        Ok(UpperWindow {
+            start,
+            end: if length == -1 {
+                0
+            } else {
+                start + length as u64
+            },
+            end_valid: length != -1,
+            offset: 0,
+            error: Error::OK,
+        })
+    }
+
+    /// `ZIP_SOURCE_OPEN`: the bytes before the start read and dropped, as
+    /// the lower source cannot seek.
+    pub(crate) fn open(&mut self, lower: &mut dyn FnMut(&mut [u8]) -> Result<usize>) -> Result<()> {
+        let mut b = vec![0; BUFSIZE];
+        let mut n = 0;
+        while n < self.start {
+            let i = (self.start - n).min(BUFSIZE as u64) as usize;
+            match lower(&mut b[..i]) {
+                Err(e) => {
+                    self.error = e;
+                    return Err(e);
+                }
+                Ok(0) => {
+                    self.error = Error::new(ErrorCode::Eof, 0);
+                    return Err(self.error);
+                }
+                Ok(ret) => n += ret as u64,
+            }
+        }
+        self.offset = self.start;
+        Ok(())
+    }
+
+    /// `ZIP_SOURCE_READ`, without seeking.
+    pub(crate) fn read(
+        &mut self,
+        data: &mut [u8],
+        lower: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+    ) -> Result<usize> {
+        let mut len = data.len() as u64;
+        if self.end_valid && len > self.end - self.offset {
+            len = self.end - self.offset;
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        let ret = match lower(&mut data[..len as usize]) {
+            Ok(ret) => ret,
+            Err(e) => {
+                self.error = e;
+                return Err(e);
+            }
+        };
+        if ret == 0 && self.end_valid && self.offset < self.end {
+            self.error = Error::new(ErrorCode::Eof, 0);
+            return Err(self.error);
+        }
+        self.offset += ret as u64;
+        Ok(ret)
+    }
+}

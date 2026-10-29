@@ -1,0 +1,15 @@
+[package]
+name = "ziptool"
+version = "0.0.0"
+description = "libzip's ziptool and tryopen on hivepack-zip, the programs libzip's tests run"
+publish = false
+# Ported from libzip's src/ziptool.c and regress/programs.
+license = "BSD-3-Clause"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hivepack-zip.workspace = true

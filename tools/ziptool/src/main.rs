@@ -1,14 +1,18 @@
 //! ziptool, with the commands libzip's tests add to it (ziptool_regress):
 //! port of libzip's `src/ziptool.c` and `regress/programs/ziptool_regress.c`,
-//! for the commands that read an archive and those that change it without
-//! new data. Adding data, compression and encryption come later; until
-//! then their commands are unknown. The output is libzip's, word for word,
+//! but for encryption, which comes later: until then its commands are
+//! unknown. The output is libzip's, word for word,
 //! so that libzip's tests can run on the port.
 
 use std::io::Write;
 use std::process::ExitCode;
 
-use hivepack_zip::{Archive, ArchiveFlags, Error, ErrorCode, Flags, OpenFlags, ZipFile, stat};
+use std::sync::Arc;
+
+use hivepack_zip::{
+    Archive, ArchiveFlags, BufferSource, DataSource, Error, ErrorCode, FileSource, Flags,
+    OpenFlags, Stat, ZipFile, ZipFileSource, cm, stat,
+};
 use ziptool::{
     Getopt, Src, strtoull, zip_close, zip_close_in_memory, zip_open, zip_open_in_memory,
 };
@@ -18,6 +22,8 @@ struct Tool {
     za: Archive<Src>,
     stat_flags: Flags,
     hex_encoded_filenames: bool,
+    /// the archives `add_from_zip` opened (`z_in`)
+    z_in: Vec<Arc<Archive<Src>>>,
     /// the entries opened by `fopen`, each from a copy of the archive as it
     /// was then: libzip's open entries read what they were opened on,
     /// whatever is changed afterwards
@@ -35,6 +41,10 @@ type Command = (
 /// `dispatch_table`, with `DISPATCH_REGRESS`: the commands that read, and
 /// those that change the archive without new data.
 const DISPATCH_TABLE: &[Command] = &[
+    ("add", 2, add),
+    ("add_dir", 1, add_dir),
+    ("add_file", 4, add_file),
+    ("add_from_zip", 5, add_from_zip),
     ("cat", 1, cat),
     ("cat_partial", 3, cat_partial),
     ("count_extra", 2, count_extra),
@@ -50,14 +60,17 @@ const DISPATCH_TABLE: &[Command] = &[
     ("get_num_entries", 1, get_num_entries),
     ("name_locate", 2, name_locate),
     ("rename", 2, zrename),
+    ("replace_file_contents", 2, replace_file_contents),
     ("set_archive_comment", 1, set_archive_comment),
     ("set_archive_flag", 2, set_archive_flag),
     ("set_extra", 5, set_extra),
     ("set_file_comment", 2, set_file_comment),
+    ("set_file_compression", 3, set_file_compression),
     ("set_file_dostime", 3, set_file_dostime),
     ("set_file_mtime", 2, set_file_mtime),
     ("set_file_mtime_all", 1, set_file_mtime_all),
     ("stat", 1, zstat),
+    ("add_nul", 2, add_nul),
     ("extract_as", 2, extract_as),
     ("fopen", 1, regress_fopen),
     ("fread", 2, regress_fread),
@@ -128,6 +141,10 @@ impl Tool {
         // try to give us compressed data
         if len == Some(0) {
             match self.za.stat_index(idx, self.stat_flags) {
+                Ok(sb) if sb.valid & stat::SIZE == 0 => {
+                    eprintln!("can't cat file at index '{idx}' with unknown size");
+                    return Err(());
+                }
                 Ok(sb) => len = Some(sb.size),
                 Err(e) => {
                     eprintln!("zip_stat_index failed on '{idx}' failed: {e}");
@@ -281,6 +298,201 @@ fn regress_fread(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
         length -= n as u64;
     }
     Ok(())
+}
+
+fn add(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let zs = BufferSource::new(argv[1].as_bytes().to_vec());
+    let name = t.decode_filename(&argv[0]);
+    t.za.file_add(&name, zs, Flags::NONE)
+        .map(|_| ())
+        .map_err(|e| {
+            eprintln!("can't add file '{}': {e}", argv[0]);
+        })
+}
+
+fn add_dir(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // add directory
+    let name = t.decode_filename(&argv[0]);
+    t.za.dir_add(&name, Flags::NONE).map(|_| ()).map_err(|e| {
+        eprintln!("can't add directory '{}': {e}", argv[0]);
+    })
+}
+
+fn add_file(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let start = strtoull(&argv[2]);
+    let len = strtoull(&argv[3]) as i64;
+    let name = t.decode_filename(&argv[0]);
+    if argv[1] == "/dev/stdin" {
+        // zip_source_filep on standard input, which is read as it comes.
+        let mut data = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut data) {
+            eprintln!("can't create zip_source from stdin: {e}");
+            return Err(());
+        }
+        let data = data.get(start as usize..).unwrap_or_default().to_vec();
+        let data = match len {
+            len if len > 0 => data[..data.len().min(len as usize)].to_vec(),
+            _ => data,
+        };
+        return t
+            .za
+            .file_add(&name, StreamSource { data }, Flags::NONE)
+            .map(|_| ())
+            .map_err(|e| {
+                eprintln!("can't add file '{}': {e}", argv[0]);
+            });
+    }
+    // zip_source_file_create: -1 is to the end, -2 (ZIP_LENGTH_UNCHECKED)
+    // to the end when read, and other lengths below 0 are refused.
+    let zs = match len {
+        -1 => FileSource::new(&argv[1], start, None),
+        -2 => FileSource::unchecked(&argv[1], start),
+        len if len < 0 => Err(Error::new(ErrorCode::Inval, 0)),
+        len => FileSource::new(&argv[1], start, Some(len as u64)),
+    };
+    let zs = match zs {
+        Ok(zs) => zs,
+        Err(e) => {
+            eprintln!("can't create zip_source from file: {e}");
+            return Err(());
+        }
+    };
+    t.za.file_add(&name, zs, Flags::NONE)
+        .map(|_| ())
+        .map_err(|e| {
+            eprintln!("can't add file '{}': {e}", argv[0]);
+        })
+}
+
+/// Data read from a stream, as `zip_source_filep` reads a pipe: its size
+/// not known, and its time now.
+struct StreamSource {
+    data: Vec<u8>,
+}
+
+impl DataSource for StreamSource {
+    fn stat(&self) -> hivepack_zip::Result<Stat<'static>> {
+        Ok(Stat {
+            valid: stat::MTIME,
+            mtime: BufferSource::new(Vec::new()).stat()?.mtime,
+            ..Stat::default()
+        })
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> hivepack_zip::Result<usize> {
+        let start = (offset as usize).min(self.data.len());
+        let n = buf.len().min(self.data.len() - start);
+        buf[..n].copy_from_slice(&self.data[start..start + n]);
+        Ok(n)
+    }
+}
+
+fn add_from_zip(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // add from another zip file
+    let idx = strtoull(&argv[2]);
+    let start = strtoull(&argv[3]);
+    let len = strtoull(&argv[4]) as i64;
+    let z_in = match zip_open(&argv[1], OpenFlags::CHECKCONS, 0, 0) {
+        Ok(z_in) => Arc::new(z_in),
+        Err(e) => {
+            // zip_error_init_with_code
+            let e = Error::new(e.code(), e.system());
+            eprintln!("can't open zip archive '{}': {e}", argv[1]);
+            return Err(());
+        }
+    };
+    let flags = if start == 0 && len == -1 {
+        Flags::COMPRESSED
+    } else {
+        Flags::NONE
+    };
+    let source = match len {
+        -1 => ZipFileSource::new(Arc::clone(&z_in), idx, flags, start, None),
+        len if len < 0 => Err(Error::new(ErrorCode::Inval, 0)),
+        len => ZipFileSource::new(Arc::clone(&z_in), idx, flags, start, Some(len as u64)),
+    };
+    let zs = match source {
+        Ok(zs) => zs,
+        Err(e) => {
+            eprintln!(
+                "error creating file source from '{}' index '{idx}': {e}",
+                argv[1]
+            );
+            return Err(());
+        }
+    };
+    let name = t.decode_filename(&argv[0]);
+    if let Err(e) = t.za.file_add(&name, zs, Flags::NONE) {
+        eprintln!("can't add file '{}': {e}", argv[0]);
+        return Err(());
+    }
+    t.z_in.push(z_in);
+    Ok(())
+}
+
+/// `source_nul`: `length` NUL bytes, of which only the size is known.
+struct NulSource {
+    length: u64,
+}
+
+impl DataSource for NulSource {
+    fn stat(&self) -> hivepack_zip::Result<Stat<'static>> {
+        Ok(Stat {
+            valid: stat::SIZE,
+            size: self.length,
+            ..Stat::default()
+        })
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> hivepack_zip::Result<usize> {
+        let n = (buf.len() as u64).min(self.length.saturating_sub(offset)) as usize;
+        buf[..n].fill(0);
+        Ok(n)
+    }
+}
+
+fn add_nul(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let length = strtoull(&argv[1]);
+    let name = argv[0].as_bytes().to_vec();
+    t.za.file_add(&name, NulSource { length }, Flags::NONE)
+        .map(|_| ())
+        .map_err(|e| {
+            eprintln!("can't add file '{}': {e}", argv[0]);
+        })
+}
+
+fn replace_file_contents(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // replace file contents with data from command line
+    let idx = strtoull(&argv[0]);
+    let s = BufferSource::new(argv[1].as_bytes().to_vec());
+    t.za.file_replace(idx, s, Flags::NONE).map_err(|e| {
+        eprintln!("error replacing file data: {e}");
+    })
+}
+
+/// `get_compression_method`: the methods this build compresses with, and
+/// `unknown`; anything else is stored.
+fn get_compression_method(arg: &str) -> i32 {
+    match arg.to_ascii_lowercase().as_str() {
+        "default" => cm::DEFAULT,
+        "store" => i32::from(cm::STORE),
+        "deflate" => i32::from(cm::DEFLATE),
+        "unknown" => 100,
+        // TODO in libzip: error handling
+        _ => 0,
+    }
+}
+
+fn set_file_compression(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let method = get_compression_method(&argv[1]);
+    let flags = strtoull(&argv[2]) as u32;
+    t.za.set_file_compression(idx, method, flags).map_err(|e| {
+        eprintln!(
+            "can't set file compression method at index '{idx}' to '{}', flags '{flags}': {e}",
+            argv[1]
+        );
+    })
 }
 
 fn delete(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
@@ -771,6 +983,7 @@ fn main() -> ExitCode {
         za,
         stat_flags,
         hex_encoded_filenames,
+        z_in: Vec::new(),
         z_files: Vec::new(),
         out: std::io::stdout(),
     };

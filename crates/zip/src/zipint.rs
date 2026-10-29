@@ -1,8 +1,11 @@
 //! The internal constants, types and macros of `zipint.h`, with
 //! `zip_entry.c`.
 
+use std::sync::Arc;
+
 use crate::dirent::Dirent;
 use crate::open::Archive;
+use crate::source_data::DataSource;
 use crate::string::ZipString;
 use crate::zip::{ArchiveFlags, Flags};
 
@@ -69,6 +72,8 @@ pub(crate) const FL_ENCODING_ALL: Flags =
 
 /// `ZIP_EXT_ATTRIB_DEFAULT`: a regular file, readable and writable by all.
 pub(crate) const EXT_ATTRIB_DEFAULT: u32 = 0o100666 << 16;
+/// `ZIP_EXT_ATTRIB_DEFAULT_DIR`: a directory, open to all.
+pub(crate) const EXT_ATTRIB_DEFAULT_DIR: u32 = 0o040777 << 16;
 
 /// `zip_encoding_type`: what a string's encoding is known or guessed to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,14 +128,16 @@ pub(crate) mod changed {
     pub const ALL: u32 = u32::MAX;
 }
 
-/// `zip_entry_t`: an entry of the archive as read, its changes, and
-/// whether it is deleted. Boxed as libzip keeps pointers, so that a
-/// directory sized from a large count of entries is small until the
+/// `zip_entry_t`: an entry of the archive as read, its changes, its new
+/// data, and whether it is deleted. Boxed as libzip keeps pointers, so
+/// that a directory sized from a large count of entries is small until the
 /// entries are read.
 #[derive(Clone, Default)]
 pub(crate) struct Entry {
     pub orig: Option<Box<Dirent>>,
     pub changes: Option<Box<Dirent>>,
+    /// the new data, shared as libzip shares a source it keeps
+    pub source: Option<Arc<dyn DataSource>>,
     pub deleted: bool,
 }
 
@@ -140,10 +147,9 @@ impl Entry {
         self.changes.as_ref().is_some_and(|c| c.changed & f != 0)
     }
 
-    /// `ZIP_ENTRY_DATA_CHANGED`: whether the entry has new data, which
-    /// comes with adding data.
+    /// `ZIP_ENTRY_DATA_CHANGED`: whether the entry has new data.
     pub(crate) fn data_changed(&self) -> bool {
-        false
+        self.source.is_some()
     }
 
     /// `ZIP_ENTRY_HAS_CHANGES`.
@@ -154,6 +160,7 @@ impl Entry {
     /// Drops the new data, and undeletes the entry: port of
     /// `_zip_unchange_data` (`zip_unchange_data.c`).
     pub(crate) fn unchange_data(&mut self) {
+        self.source = None;
         self.deleted = false;
     }
 }

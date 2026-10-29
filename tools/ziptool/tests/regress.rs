@@ -21,6 +21,11 @@ use std::process::{Command, Stdio};
 
 /// The commands of the port's ziptool, with how many arguments each takes.
 const COMMANDS: &[(&str, usize)] = &[
+    ("add", 2),
+    ("add_dir", 1),
+    ("add_file", 4),
+    ("add_from_zip", 5),
+    ("add_nul", 2),
     ("cat", 1),
     ("cat_partial", 3),
     ("count_extra", 2),
@@ -39,10 +44,12 @@ const COMMANDS: &[(&str, usize)] = &[
     ("get_num_entries", 1),
     ("name_locate", 2),
     ("rename", 2),
+    ("replace_file_contents", 2),
     ("set_archive_comment", 1),
     ("set_archive_flag", 2),
     ("set_extra", 5),
     ("set_file_comment", 2),
+    ("set_file_compression", 3),
     ("set_file_dostime", 3),
     ("set_file_mtime", 2),
     ("set_file_mtime_all", 1),
@@ -52,10 +59,7 @@ const COMMANDS: &[(&str, usize)] = &[
 ];
 
 /// The tests that wait for what the port cannot do yet, and why.
-const WAITING: &[(&str, &str)] = &[
-    ("convert_to_torrentzip", "recompresses"),
-    ("convert_to_torrentzip_ef", "recompresses"),
-];
+const WAITING: &[(&str, &str)] = &[];
 
 /// What a file of a test holds: nothing (`{}`, no file), the lines given
 /// in the script (`<inline>`), or a file of libzip's.
@@ -315,15 +319,19 @@ fn run(test: &Test, regress: &Path, extracted: &Path, folder: &Path) -> Result<(
         // nihtest.conf's comparators: an archive written as one with the
         // same name is compared with `zipcmp -pv`, anything else byte for
         // byte.
-        if let (Some(Content::File(expected)), Some(_)) = (after, &want)
+        if let (Content::File(expected), Some(_)) = (after.as_ref().unwrap_or(before), &want)
             && name.ends_with(".zip")
             && expected.ends_with(".zip")
             && folder.join(name).is_file()
         {
-            let expected_path = [regress.join(expected), regress.join("data").join(expected)]
-                .into_iter()
-                .find(|p| p.is_file())
-                .ok_or(format!("no file {expected}"))?;
+            let expected_path = [
+                regress.join(expected),
+                regress.join("data").join(expected),
+                extracted.join(expected),
+            ]
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or(format!("no file {expected}"))?;
             let zipcmp = Command::new(env!("CARGO_BIN_EXE_zipcmp"))
                 .arg("-pv")
                 .arg(&expected_path)

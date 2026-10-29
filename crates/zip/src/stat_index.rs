@@ -1,7 +1,7 @@
 //! Port of `zip_stat_index.c`.
 
-use crate::dirent::{DosTime, d2u_time};
-use crate::error::Result;
+use crate::dirent::{CM_DEFAULT, DosTime, d2u_time};
+use crate::error::{Error, ErrorCode, Result};
 use crate::open::Archive;
 use crate::source::ReadAt;
 use crate::zip::{Flags, Stat, cm, stat};
@@ -16,6 +16,41 @@ impl<R: ReadAt> Archive<R> {
     pub fn stat_index(&self, index: u64, flags: Flags) -> Result<Stat<'_>> {
         let de = self.get_dirent(index, flags)?;
         let name = self.get_name(index, flags)?;
+
+        let entry = &self.entry[index as usize];
+        if !flags.intersects(Flags::UNCHANGED)
+            && let Some(source) = &entry.source
+        {
+            let Ok(mut st) = source.stat() else {
+                return Err(Error::new(ErrorCode::Changed, 0));
+            };
+
+            if de.comp_method == CM_DEFAULT {
+                if st.valid & stat::COMP_METHOD == 0 || st.comp_method == cm::STORE {
+                    st.valid &= !(stat::COMP_SIZE | stat::COMP_METHOD);
+                }
+            } else {
+                if st.valid & stat::COMP_METHOD != 0 && i32::from(st.comp_method) != de.comp_method
+                {
+                    st.valid &= !stat::COMP_SIZE;
+                }
+                st.valid |= stat::COMP_METHOD;
+                st.comp_method = de.comp_method as u16;
+            }
+
+            if st.valid & (stat::COMP_METHOD | stat::SIZE) == stat::COMP_METHOD | stat::SIZE
+                && st.comp_method == cm::STORE
+            {
+                st.valid |= stat::COMP_SIZE;
+                st.comp_size = st.size;
+            }
+
+            if entry.changed(changed::LAST_MOD) {
+                st.mtime = de.get_last_mod_mtime();
+                st.valid |= stat::MTIME;
+            }
+            return Ok(self.stat_finish(st, index, name, flags));
+        }
 
         let mut st = Stat {
             crc: de.crc,
@@ -36,6 +71,18 @@ impl<R: ReadAt> Archive<R> {
             st.valid &= !stat::COMP_SIZE;
         }
 
+        Ok(self.stat_finish(st, index, name, flags))
+    }
+
+    /// The end of `zip_stat_index`: torrentzip's method and time, and the
+    /// index and name.
+    fn stat_finish<'a>(
+        &self,
+        mut st: Stat<'static>,
+        index: u64,
+        name: &'a [u8],
+        flags: Flags,
+    ) -> Stat<'a> {
         if self.want_torrentzip() && !flags.intersects(Flags::UNCHANGED) {
             st.comp_method = cm::DEFLATE;
             st.mtime = d2u_time(DosTime {
@@ -46,10 +93,11 @@ impl<R: ReadAt> Archive<R> {
             st.valid &= !stat::COMP_SIZE;
         }
 
+        let mut st: Stat<'a> = st;
         st.index = index;
         st.name = Some(name);
         st.valid |= stat::INDEX | stat::NAME;
-        Ok(st)
+        st
     }
 
     /// The modification time of entry `index` as stored, in MS-DOS format:

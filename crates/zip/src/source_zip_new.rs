@@ -1,11 +1,13 @@
-//! The sources that read an entry's data: port of `zip_source_zip_new.c`,
-//! for an entry of the archive as read.
+//! The sources that read an entry's data, as read or new: port of
+//! `zip_source_zip_new.c`.
 
+use crate::dirent::Dirent;
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::open::Archive;
 use crate::source::ReadAt;
 use crate::source_compress::Decompress;
 use crate::source_crc::Crc;
+use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK, file_attributes};
 use crate::source_stack::{Layer, Stack};
 use crate::source_window::{Lower, UpperWindow, Window};
 use crate::zip::{Flags, OpenFlags, Stat, cm, em, stat};
@@ -36,7 +38,25 @@ impl<R: ReadAt> Archive<R> {
             flags = flags | Flags::COMPRESSED;
         }
 
-        let stat_flags = flags | Flags::UNCHANGED;
+        let entry = &self.entry[srcidx as usize];
+        let mut changed_data = false;
+        if !flags.intersects(Flags::UNCHANGED) {
+            if entry.data_changed() {
+                // A source of new data can always be read again.
+                if flags.intersects(Flags::COMPRESSED) {
+                    return Err(Error::new(ErrorCode::Changed, 0));
+                }
+                changed_data = true;
+            } else if entry.deleted {
+                return Err(Error::new(ErrorCode::Changed, 0));
+            }
+        }
+
+        let stat_flags = if changed_data {
+            flags
+        } else {
+            flags | Flags::UNCHANGED
+        };
         let st: Stat<'static> = match self.stat_index(srcidx, stat_flags) {
             Ok(st) => Stat { name: None, ..st },
             Err(_) => return Err(Error::new(ErrorCode::Internal, 0)),
@@ -90,11 +110,13 @@ impl<R: ReadAt> Archive<R> {
             return Err(Error::new(ErrorCode::NoPasswd, 0));
         }
 
-        self.get_dirent(srcidx, flags)?;
+        let de = self.get_dirent(srcidx, flags)?;
+        let attributes = file_attributes_from_dirent(de);
+        let dostime = Some((de.last_mod.time, de.last_mod.date));
         // Where the local header is, from the entry as read, as
         // `_zip_file_get_offset` finds it when the window opens: an entry
         // with changes has the offset it is written at once closed.
-        let header = self.entry[srcidx as usize].orig.as_ref().map(|o| o.offset);
+        let header = entry.orig.as_ref().map(|o| o.offset);
 
         let have_comp_size = st.valid & stat::COMP_SIZE != 0;
         let empty_data = if needs_decrypt || needs_decompress {
@@ -104,12 +126,15 @@ impl<R: ReadAt> Archive<R> {
         };
         // An entry with no data is read from an empty buffer, as if its data
         // had been changed.
-        let lower = if empty_data {
-            Lower::Empty
-        } else {
-            Lower::Archive(self.src.view())
+        let lower = match (&entry.source, changed_data) {
+            _ if empty_data => Lower::Empty,
+            (Some(source), true) => Lower::Data {
+                source: source.clone(),
+                offset: 0,
+            },
+            _ => Lower::Archive(self.src.view()),
         };
-        let changed_data = empty_data;
+        let changed_data = changed_data || empty_data;
 
         let window = if partial_data && !needs_decrypt && !needs_decompress {
             if start + data_len as u64 > st.comp_size {
@@ -133,7 +158,16 @@ impl<R: ReadAt> Archive<R> {
                 false => Some(header.ok_or(Error::new(ErrorCode::Internal, 0))?),
                 true => None,
             };
-            Window::new(&lower, start, data_len, &st2, stat::NAME, source_archive)?
+            Window::new(
+                &lower,
+                start,
+                data_len,
+                &st2,
+                stat::NAME,
+                attributes,
+                dostime,
+                source_archive,
+            )?
         } else if !changed_data {
             // this branch is executed only for archive sources; we know that
             // stat data come from the archive too, so it's safe to assume
@@ -147,11 +181,23 @@ impl<R: ReadAt> Archive<R> {
                 st.comp_size as i64,
                 &st,
                 stat::NAME,
+                attributes,
+                dostime,
                 Some(header.ok_or(Error::new(ErrorCode::Internal, 0))?),
             )?
         } else {
-            // reading from a zero-sized source buffer created above
-            Window::new(&lower, 0, data_len, &st, stat::NAME, None)?
+            // reading the whole changed data, or from a zero-sized source
+            // buffer created above
+            Window::new(
+                &lower,
+                0,
+                data_len,
+                &st,
+                stat::NAME,
+                attributes,
+                dostime,
+                None,
+            )?
         };
 
         if needs_decrypt {
@@ -187,5 +233,22 @@ impl<R: ReadAt> Archive<R> {
         }
 
         Ok(stack)
+    }
+}
+
+/// What an entry's header says about its file, as a source of its data
+/// gives it: port of `_zip_file_attributes_from_dirent`.
+fn file_attributes_from_dirent(de: &Dirent) -> FileAttributes {
+    FileAttributes {
+        valid: file_attributes::ASCII
+            | file_attributes::HOST_SYSTEM
+            | file_attributes::EXTERNAL_FILE_ATTRIBUTES
+            | file_attributes::GENERAL_PURPOSE_BIT_FLAGS,
+        ascii: de.int_attrib & 1 != 0,
+        host_system: (de.version_madeby >> 8) as u8,
+        external_file_attributes: de.ext_attrib,
+        general_purpose_bit_flags: de.bitflags,
+        general_purpose_bit_mask: GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK,
+        ..FileAttributes::default()
     }
 }

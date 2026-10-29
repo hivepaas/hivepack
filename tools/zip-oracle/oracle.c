@@ -77,6 +77,15 @@
  *         e<i>:<id>:<idx>:<data>:<flags>  zip_file_extra_field_set
  *         E<i>:<id>:<idx>:<flags>   zip_file_extra_field_delete_by_id
  *         D<i>:<idx>:<flags>        zip_file_extra_field_delete
+ *         +<name>:<flags>:<mtime>:<data>:<kind>  zip_file_add, from a
+ *                                   source of <data> with <mtime>, its size
+ *                                   known (<kind> "s") or not ("u")
+ *         R<i>:<mtime>:<data>:<kind> zip_file_replace, from the same
+ *         N<name>:<flags>:<time>:<date>  zip_dir_add, then
+ *                                   zip_file_set_dostime of the directory,
+ *                                   as its buffer source has the time now
+ *         z<i>:<method>:<flags>     zip_set_file_compression
+ *       An add answers with the index of the entry, others with 0.
  *       Answered with the error of opening, or "ok", each op's result (" 0"
  *       or " " and the error), " |" and the archive comment with 0 and
  *       ZIP_FL_UNCHANGED, then for each entry " |" and "<name>/<name as
@@ -364,7 +373,89 @@ done:
     free(data);
 }
 
-/* Applies one op of an edit request; its result, 0 or -1. */
+/* A source of data in memory, with a fixed modification time, and its size
+ * known or not. */
+struct memory_source {
+    unsigned char *data;
+    zip_uint64_t len;
+    zip_uint64_t offset;
+    time_t mtime;
+    int known_size;
+    zip_error_t error;
+};
+
+static zip_int64_t memory_callback(void *ud, void *data, zip_uint64_t len, zip_source_cmd_t cmd) {
+    struct memory_source *m = ud;
+    switch (cmd) {
+    case ZIP_SOURCE_OPEN:
+        m->offset = 0;
+        return 0;
+    case ZIP_SOURCE_READ: {
+        zip_uint64_t n = ZIP_MIN(len, m->len - m->offset);
+        memcpy(data, m->data + m->offset, n);
+        m->offset += n;
+        return (zip_int64_t)n;
+    }
+    case ZIP_SOURCE_CLOSE:
+        return 0;
+    case ZIP_SOURCE_STAT: {
+        zip_stat_t *st = data;
+        zip_stat_init(st);
+        st->mtime = m->mtime;
+        st->valid = ZIP_STAT_MTIME;
+        if (m->known_size) {
+            st->size = m->len;
+            st->comp_size = m->len;
+            st->comp_method = ZIP_CM_STORE;
+            st->encryption_method = ZIP_EM_NONE;
+            st->valid |= ZIP_STAT_SIZE | ZIP_STAT_COMP_SIZE | ZIP_STAT_COMP_METHOD | ZIP_STAT_ENCRYPTION_METHOD;
+        }
+        return sizeof(*st);
+    }
+    case ZIP_SOURCE_ERROR:
+        return zip_error_to_data(&m->error, data, len);
+    case ZIP_SOURCE_FREE:
+        free(m->data);
+        free(m);
+        return 0;
+    case ZIP_SOURCE_SEEK: {
+        zip_int64_t new_offset = zip_source_seek_compute_offset(m->offset, m->len, data, len, &m->error);
+        if (new_offset < 0)
+            return -1;
+        m->offset = (zip_uint64_t)new_offset;
+        return 0;
+    }
+    case ZIP_SOURCE_TELL:
+        return (zip_int64_t)m->offset;
+    case ZIP_SOURCE_SUPPORTS:
+        return zip_source_make_command_bitmap(ZIP_SOURCE_OPEN, ZIP_SOURCE_READ, ZIP_SOURCE_CLOSE, ZIP_SOURCE_STAT,
+                                              ZIP_SOURCE_ERROR, ZIP_SOURCE_FREE, ZIP_SOURCE_SEEK, ZIP_SOURCE_TELL,
+                                              ZIP_SOURCE_SUPPORTS_REOPEN, -1);
+    default:
+        zip_error_set(&m->error, ZIP_ER_OPNOTSUPP, 0);
+        return -1;
+    }
+}
+
+static zip_source_t *memory_source(zip_t *za, const char *mtime, const char *data_hex, const char *kind) {
+    struct memory_source *m = malloc(sizeof(*m));
+    zip_source_t *src;
+    size_t len;
+    m->data = unhex(data_hex, &len);
+    m->len = len;
+    m->offset = 0;
+    m->mtime = (time_t)strtoll(mtime, NULL, 10);
+    m->known_size = strcmp(kind, "u") != 0;
+    zip_error_init(&m->error);
+    if ((src = zip_source_function(za, memory_callback, m)) == NULL) {
+        free(m->data);
+        free(m);
+    }
+    return src;
+}
+
+/* Applies one op of an edit request; its result, 0 or -1, or for an add
+ * the index. */
 static int edit_op(zip_t *za, char *op) {
     char *rest = op + 1;
     char *fields[5] = {rest, NULL, NULL, NULL, NULL};
@@ -434,6 +525,46 @@ static int edit_op(zip_t *za, char *op) {
     case 'D':
         return zip_file_extra_field_delete(za, strtoull(fields[0], NULL, 10), (zip_uint16_t)atoi(fields[1]),
                                            (zip_flags_t)strtoul(fields[2], NULL, 10));
+    case '+': {
+        size_t len;
+        unsigned char *name = unhex(fields[0], &len);
+        zip_source_t *src = memory_source(za, fields[2], fields[3], fields[4]);
+        zip_int64_t idx;
+        name[len] = '\0';
+        if (src == NULL) {
+            free(name);
+            return -1;
+        }
+        if ((idx = zip_file_add(za, (const char *)name, src, (zip_flags_t)strtoul(fields[1], NULL, 10))) < 0)
+            zip_source_free(src);
+        free(name);
+        return idx < 0 ? -1 : (int)idx;
+    }
+    case 'R': {
+        zip_source_t *src = memory_source(za, fields[1], fields[2], fields[3]);
+        int ret;
+        if (src == NULL)
+            return -1;
+        if ((ret = zip_file_replace(za, strtoull(fields[0], NULL, 10), src, 0)) < 0)
+            zip_source_free(src);
+        return ret;
+    }
+    case 'N': {
+        size_t len;
+        unsigned char *name = unhex(fields[0], &len);
+        zip_int64_t idx;
+        name[len] = '\0';
+        idx = zip_dir_add(za, (const char *)name, (zip_flags_t)strtoul(fields[1], NULL, 10));
+        free(name);
+        if (idx < 0)
+            return -1;
+        if (zip_file_set_dostime(za, (zip_uint64_t)idx, (zip_uint16_t)atoi(fields[2]), (zip_uint16_t)atoi(fields[3]), 0) < 0)
+            return -1;
+        return (int)idx;
+    }
+    case 'z':
+        return zip_set_file_compression(za, strtoull(fields[0], NULL, 10), (zip_int32_t)strtol(fields[1], NULL, 10),
+                                        (zip_uint32_t)strtoul(fields[2], NULL, 10));
     default:
         return -2;
     }
@@ -510,8 +641,8 @@ static void do_edit(int flags, long long fragment, char *ops, const char *data_h
             errno = 0;
             ret = edit_op(za, op);
             putchar(' ');
-            if (ret == 0)
-                putchar('0');
+            if (ret >= 0)
+                printf("%d", ret);
             else if (ret == -2)
                 fputs("bad", stdout);
             else

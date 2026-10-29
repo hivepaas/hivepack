@@ -18,7 +18,9 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-# CRC-32, ported from zlib.
+# CRC-32 and deflate, ported from zlib.
 hivepack-deflate.workspace = true
+# bzip2, ported from libbzip2.
+hivepack-bzip2.workspace = true
 # AES, HMAC-SHA1 and PBKDF2 for WinZip AES, ported from BearSSL.
 hivepack-crypto.workspace = true

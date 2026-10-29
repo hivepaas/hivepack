@@ -473,8 +473,9 @@ impl<R: ReadAt> Archive<R> {
                 return None;
             }
 
-            orig.extra_fields.local = temp.extra_fields.local;
-            orig.local_extra_fields_read = true;
+            // The local fields are read now, none if there are none.
+            let local = temp.extra_fields.local.into_inner().unwrap_or_default();
+            orig.extra_fields.local = std::sync::OnceLock::from(local);
 
             if let Some(detail) = check_consistency(orig) {
                 *error = Error::new(ErrorCode::Incons, make_detail_with_index(detail, i as u64));

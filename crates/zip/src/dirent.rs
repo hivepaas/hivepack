@@ -5,6 +5,8 @@
 //! error, so what the caller reports is what the error held before, and the
 //! port reports the same.
 
+use std::sync::OnceLock;
+
 use crate::buffer::Buffer;
 use crate::error::{Detail, Error, ErrorCode};
 use crate::extra_field::{EFBIG, ExtraFields, ef_parse, ef_remove_internal};
@@ -33,8 +35,6 @@ pub(crate) const CM_DEFAULT: i32 = -1;
 /// The editor will add the fields libzip uses for changes.
 #[derive(Clone, Debug)]
 pub(crate) struct Dirent {
-    /// whether we already read in local header extra fields
-    pub local_extra_fields_read: bool,
     /// if CRC is valid (sometimes not for encrypted archives)
     pub crc_valid: bool,
     /// (c) version of creator
@@ -75,7 +75,6 @@ impl Default for Dirent {
     /// Port of `_zip_dirent_init`.
     fn default() -> Dirent {
         Dirent {
-            local_extra_fields_read: false,
             crc_valid: true,
             version_madeby: 63 | (u16::from(opsys::DEFAULT) << 8),
             version_needed: 10, // 1.0
@@ -242,15 +241,12 @@ impl Dirent {
                 }
             };
             match ef_parse(&ef) {
-                Ok(fields) if local => zde.extra_fields.local = fields,
+                Ok(fields) if local => zde.extra_fields.local = OnceLock::from(fields),
                 Ok(fields) => zde.extra_fields.central = fields,
                 Err(e) => {
                     *error = e;
                     return None;
                 }
-            }
-            if local {
-                zde.local_extra_fields_read = true;
             }
         }
 
@@ -400,12 +396,13 @@ impl Dirent {
             return None;
         }
 
-        let efp = if local {
-            &mut zde.extra_fields.local
+        if local {
+            if let Some(efp) = zde.extra_fields.local.get_mut() {
+                ef_remove_internal(efp);
+            }
         } else {
-            &mut zde.extra_fields.central
-        };
-        ef_remove_internal(efp);
+            ef_remove_internal(&mut zde.extra_fields.central);
+        }
 
         Some((zde, size + variable_size))
     }

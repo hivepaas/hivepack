@@ -44,6 +44,16 @@
  *       <end>/<zip_fclose>": <end> is "eof", "limit" or the error, and the
  *       hashes are FNV-1a, the second of the returns written in decimal, each
  *       followed by a comma.
+ *
+ *   range <flags> <source> <start> <len> <hex>
+ *       Opens the archive as open does, then reads part of every entry, as
+ *       ziptool's cat_partial does: zip_source_zip_file_create with <start>
+ *       and <len> (-1 for the rest), zip_source_open, zip_source_read in
+ *       pieces of 8192 until it returns 0 or fails, zip_source_close.
+ *       Answered "ok <entries>", then for each entry " |" and the error of
+ *       creating or opening the source, or "<bytes>/<hash>/<end>/<close>",
+ *       <end> "eof" or the error of reading, <close> "0" or the error of
+ *       closing, "-" if reading failed (cat_partial does not close then).
  */
 
 #include <stdio.h>
@@ -253,6 +263,65 @@ done:
     free(data);
 }
 
+static void do_range(int flags, const char *kind, unsigned long long start, long long rlen,
+                     const char *data_hex) {
+    size_t len;
+    unsigned char *data = unhex(data_hex, &len);
+    char path[] = "/tmp/zip-oracle-XXXXXX";
+    int made_file = 0;
+    zip_t *za = open_archive(flags, kind, data, len, path, &made_file);
+    zip_uint64_t i, n;
+    unsigned char buffer[8192];
+
+    if (za == NULL)
+        goto done;
+    n = (zip_uint64_t)zip_get_num_entries(za, 0);
+    printf("ok %llu", (unsigned long long)n);
+    for (i = 0; i < n; i++) {
+        zip_error_t error;
+        zip_source_t *src;
+        zip_int64_t got;
+        unsigned long long hash = 0xcbf29ce484222325ULL, total = 0;
+
+        printf(" |");
+        zip_error_init(&error);
+        src = zip_source_zip_file_create(za, i, 0, start, rlen, NULL, &error);
+        if (src == NULL) {
+            put_error(&error);
+            continue;
+        }
+        if (zip_source_open(src) < 0) {
+            put_error(zip_source_error(src));
+            zip_source_free(src);
+            continue;
+        }
+        while ((got = zip_source_read(src, buffer, sizeof(buffer))) > 0) {
+            hash = fnv64(hash, buffer, (size_t)got);
+            total += (unsigned long long)got;
+        }
+        printf("%llu/%016llx/", total, hash);
+        if (got < 0) {
+            put_error(zip_source_error(src));
+            fputs("/-", stdout);
+        }
+        else {
+            fputs("eof/", stdout);
+            if (zip_source_close(src) < 0)
+                put_error(zip_source_error(src));
+            else
+                putchar('0');
+        }
+        zip_source_free(src);
+    }
+    putchar('\n');
+    zip_discard(za);
+
+done:
+    if (made_file)
+        unlink(path);
+    free(data);
+}
+
 static void do_open(int flags, const char *kind, const char *data_hex) {
     size_t len;
     unsigned char *data = unhex(data_hex, &len);
@@ -394,6 +463,8 @@ int main(void) {
             words[count++] = word;
         if (count == 4 && strcmp(words[0], "open") == 0)
             do_open(atoi(words[1]), words[2], words[3]);
+        else if (count == 6 && strcmp(words[0], "range") == 0)
+            do_range(atoi(words[1]), words[2], strtoull(words[3], NULL, 10), atoll(words[4]), words[5]);
         else if (count == 7 && strcmp(words[0], "read") == 0)
             do_read(atoi(words[1]), words[2], atoi(words[3]), words[4], atoll(words[5]), words[6]);
         else

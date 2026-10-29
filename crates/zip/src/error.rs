@@ -282,8 +282,9 @@ pub struct Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    /// `zip_error_set(error, ze, se)`.
-    pub(crate) const fn new(zip_err: ErrorCode, sys_err: i32) -> Error {
+    /// An error with this code and system error: `zip_error_set(error,
+    /// ze, se)`.
+    pub const fn new(zip_err: ErrorCode, sys_err: i32) -> Error {
         Error { zip_err, sys_err }
     }
 

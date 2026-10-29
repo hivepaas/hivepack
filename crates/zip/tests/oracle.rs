@@ -41,6 +41,10 @@ fn recorded_read_path() -> PathBuf {
     repository().join("testdata/oracle/zip-read.txt")
 }
 
+fn recorded_range_path() -> PathBuf {
+    repository().join("testdata/oracle/zip-range.txt")
+}
+
 fn error_text(e: Error) -> String {
     format!("e{}/{}", e.code().number(), e.system())
 }
@@ -52,7 +56,7 @@ fn c_string(name: &[u8]) -> &[u8] {
 
 /// The oracle's description of an open archive, or of the error.
 fn describe<R: ReadAt>(result: hivepack_zip::Result<Archive<R>>) -> String {
-    let mut za = match result {
+    let za = match result {
         Ok(za) => za,
         Err(e) => return error_text(e),
     };
@@ -246,10 +250,79 @@ fn read_entries<R: ReadAt>(
     text
 }
 
+/// The oracle's answer to a `range` request: part of every entry read, as
+/// ziptool's cat_partial reads it.
+fn range_entries<R: ReadAt>(
+    result: hivepack_zip::Result<Archive<R>>,
+    start: u64,
+    len: i64,
+) -> String {
+    let za = match result {
+        Ok(za) => za,
+        Err(e) => return error_text(e),
+    };
+    let n = za.get_num_entries(Flags::NONE);
+    let mut text = format!("ok {n}");
+    let mut buffer = vec![0u8; 8192];
+    let len = u64::try_from(len).ok();
+    for i in 0..n {
+        text.push_str(" |");
+        let deflate64 = za
+            .stat_index(i, Flags::NONE)
+            .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
+        // zip_source_zip_file_create sets ZIP_ER_COMPNOTSUPP on the archive's
+        // error, not on the one it is given, which stays ZIP_ER_OK; the port
+        // returns the error. libzip has no Deflate64 (see read_entries).
+        let mut zf = match za.fopen_index_range(i, Flags::NONE, start, len) {
+            Err(e) if e.code() == ErrorCode::CompNotSupp => {
+                text.push_str("e0/0");
+                continue;
+            }
+            Err(e) if deflate64 && !matches!(e.code(), ErrorCode::Inval | ErrorCode::NoPasswd) => {
+                text.push_str("e0/0");
+                continue;
+            }
+            Ok(_) if deflate64 => {
+                text.push_str("e0/0");
+                continue;
+            }
+            Ok(zf) => zf,
+            Err(e) => {
+                text.push_str(&error_text(e));
+                continue;
+            }
+        };
+        let (mut hash, mut total) = (0xcbf2_9ce4_8422_2325, 0u64);
+        let end = loop {
+            match zf.fread(&mut buffer) {
+                Ok(0) => break None,
+                Ok(got) => {
+                    hash = fnv(hash, &buffer[..got]);
+                    total += got as u64;
+                }
+                Err(e) => break Some(e),
+            }
+        };
+        let _ = write!(text, "{total}/{hash:016x}/");
+        match end {
+            Some(e) => {
+                text.push_str(&error_text(e));
+                text.push_str("/-");
+            }
+            None => match zf.fclose() {
+                Ok(()) => text.push_str("eof/0"),
+                Err(e) => text.push_str(&format!("eof/{}", error_text(e))),
+            },
+        }
+    }
+    text
+}
+
 /// The port's answer to a request, in the oracle's format.
 fn respond<R: ReadAt>(words: &[&str], result: hivepack_zip::Result<Archive<R>>) -> String {
     match words[0] {
         "open" => describe(result),
+        "range" => range_entries(result, words[3].parse().unwrap(), words[4].parse().unwrap()),
         _ => read_entries(
             result,
             words[3].parse().unwrap(),
@@ -266,6 +339,7 @@ fn answer(request: &str) -> String {
     let (flags, kind, data) = match words[..] {
         ["open", flags, kind, data] => (flags, kind, data),
         ["read", flags, kind, _, _, _, data] => (flags, kind, data),
+        ["range", flags, kind, _, _, data] => (flags, kind, data),
         _ => panic!("{request:.100}"),
     };
     let flags = OpenFlags(flags.parse().unwrap());
@@ -908,6 +982,32 @@ fn read_requests(rng: &mut Rng, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// `count` range requests on generated archives, some damaged.
+fn range_requests(rng: &mut Rng, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            let mut zip = archive(rng);
+            if rng.below(6) == 0 {
+                zip = damage(rng, &zip);
+            }
+            format!("range {} {}", range_parameters(rng), hex(&zip))
+        })
+        .collect()
+}
+
+/// The flags, source, start and length of a range request.
+fn range_parameters(rng: &mut Rng) -> String {
+    let flags = rng.pick(&[0, 4]);
+    let kind = if rng.below(10) == 0 { "f" } else { "b" };
+    let start = rng.pick(&[0, 0, 1, 3, 10, 100, 2000]);
+    let len: i64 = match rng.below(4) {
+        0 => -1,
+        1 => 0,
+        _ => rng.pick(&[1, 2, 5, 40, 300, 5000]),
+    };
+    format!("{flags} {kind} {start} {len}")
+}
+
 /// The flags, source, file flags, pieces and limit of a read request.
 fn read_parameters(rng: &mut Rng) -> String {
     let flags = rng.pick(&[0, 4]);
@@ -1003,6 +1103,59 @@ fn regress_archives_read_like_libzip() {
             assert_eq!(answer(&request), want, "{name}: read {parameters}");
         }
     }
+}
+
+#[test]
+fn regress_archives_read_in_ranges_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x2800_0001);
+    for (name, data) in &regress_archives() {
+        if data.len() > 1 << 20 {
+            continue;
+        }
+        for parameters in ["0 b 2 3", "4 b 0 -1"]
+            .map(String::from)
+            .into_iter()
+            .chain([range_parameters(&mut rng)])
+        {
+            let request = format!("range {parameters} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_eq!(answer(&request), want, "{name}: range {parameters}");
+        }
+    }
+}
+
+#[test]
+fn generated_archives_read_in_ranges_like_libzip() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x2800_0002);
+    for request in range_requests(&mut rng, 500) {
+        let want = oracle.ask(&request);
+        assert_eq!(answer(&request), want, "{request:.400}");
+    }
+}
+
+#[test]
+fn port_reads_ranges_as_recorded() {
+    replay(&recorded_range_path(), 200);
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/zip-range.txt from the oracle"]
+fn record_range_answers() {
+    let mut rng = Rng(0x2800_0003);
+    record(
+        &recorded_range_path(),
+        "Ranges",
+        "record_range_answers",
+        range_requests(&mut rng, 1500),
+        4_000,
+        5,
+    );
 }
 
 #[test]

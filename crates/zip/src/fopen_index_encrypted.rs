@@ -17,6 +17,34 @@ pub struct ZipFile<'a, R: ?Sized> {
 }
 
 impl<R: ReadAt> Archive<R> {
+    /// Opens `len` bytes of entry `index` from byte `start` (or all from
+    /// there, if `len` is `None`) for reading, decompressed: port of
+    /// `zip_source_zip_file_create` with `start` and `len`, then
+    /// `zip_source_open`. A part of the data has no CRC-32 to
+    /// check; all of it, from 0 with `len` its size, is checked as
+    /// [`Archive::fopen_index`] checks it.
+    pub fn fopen_index_range(
+        &self,
+        index: u64,
+        flags: Flags,
+        start: u64,
+        len: Option<u64>,
+    ) -> Result<ZipFile<'_, R>> {
+        let len = match len {
+            None => -1,
+            Some(len) => match i64::try_from(len) {
+                Ok(len) => len,
+                Err(_) => return Err(Error::new(crate::ErrorCode::Inval, 0)),
+            },
+        };
+        let mut src = self.source_zip_file_create(index, flags, start, len, None)?;
+        src.open()?;
+        Ok(ZipFile {
+            error: Error::OK,
+            src: Some(src),
+        })
+    }
+
     /// Opens entry `index` for reading with a password: port of
     /// `zip_fopen_index_encrypted`. An empty password is none.
     ///
@@ -29,7 +57,7 @@ impl<R: ReadAt> Archive<R> {
         password: Option<&[u8]>,
     ) -> Result<ZipFile<'_, R>> {
         let password = password.filter(|p| !p.is_empty());
-        let mut src = self.source_zip_file_create(index, flags, password)?;
+        let mut src = self.source_zip_file_create(index, flags, 0, -1, password)?;
         src.open()?;
         Ok(ZipFile {
             error: Error::OK,

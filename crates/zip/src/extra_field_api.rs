@@ -15,7 +15,7 @@ impl<R: ReadAt> Archive<R> {
     /// itself (Zip64, the Info-ZIP UTF-8 name and comment, WinZip AES) are
     /// not among them.
     pub fn file_extra_field_get(
-        &mut self,
+        &self,
         idx: u64,
         ef_idx: u16,
         flags: Flags,
@@ -26,7 +26,7 @@ impl<R: ReadAt> Archive<R> {
     /// Extra field number `ef_idx` among those of entry `idx` with header id
     /// `ef_id`: port of `zip_file_extra_field_get_by_id`.
     pub fn file_extra_field_get_by_id(
-        &mut self,
+        &self,
         idx: u64,
         ef_id: u16,
         ef_idx: u16,
@@ -38,22 +38,17 @@ impl<R: ReadAt> Archive<R> {
 
     /// The number of extra fields of entry `idx`: port of
     /// `zip_file_extra_fields_count`.
-    pub fn file_extra_fields_count(&mut self, idx: u64, flags: Flags) -> Result<i16> {
+    pub fn file_extra_fields_count(&self, idx: u64, flags: Flags) -> Result<i16> {
         self.count_impl(idx, -1, flags)
     }
 
     /// The number of extra fields of entry `idx` with header id `ef_id`:
     /// port of `zip_file_extra_fields_count_by_id`.
-    pub fn file_extra_fields_count_by_id(
-        &mut self,
-        idx: u64,
-        ef_id: u16,
-        flags: Flags,
-    ) -> Result<i16> {
+    pub fn file_extra_fields_count_by_id(&self, idx: u64, ef_id: u16, flags: Flags) -> Result<i16> {
         self.count_impl(idx, i32::from(ef_id), flags)
     }
 
-    fn count_impl(&mut self, idx: u64, id: i32, flags: Flags) -> Result<i16> {
+    fn count_impl(&self, idx: u64, id: i32, flags: Flags) -> Result<i16> {
         if !flags.intersects(EF_BOTH) {
             return Err(Error::new(ErrorCode::Inval, 0));
         }
@@ -67,7 +62,7 @@ impl<R: ReadAt> Archive<R> {
     /// Port of `_zip_file_extra_field_get`. The field is found first, then
     /// borrowed, as the local header may have to be read in between.
     fn file_extra_field_get_impl(
-        &mut self,
+        &self,
         idx: u64,
         mut ef_idx: u16,
         ef_id: Option<u16>,
@@ -85,7 +80,12 @@ impl<R: ReadAt> Archive<R> {
         if found.is_none() && flags.intersects(Flags::LOCAL) {
             self.read_local_ef(idx)?;
             let de = self.get_dirent(idx, flags)?;
-            found = get_one(&de.extra_fields.local, &mut ef_idx, ef_id).map(|at| (true, at));
+            found = get_one(
+                de.extra_fields.local.get().map_or(&[][..], Vec::as_slice),
+                &mut ef_idx,
+                ef_id,
+            )
+            .map(|at| (true, at));
         }
 
         let Some((local, at)) = found else {
@@ -93,7 +93,7 @@ impl<R: ReadAt> Archive<R> {
         };
         let de = self.get_dirent(idx, flags)?;
         let fields = if local {
-            &de.extra_fields.local
+            de.extra_fields.local.get().map_or(&[][..], Vec::as_slice)
         } else {
             &de.extra_fields.central
         };

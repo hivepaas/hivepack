@@ -1,18 +1,19 @@
 //! Opens the input as a ZIP archive with hivepack-zip, leniently and with
 //! `ZIP_CHECKCONS`, asks everything the reading API answers about each
-//! entry, and reads each entry's data, decompressed and raw, in pieces. A
-//! panic is a bug. libzip is not built here:
+//! entry, and reads each entry's data, decompressed and raw, in pieces, and
+//! decrypted with the password "foo", which some of the recorded archives
+//! are encrypted with. A panic is a bug. libzip is not built here:
 //! `crates/zip/tests/oracle.rs` compares the answers with it through the
 //! oracle.
 
 #![no_main]
 
-use hivepack_zip::{Archive, ArchiveFlags, Flags, OpenFlags, ReadAt};
+use hivepack_zip::{Archive, ArchiveFlags, Flags, OpenFlags, ReadAt, em};
 use libfuzzer_sys::fuzz_target;
 
 /// Reads entry `i` to its end, in pieces of growing sizes, and closes it.
-fn read_all<R: ReadAt>(za: &Archive<R>, i: u64, flags: Flags) {
-    let Ok(mut zf) = za.fopen_index(i, flags) else { return };
+fn read_all<R: ReadAt>(za: &Archive<R>, i: u64, flags: Flags, password: Option<&[u8]>) {
+    let Ok(mut zf) = za.fopen_index_encrypted(i, flags, password) else { return };
     let mut buf = vec![0u8; 70_000];
     let mut piece = 1;
     // A bound on the work: the data of an entry can be large.
@@ -46,7 +47,10 @@ fuzz_target!(|data: &[u8]| {
             }
             let _ = za.file_get_offset(i);
             for flags in [Flags::NONE, Flags::COMPRESSED] {
-                read_all(&za, i, flags);
+                read_all(&za, i, flags, None);
+            }
+            if za.stat_index(i, Flags::NONE).is_ok_and(|st| st.encryption_method != em::NONE) {
+                read_all(&za, i, Flags::NONE, Some(b"foo"));
             }
             if let Ok(name) = za.get_name(i, Flags::NONE) {
                 let name = name.to_vec();

@@ -233,6 +233,11 @@ jobs:
           for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
               data = line.split("\t")[0].split(" ")[3]
               pathlib.Path(f"fuzz/corpus/zip_open/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
+          # Archives libzip encrypted, some with the password the target tries.
+          lines = pathlib.Path("testdata/oracle/zip-decrypt.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              data = line.split("\t")[0].split(" ")[-1]
+              pathlib.Path(f"fuzz/corpus/zip_open/d{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_open -- -max_total_time=120
       - name: Seed the editing corpus with the same archives, behind a few edits

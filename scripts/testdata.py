@@ -6,7 +6,8 @@ testdata/manifest.json lists every set:
 - Sets with "fetch" are downloaded, checked against their SHA-256 and unpacked
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
-  by the oracles in tools/, built from the pinned zstd and zlib releases.
+  by the oracles in tools/, built from the pinned zstd, zlib, libzip and
+  nettle releases.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -178,6 +179,46 @@ def libzip_sources(lib: Path) -> list:
     return names + ["zip_source_file_stdio_named.c", "zip_random_unix.c"]
 
 
+# nettle's AES (encryption only), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, in
+# C: what the oracles call, without the assembly versions or the fat
+# builds that choose between them.
+NETTLE_SOURCES = [
+    "aes-set-encrypt-key.c", "aes128-set-encrypt-key.c", "aes192-set-encrypt-key.c",
+    "aes256-set-encrypt-key.c", "aes-set-key-internal.c", "aes-encrypt-internal.c",
+    "aes-encrypt-table.c", "aes128-encrypt.c", "aes192-encrypt.c", "aes256-encrypt.c",
+    "sha1.c", "sha1-compress.c", "sha1-meta.c", "hmac.c", "hmac-sha1.c", "pbkdf2.c",
+    "pbkdf2-hmac-sha1.c", "memxor.c", "write-be32.c",
+]
+
+
+# What nettle's C files need of the config.h its configure writes: alloca,
+# which every system the oracles are built on has. Without it, nettle's
+# temporary arrays are local to the block that declares them, and
+# hmac_set_key keeps a pointer to the digest of a key longer than a block
+# past its block: gcc happens to leave it there, clang does not.
+NETTLE_FLAGS = ["-DHAVE_ALLOCA=1", "-include", "alloca.h"]
+
+
+def nettle_headers(nettle: Path, folder: Path) -> Path:
+    """A folder with nettle's headers in nettle/, as an installed nettle has
+    them, for `#include <nettle/aes.h>`. Without config.h (HAVE_CONFIG_H
+    unset, NETTLE_FLAGS in its place), nettle's C files assume a
+    little-endian machine, which the oracles are built on."""
+    include = folder / "include"
+    (include / "nettle").mkdir(parents=True)
+    for header in nettle.glob("*.h"):
+        shutil.copy(header, include / "nettle" / header.name)
+    return include
+
+
+# What lib/CMakeLists.txt adds to ZIP_SOURCES with HAVE_CRYPTO and
+# HAVE_GNUTLS.
+LIBZIP_CRYPTO_SOURCES = [
+    "zip_crypto_gnutls.c", "zip_winzip_aes.c", "zip_source_winzip_aes_decode.c",
+    "zip_source_winzip_aes_encode.c",
+]
+
+
 def zip_err_str(lib: Path) -> str:
     """zip_err_str.c, as libzip's cmake/GenerateZipErrorStrings.cmake writes
     it from the comments in zip.h and zipint.h."""
@@ -208,23 +249,29 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
-    Deflate64. tools/zip-oracle is built with libzip's, its own config.h and
-    zipconf.h in place of those libzip's CMake build writes, and zlib's
-    (the `extra` set)."""
+    Deflate64. tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
+    tools/zip-oracle is built with libzip's, its crypto backend for
+    GnuTLS among them, its own config.h and zipconf.h in place of those
+    libzip's CMake build writes, the part of GnuTLS that backend uses in
+    gnutls/, and zlib's and nettle's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
     libzip = next(source.glob("libzip-*"), None)
     if libzip is not None:
         lib = libzip / "lib"
         zlib = next(extra[0].glob("zlib-*"))
+        nettle = next(extra[1].glob("nettle-*"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
-        files += [str(lib / name) for name in libzip_sources(lib)] + [str(generated / "zip_err_str.c")]
+        files += [str(lib / name) for name in libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES]
+        files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+        files += [str(nettle / name) for name in NETTLE_SOURCES]
+        include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
-        subprocess.run([compiler, "-O2", "-w", f"-I{config}", f"-I{lib}", f"-I{zlib}", *files,
-                        "-o", str(folder / "oracle")], check=True)
+        subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
+                        f"-I{include}", f"-I{nettle}", *files, "-o", str(folder / "oracle")], check=True)
         return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:
@@ -232,6 +279,13 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(infback9 / "infback9.c"), str(infback9 / "inftree9.c")]
         subprocess.run([compiler, "-O2", f"-I{zlib}", f"-I{infback9}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
+    nettle = next(source.glob("nettle-*"), None)
+    if nettle is not None:
+        include = nettle_headers(nettle, folder)
+        files += [str(nettle / name) for name in NETTLE_SOURCES]
+        subprocess.run([compiler, "-O2", *NETTLE_FLAGS, f"-I{include}", f"-I{nettle}", *files,
                         "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))

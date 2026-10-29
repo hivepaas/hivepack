@@ -13,13 +13,13 @@ impl<R: ReadAt> Archive<R> {
     /// and the CRC-32 and length of an entry read to its end are checked.
     /// Stored, deflated and Deflate64 entries are read for now (libzip
     /// reads no Deflate64); others fail with
-    /// [`ErrorCode::CompNotSupp`](crate::ErrorCode::CompNotSupp), and
-    /// encrypted ones with [`ErrorCode::NoPasswd`](crate::ErrorCode::NoPasswd).
+    /// [`ErrorCode::CompNotSupp`](crate::ErrorCode::CompNotSupp). An
+    /// encrypted entry is decrypted with the default password
+    /// ([`Archive::set_default_password`]), and fails with
+    /// [`ErrorCode::NoPasswd`](crate::ErrorCode::NoPasswd) without one.
     /// Several entries may be open at once, each reading at its own
     /// position.
     pub fn fopen_index(&self, index: u64, flags: Flags) -> Result<ZipFile<'_, R>> {
-        // The archive has no default password: zip_set_default_password
-        // comes with decryption.
-        self.fopen_index_encrypted(index, flags, None)
+        self.fopen_index_encrypted(index, flags, self.default_password.as_deref())
     }
 }

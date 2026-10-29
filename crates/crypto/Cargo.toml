@@ -1,0 +1,18 @@
+[package]
+name = "hivepack-crypto"
+version = "0.0.0"
+description = "AES, SHA-1, HMAC and PBKDF2 for ZIP encryption, in safe Rust, ported from BearSSL"
+license = "MIT"
+readme = "README.md"
+keywords = ["aes", "sha1", "hmac", "pbkdf2", "bearssl"]
+categories = ["cryptography"]
+# Nothing to publish yet.
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true

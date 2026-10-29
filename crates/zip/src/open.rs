@@ -12,9 +12,11 @@ use crate::dirent::{Dirent, check_consistency};
 use crate::error::{Detail, Error, ErrorCode, Result, add_index_to_detail, make_detail_with_index};
 use crate::extra_field::EFBIG;
 use crate::hash::Names;
+use crate::random::RandomSource;
 use crate::source::{ReadAt, Source, Whence, stat};
 use crate::string::{ZipString, string_equal, string_get, string_length};
 use crate::zip::{ArchiveFlags, Flags, OpenFlags};
+use crate::zipint::Password;
 use crate::zipint::{
     CDBUFSIZE, CDENTRYSIZE, CENTRAL_MAGIC, Cdir, EOCD_MAGIC, EOCD64_MAGIC, EOCD64LEN,
     EOCD64LOC_MAGIC, EOCD64LOCLEN, EOCDLEN, Entry, GPBF_DATA_DESCRIPTOR, LENTRYSIZE, LOCAL_MAGIC,
@@ -43,6 +45,10 @@ pub struct Archive<R> {
     pub(crate) entry: Vec<Entry>,
     /// hash table for name lookup
     pub(crate) names: Names,
+    /// password used when no other supplied
+    pub(crate) default_password: Option<Password>,
+    /// where encrypting takes its random bytes from, if not the system
+    pub(crate) random: Option<RandomSource>,
 }
 
 /// What `_zip_read_eocd64` found.
@@ -163,6 +169,8 @@ impl<R: ReadAt> Archive<R> {
             comment_changed: false,
             entry: Vec::new(),
             names: Names::default(),
+            default_password: None,
+            random: None,
         };
         if flags.intersects(OpenFlags::RDONLY) {
             za.flags = za.flags | ArchiveFlags::RDONLY;

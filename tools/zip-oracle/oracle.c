@@ -4,9 +4,17 @@
  * It reads one request per line on stdin and answers each on one line of
  * stdout, by calling libzip 1.12.1. The Rust tests ask the port the same
  * questions and compare the answers as text. scripts/testdata.py builds it
- * from the libzip and zlib release sources, with config.h and zipconf.h
- * from this folder. Times are in UTC: the oracle sets TZ, as libzip turns
- * MS-DOS times into time_t with mktime.
+ * from the libzip, zlib and nettle release sources, with config.h, zipconf.h
+ * and the part of GnuTLS libzip's crypto backend uses (gnutls/) from this
+ * folder. Times are in UTC: the oracle sets TZ, as libzip turns MS-DOS
+ * times into time_t with mktime.
+ *
+ * The random bytes libzip encrypts with (zip_secure_random, through
+ * gnutls_rnd) come from a stream the oracle restarts before each
+ * zip_close, from the FNV-1a hash of the request's <ops>: a byte is the top
+ * byte of x after x = x * 6364136223846793005 + 1442695040888963407, x
+ * starting at the hash. Temporary file names take their random numbers
+ * apart, from rand().
  *
  * Byte strings are hexadecimal, and "-" is an empty one. An error is
  * "e<zip error>/<system error>". errno is cleared before each request,
@@ -48,6 +56,13 @@
  *       hashes are FNV-1a, the second of the returns written in decimal, each
  *       followed by a comma.
  *
+ *   decrypt <flags> <source> <how> <password> <fflags> <chunks> <limit> <hex>
+ *       As read, with a password, which <how> gives: "n" none, "d" set
+ *       with zip_set_default_password and entries opened with
+ *       zip_fopen_index, "e" given to zip_fopen_index_encrypted, "x" set
+ *       as the default and an empty one given to zip_fopen_index_encrypted.
+ *       The password is a C string, so it ends at a NUL byte in <password>.
+ *
  *   range <flags> <source> <start> <len> <hex>
  *       Opens the archive as open does, then reads part of every entry, as
  *       ziptool's cat_partial does: zip_source_zip_file_create with <start>
@@ -85,6 +100,9 @@
  *                                   zip_file_set_dostime of the directory,
  *                                   as its buffer source has the time now
  *         z<i>:<method>:<flags>     zip_set_file_compression
+ *         y<i>:<method>:<password>  zip_file_set_encryption, the password
+ *                                   NULL if "-"
+ *         P<password>               zip_set_default_password, NULL if "-"
  *       An add answers with the index of the entry, others with 0.
  *       Answered with the error of opening, or "ok", each op's result (" 0"
  *       or " " and the error), " |" and the archive comment with 0 and
@@ -150,6 +168,39 @@ static unsigned long long fnv64(unsigned long long hash, const unsigned char *by
         hash *= 0x00000100000001b3ULL;
     }
     return hash;
+}
+
+static unsigned long long random_state;
+
+int gnutls_rnd(int level, void *data, size_t len) {
+    unsigned char *bytes = data;
+    size_t i;
+    (void)level;
+    for (i = 0; i < len; i++) {
+        random_state = random_state * 6364136223846793005ULL + 1442695040888963407ULL;
+        bytes[i] = (unsigned char)(random_state >> 56);
+    }
+    return 0;
+}
+
+zip_uint32_t zip_random_uint32(void) {
+    static int seeded = 0;
+    if (!seeded) {
+        srand((unsigned)getpid() ^ (unsigned)time(NULL));
+        seeded = 1;
+    }
+    return (zip_uint32_t)rand() << 16 ^ (zip_uint32_t)rand();
+}
+
+/* A password in hexadecimal as a C string, or NULL for "-" if dash_null. */
+static char *password_of(const char *hex, int dash_null) {
+    size_t len;
+    unsigned char *bytes;
+    if (dash_null && strcmp(hex, "-") == 0)
+        return NULL;
+    bytes = unhex(hex, &len);
+    bytes[len] = '\0';
+    return (char *)bytes;
 }
 
 static void put_error(const zip_error_t *error) {
@@ -242,8 +293,8 @@ static zip_t *open_archive(int flags, const char *kind, unsigned char *data, siz
     return za;
 }
 
-static void do_read(int flags, const char *kind, int fflags, const char *chunks, long long limit,
-                    const char *data_hex) {
+static void do_read(int flags, const char *kind, char how, const char *password_hex, int fflags,
+                    const char *chunks, long long limit, const char *data_hex) {
     size_t len;
     unsigned char *data = unhex(data_hex, &len);
     char path[] = "/tmp/zip-oracle-XXXXXX";
@@ -251,13 +302,18 @@ static void do_read(int flags, const char *kind, int fflags, const char *chunks,
     zip_t *za = open_archive(flags, kind, data, len, path, &made_file);
     zip_uint64_t i, n;
     unsigned char *buffer = malloc(1 << 20);
+    char *password = password_of(password_hex, 0);
 
     if (za == NULL)
         goto done;
+    if (how == 'd' || how == 'x')
+        zip_set_default_password(za, password);
     n = (zip_uint64_t)zip_get_num_entries(za, 0);
     printf("ok %llu", (unsigned long long)n);
     for (i = 0; i < n; i++) {
-        zip_file_t *zf = zip_fopen_index(za, i, (zip_flags_t)fflags);
+        zip_file_t *zf = how == 'e'   ? zip_fopen_index_encrypted(za, i, (zip_flags_t)fflags, password)
+                         : how == 'x' ? zip_fopen_index_encrypted(za, i, (zip_flags_t)fflags, "")
+                                      : zip_fopen_index(za, i, (zip_flags_t)fflags);
         unsigned long long data_hash = 0xcbf29ce484222325ULL, returns_hash = 0xcbf29ce484222325ULL;
         long long total = 0, reads = 0;
         const char *chunk = chunks;
@@ -310,6 +366,7 @@ static void do_read(int flags, const char *kind, int fflags, const char *chunks,
 done:
     if (made_file)
         unlink(path);
+    free(password);
     free(buffer);
     free(data);
 }
@@ -565,6 +622,19 @@ static int edit_op(zip_t *za, char *op) {
     case 'z':
         return zip_set_file_compression(za, strtoull(fields[0], NULL, 10), (zip_int32_t)strtol(fields[1], NULL, 10),
                                         (zip_uint32_t)strtoul(fields[2], NULL, 10));
+    case 'y': {
+        char *password = password_of(fields[2], 1);
+        int ret = zip_file_set_encryption(za, strtoull(fields[0], NULL, 10), (zip_uint16_t)strtoul(fields[1], NULL, 10),
+                                          password);
+        free(password);
+        return ret;
+    }
+    case 'P': {
+        char *password = password_of(fields[0], 1);
+        int ret = zip_set_default_password(za, password);
+        free(password);
+        return ret;
+    }
     default:
         return -2;
     }
@@ -603,6 +673,7 @@ static void do_edit(int flags, long long fragment, char *ops, const char *data_h
     const char *comment;
     char *op;
     int made_file = 0;
+    unsigned long long seed = fnv64(0xcbf29ce484222325ULL, (const unsigned char *)ops, strlen(ops));
 
     zip_error_init(&error);
     if (fragment < 0) {
@@ -694,6 +765,7 @@ static void do_edit(int flags, long long fragment, char *ops, const char *data_h
 
     fputs(" |", stdout);
     errno = 0;
+    random_state = seed;
     if (zip_close(za) < 0) {
         put_error(zip_get_error(za));
         zip_discard(za);
@@ -880,7 +952,7 @@ int main(void) {
 
     while (fgets(line, (int)cap, stdin)) {
         size_t n = strlen(line);
-        char *words[7];
+        char *words[9];
         int count = 0;
         char *word;
         while (n == cap - 1 && line[n - 1] != '\n') {
@@ -892,7 +964,7 @@ int main(void) {
         }
         if (n && line[n - 1] == '\n')
             line[--n] = '\0';
-        for (word = strtok(line, " "); word && count < 7; word = strtok(NULL, " "))
+        for (word = strtok(line, " "); word && count < 9; word = strtok(NULL, " "))
             words[count++] = word;
         errno = 0;
         if (count == 4 && strcmp(words[0], "open") == 0)
@@ -904,7 +976,10 @@ int main(void) {
         else if (count == 5 && strcmp(words[0], "editb") == 0)
             do_edit(atoi(words[1]), atoll(words[2]), words[3], words[4]);
         else if (count == 7 && strcmp(words[0], "read") == 0)
-            do_read(atoi(words[1]), words[2], atoi(words[3]), words[4], atoll(words[5]), words[6]);
+            do_read(atoi(words[1]), words[2], 'n', "-", atoi(words[3]), words[4], atoll(words[5]), words[6]);
+        else if (count == 9 && strcmp(words[0], "decrypt") == 0)
+            do_read(atoi(words[1]), words[2], words[3][0], words[4], atoi(words[5]), words[6], atoll(words[7]),
+                    words[8]);
         else
             puts("bad");
         fflush(stdout);

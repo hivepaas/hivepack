@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hivepack_extract::{
-    ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Permissions, Summary,
-    extract_zip,
+    ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Summary, extract_zip,
 };
 use hivepack_zip::{Archive, BufferSource, Flags, OpenFlags, cm, em, opsys};
 
@@ -329,6 +328,11 @@ fn nothing_is_overwritten() {
     let data = zip(&[Entry::File(b"dir/a.txt/b", b"theirs")]);
     let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
     assert!(matches!(error.kind, ErrorKind::NotADirectory), "{error}");
+    // A directory where a file is to be, which Windows reports as access
+    // denied.
+    let data = zip(&[Entry::File(b"dir", b"theirs")]);
+    let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Exists), "{error}");
 }
 
 fn limits(change: impl FnOnce(&mut Limits)) -> Options {
@@ -703,6 +707,7 @@ fn links_are_not_overwritten() {
 #[cfg(unix)]
 #[test]
 fn permissions_can_be_kept_or_left_to_the_system() {
+    use hivepack_extract::Permissions;
     use std::os::unix::fs::PermissionsExt;
     let data = zip(&[Entry::Mode(b"x", b"x", 0o106_775)]);
     let mode = |permissions| {

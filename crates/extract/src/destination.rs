@@ -67,19 +67,19 @@ impl Destination {
         options.write(true).create_new(true);
         options.follow(FollowSymlinks::No);
         match dir.open_with(name, &options) {
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && overwrite => {
-                match dir.symlink_metadata(name) {
-                    Ok(metadata) if metadata.is_file() => {}
-                    _ => return Err(ErrorKind::Exists),
-                }
-                let mut options = OpenOptions::new();
-                options.write(true).truncate(true);
-                options.follow(FollowSymlinks::No);
-                dir.open_with(name, &options).map_err(ErrorKind::Io)
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(ErrorKind::Exists),
-            Err(e) => Err(ErrorKind::Io(e)),
             Ok(file) => Ok(file),
+            // What is there decides, not the error: Windows says a
+            // directory is there as access denied.
+            Err(e) => match dir.symlink_metadata(name) {
+                Ok(metadata) if overwrite && metadata.is_file() => {
+                    let mut options = OpenOptions::new();
+                    options.write(true).truncate(true);
+                    options.follow(FollowSymlinks::No);
+                    dir.open_with(name, &options).map_err(ErrorKind::Io)
+                }
+                Ok(_) => Err(ErrorKind::Exists),
+                Err(_) => Err(ErrorKind::Io(e)),
+            },
         }
     }
 

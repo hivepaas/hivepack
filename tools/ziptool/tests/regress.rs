@@ -53,6 +53,7 @@ const COMMANDS: &[(&str, usize)] = &[
     ("set_file_dostime", 3),
     ("set_file_mtime", 2),
     ("set_file_mtime_all", 1),
+    ("set_password", 1),
     ("stat", 1),
     ("unchange", 1),
     ("unchange_all", 0),
@@ -163,6 +164,8 @@ fn parse(text: &str) -> Test {
                 let after = parts.get(2).map(|p| content(p));
                 test.files.push((parts[0].into(), before, after));
             }
+            // WinZip AES, which needs a crypto library in libzip.
+            "features" if rest == "HAVE_CRYPTO" => {}
             "stdin" if rest.is_empty() => test.stdin = inline(&mut lines),
             "stdout" if rest.is_empty() => test.stdout = inline(&mut lines),
             "stderr" if rest.is_empty() => test.stderr = inline(&mut lines),

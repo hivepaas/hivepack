@@ -6,13 +6,39 @@
 //! dictionary from the start of the input, raw content or behind the
 //! dictionary magic number (a zstd dictionary to read, if it can be), in
 //! `ZSTD_compress_usingDict`, or as a `CDict` in `ZSTD_compress_usingCDict`.
-//! A panic or a difference is a bug.
+//! With another, worker threads (`ZSTD_c_nbWorkers`), a different number
+//! on each side: through `compress2`, where an input this small takes
+//! none, and streamed with its size unknown, which takes them; the frames
+//! do not depend on their number. A panic or a difference is a bug.
 
 #![no_main]
 
-use hivepack_zstd::{CCtx, CDict, CParameter as P, DCtx, ParamSwitch};
+use hivepack_zstd::{CCtx, CDict, CParameter as P, DCtx, EndDirective, ParamSwitch};
 use libfuzzer_sys::fuzz_target;
-use zstd::zstd_safe::{self, CParameter as C};
+use zstd::zstd_safe::{self, CParameter as C, zstd_sys::ZSTD_EndDirective};
+
+/// `src` streamed with its size unknown, all of it with
+/// `ZSTD_e_continue`, then `ZSTD_e_end`, with room for the whole frame.
+fn libzstd_stream(c: &mut zstd_safe::CCtx<'_>, src: &[u8], out: &mut [u8]) -> Result<usize, usize> {
+    let mut output = zstd_safe::OutBuffer::around(out);
+    let mut input = zstd_safe::InBuffer::around(src);
+    while input.pos() < src.len() {
+        c.compress_stream2(&mut output, &mut input, ZSTD_EndDirective::ZSTD_e_continue)?;
+    }
+    while c.compress_stream2(&mut output, &mut input, ZSTD_EndDirective::ZSTD_e_end)? != 0 {}
+    Ok(output.pos())
+}
+
+/// The same with the port.
+fn port_stream(p: &mut CCtx, src: &[u8], out: &mut [u8]) -> hivepack_zstd::Result<usize> {
+    let mut output = hivepack_zstd::OutBuffer::new(out);
+    let mut input = hivepack_zstd::InBuffer::new(src);
+    while input.pos < src.len() {
+        p.compress_stream2(&mut output, &mut input, EndDirective::Continue)?;
+    }
+    while p.compress_stream2(&mut output, &mut input, EndDirective::End)? != 0 {}
+    Ok(output.pos)
+}
 
 /// `ZSTD_compress_usingDict` or `ZSTD_compress_usingCDict` with a dictionary
 /// from the start of `src`, its size picked by its first byte.
@@ -96,20 +122,50 @@ fuzz_target!(|input: &[u8]| {
         return;
     }
     let split = pick & 0x10 != 0;
-    let capacity = hivepack_zstd::compress_bound(src.len()).unwrap_or(0);
+    let workers = pick & 0x40 != 0;
+    // Room for the frame, and for a frame of unknown size.
+    let capacity = hivepack_zstd::compress_bound(src.len()).unwrap_or(0) + 32;
     let mut c_out = vec![0u8; capacity];
     let mut p_out = vec![0u8; capacity];
-    let (want, got) = if split {
+    let (want, got) = if split || workers {
         let mut c = zstd_safe::CCtx::create();
         let mut p = CCtx::new();
-        for (pp, cp) in [
-            (P::CompressionLevel(level), C::CompressionLevel(level)),
-            (
+        let mut parameters = vec![(P::CompressionLevel(level), C::CompressionLevel(level))];
+        if split {
+            parameters.push((
                 P::SplitAfterSequences(ParamSwitch::Enable),
                 C::UseBlockSplitter(zstd_safe::ParamSwitch::Enable),
-            ),
-        ] {
+            ));
+        }
+        if workers {
+            let count = 1 + u32::from(pick >> 7);
+            parameters.push((P::NbWorkers(count), C::NbWorkers(3 - count)));
+            parameters.push((P::ChecksumFlag(true), C::ChecksumFlag(true)));
+        }
+        for (pp, cp) in parameters {
             assert!(c.set_parameter(cp).is_ok() && p.set_parameter(pp).is_ok());
+        }
+        if workers {
+            // Streamed with its size unknown: with the workers.
+            let mut c_stream = vec![0u8; capacity];
+            let mut p_stream = vec![0u8; capacity];
+            let want = libzstd_stream(&mut c, src, &mut c_stream);
+            let got = port_stream(&mut p, src, &mut p_stream);
+            match (want, got) {
+                (Ok(want), Ok(got)) => {
+                    assert!(
+                        c_stream[..want] == p_stream[..got],
+                        "level {level}, with workers, streamed: the frames differ"
+                    );
+                    let mut back = vec![0u8; src.len()];
+                    let size = hivepack_zstd::decompress(&mut back, &p_stream[..got])
+                        .expect("the frame decodes");
+                    assert!(back[..size] == *src, "level {level}: does not decode back");
+                }
+                (want, got) => panic!(
+                    "level {level}, with workers, streamed: port {got:?}, libzstd {want:?}"
+                ),
+            }
         }
         (
             c.compress2(&mut c_out[..], src).map(|n| &c_out[..n]),
@@ -125,14 +181,14 @@ fuzz_target!(|input: &[u8]| {
         (Ok(got), Ok(want)) => {
             assert!(
                 got == want,
-                "level {level}, split {split}: the frames differ"
+                "level {level}, split {split}, workers {workers}: the frames differ"
             );
             let mut back = vec![0u8; src.len()];
             let size = hivepack_zstd::decompress(&mut back, got).expect("the frame decodes");
             assert!(back[..size] == *src, "level {level}: does not decode back");
         }
         (got, want) => panic!(
-            "level {level}, split {split}: port {:?}, libzstd {:?}",
+            "level {level}, split {split}, workers {workers}: port {:?}, libzstd {:?}",
             got.map(<[u8]>::len),
             want.map(<[u8]>::len)
         ),

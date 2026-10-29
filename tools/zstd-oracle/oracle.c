@@ -109,6 +109,9 @@
  * Frames:
  *   compress <level> <dstCapacity> <hex>
  *                                     ZSTD_compressCCtx, on one context used again and again
+ *   zstdmt                            whether the oracle is built with libzstd's threads
+ *                                     (ZSTD_MULTITHREAD), for the cstream requests that
+ *                                     set ZSTD_c_nbWorkers: answered "1" or "0"
  *
  * A block's entropy coding, with the tables of the block before kept from
  * request to request, as the block compressor keeps them:
@@ -845,6 +848,15 @@ static void hufreadctable(char** args, int nargs)
 
 /* ---- Frames ---- */
 
+static void zstdmt(void)
+{
+#ifdef ZSTD_MULTITHREAD
+    puts("1");
+#else
+    puts("0");
+#endif
+}
+
 static void compress(char** args, int nargs)
 {
     static ZSTD_CCtx* cctx;
@@ -1331,6 +1343,7 @@ int main(void)
         else if (!strcmp(command, "seqreset")) seqreset(nargs);
         else if (!strcmp(command, "compress")) compress(args, nargs);
         else if (!strcmp(command, "cstream")) cstream(args, nargs);
+        else if (!strcmp(command, "zstdmt")) zstdmt();
         else if (!strcmp(command, "seqblock")) seqblock(args, nargs);
         else puts("bad");
         fflush(stdout);

@@ -23,7 +23,7 @@ use crate::compress::huf_compress::{
 use crate::compress::zstd_cdict::{
     CDict, DictTableLoadMethod, TableFillPurpose, zstd_cdict_indices_are_tagged,
     zstd_compress_insert_dictionary, zstd_dedicated_dict_search_revert_cparams,
-    zstd_get_cparam_mode, zstd_should_attach_dict,
+    zstd_get_cparam_mode, zstd_load_dictionary_content, zstd_should_attach_dict,
 };
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, DictAttachPref, DictMatchState,
@@ -57,11 +57,16 @@ use crate::compress::zstd_lazy::{
 use crate::compress::zstd_ldm::{
     ZSTD_LDM_BUCKETSIZELOG_MAX, ZSTD_LDM_DEFAULT_WINDOW_LOG, zstd_ldm_adjust_parameters,
     zstd_ldm_block_compress, zstd_ldm_generate_sequences, zstd_ldm_get_max_nb_seq,
+    zstd_ldm_skip_raw_seq_store_bytes, zstd_ldm_skip_sequences,
 };
 use crate::compress::zstd_opt::{
     zstd_compress_block_opt, zstd_compress_block_opt_dict_match_state,
 };
 use crate::compress::zstd_pre_split::zstd_split_block;
+use crate::compress::zstdmt_compress::{
+    MtCCtx, ZSTD_OVERLAPLOG_MAX, ZSTD_OVERLAPLOG_MIN, ZSTDMT_JOBSIZE_MAX, ZSTDMT_JOBSIZE_MIN,
+    ZSTDMT_NBWORKERS_MAX,
+};
 use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
@@ -1701,6 +1706,26 @@ pub(crate) struct CCtxParams {
     /// parameters lays out its tables for the dedicated dictionary search
     /// (`ZSTD_c_enableDedicatedDictSearch`).
     pub(crate) enable_dedicated_dict_search: bool,
+    /// `nbWorkers`: how many threads compress a frame when streaming
+    /// (`ZSTD_c_nbWorkers`); 0 for none, the frame compressed by the
+    /// caller's thread.
+    pub(crate) nb_workers: u32,
+    /// `jobSize`: the input of each job of those threads
+    /// (`ZSTD_c_jobSize`); 0 for a size from the window.
+    pub(crate) job_size: usize,
+    /// `overlapLog`: how much of the input before a job its threads
+    /// load, as a fraction of the window (`ZSTD_c_overlapLog`); 0 for the
+    /// strategy's.
+    pub(crate) overlap_log: i32,
+    /// `rsyncable`: whether jobs end where the content says
+    /// (`ZSTD_c_rsyncable`).
+    pub(crate) rsyncable: bool,
+    /// `forceWindow` (`ZSTD_c_forceMaxWindow`): whether a dictionary's
+    /// content is part of the window, its matches no farther than the
+    /// window's size, rather than reached whole. Not a parameter the port
+    /// offers: only the jobs of multithreaded compression after the first
+    /// set it, for the content of the job before that they load.
+    pub(crate) force_window: bool,
 }
 
 impl CCtxParams {
@@ -1727,6 +1752,11 @@ impl CCtxParams {
             ldm: LdmParams::default(),
             attach_dict_pref: DictAttachPref::DefaultAttach,
             enable_dedicated_dict_search: false,
+            nb_workers: 0,
+            job_size: 0,
+            overlap_log: 0,
+            rsyncable: false,
+            force_window: false,
         }
     }
 
@@ -2197,6 +2227,42 @@ pub enum CParameter {
     /// [`DictAttachPref::ForceLoad`]), never copy them. A context's own
     /// frames do not use the parameter otherwise.
     EnableDedicatedDictSearch(bool),
+    /// How many worker threads compress each frame streamed
+    /// (`ZSTD_c_nbWorkers`), [`CCtx::compress2`] included: 0, the default,
+    /// for none, the frame compressed by the caller's thread, in the calls;
+    /// up to 256 (larger values are clamped). With workers, the input is
+    /// cut into jobs (see [`CParameter::JobSize`]) that the threads
+    /// compress side by side, each with the end of the input before it
+    /// (see [`CParameter::OverlapLog`]); calls take input and write out
+    /// what the threads have done, waiting for them only when they cannot
+    /// do either. A frame of a known size of 512 KB or less is compressed
+    /// without them.
+    ///
+    /// The frames depend on whether there are workers, not on how many:
+    /// they differ from those without, but any number from 1 gives the
+    /// same frames, those libzstd gives with workers. How much input each
+    /// call takes, and how much it writes out, depends on how far the
+    /// threads have got; the frame does not.
+    NbWorkers(u32),
+    /// With workers, the input of each job (`ZSTD_c_jobSize`): 0, the
+    /// default, for 4 times the window, at least 1 MB (with long distance
+    /// matching, 8 times the cycle of the chain table, at least 2 MB), and
+    /// at least the overlap; otherwise from 512 KB (smaller values are
+    /// raised to it) to 1 GB (larger ones are clamped).
+    JobSize(u32),
+    /// With workers, how much of the input before a job the job loads as
+    /// its history, as a fraction of the window (`ZSTD_c_overlapLog`):
+    /// from 1 for none to 9 for the whole window, each step doubling it;
+    /// 0, the default, for the strategy's: 6 (an eighth) up to `lazy`, 7
+    /// for `lazy2` and `btlazy2`, 8 for `btopt` and `btultra`, 9 for
+    /// `btultra2`. Values out of 0 to 9 are clamped.
+    OverlapLog(i32),
+    /// With workers, end jobs where the content says, besides their size
+    /// (`ZSTD_c_rsyncable`): where a hash of the last 32 bytes has its low
+    /// bits set, once a job has 128 KB. Output then changes less where the
+    /// input changes, which helps `rsync`, at a small cost in compression.
+    /// Off by default.
+    Rsyncable(bool),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -2229,6 +2295,10 @@ pub enum CParameterKind {
     LdmHashRateLog,
     ForceAttachDict,
     EnableDedicatedDictSearch,
+    NbWorkers,
+    JobSize,
+    OverlapLog,
+    Rsyncable,
 }
 
 impl CParameter {
@@ -2262,6 +2332,10 @@ impl CParameter {
             CParameter::LdmHashRateLog(_) => CParameterKind::LdmHashRateLog,
             CParameter::ForceAttachDict(_) => CParameterKind::ForceAttachDict,
             CParameter::EnableDedicatedDictSearch(_) => CParameterKind::EnableDedicatedDictSearch,
+            CParameter::NbWorkers(_) => CParameterKind::NbWorkers,
+            CParameter::JobSize(_) => CParameterKind::JobSize,
+            CParameter::OverlapLog(_) => CParameterKind::OverlapLog,
+            CParameter::Rsyncable(_) => CParameterKind::Rsyncable,
         }
     }
 }
@@ -2412,6 +2486,24 @@ pub(crate) fn set_cctx_parameter(
         CParameter::EnableDedicatedDictSearch(enable) => {
             params.enable_dedicated_dict_search = enable;
         }
+        // Clamped to their bounds (ZSTD_cParam_clampBounds), not refused.
+        // libzstd takes an int: the port takes values past i32::MAX as
+        // large ones, where libzstd would read them as negative.
+        CParameter::NbWorkers(value) => params.nb_workers = value.min(ZSTDMT_NBWORKERS_MAX),
+        CParameter::JobSize(value) => {
+            let mut value = value as usize;
+            // Raised to the smallest job, but 0.
+            if value != 0 && value < ZSTDMT_JOBSIZE_MIN {
+                value = ZSTDMT_JOBSIZE_MIN;
+            }
+            params.job_size = value.min(ZSTDMT_JOBSIZE_MAX);
+        }
+        CParameter::OverlapLog(value) => {
+            params.overlap_log = value.clamp(ZSTD_OVERLAPLOG_MIN, ZSTD_OVERLAPLOG_MAX);
+        }
+        // libzstd clamps the value to the overlap log's bounds and keeps
+        // it; any but 0 is on.
+        CParameter::Rsyncable(rsyncable) => params.rsyncable = rsyncable,
     }
     Ok(())
 }
@@ -2465,12 +2557,17 @@ struct LocalDict {
 /// prefix for the next frame ([`CCtx::ref_prefix`]), or in one call with
 /// one ([`CCtx::compress_using_dict`], [`CCtx::compress_using_cdict`]).
 ///
-/// Not yet: frames that would attach a [`CDict`], searching its tables
-/// where they are (`dictMatchState`), which libzstd does for small inputs
-/// and inputs of unknown size. They fail with
-/// [`ErrorCode::ParameterUnsupported`] when they start; with
-/// [`CParameter::ForceAttachDict`] set to [`DictAttachPref::ForceCopy`] or
-/// [`DictAttachPref::ForceLoad`], they compress as libzstd does.
+/// With [`CParameter::NbWorkers`] set, the frames it streams (and those of
+/// [`CCtx::compress2`]) are compressed by that many threads of its own, in
+/// jobs, side by side. The frames then depend on whether there are workers,
+/// not on how many: they are those libzstd writes with workers, for any
+/// number. The threads end when the context is dropped, once their jobs
+/// are done. The context can move between threads.
+///
+/// A [`CDict`] is attached, its tables searched where they are
+/// (`dictMatchState`), for small inputs and inputs of unknown size, and
+/// copied in or its content loaded again otherwise, as libzstd decides;
+/// [`CParameter::ForceAttachDict`] can force one way.
 pub struct CCtx {
     stage: CompressionStage,
     /// The parameters set for the next frames (`requestedParams`); the
@@ -2534,6 +2631,18 @@ pub struct CCtx {
     /// With a stable input buffer, the input said to be taken but not
     /// compressed yet: it waits for a block's worth.
     stable_in_not_consumed: usize,
+
+    // Multithreading.
+    /// `mtctx`: the worker threads and their jobs, made by the first frame
+    /// with workers.
+    mtctx: Option<Box<MtCCtx>>,
+    /// `cParamsChanged`: compression parameters were set while a frame was
+    /// streamed; a frame with workers takes them for its next jobs.
+    c_params_changed: bool,
+    /// `externSeqStore`: in a job of multithreaded compression, the
+    /// sequences long distance matching found for the job, which its
+    /// blocks take in turn.
+    extern_seq_store: RawSeqStore,
 }
 
 impl CCtx {
@@ -2575,6 +2684,9 @@ impl CCtx {
             expected_in_buffer: InBufferId::default(),
             expected_out_buffer_size: 0,
             stable_in_not_consumed: 0,
+            mtctx: None,
+            c_params_changed: false,
+            extern_seq_store: RawSeqStore::default(),
         }
     }
 
@@ -2658,7 +2770,7 @@ impl CCtx {
             ResetTarget::CCtx,
         );
 
-        self.seq_store = SeqStore::with_capacity(block_size, max_nb_seq);
+        self.seq_store.reset_for(block_size, max_nb_seq);
 
         // The tables of long distance matching, cleared, and its window,
         // new: unlike the match state's, libzstd starts its indices again
@@ -2690,6 +2802,10 @@ impl CCtx {
             *ldm = LdmState::new();
             self.ldm_sequences = RawSeqStore::default();
         }
+        // No external sequences (ZSTD_referenceExternalSequences(zc, NULL,
+        // 0)).
+        self.extern_seq_store.reset();
+        self.extern_seq_store.capacity = 0;
 
         // The buffers. What they hold is not used again: the window starts
         // over.
@@ -2847,7 +2963,7 @@ impl CCtx {
     ///
     /// The window's [`WindowBuffer::Dict`] is then `dict`, or `cdict`'s
     /// content: the frame's buffers must give it as the dictionary's.
-    fn compress_begin_internal(
+    pub(crate) fn compress_begin_internal(
         &mut self,
         dict: Option<(&[u8], DictContentType)>,
         cdict: Option<&CDict>,
@@ -2891,6 +3007,63 @@ impl CCtx {
         Ok(())
     }
 
+    /// `ZSTD_compressBegin_advanced_internal`, for a job of multithreaded
+    /// compression after the first: the context reset for a frame of
+    /// `pledged_src_size` bytes with `params`, without buffers, and the
+    /// first `prefix_size` bytes of `input`, the end of the job before,
+    /// loaded as raw content (`ZSTD_dct_rawContent`, `ZSTD_dtlm_fast`); as
+    /// a dictionary's, it is left out under 8 bytes. The job's input
+    /// follows it in `input`.
+    ///
+    /// Differs from libzstd: libzstd loads the prefix where it lies in its
+    /// round buffer, right before the job's input; the port has both in
+    /// the job's own buffer, the prefix first. The window then has them in
+    /// one segment, as libzstd's.
+    pub(crate) fn compress_begin_job(
+        &mut self,
+        input: &[u8],
+        prefix_size: usize,
+        params: &CCtxParams,
+        pledged_src_size: u64,
+    ) -> Result<()> {
+        self.reset_cctx_internal(params, pledged_src_size, TableReset::MakeClean, false)?;
+        // ZSTD_compress_insertDictionary, for raw content.
+        if prefix_size < 8 {
+            return Ok(());
+        }
+        self.prev_cblock.reset();
+        let params = self.applied_params;
+        zstd_load_dictionary_content(
+            &mut self.match_state,
+            Some(&mut self.ldm_state),
+            &params,
+            input,
+            WindowBuffer::Input,
+            0,
+            prefix_size,
+            DictTableLoadMethod::Fast,
+            TableFillPurpose::ForCCtx,
+        )
+    }
+
+    /// `ZSTD_referenceExternalSequences`: `seqs`, the sequences long
+    /// distance matching found for the frame's input, for its blocks to
+    /// take in turn; the store it replaces comes back.
+    pub(crate) fn reference_external_sequences(&mut self, mut seqs: RawSeqStore) -> RawSeqStore {
+        seqs.pos = 0;
+        seqs.pos_in_sequence = 0;
+        seqs.capacity = seqs.size();
+        std::mem::replace(&mut self.extern_seq_store, seqs)
+    }
+
+    /// `ZSTD_invalidateRepCodes`: no repeat offsets for the next block, as
+    /// for a job of multithreaded compression after the first, which does
+    /// not know those of the job before. Only for a window of one segment.
+    pub(crate) fn invalidate_rep_codes(&mut self) {
+        self.prev_cblock.rep = [0; ZSTD_REP_NUM];
+        debug_assert!(!self.match_state.window.has_ext_dict());
+    }
+
     /// `ZSTD_buildSeqStore`: the block `istart..iend` of the window's
     /// prefix: its sequences and literals. Returns whether to compress it:
     /// blocks too small are stored raw.
@@ -2898,7 +3071,17 @@ impl CCtx {
         let src_size = iend - istart;
         debug_assert!(src_size <= ZSTD_BLOCKSIZE_MAX);
         if src_size < MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 + 1 {
-            // Too small to try compressing.
+            // Too small to try compressing: past its bytes in the external
+            // sequences.
+            if self.applied_params.c_params.strategy >= Strategy::Btopt {
+                zstd_ldm_skip_raw_seq_store_bytes(&mut self.extern_seq_store, src_size);
+            } else {
+                zstd_ldm_skip_sequences(
+                    &mut self.extern_seq_store,
+                    src_size,
+                    self.applied_params.c_params.min_match,
+                );
+            }
             return Ok(false);
         }
         self.seq_store.reset();
@@ -2938,7 +3121,21 @@ impl CCtx {
             symbol_costs: &self.prev_cblock.entropy,
             literal_compression_mode: params.literal_compression_mode,
         };
-        let last_ll_size = if params.ldm_enable == ParamSwitch::Enable {
+        let last_ll_size = if self.extern_seq_store.pos < self.extern_seq_store.size() {
+            // The sequences given, those long distance matching found for
+            // a job of multithreaded compression (which then has it off
+            // itself): the block compressor between them.
+            debug_assert!(params.ldm_enable == ParamSwitch::Disable);
+            zstd_ldm_block_compress(
+                &mut self.extern_seq_store,
+                ms,
+                seq_store,
+                rep,
+                &block_compressor,
+                istart,
+                iend,
+            )?
+        } else if params.ldm_enable == ParamSwitch::Enable {
             // Long distance matching: its sequences of the block, from its
             // own window, over the same buffers; then the block compressor
             // between them.
@@ -3610,7 +3807,7 @@ impl CCtx {
 
     /// `ZSTD_compressContinue_public`: `start..end` of the buffer `which`,
     /// more of the frame.
-    fn compress_continue(
+    pub(crate) fn compress_continue(
         &mut self,
         dst: &mut [u8],
         bufs: Buffers<'_>,
@@ -3664,7 +3861,7 @@ impl CCtx {
 
     /// `ZSTD_compressEnd_public`: `start..end` of the buffer `which`, the
     /// rest of the frame, and the end of the frame.
-    fn compress_end(
+    pub(crate) fn compress_end(
         &mut self,
         dst: &mut [u8],
         bufs: Buffers<'_>,
@@ -3777,9 +3974,6 @@ impl CCtx {
     /// large as the input, up to 512 KB. As [`CCtx::compress`], the
     /// parameters set and the dictionaries loaded or referenced do not
     /// apply.
-    ///
-    /// Not yet for inputs small enough to attach the `CDict` (up to 8 to
-    /// 32 KB, by strategy, when it has content): see [`CCtx`].
     pub fn compress_using_cdict(
         &mut self,
         dst: &mut [u8],
@@ -3864,9 +4058,14 @@ impl CCtx {
     /// Values out of range fail with [`ErrorCode::ParameterOutOfBound`],
     /// but the level's, which are clamped.
     pub fn set_parameter(&mut self, parameter: CParameter) -> Result<()> {
-        if self.stream_stage != StreamStage::Init && !zstd_is_update_authorized(parameter.kind()) {
-            // Only in the init stage.
-            return error!(StageWrong);
+        if self.stream_stage != StreamStage::Init {
+            if !zstd_is_update_authorized(parameter.kind()) {
+                // Only in the init stage.
+                return error!(StageWrong);
+            }
+            // For the next jobs of a frame with workers: the flag stays
+            // set until such a frame takes it, even one started later.
+            self.c_params_changed = true;
         }
         set_cctx_parameter(
             &mut self.requested_params,
@@ -3917,6 +4116,10 @@ impl CCtx {
             CParameterKind::EnableDedicatedDictSearch => {
                 i32::from(params.enable_dedicated_dict_search)
             }
+            CParameterKind::NbWorkers => params.nb_workers as i32,
+            CParameterKind::JobSize => params.job_size as i32,
+            CParameterKind::OverlapLog => params.overlap_log,
+            CParameterKind::Rsyncable => i32::from(params.rsyncable),
         }
     }
 
@@ -4055,8 +4258,6 @@ impl CCtx {
     /// otherwise. Copied in, its tables keep their own sizes. It drops the
     /// dictionary, prefix or `CDict` set before. Only between frames (or
     /// fails with [`ErrorCode::StageWrong`]).
-    ///
-    /// Not yet for frames that attach it: see [`CCtx`].
     pub fn ref_cdict(&mut self, cdict: Option<Arc<CDict>>) -> Result<()> {
         if self.stream_stage != StreamStage::Init {
             // Only in the init stage.
@@ -4209,10 +4410,88 @@ impl CCtx {
         }
 
         self.check_buffer_stability(output, input)?;
+        if self.applied_params.nb_workers > 0 {
+            // The frame goes to the workers.
+            let Some(mut mtctx) = self.mtctx.take() else {
+                return error!(InitMissing);
+            };
+            let result = self.compress_stream2_mt(&mut mtctx, output, input, end_op);
+            self.mtctx = Some(mtctx);
+            return result;
+        }
         self.compress_stream_generic(output, input, end_op)?;
         self.set_buffer_expectations(output, input);
         // What is left to write out.
         Ok(self.out_buff_content_size - self.out_buff_flushed_size)
+    }
+
+    /// `ZSTD_compressStream2`, for a frame with workers, through
+    /// `ZSTDMT_compressStream_generic`. With [`EndDirective::Continue`],
+    /// until it takes input or writes some, or either buffer is full; with
+    /// the others, until all is written out or the output is full. Returns
+    /// how much is left to write out, at least; 1 when not known.
+    fn compress_stream2_mt(
+        &mut self,
+        mtctx: &mut MtCCtx,
+        output: &mut OutBuffer<'_>,
+        input: &mut InBuffer<'_>,
+        end_op: EndDirective,
+    ) -> Result<usize> {
+        if self.c_params_changed {
+            // The compression level and parameters set while streaming, for
+            // the next jobs, sized for an input of unknown size.
+            let c_params = zstd_get_cparams_from_cctx_params(
+                &self.requested_params,
+                &self.requested_c_params,
+                ZSTD_CONTENTSIZE_UNKNOWN,
+                0,
+                CParamMode::NoAttachDict,
+            );
+            mtctx.update_cparams_while_compressing(
+                self.requested_params.compression_level,
+                c_params,
+            );
+            self.c_params_changed = false;
+        }
+        if self.stable_in_not_consumed != 0 {
+            // The input said to be taken and not compressed yet is before
+            // the position: make it available. libzstd asserts it is there.
+            debug_assert!(self.applied_params.in_buffer_mode == BufferMode::Stable);
+            if input.pos < self.stable_in_not_consumed {
+                return error!(StabilityConditionNotRespected);
+            }
+            input.pos -= self.stable_in_not_consumed;
+            self.stable_in_not_consumed = 0;
+        }
+        let flush_min = loop {
+            let ipos = input.pos;
+            let opos = output.pos;
+            let result = mtctx.compress_stream_generic(output, input, end_op);
+            self.consumed_src_size += (input.pos - ipos) as u64;
+            self.produced_csize += (output.pos - opos) as u64;
+            if result.is_err() || (end_op == EndDirective::End && result == Ok(0)) {
+                // The frame is complete, or failed.
+                self.reset_session();
+            }
+            let flush_min = result?;
+            if end_op == EndDirective::Continue {
+                // Some progress is enough: input taken or output written,
+                // or either buffer full.
+                if input.pos != ipos
+                    || output.pos != opos
+                    || input.pos == input.src.len()
+                    || output.pos == output.dst.len()
+                {
+                    break flush_min;
+                }
+            } else if flush_min == 0 || output.pos == output.dst.len() {
+                // All the progress possible: all written out, or the
+                // output full.
+                break flush_min;
+            }
+        };
+        self.set_buffer_expectations(output, input);
+        Ok(flush_min)
     }
 
     /// `ZSTD_compressStream2_simpleArgs`: [`CCtx::compress_stream2`], with
@@ -4251,6 +4530,12 @@ impl CCtx {
         input: &mut InBuffer<'_>,
     ) -> Result<usize> {
         self.compress_stream2(output, input, EndDirective::Continue)?;
+        // ZSTD_nextInputSizeHint_MTorST
+        if self.applied_params.nb_workers > 0
+            && let Some(mtctx) = &self.mtctx
+        {
+            return Ok(mtctx.next_input_size_hint());
+        }
         Ok(self.next_input_size_hint())
     }
 
@@ -4282,6 +4567,10 @@ impl CCtx {
         }
         let mut input = InBuffer { src: &[], pos: 0 };
         let remaining_to_flush = self.compress_stream2(output, &mut input, EndDirective::End)?;
+        if self.applied_params.nb_workers > 0 {
+            // At least that much.
+            return Ok(remaining_to_flush);
+        }
         // Without workers: what is left more precisely.
         let last_block_size = if self.frame_ended {
             0
@@ -4340,6 +4629,33 @@ impl CCtx {
         params.use_row_match_finder =
             zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
+
+        // A frame of a known size of ZSTDMT_JOBSIZE_MIN or less is
+        // compressed without workers.
+        if pledged_src_size <= ZSTDMT_JOBSIZE_MIN as u64 {
+            params.nb_workers = 0;
+        }
+        if params.nb_workers > 0 {
+            // The workers' context, made by the first frame with them.
+            let mtctx = match &mut self.mtctx {
+                Some(mtctx) => mtctx,
+                None => self.mtctx.insert(Box::new(MtCCtx::new(params.nb_workers)?)),
+            };
+            mtctx.init_cstream_internal(prefix_dict, cdict.clone(), &params, pledged_src_size)?;
+            self.dict_id = cdict.as_ref().map_or(0, |cdict| cdict.dict_id);
+            self.consumed_src_size = 0;
+            self.produced_csize = 0;
+            self.stream_stage = StreamStage::Load;
+            self.applied_params = params;
+            // The workers have the frame's dictionary.
+            self.frame_dict = FrameDict::None;
+            if self.applied_params.in_buffer_mode == BufferMode::Buffered {
+                // As without workers: the port drops input a stable buffer
+                // was said to give, with the mode changed since.
+                self.stable_in_not_consumed = 0;
+            }
+            return Ok(());
+        }
 
         // The frame's dictionary, kept through the frame: the window's
         // dictionary segment, or the dictMatchState.

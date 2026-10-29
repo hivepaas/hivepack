@@ -11,8 +11,10 @@
 //! ([`CCtx::set_parameter`]), giving the frames libzstd gives; with
 //! dictionaries too ([`CCtx::load_dictionary`], [`CDict`],
 //! [`CCtx::ref_prefix`], [`CCtx::compress_using_dict`]), attached, copied
-//! in or loaded again as libzstd decides. The plan, and the rules the port
-//! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
+//! in or loaded again as libzstd decides; and on several threads
+//! ([`CParameter::NbWorkers`]), as libzstd's `ZSTD_c_nbWorkers`. The plan,
+//! and the rules the port follows, are in the repository: `docs/porting.md`
+//! and `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -59,6 +61,34 @@
 //! let mut out = vec![0; 19];
 //! assert_eq!(hivepack_zstd::decompress(&mut out, &frame)?, 19);
 //! assert_eq!(&out, b"hello, hello, hello");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Compressing on worker threads: the frames depend on whether there are
+//! workers, not on how many, and are those libzstd writes with workers. A
+//! frame of a known size of 512 KB or less takes none.
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_zstd::Error> {
+//! use hivepack_zstd::{CCtx, CParameter};
+//!
+//! let data: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8 ^ (i >> 13) as u8).collect();
+//! let mut frames = Vec::new();
+//! for workers in [2, 4] {
+//!     let mut cctx = CCtx::new();
+//!     cctx.set_parameter(CParameter::NbWorkers(workers))?;
+//!     // Jobs of 512 KB, the smallest, for the threads to share.
+//!     cctx.set_parameter(CParameter::JobSize(512 << 10))?;
+//!     let mut frame = vec![0; hivepack_zstd::compress_bound(data.len()).unwrap_or(0)];
+//!     let size = cctx.compress2(&mut frame, &data)?;
+//!     frame.truncate(size);
+//!     frames.push(frame);
+//! }
+//! assert_eq!(frames[0], frames[1]);
+//! let mut out = vec![0; data.len()];
+//! assert_eq!(hivepack_zstd::decompress(&mut out, &frames[0])?, data.len());
+//! assert_eq!(out, data);
 //! # Ok(())
 //! # }
 //! ```

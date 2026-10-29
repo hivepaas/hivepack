@@ -98,6 +98,16 @@ impl Oracle {
         })
     }
 
+    /// The answer to `request`, "bad" included: for a request an oracle
+    /// built from older sources does not know.
+    pub(crate) fn try_ask(&mut self, request: &str) -> String {
+        writeln!(self.input, "{request}").expect("request sent");
+        self.input.flush().expect("request sent");
+        let mut line = String::new();
+        self.output.read_line(&mut line).expect("answer read");
+        line.trim_end().to_string()
+    }
+
     pub(crate) fn ask(&mut self, request: &str) -> String {
         writeln!(self.input, "{request}").expect("request sent");
         self.input.flush().expect("request sent");

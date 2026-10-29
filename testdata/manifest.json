@@ -207,6 +207,20 @@
       "kind": "tool"
     },
     {
+      "name": "nettle-3.10.2-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz", "sha256": "fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5", "unpack": "tar.gz" }] },
+      "source": "https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz, signed by Niels Möller (key 343C2FF0FBEE5EC2EDBEF399F3599FF828C67298)",
+      "license": "LGPL-3.0-or-later OR GPL-2.0-or-later",
+      "kind": "source"
+    },
+    {
+      "name": "nettle-oracle",
+      "generate": { "group": "generated", "from": "nettle-3.10.2-source", "tool": "oracle", "sources": ["tools/nettle-oracle/oracle.c"] },
+      "source": "tools/nettle-oracle/oracle.c, built with the nettle 3.10.2 sources",
+      "license": "MIT (the program) and LGPL-3.0-or-later OR GPL-2.0-or-later (nettle)",
+      "kind": "tool"
+    },
+    {
       "name": "libzip-1.12.1-source",
       "fetch": { "group": "generated", "files": [{ "url": "https://github.com/nih-at/libzip/releases/download/v1.12.1/libzip-1.12.1.tar.gz", "sha256": "3b66fe92cbc768d8d4d16e1427bfb7399e15d9c2795c2fc482e7b30a6332a422", "unpack": "tar.gz" }] },
       "source": "https://github.com/nih-at/libzip/releases/tag/v1.12.1 (commit 8e037534ccd62f444abbe4ce265443ee74bbfeb3)",

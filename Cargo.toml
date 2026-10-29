@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deflate", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/crypto", "crates/deflate", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ repository = "https://github.com/hivepaas/hivepack-rs"
 homepage = "https://github.com/hivepaas/hivepack-rs"
 
 [workspace.dependencies]
+hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-zip = { path = "crates/zip" }
 hivepack-zstd = { path = "crates/zstd" }

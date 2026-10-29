@@ -11,7 +11,8 @@ impl<R: ReadAt> Archive<R> {
     ///
     /// The data is decompressed, unless `flags` has [`Flags::COMPRESSED`],
     /// and the CRC-32 and length of an entry read to its end are checked.
-    /// Stored and deflated entries are read for now; others fail with
+    /// Stored, deflated and Deflate64 entries are read for now (libzip
+    /// reads no Deflate64); others fail with
     /// [`ErrorCode::CompNotSupp`](crate::ErrorCode::CompNotSupp), and
     /// encrypted ones with [`ErrorCode::NoPasswd`](crate::ErrorCode::NoPasswd).
     /// Several entries may be open at once, each reading at its own

@@ -2,7 +2,7 @@
 
 `hivepack-zip` will read and write ZIP archives. Its container logic is a port of [libzip](https://libzip.org) to safe Rust; its compression and encryption come from hivepack's own crates, each ported from or checked against an official library. What libzip does not do, such as split archives, legacy file name encodings and extracting to disk, is written for hivepack and checked against other implementations.
 
-> **Status:** step 2 is under way. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored and deflated entries as libzip does, compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). Deflate64 entries and `tools/ziptool` are next.
+> **Status:** step 2 is under way. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries as libzip does (libzip reads no Deflate64), compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). `tools/ziptool` and libzip's `.test` files are next.
 
 ## Why libzip
 
@@ -58,7 +58,7 @@ These are hivepack's own, and each one has its own oracles.
 | Split archives (`.z01`, `.z02`, …, `.zip`) | `check_eocd` and `_zip_read_eocd64` fail with `ZIP_ER_MULTIDISK` | A volume set that reads the segments as one byte space, and a writer that splits. A single segment on its own still fails with `ZIP_ER_MULTIDISK` | minizip-ng, Commons Compress, 7-Zip, Info-ZIP `zip -s` |
 | `.zip.001` volumes | Not a ZIP feature: 7-Zip splits the bytes | The same volume set, joined end to end | 7-Zip |
 | Legacy code pages | `zip_utf-8.c` knows only CP437 | Tables for CP932, CP936, CP949, CP950, CP866, CP1258 and others, chosen by the caller or guessed | 7-Zip `-mcp`, `unzip -O`, libarchive `hdrcharset`, Python `metadata_encoding` |
-| Deflate64 and PPMd | Not among libzip's methods | Deflate64: `hivepack-deflate`'s `InflateBack9`, ported from zlib's `contrib/infback9` (done); PPMd later | .NET and Commons Compress test data, 7-Zip |
+| Deflate64 and PPMd | Not among libzip's methods | Deflate64: read with `hivepack-deflate`'s `Inflate9`, which decodes as zlib's `contrib/infback9` (done); PPMd later | .NET and Commons Compress test data, 7-Zip |
 | Writing to a stream | `add_data` seeks back to rewrite the local header, and forces Zip64 when the size is unknown | A streaming writer with data descriptors | Every oracle reads what it writes |
 | Reading a stream | Needs a seekable source | An opt-in streaming reader that checks what it read against the central directory at the end | libarchive's streaming reader |
 | Parallel work | One thread | Entries decompressed in parallel through `ReaderAt`; compressed in parallel and written in order | The single-threaded output, byte for byte |
@@ -98,7 +98,8 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 | `zip_source_zip_new.c`, `zip_source_window.c`, `zip_source_crc.c` | modules of the same names | the reading of a whole entry |
 | `zip_source_compress.c`, `zip_algorithm_deflate.c` | `source_compress.rs`, `algorithm_deflate.rs` | decompressing deflate |
 | The rules of `zip_source_read.c`, `zip_source_open.c`, `zip_source_close.c`, `zip_source_at_eof.c`, `zip_source_stat.c`, `zip_source_layered.c` for those layers | `source_stack.rs` | done |
-| Deflate64, `tools/ziptool` and libzip's `.test` files | | next |
+| Deflate64 (libzip has none) | `algorithm_deflate.rs`, with `Inflate9` | done: `tests/deflate64.rs` reads streams with long and far matches back to their data, checks the CRC and length, and refuses garbage after the stream with `ZIP_CHECKCONS` |
+| `tools/ziptool` and libzip's `.test` files | | next |
 
 Where the port differs from libzip, a `Differs from libzip:` comment says so. The differences so far:
 
@@ -107,12 +108,12 @@ Where the port differs from libzip, a `Differs from libzip:` comment says so. Th
 - Times are taken as UTC, where libzip calls `mktime` in the machine's time zone; the oracle runs with `TZ=UTC`. `Archive::file_get_dos_time` gives the time as stored.
 - The system error of an error is described by the standard library, whose text is `strerror`'s on Unix.
 - An entry is read through a struct of layers (a window on the archive, then decompression, then the CRC check), each with the state libzip keeps in its `zip_source_t`, in place of a chain of callbacks. Each open entry reads through a view of the archive's source with its own position, so several can be read at once from `&Archive`; a failed read fails only that entry's later reads.
-- Decryption comes with step 4: an encrypted entry fails with `ZIP_ER_NOPASSWD`, as in libzip without a password. Of the compression methods, deflate is read, as the oracle's libzip is built without bzip2, LZMA and Zstandard.
+- Decryption comes with step 4: an encrypted entry fails with `ZIP_ER_NOPASSWD`, as in libzip without a password. Of the compression methods, deflate is read, as the oracle's libzip is built without bzip2, LZMA and Zstandard, and Deflate64, which libzip does not read: where libzip refuses such an entry with `ZIP_ER_COMPNOTSUPP` (once the password and sizes are checked, before the local header is read), the port reads it. The comparison with the oracle expects libzip's refusal there, and `tests/deflate64.rs` checks the data.
 
 ## The order of work
 
 1. **CRC-32 and inflate.** The decompressor and checksums of `hivepack-deflate`, ported from zlib 1.3.2 (`crc32.c`; `inflate.c`, `inftrees.c`, `inffast.c`). Nothing compressed can be read before them. Done: see [deflate.md](deflate.md).
-2. **Reading.** Errors, buffers, extra fields, headers, file names, `open.rs`; stored and deflated entries; `tools/zip-oracle`, and `tools/ziptool`'s reading commands. Deflate64 entries, whose decoder is done: see [deflate.md](deflate.md).
+2. **Reading.** Errors, buffers, extra fields, headers, file names, `open.rs`; stored and deflated entries; `tools/zip-oracle`, and `tools/ziptool`'s reading commands. Deflate64 entries, with `Inflate9` (see [deflate.md](deflate.md)): done.
 3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md).
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto`.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.

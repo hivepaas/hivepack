@@ -1,15 +1,18 @@
 //! Extracts the input as a ZIP archive with hivepack-extract, its first
 //! byte choosing the options, into a scratch folder beside a file that
-//! must stay as it was. A panic is a bug, and so is a file written outside
-//! the destination, a link that leads outside it, or a count of files the
-//! summary does not give. `crates/extract/tests/extract.rs` has the cases
-//! made by hand.
+//! must stay as it was, and cancelled after some progress if it says so.
+//! A panic is a bug, and so is a file written outside the destination, a
+//! link that leads outside it, a count of files the summary does not give,
+//! or a file left cut off: the files left hold the bytes of the entries
+//! written in full, however the extraction ends.
+//! `crates/extract/tests/extract.rs` has the cases made by hand.
 
 #![no_main]
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use hivepack_extract::{Links, Names, OnRefused, Options, extract_zip};
+use hivepack_extract::{Cancel, Links, Names, OnRefused, Options, Progress, extract_zip};
 use hivepack_zip::{Archive, OpenFlags};
 use libfuzzer_sys::fuzz_target;
 
@@ -76,6 +79,25 @@ fuzz_target!(|data: &[u8]| {
     options.limits.max_entry_size = 256 << 10;
     options.limits.max_total_size = 1 << 20;
     options.limits.max_entries = 200;
+    // The bytes written when the last entry was, and the reports so far;
+    // cancelled after some, which the input's length picks.
+    let seen = Arc::new(Mutex::new((0u64, 0u64, 0usize)));
+    let cancel_after = (choice & 128 != 0).then_some(zip.len() % 16);
+    let cancel = Cancel::new();
+    options.cancel = Some(cancel.clone());
+    let record = Arc::clone(&seen);
+    options.progress = Some(Arc::new(move |progress: &Progress| {
+        let mut seen = record.lock().unwrap();
+        let (entries, done, reports) = &mut *seen;
+        if progress.entries > *entries {
+            (*entries, *done) = (progress.entries, progress.bytes);
+        }
+        assert!(progress.bytes <= progress.total_bytes, "{progress:?}");
+        if Some(*reports) == cancel_after {
+            cancel.cancel();
+        }
+        *reports += 1;
+    }));
 
     let scratch = std::env::temp_dir().join(format!("hivepack-fuzz-extract-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
@@ -103,8 +125,15 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(options.links, Links::Inside, "a link created: {link:?}");
         assert!(inside(&out, link, target), "{link:?} leads outside: {target:?}");
     }
+    let on_disk: u64 = files
+        .iter()
+        .map(|file| std::fs::symlink_metadata(file).map_or(0, |m| m.len()))
+        .sum();
+    let done = seen.lock().unwrap().1;
+    assert_eq!(on_disk, done, "a file cut off is left: {result:?}");
     if let Ok(summary) = result {
         assert_eq!(files.len() as u64, summary.files);
         assert_eq!(links.len() as u64, summary.links);
+        assert_eq!(on_disk, summary.bytes);
     }
 });

@@ -51,6 +51,10 @@ pub enum ErrorKind {
     /// A directory on the entry's path is a symbolic link, or not a
     /// directory: nothing is written through it.
     NotADirectory,
+    /// Past [`Options::time_limit`](crate::Options::time_limit).
+    TimeLimit,
+    /// Stopped by [`Options::cancel`](crate::Options::cancel).
+    Cancelled,
     /// The archive could not be read.
     Archive(hivepack_zip::Error),
     /// The destination could not be written.
@@ -91,6 +95,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::SizeMismatch => f.write_str("data not of the size the archive says"),
             ErrorKind::Exists => f.write_str("already exists"),
             ErrorKind::NotADirectory => f.write_str("a directory on the path is a link or a file"),
+            ErrorKind::TimeLimit => f.write_str("past the time limit"),
+            ErrorKind::Cancelled => f.write_str("cancelled"),
             ErrorKind::Archive(e) => write!(f, "archive: {e}"),
             ErrorKind::Io(e) => write!(f, "{e}"),
         }

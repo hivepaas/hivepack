@@ -1,8 +1,11 @@
 //! ziptool, with the commands libzip's tests add to it (ziptool_regress):
 //! port of libzip's `src/ziptool.c` and `regress/programs/ziptool_regress.c`,
-//! but for encrypting, which comes later: until then
-//! `set_file_encryption` is unknown. The output is libzip's, word for word,
-//! so that libzip's tests can run on the port.
+//! The output is libzip's, word for word, so that libzip's tests can run
+//! on the port.
+//!
+//! Differs from libzip: `ziptool_regress_nonrandom`, ziptool built with
+//! random bytes that are all zeros so that encrypting is repeatable, is
+//! this program with `HIVEPACK_ZIPTOOL_NONRANDOM` set.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -11,7 +14,7 @@ use std::sync::Arc;
 
 use hivepack_zip::{
     Archive, ArchiveFlags, BufferSource, DataSource, Error, ErrorCode, FileSource, Flags,
-    OpenFlags, Stat, ZipFile, ZipFileSource, cm, stat,
+    OpenFlags, Stat, ZipFile, ZipFileSource, cm, em, stat,
 };
 use ziptool::{
     Getopt, Src, strtoull, zip_close, zip_close_in_memory, zip_open, zip_open_in_memory,
@@ -68,6 +71,7 @@ const DISPATCH_TABLE: &[Command] = &[
     ("set_file_compression", 3, set_file_compression),
     ("set_file_dostime", 3, set_file_dostime),
     ("set_file_mtime", 2, set_file_mtime),
+    ("set_file_encryption", 3, set_file_encryption),
     ("set_file_mtime_all", 1, set_file_mtime_all),
     ("set_password", 1, set_password),
     ("stat", 1, zstat),
@@ -555,6 +559,32 @@ fn set_archive_comment(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
     })
 }
 
+fn get_encryption_method(arg: &str) -> u16 {
+    match arg.to_ascii_lowercase().as_str() {
+        "none" => em::NONE,
+        "pkware" => em::TRAD_PKWARE,
+        "aes-128" => em::AES_128,
+        "aes-192" => em::AES_192,
+        "aes-256" => em::AES_256,
+        "unknown" => 100,
+        // TODO in libzip: error handling
+        _ => u16::MAX,
+    }
+}
+
+fn set_file_encryption(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let method = get_encryption_method(&argv[1]);
+    let password = Some(argv[2].as_bytes()).filter(|p| !p.is_empty());
+    t.za.file_set_encryption(idx, method, password)
+        .map_err(|e| {
+            eprintln!(
+                "can't set file encryption method at index '{idx}' to '{}': {e}",
+                argv[1]
+            );
+        })
+}
+
 fn set_password(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
     // set default password
     t.za.set_default_password(Some(argv[0].as_bytes()));
@@ -987,6 +1017,14 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let mut za = za;
+    if std::env::var_os("HIVEPACK_ZIPTOOL_NONRANDOM").is_some() {
+        // zip_secure_nonrandom
+        za.set_random_source(Some(std::sync::Arc::new(|buffer: &mut [u8]| {
+            buffer.fill(0);
+            Ok(())
+        })));
+    }
     let mut tool = Tool {
         za,
         stat_flags,

@@ -23,20 +23,20 @@ use crate::compress::zstd_compress::{
     CCtxParams, CParamMode, CParamOverrides, CParameter, ResetTarget, TableReset,
     ZSTD_CLEVEL_DEFAULT, ZSTD_CONTENTSIZE_UNKNOWN, set_cctx_parameter,
     zstd_get_cparams_from_cctx_params, zstd_get_cparams_internal, zstd_overflow_correct_if_needed,
-    zstd_reset_match_state, zstd_resolve_row_match_finder_mode,
+    zstd_override_cparams, zstd_reset_match_state, zstd_resolve_row_match_finder_mode,
 };
 use crate::compress::zstd_compress_internal::{
     CompressedBlockState, CompressionParameters, DictAttachPref, FseRepeat, HASH_READ_SIZE,
     LdmState, MatchState, ParamSwitch, Strategy, WindowBuffer, ZSTD_CHUNKSIZE_MAX,
-    ZSTD_CURRENT_MAX, ZSTD_SHORT_CACHE_TAG_BITS, ZSTD_WINDOW_START_INDEX,
+    ZSTD_CURRENT_MAX, ZSTD_HASHLOG_MIN, ZSTD_SHORT_CACHE_TAG_BITS, ZSTD_WINDOW_START_INDEX,
 };
 use crate::compress::zstd_double_fast::{
     zstd_fill_double_hash_table, zstd_fill_double_hash_table_for_cdict,
 };
 use crate::compress::zstd_fast::{zstd_fill_hash_table, zstd_fill_hash_table_for_cdict};
 use crate::compress::zstd_lazy::{
-    zstd_dedicated_dict_search_lazy_load_dictionary, zstd_insert_and_find_first_index,
-    zstd_row_update,
+    ZSTD_LAZY_DDSS_BUCKET_LOG, zstd_dedicated_dict_search_lazy_load_dictionary,
+    zstd_insert_and_find_first_index, zstd_row_update,
 };
 use crate::compress::zstd_ldm::zstd_ldm_fill_hash_table;
 use crate::compress::zstd_opt::zstd_update_tree;
@@ -149,15 +149,34 @@ impl CDict {
         overrides: &CParamOverrides,
     ) -> Result<CDict> {
         let mut cctx_params = *params;
-        // Phase 1: with ZSTD_c_enableDedicatedDictSearch, the parameters of
-        // ZSTD_dedicatedDictSearch_getCParams when the strategy supports it.
-        let c_params = zstd_get_cparams_from_cctx_params(
-            &cctx_params,
-            overrides,
-            ZSTD_CONTENTSIZE_UNKNOWN,
-            dict.len(),
-            CParamMode::CreateCDict,
-        );
+        // With ZSTD_c_enableDedicatedDictSearch, the level's parameters for
+        // the dictionary alone with a larger hash table, under those set,
+        // if they suit the dedicated search; otherwise as without it.
+        let mut c_params = if cctx_params.enable_dedicated_dict_search {
+            let mut c_params =
+                zstd_dedicated_dict_search_get_cparams(cctx_params.compression_level, dict.len());
+            zstd_override_cparams(&mut c_params, overrides);
+            c_params
+        } else {
+            zstd_get_cparams_from_cctx_params(
+                &cctx_params,
+                overrides,
+                ZSTD_CONTENTSIZE_UNKNOWN,
+                dict.len(),
+                CParamMode::CreateCDict,
+            )
+        };
+        if !zstd_dedicated_dict_search_is_supported(&c_params) {
+            // Back to the parameters without the dedicated search.
+            cctx_params.enable_dedicated_dict_search = false;
+            c_params = zstd_get_cparams_from_cctx_params(
+                &cctx_params,
+                overrides,
+                ZSTD_CONTENTSIZE_UNKNOWN,
+                dict.len(),
+                CParamMode::CreateCDict,
+            );
+        }
         cctx_params.c_params = c_params;
         cctx_params.use_row_match_finder =
             zstd_resolve_row_match_finder_mode(cctx_params.use_row_match_finder, &c_params);
@@ -173,10 +192,9 @@ impl CDict {
             compression_level: 0,
             use_row_match_finder: cctx_params.use_row_match_finder,
         };
-        // Phase 1: ZSTD_c_enableDedicatedDictSearch
-        // (cdict->matchState.dedicatedDictSearch), before the reset, which
-        // then gives it a chain table.
-        cdict.match_state.dedicated_dict_search = false;
+        // Before the reset, which then gives it a chain table whatever the
+        // strategy.
+        cdict.match_state.dedicated_dict_search = cctx_params.enable_dedicated_dict_search;
         // No dictionary yet.
         cdict.c_block_state.reset();
         zstd_reset_match_state(
@@ -276,6 +294,67 @@ pub(crate) fn zstd_should_attach_dict(
             || pledged_src_size == ZSTD_CONTENTSIZE_UNKNOWN
             || params.attach_dict_pref == DictAttachPref::ForceAttach)
             && params.attach_dict_pref != DictAttachPref::ForceCopy)
+}
+
+/// `ZSTD_dedicatedDictSearch_getCParams`: the parameters of a `CDict` with
+/// the dedicated dictionary search, at `compression_level`: the level's
+/// for an input of size 0 with a dictionary of `dict_size` bytes, with a
+/// hash table `1 << ZSTD_LAZY_DDSS_BUCKET_LOG` times as large for `greedy`,
+/// `lazy` and `lazy2`, its buckets.
+///
+/// Unlike a `CDict` without it, the size hint is not looked at, nor long
+/// distance matching's window, and the parameters set over these are not
+/// fitted to the dictionary again: libzstd does neither.
+fn zstd_dedicated_dict_search_get_cparams(
+    compression_level: i32,
+    dict_size: usize,
+) -> CompressionParameters {
+    let mut c_params =
+        zstd_get_cparams_internal(compression_level, 0, dict_size, CParamMode::CreateCDict);
+    match c_params.strategy {
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+            c_params.hash_log += ZSTD_LAZY_DDSS_BUCKET_LOG;
+        }
+        Strategy::Fast
+        | Strategy::Dfast
+        | Strategy::Btlazy2
+        | Strategy::Btopt
+        | Strategy::Btultra
+        | Strategy::Btultra2 => {}
+    }
+    c_params
+}
+
+/// `ZSTD_dedicatedDictSearch_isSupported`: whether a `CDict` with
+/// `c_params` can have the dedicated dictionary search: `greedy`, `lazy`
+/// and `lazy2`, with a hash table larger than the chain table, which has
+/// no more than `1 << 24` entries (their index takes 24 bits of a bucket's
+/// last entry).
+fn zstd_dedicated_dict_search_is_supported(c_params: &CompressionParameters) -> bool {
+    c_params.strategy >= Strategy::Greedy
+        && c_params.strategy <= Strategy::Lazy2
+        && c_params.hash_log > c_params.chain_log
+        && c_params.chain_log <= 24
+}
+
+/// `ZSTD_dedicatedDictSearch_revertCParams`: the parameters of a `CDict`
+/// with the dedicated dictionary search without its larger hash table, for
+/// the context that attaches it: its own tables would grow too otherwise.
+pub(crate) fn zstd_dedicated_dict_search_revert_cparams(c_params: &mut CompressionParameters) {
+    match c_params.strategy {
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+            c_params.hash_log = c_params
+                .hash_log
+                .saturating_sub(ZSTD_LAZY_DDSS_BUCKET_LOG)
+                .max(ZSTD_HASHLOG_MIN);
+        }
+        Strategy::Fast
+        | Strategy::Dfast
+        | Strategy::Btlazy2
+        | Strategy::Btopt
+        | Strategy::Btultra
+        | Strategy::Btultra2 => {}
+    }
 }
 
 /// `ZSTD_getCParamMode`: what the parameters of a frame with `cdict` (if

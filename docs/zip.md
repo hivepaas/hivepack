@@ -156,7 +156,7 @@ libzip's ways that the port keeps, though they surprise:
 3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md). Editing, adding data and writing archives, `ziptool`'s commands and the tests that use them: done.
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto` (AES, SHA-1, HMAC and PBKDF2, ported from BearSSL and compared with nettle; see [crypto.md](crypto.md)): decrypting and encrypting, done.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.
-6. **More methods.** bzip2, LZMA, XZ and PPMd, as their crates arrive; zstd once `hivepack-zstd` compresses.
+6. **More methods.** bzip2 with `hivepack-bzip2` (see [bzip2.md](bzip2.md)), and zstd, now that `hivepack-zstd` compresses; LZMA, XZ and PPMd as their crates arrive.
 
 ## Questions to settle first
 

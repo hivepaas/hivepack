@@ -11,6 +11,9 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
+  # BSD-style, with zlib's rule that altered versions say so: libbzip2's,
+  # which hivepack-bzip2, a port of it, keeps.
+  "bzip2-1.0.6",
   "ISC",
   "Unicode-3.0",
   "Zlib",

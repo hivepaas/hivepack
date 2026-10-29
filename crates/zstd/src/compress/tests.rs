@@ -946,3 +946,493 @@ fn long_distance_matching_matches_libzstd() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Frames attached to a CDict: btlazy2 and the optimal parser
+
+/// Text-like data drawn from `base`, with repeats of its own near and far,
+/// so that a dictionary drawn from `base` helps. Sometimes it starts with
+/// the end of `dict` twice: matches in the dictionary then run on into the
+/// input, and repcodes reach across.
+fn drawn_from(rng: &mut Rng, len: usize, base: &[u8], dict: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len + 256);
+    if rng.range(0, 3) == 0 {
+        let tail = &dict[dict.len() - (rng.range(1, 300) as usize).min(dict.len())..];
+        data.extend_from_slice(tail);
+        data.extend_from_slice(tail);
+    }
+    while data.len() < len {
+        match rng.range(0, 3) {
+            0 => {
+                let at = rng.range(0, base.len() as u64 - 1) as usize;
+                let n = (rng.range(4, 200) as usize).min(base.len() - at);
+                data.extend_from_slice(&base[at..at + n]);
+            }
+            1 if data.len() > 8 => {
+                let offset = rng.range(1, data.len() as u64) as usize;
+                for _ in 0..rng.range(3, 50) {
+                    let byte = data[data.len() - offset];
+                    data.push(byte);
+                }
+            }
+            _ => {
+                for _ in 0..rng.range(1, 12) {
+                    data.push(b'a' + rng.range(0, 25) as u8);
+                }
+            }
+        }
+    }
+    data.truncate(len);
+    data
+}
+
+/// libzstd's name for `strategy`.
+fn c_strategy(strategy: Strategy) -> zstd_safe::Strategy {
+    match strategy {
+        Strategy::Fast => zstd_safe::Strategy::ZSTD_fast,
+        Strategy::Dfast => zstd_safe::Strategy::ZSTD_dfast,
+        Strategy::Greedy => zstd_safe::Strategy::ZSTD_greedy,
+        Strategy::Lazy => zstd_safe::Strategy::ZSTD_lazy,
+        Strategy::Lazy2 => zstd_safe::Strategy::ZSTD_lazy2,
+        Strategy::Btlazy2 => zstd_safe::Strategy::ZSTD_btlazy2,
+        Strategy::Btopt => zstd_safe::Strategy::ZSTD_btopt,
+        Strategy::Btultra => zstd_safe::Strategy::ZSTD_btultra,
+        Strategy::Btultra2 => zstd_safe::Strategy::ZSTD_btultra2,
+    }
+}
+
+/// libzstd's name for `pref`.
+fn c_attach_pref(pref: DictAttachPref) -> zstd_safe::DictAttachPref {
+    match pref {
+        DictAttachPref::DefaultAttach => zstd_safe::DictAttachPref::DefaultAttach,
+        DictAttachPref::ForceAttach => zstd_safe::DictAttachPref::ForceAttach,
+        DictAttachPref::ForceCopy => zstd_safe::DictAttachPref::ForceCopy,
+        DictAttachPref::ForceLoad => zstd_safe::DictAttachPref::ForceLoad,
+    }
+}
+
+/// Whether a frame of `pledged` bytes (`None`: unknown) with a `CDict` of
+/// `strategy`, with content in its window or not, of `dict_size` bytes in
+/// all, made for a level (`by_level`), attaches it
+/// (`ZSTD_compressBegin_internal`, `ZSTD_shouldAttachDict`): not when its
+/// content is loaded again, for a large input; up to the strategy's
+/// cutoff, of unknown size, or forced, unless copied.
+fn attaches(
+    strategy: Strategy,
+    has_content: bool,
+    dict_size: usize,
+    by_level: bool,
+    pref: DictAttachPref,
+    pledged: Option<usize>,
+) -> bool {
+    let reloaded = pref == DictAttachPref::ForceLoad
+        || pledged.is_some_and(|len| by_level && len >= 128 << 10 && len >= 6 * dict_size);
+    let cutoff = if strategy >= Strategy::Btultra {
+        8 << 10
+    } else {
+        32 << 10
+    };
+    has_content
+        && !reloaded
+        && pref != DictAttachPref::ForceCopy
+        && (pledged.is_none_or(|len| len <= cutoff) || pref == DictAttachPref::ForceAttach)
+}
+
+/// `data` streamed through both contexts in the same calls, as one frame:
+/// pieces taken with `Continue`, sometimes `Flush`, then `End`. The first
+/// call ends the frame only when `known` (its size then pledged): the size
+/// is unknown otherwise. Returns both frames.
+fn stream_both_frames(
+    c_cctx: &mut zstd_safe::CCtx<'_>,
+    cctx: &mut CCtx,
+    data: &[u8],
+    rng: &mut Rng,
+    known: bool,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use zstd_safe::zstd_sys::ZSTD_EndDirective as D;
+    let room = zstd_compress_bound(data.len()).expect("a bound") + 1024;
+    let mut want = Vec::new();
+    let mut got = Vec::new();
+    let (mut c_out, mut p_out) = (vec![0u8; room], vec![0u8; room]);
+    let mut taken = 0;
+    for call in 0..10_000 {
+        let end = if call == 0 && known {
+            data.len()
+        } else {
+            (taken + rng.range(0, 20_000) as usize).min(data.len())
+        };
+        let directive = if end == data.len() && (call > 0 || known) {
+            EndDirective::End
+        } else if rng.range(0, 7) == 0 {
+            EndDirective::Flush
+        } else {
+            EndDirective::Continue
+        };
+        let (c_result, c_read, c_written) = {
+            let mut output = zstd_safe::OutBuffer::around(&mut c_out[..]);
+            let mut input = zstd_safe::InBuffer::around(&data[taken..end]);
+            let result = c_cctx.compress_stream2(
+                &mut output,
+                &mut input,
+                match directive {
+                    EndDirective::Continue => D::ZSTD_e_continue,
+                    EndDirective::Flush => D::ZSTD_e_flush,
+                    EndDirective::End => D::ZSTD_e_end,
+                },
+            );
+            (result, input.pos(), output.pos())
+        };
+        let mut output = OutBuffer::new(&mut p_out);
+        let mut input = InBuffer::new(&data[taken..end]);
+        let p_result = cctx.compress_stream2(&mut output, &mut input, directive);
+        let remaining = match (c_result, p_result) {
+            (Ok(want), Ok(got)) if want == got => want,
+            (want, got) => {
+                return Err(format!(
+                    "call {call}: libzstd {want:?}, port {:?}",
+                    got.map_err(|error| error.code())
+                ));
+            }
+        };
+        if (c_read, c_written) != (input.pos, output.pos) {
+            return Err(format!(
+                "call {call}: libzstd read {c_read} wrote {c_written}, the port read {} wrote {}",
+                input.pos, output.pos
+            ));
+        }
+        want.extend_from_slice(&c_out[..c_written]);
+        got.extend_from_slice(&p_out[..c_written]);
+        taken += c_read;
+        if directive == EndDirective::End && remaining == 0 {
+            return Ok((want, got));
+        }
+    }
+    Err("no end".into())
+}
+
+/// Frames attached to a `CDict` (`ZSTD_resetCCtx_byAttachingCDict`) at
+/// btlazy2 and the optimal parser's strategies, whose block compressors
+/// then search the `CDict`'s tables and content as well as the frame's
+/// (`ZSTD_dictMatchState`), against libzstd; decoded back.
+///
+/// Raw content of 8 bytes (the least attached) to 90 KB, and zstd
+/// dictionaries, whose entropy tables give the optimal parser its first
+/// statistics; inputs on both sides of the cutoffs, 8 KB for btultra and
+/// btultra2, 32 KB for btlazy2 and btopt. `CDict`s made for levels, used in
+/// one call or referenced, and dictionaries loaded with a strategy set,
+/// some with a shortest match of 3 bytes (the frame's 3-byte hash table,
+/// none in the `CDict`); attached by size, of unknown size (streaming), or
+/// forced; a few copied, for comparison. Several frames on each context,
+/// in one call and streaming. Small windows, which leave the dictionary
+/// behind within the frame, and long distance matching.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn frames_attached_to_a_cdict_match_libzstd_from_btlazy2_up() {
+    use zstd_safe::CParameter as C;
+    let mut rng = Rng::new(0x5EED_0301);
+    // The optimal parser is slow in debug builds.
+    let debug = cfg!(debug_assertions);
+    let corpus = rng.lz_data(150_000);
+    let mut dicts: Vec<Vec<u8>> = [8usize, 9, 300, 5000, 30_000, 90_000]
+        .iter()
+        .map(|&len| {
+            let at = rng.range(0, (corpus.len() - len) as u64) as usize;
+            corpus[at..at + len].to_vec()
+        })
+        .collect();
+    for (size, chunk) in [(2 << 10, 200), (12 << 10, 500)] {
+        let samples: Vec<&[u8]> = corpus[..60_000].chunks(chunk).collect();
+        if let Ok(dict) = zstd::dict::from_samples(&samples, size) {
+            dicts.push(dict);
+        }
+    }
+    assert_eq!(dicts.len(), 8, "the zstd dictionaries are trained");
+
+    // CDicts for levels whose strategy is btlazy2 or up with each
+    // dictionary, made by both; before libzstd's context, which borrows
+    // them.
+    let mut cdicts: Vec<(usize, i32, zstd_safe::CDict<'static>, Arc<CDict>)> = Vec::new();
+    for (d, dict) in dicts.iter().enumerate() {
+        let mut levels: Vec<i32> = (9..=22).collect();
+        for _ in 0..3 {
+            let level = levels.remove(rng.range(0, levels.len() as u64 - 1) as usize);
+            let p_cdict = CDict::new(dict, level).expect("a CDict");
+            if p_cdict.c_params().strategy >= Strategy::Btlazy2 {
+                cdicts.push((
+                    d,
+                    level,
+                    zstd_safe::CDict::create(dict, level),
+                    Arc::new(p_cdict),
+                ));
+            }
+        }
+    }
+    let strategies = [
+        Strategy::Btlazy2,
+        Strategy::Btopt,
+        Strategy::Btultra,
+        Strategy::Btultra2,
+    ];
+    for strategy in strategies {
+        assert!(
+            cdicts.iter().any(|c| c.3.c_params().strategy == strategy),
+            "no CDict at {strategy:?}"
+        );
+    }
+
+    let sizes: &[usize] = if debug {
+        &[
+            0, 1, 7, 8, 9, 600, 3000, 8191, 8192, 8193, 20_000, 32_767, 32_768, 32_769,
+        ]
+    } else {
+        &[
+            0, 1, 7, 8, 9, 600, 3000, 8191, 8192, 8193, 20_000, 32_767, 32_768, 32_769, 70_000,
+            140_000, 300_000,
+        ]
+    };
+    let mut cctx = CCtx::new();
+    let mut c_cctx = zstd_safe::CCtx::create();
+    let mut problems = Vec::new();
+    let (mut attached, mut by_level, mut loaded, mut streamed, mut copied) = (0, 0, 0, 0, 0);
+    let (mut zstd_dicts, mut small_windows, mut with_ldm, mut hash3) = (0, 0, 0, 0);
+    let mut by_strategy = [0usize; 4];
+    let settings = if debug { 150 } else { 400 };
+    for setting in 0..settings {
+        cctx.reset(crate::decompress::zstd_decompress::ResetDirective::SessionAndParameters)
+            .expect("between frames");
+        c_cctx
+            .reset(zstd_safe::ResetDirective::SessionAndParameters)
+            .expect("between frames");
+        let mut parameters: Vec<(CParameter, C)> = Vec::new();
+        // 0: ZSTD_compress_usingCDict; 1: a CDict referenced; 2: a
+        // dictionary loaded with a strategy set. Streaming for 1 and 2 too.
+        let way = rng.range(0, 2);
+        let stream = way != 0 && rng.range(0, 2) == 0;
+        // The CDict's, when known: 3 for the 3-byte hash table.
+        let mut min_match = 0;
+        let (d, strategy, cdict) = if way == 2 {
+            let d = rng.range(0, dicts.len() as u64 - 1) as usize;
+            let strategy = strategies[rng.range(0, 3) as usize];
+            let level = rng.range(1, 22) as i32;
+            parameters.push((
+                CParameter::CompressionLevel(level),
+                C::CompressionLevel(level),
+            ));
+            parameters.push((
+                CParameter::Strategy(Some(strategy)),
+                C::Strategy(c_strategy(strategy)),
+            ));
+            match rng.range(0, 5) {
+                0 | 1 => {
+                    parameters.push((CParameter::MinMatch(3), C::MinMatch(3)));
+                    min_match = 3;
+                }
+                2 => {
+                    let value = rng.range(4, 7) as u32;
+                    parameters.push((CParameter::MinMatch(value), C::MinMatch(value)));
+                }
+                _ => {}
+            }
+            (d, strategy, None)
+        } else {
+            let c = &cdicts[rng.range(0, cdicts.len() as u64 - 1) as usize];
+            min_match = c.3.c_params().min_match;
+            (c.0, c.3.c_params().strategy, Some(c))
+        };
+        let dict = &dicts[d];
+        let pref = if way == 0 {
+            // ZSTD_compress_usingCDict takes no parameters of the context.
+            DictAttachPref::DefaultAttach
+        } else {
+            [
+                DictAttachPref::DefaultAttach,
+                DictAttachPref::DefaultAttach,
+                DictAttachPref::ForceAttach,
+                DictAttachPref::ForceAttach,
+                DictAttachPref::ForceCopy,
+            ][rng.range(0, 4) as usize]
+        };
+        let mut small_window = false;
+        if way != 0 {
+            parameters.push((
+                CParameter::ForceAttachDict(pref),
+                C::ForceAttachDict(c_attach_pref(pref)),
+            ));
+            if rng.range(0, 3) == 0 {
+                // A small window, which leaves the dictionary behind after
+                // the first blocks.
+                let value = rng.range(10, 13) as u32;
+                parameters.push((CParameter::WindowLog(value), C::WindowLog(value)));
+                small_window = true;
+            }
+            let checksum = rng.range(0, 2) == 0;
+            parameters.push((
+                CParameter::ChecksumFlag(checksum),
+                C::ChecksumFlag(checksum),
+            ));
+            if rng.range(0, 5) == 0 {
+                parameters.push((
+                    CParameter::EnableLongDistanceMatching(ParamSwitch::Enable),
+                    C::EnableLongDistanceMatching(true),
+                ));
+                parameters.push((CParameter::LdmMinMatch(16), C::LdmMinMatch(16)));
+                parameters.push((CParameter::LdmHashRateLog(2), C::LdmHashRateLog(2)));
+                if !small_window {
+                    parameters.push((CParameter::WindowLog(18), C::WindowLog(18)));
+                }
+            }
+            if rng.range(0, 9) == 0 {
+                parameters.push((
+                    CParameter::LiteralCompressionMode(ParamSwitch::Disable),
+                    C::LiteralCompressionMode(zstd_safe::ParamSwitch::Disable),
+                ));
+            }
+        }
+        for &(p, c) in &parameters {
+            cctx.set_parameter(p).expect("the port takes it");
+            c_cctx.set_parameter(c).expect("libzstd takes it");
+        }
+        match (way, cdict) {
+            (1, Some((_, _, c_cdict, p_cdict))) => {
+                c_cctx.ref_cdict(c_cdict).expect("libzstd takes it");
+                cctx.ref_cdict(Some(p_cdict.clone()))
+                    .expect("the port takes it");
+            }
+            (2, _) => {
+                c_cctx.load_dictionary(dict).expect("libzstd loads it");
+                cctx.load_dictionary(dict).expect("the port loads it");
+            }
+            _ => {}
+        }
+        // Whether the CDict has content in its window (it is given 8 bytes
+        // or more), and whether it was made for a level; a loaded
+        // dictionary's is made from the context's parameters. The zstd
+        // dictionaries have content enough.
+        let (has_content, level_cdict) = match cdict {
+            Some(c) => (c.3.window_end_and_len().1 != 0, true),
+            None => (dict.len() >= 8, false),
+        };
+
+        for frame in 0..rng.range(1, 3) {
+            let len = sizes[rng.range(0, sizes.len() as u64 - 1) as usize];
+            let data = drawn_from(&mut rng, len, &corpus, dict);
+            // On big-endian machines libzstd's block splitter splits
+            // elsewhere (see `is_ported`).
+            if cfg!(target_endian = "big") && len >= 128 << 10 {
+                continue;
+            }
+            let known = !stream || rng.range(0, 3) == 0;
+            let what = format!(
+                "setting {setting} frame {frame}: {len} bytes, dictionary {d} ({} bytes), way \
+                 {way}{}, CDict level {:?}, {strategy:?}, {pref:?}, {parameters:?}",
+                dict.len(),
+                if stream { " streaming" } else { "" },
+                cdict.map(|c| c.1),
+            );
+            let frames = if stream {
+                stream_both_frames(&mut c_cctx, &mut cctx, &data, &mut rng, known)
+            } else {
+                let bound = zstd_compress_bound(len).expect("a bound");
+                let mut want = vec![0u8; bound];
+                let mut got = vec![0u8; bound];
+                let (w, g) = match cdict {
+                    Some((_, _, c_cdict, p_cdict)) if way == 0 => (
+                        c_cctx.compress_using_cdict(&mut want[..], &data, c_cdict),
+                        cctx.compress_using_cdict(&mut got, &data, p_cdict),
+                    ),
+                    _ => (
+                        c_cctx.compress2(&mut want[..], &data),
+                        cctx.compress2(&mut got, &data),
+                    ),
+                };
+                match (w, g) {
+                    (Ok(w), Ok(g)) => {
+                        want.truncate(w);
+                        got.truncate(g);
+                        Ok((want, got))
+                    }
+                    (w, g) => Err(format!(
+                        "libzstd {w:?}, port {:?}",
+                        g.map_err(|error| error.code())
+                    )),
+                }
+            };
+            let (want, got) = match frames {
+                Ok(frames) => frames,
+                Err(problem) => {
+                    problems.push(format!("{what}: {problem}"));
+                    continue;
+                }
+            };
+            if want != got {
+                let at = want.iter().zip(&got).position(|(a, b)| a != b);
+                problems.push(format!(
+                    "{what}: {} bytes, libzstd {}, first difference at {at:?}",
+                    got.len(),
+                    want.len()
+                ));
+                continue;
+            }
+            let mut back = vec![0u8; len];
+            if DCtx::new()
+                .decompress_using_dict(&mut back, &got, dict)
+                .ok()
+                != Some(len)
+                || back != data
+            {
+                problems.push(format!("{what}: does not decode back"));
+                continue;
+            }
+            let pledged = known.then_some(len);
+            if attaches(
+                strategy,
+                has_content,
+                dict.len(),
+                level_cdict,
+                pref,
+                pledged,
+            ) {
+                attached += 1;
+                by_strategy[strategy as usize - Strategy::Btlazy2 as usize] += 1;
+                by_level += usize::from(cdict.is_some());
+                loaded += usize::from(cdict.is_none());
+                streamed += usize::from(!known);
+                zstd_dicts += usize::from(d >= 6);
+                hash3 += usize::from(min_match == 3 && strategy >= Strategy::Btopt);
+                small_windows += usize::from(small_window && len > 1 << 13);
+                with_ldm += usize::from(
+                    parameters
+                        .iter()
+                        .any(|p| matches!(p.0, CParameter::EnableLongDistanceMatching(_))),
+                );
+            } else {
+                copied += 1;
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    eprintln!(
+        "{attached} frames attached ({by_strategy:?} by strategy; {by_level} with CDicts made for \
+         levels, {loaded} loaded, {streamed} of unknown size, {zstd_dicts} zstd dictionaries, \
+         {small_windows} with small windows, {with_ldm} with long distance matching, {hash3} \
+         with a 3-byte hash table), {copied} not"
+    );
+    let least = if debug { 1 } else { 4 };
+    assert!(attached > 60 * least, "only {attached} frames attached");
+    assert!(
+        by_strategy.iter().all(|&n| n > 8 * least),
+        "{by_strategy:?} frames attached by strategy"
+    );
+    for (count, what) in [
+        (by_level, "with CDicts made for levels"),
+        (loaded, "with dictionaries loaded"),
+        (streamed, "of unknown size"),
+        (zstd_dicts, "with zstd dictionaries"),
+        (small_windows, "with small windows"),
+        (with_ldm, "with long distance matching"),
+        (hash3, "with a 3-byte hash table"),
+    ] {
+        assert!(count > 3 * least, "only {count} frames attached {what}");
+    }
+    assert!(copied > 5, "only {copied} frames not attached");
+}

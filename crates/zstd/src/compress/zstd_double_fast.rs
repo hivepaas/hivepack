@@ -13,8 +13,8 @@ use crate::common::mem::idx;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
     HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
-    mem_read32, mem_read32_within, mem_read64, mem_read64_within, offset_to_offbase, zstd_count,
-    zstd_count_2segments, zstd_hash_ptr,
+    ZSTD_SHORT_CACHE_TAG_BITS, mem_read32, mem_read32_within, mem_read64, mem_read64_within,
+    offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr, zstd_write_tagged_index,
 };
 
 /// `ZSTD_fillDoubleHashTable` for a context
@@ -40,6 +40,46 @@ pub(crate) fn zstd_fill_double_hash_table(ms: &mut MatchState, src: &[u8], end: 
         let lg_hash = zstd_hash_ptr(src, ip as usize, h_bits_l, 8);
         ms.chain_table[sm_hash] = curr;
         ms.hash_table[lg_hash] = curr;
+        ip += FAST_HASH_FILL_STEP;
+    }
+}
+
+/// `ZSTD_fillDoubleHashTable` for a `CDict`
+/// (`ZSTD_fillDoubleHashTableForCDict`), with `ZSTD_dtlm_full`, the only way
+/// libzstd calls it for one: every third position from `nextToUpdate` into
+/// both tables, and the two after it into the long one where their entry
+/// is still empty, while 8 bytes from the third fit before `end`, a
+/// position of `src`, the buffer of the `CDict`'s window. The entries hold
+/// tagged indices (see [`ZSTD_SHORT_CACHE_TAG_BITS`]). `nextToUpdate`
+/// stays.
+pub(crate) fn zstd_fill_double_hash_table_for_cdict(ms: &mut MatchState, src: &[u8], end: usize) {
+    const FAST_HASH_FILL_STEP: i64 = 3;
+    let h_bits_l = ms.c_params.hash_log + ZSTD_SHORT_CACHE_TAG_BITS;
+    let mls = ms.c_params.min_match;
+    let h_bits_s = ms.c_params.chain_log + ZSTD_SHORT_CACHE_TAG_BITS;
+    let base = ms.window.base;
+    let mut ip = i64::from(ms.next_to_update) - base;
+    debug_assert!(ip >= 0);
+    // libzstd's iend, end - HASH_READ_SIZE, which can be before the buffer.
+    let iend = end as i64 - HASH_READ_SIZE as i64;
+    let MatchState {
+        hash_table: hash_large,
+        chain_table: hash_small,
+        ..
+    } = ms;
+    while ip + FAST_HASH_FILL_STEP - 1 <= iend {
+        let curr = (ip + base) as u32;
+        for i in 0..FAST_HASH_FILL_STEP {
+            let at = (ip + i) as usize;
+            let sm_hash_and_tag = zstd_hash_ptr(src, at, h_bits_s, mls);
+            let lg_hash_and_tag = zstd_hash_ptr(src, at, h_bits_l, 8);
+            if i == 0 {
+                zstd_write_tagged_index(hash_small, sm_hash_and_tag, curr);
+            }
+            if i == 0 || hash_large[lg_hash_and_tag >> ZSTD_SHORT_CACHE_TAG_BITS] == 0 {
+                zstd_write_tagged_index(hash_large, lg_hash_and_tag, curr + i as u32);
+            }
+        }
         ip += FAST_HASH_FILL_STEP;
     }
 }

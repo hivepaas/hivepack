@@ -11,8 +11,8 @@ use crate::common::zstd_internal::{
     BlockType, DEFAULT_MAX_OFF, LIT_HUF_LOG, LL_BITS, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG,
     LL_FSE_LOG, LONGNBSEQ, MAX_LL, MAX_ML, MAX_OFF, MAX_SEQ, MIN_CBLOCK_SIZE, MINMATCH, ML_BITS,
     ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG, ML_FSE_LOG, OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG,
-    OFF_FSE_LOG, REP_START_VALUE, SymbolEncodingType, ZSTD_BLOCKHEADERSIZE, ZSTD_BLOCKSIZE_MAX,
-    ZSTD_MAGICNUMBER, ZSTD_REP_NUM, ZSTD_WINDOWLOG_ABSOLUTEMIN,
+    OFF_FSE_LOG, SymbolEncodingType, ZSTD_BLOCKHEADERSIZE, ZSTD_BLOCKSIZE_MAX, ZSTD_MAGICNUMBER,
+    ZSTD_REP_NUM, ZSTD_WINDOWLOG_ABSOLUTEMIN,
 };
 use crate::compress::clevels::{ZSTD_DEFAULT_CPARAMETERS, ZSTD_MAX_CLEVEL};
 use crate::compress::hist::{HIST_WKSP_SIZE_U32, hist_count_fast_wksp, hist_count_wksp};
@@ -20,13 +20,18 @@ use crate::compress::huf_compress::{
     HUF_CTABLE_SIZE, HufRepeat, huf_build_ctable_wksp, huf_estimate_compressed_size,
     huf_optimal_table_log, huf_validate_ctable, huf_write_ctable_wksp,
 };
+use crate::compress::zstd_cdict::{
+    CDict, DictTableLoadMethod, TableFillPurpose, zstd_cdict_indices_are_tagged,
+    zstd_compress_insert_dictionary, zstd_get_cparam_mode, zstd_should_attach_dict,
+};
 use crate::compress::zstd_compress_internal::{
-    Buffers, CompressedBlockState, CompressionParameters, EntropyCTables, FrameParameters,
-    FseCTables, FseRepeat, HufCTables, LdmEntry, LdmParams, LdmState, LongLengthType, MatchState,
-    OptState, ParamSwitch, RawSeqStore, SeqDef, SeqStore, SeqStoreChunk, SeqStoreView, Strategy,
-    Window, WindowBuffer, ZSTD_HASHLOG_MIN, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_WINDOWLOG_MAX,
-    offset_to_offbase, zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain,
-    zstd_ml_code, zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
+    Buffers, CompressedBlockState, CompressionParameters, DictAttachPref, DictMatchState,
+    EntropyCTables, FrameParameters, FseCTables, FseRepeat, HufCTables, LdmEntry, LdmParams,
+    LdmState, LongLengthType, MatchState, OptState, ParamSwitch, RawSeqStore, SeqDef, SeqStore,
+    SeqStoreChunk, SeqStoreView, Strategy, Window, WindowBuffer, ZSTD_HASHLOG_MIN,
+    ZSTD_SHORT_CACHE_TAG_BITS, ZSTD_WINDOWLOG_MAX, offset_to_offbase,
+    zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain, zstd_ml_code,
+    zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
 };
 use crate::compress::zstd_compress_literals::{
     HUF_OPTIMAL_DEPTH_THRESHOLD, zstd_compress_literals,
@@ -49,8 +54,10 @@ use crate::compress::zstd_ldm::{
 };
 use crate::compress::zstd_opt::zstd_compress_block_opt;
 use crate::compress::zstd_pre_split::zstd_split_block;
+use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
+use std::sync::Arc;
 
 /// `ZSTD_seqToCodes`: the codes of the sequences' lengths and offsets, into
 /// the store (or the chunk of it). Returns `longOffsets`, which is only
@@ -1170,6 +1177,26 @@ pub(crate) fn zstd_frame_ported(_params: &CCtxParams) -> bool {
     true
 }
 
+/// Whether the port has the `dictMatchState` block compressors a frame
+/// with `params`, attached to a `CDict` (see
+/// [`BlockCompressor::compress_dict_match_state`]), needs; `dedicated` for
+/// a `CDict` with a dedicated dictionary search. The context refuses the
+/// others with `ParameterUnsupported`, when it attaches the `CDict`.
+///
+/// Phase 1 ports them, in three groups: one line each.
+pub(crate) fn zstd_dict_match_state_ported(params: &CCtxParams, dedicated: bool) -> bool {
+    let _ = (params.use_row_match_finder, dedicated);
+    match params.c_params.strategy {
+        // Phase 1: fast and dfast.
+        Strategy::Fast | Strategy::Dfast => false,
+        // Phase 1: greedy, lazy and lazy2: the hash chain, the row match
+        // finder, and the dedicated dictionary search.
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => false,
+        // Phase 1: btlazy2 and the optimal parser.
+        Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => false,
+    }
+}
+
 /// Whether the port has what `ZSTD_compressCCtx` takes at `level` for
 /// `src_size` bytes.
 #[cfg(test)]
@@ -1220,9 +1247,16 @@ pub(crate) fn zstd_resolve_enable_ldm(
 }
 
 /// `ZSTD_allocateChainTable`: whether the strategy needs a chain table (for
-/// `dfast`, its short hash table).
-fn zstd_allocate_chain_table(strategy: Strategy, use_row_match_finder: ParamSwitch) -> bool {
-    strategy != Strategy::Fast && !zstd_row_match_finder_used(strategy, use_row_match_finder)
+/// `dfast`, its short hash table); a `CDict`'s match state for the
+/// dedicated dictionary search always does.
+fn zstd_allocate_chain_table(
+    strategy: Strategy,
+    use_row_match_finder: ParamSwitch,
+    for_dds_dict: bool,
+) -> bool {
+    for_dds_dict
+        || (strategy != Strategy::Fast
+            && !zstd_row_match_finder_used(strategy, use_row_match_finder))
 }
 
 /// `ZSTD_bitmix`: the bits of `val` mixed, after `XXH3_rrmxmx`.
@@ -1238,6 +1272,145 @@ fn zstd_bitmix(mut val: u64, len: u64) -> u64 {
 /// one and the hashes searched since.
 fn zstd_advance_hash_salt(ms: &mut MatchState) {
     ms.hash_salt = zstd_bitmix(ms.hash_salt, 8) ^ zstd_bitmix(u64::from(ms.hash_salt_entropy), 4);
+}
+
+/// `ZSTD_compResetPolicy_e`: whether a reset clears the tables, or leaves
+/// them for what is about to write over them all (a `CDict`'s copy).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TableReset {
+    /// `ZSTDcrp_makeClean`
+    MakeClean,
+    /// `ZSTDcrp_leaveDirty`
+    LeaveDirty,
+}
+
+/// `ZSTD_resetTarget_e`: whose match state a reset is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResetTarget {
+    /// A `CDict`'s: no 3-byte hash table nor optimal parser's state, and
+    /// the row match finder's tags without a salt.
+    CDict,
+    /// A context's.
+    CCtx,
+}
+
+/// A table of `size` entries; cleared, or as it was when it already has
+/// that size.
+fn zstd_reserve_table<T: Copy + Default>(table: &mut Vec<T>, size: usize, crp: TableReset) {
+    if crp == TableReset::MakeClean {
+        table.clear();
+    }
+    table.resize(size, T::default());
+}
+
+/// `ZSTD_reset_matchState`: the match state for a frame (or a `CDict`)
+/// with `c_params`: a new window, no dictionary, and tables of the sizes
+/// the parameters ask for, clean unless `crp` says.
+///
+/// Differs from libzstd: the indices always start again (libzstd's
+/// `ZSTDirp_reset`); see `CCtx::reset_cctx_internal`.
+pub(crate) fn zstd_reset_match_state(
+    ms: &mut MatchState,
+    c_params: &CompressionParameters,
+    use_row_match_finder: ParamSwitch,
+    crp: TableReset,
+    for_who: ResetTarget,
+) {
+    // No chain table for fast, nor for the row match finder.
+    let chain_size = if zstd_allocate_chain_table(
+        c_params.strategy,
+        use_row_match_finder,
+        ms.dedicated_dict_search && for_who == ResetTarget::CDict,
+    ) {
+        1 << c_params.chain_log
+    } else {
+        0
+    };
+    let h_size = 1usize << c_params.hash_log;
+    // The 3-byte hash table, for a shortest match of 3 bytes.
+    let hash_log3 = if for_who == ResetTarget::CCtx && c_params.min_match == 3 {
+        ZSTD_HASHLOG3_MAX.min(c_params.window_log)
+    } else {
+        0
+    };
+    let h3_size = if hash_log3 != 0 { 1 << hash_log3 } else { 0 };
+    debug_assert!(use_row_match_finder != ParamSwitch::Auto);
+
+    ms.window = Window::new();
+    ms.hash_log3 = hash_log3;
+    ms.lazy_skipping = false;
+
+    // ZSTD_invalidateMatchState
+    ms.window.clear();
+    ms.next_to_update = ms.window.dict_limit;
+    ms.loaded_dict_end = 0;
+    if let Some(opt) = &mut ms.opt {
+        // The optimal parser's statistics start again.
+        opt.lit_length_sum = 0;
+    }
+    ms.dict_match_state = false;
+
+    zstd_reserve_table(&mut ms.hash_table, h_size, crp);
+    zstd_reserve_table(&mut ms.chain_table, chain_size, crp);
+    zstd_reserve_table(&mut ms.hash_table3, h3_size, crp);
+
+    if zstd_row_match_finder_used(c_params.strategy, use_row_match_finder) {
+        // The row match finder's table of tags.
+        if for_who == ResetTarget::CCtx {
+            // And a new salt. Unlike the window, the salt goes on from frame
+            // to frame, as libzstd's does. It changes no output: XORed into
+            // the hashes before their shift, it changes which row and which
+            // tag a position gets, never which positions share them.
+            //
+            // Differs from libzstd: the tags are zeroed at every frame
+            // (unless a CDict's copy writes over them), where libzstd zeroes
+            // them only the first time its workspace holds them
+            // (ZSTD_cwksp_reserve_aligned_init_once): later frames find the
+            // tags and heads of earlier ones, or other bytes. They change
+            // nothing. A search goes through a row from its head, newest
+            // entry first, so the entries written in this frame come first,
+            // wherever the head is. Every other entry holds an index below
+            // the window: an earlier frame's in libzstd, whose indices go
+            // on from frame to frame, or 0. A search stops at the first
+            // entry below the window that has its tag, after taking those
+            // with its tag before it; so it takes the same candidates in
+            // the same order, whatever the other entries' tags and the
+            // head. Lowering the indices (ZSTD_reduceIndex) leaves the tags
+            // too: the entries it sets to 0 held indices below the window
+            // already, the oldest of their rows. A dictionary loaded into
+            // the context zeroes them first.
+            zstd_reserve_table(&mut ms.tag_table, h_size, crp);
+            zstd_advance_hash_salt(ms);
+        } else {
+            // A CDict's, always zeroed, without a salt.
+            zstd_reserve_table(&mut ms.tag_table, h_size, TableReset::MakeClean);
+            ms.hash_salt = 0;
+        }
+        // Rows of 16 entries, 32 from a search log of 5, 64 from 6.
+        let row_log = c_params.search_log.clamp(4, 6);
+        debug_assert!(c_params.hash_log >= row_log);
+        ms.row_hash_log = c_params.hash_log - row_log;
+    }
+
+    // The optimal parser's state. libzstd reserves it in the workspace at
+    // every frame; the port keeps it from frame to frame.
+    if for_who == ResetTarget::CCtx && c_params.strategy >= Strategy::Btopt && ms.opt.is_none() {
+        ms.opt = Some(Box::new(OptState::new()));
+    }
+
+    ms.c_params = *c_params;
+}
+
+/// `ZSTD_copyCDictTableIntoCCtx`: a `CDict`'s table into a context's, its
+/// tags taken out when `tagged` (see `ZSTD_SHORT_CACHE_TAG_BITS`).
+fn zstd_copy_cdict_table_into_cctx(dst: &mut [u32], src: &[u32], tagged: bool) {
+    if tagged {
+        for (dst, &tagged_index) in dst.iter_mut().zip(src) {
+            *dst = tagged_index >> ZSTD_SHORT_CACHE_TAG_BITS;
+        }
+    } else {
+        dst.copy_from_slice(src);
+    }
 }
 
 /// `ZSTD_cycleLog`
@@ -1329,9 +1502,18 @@ pub(crate) fn zstd_adjust_cparams_internal(
         c_par.window_log = ZSTD_WINDOWLOG_ABSOLUTEMIN;
     }
 
-    // A dictionary's indices carry tags in their top bits; libzstd checks
-    // that for dictionaries it makes (ZSTD_CDictIndicesAreTagged), which the
-    // port does not make yet.
+    // A CDict for fast or dfast keeps tags in the low bits of its tables'
+    // entries (see ZSTD_SHORT_CACHE_TAG_BITS): no more than 32 bits of hash
+    // and tag in all, hashLog + 8 <= 32 and chainLog + 8 <= 32.
+    if mode == CParamMode::CreateCDict && zstd_cdict_indices_are_tagged(&c_par) {
+        let max_short_cache_hash_log = 32 - ZSTD_SHORT_CACHE_TAG_BITS;
+        if c_par.hash_log > max_short_cache_hash_log {
+            c_par.hash_log = max_short_cache_hash_log;
+        }
+        if c_par.chain_log > max_short_cache_hash_log {
+            c_par.chain_log = max_short_cache_hash_log;
+        }
+    }
 
     // Whether the row match finder will be used is not known yet; unless it
     // is turned off, assume it is. It is only turned off for small inputs,
@@ -1446,6 +1628,23 @@ pub(crate) struct CParamOverrides {
     pub(crate) strategy: Option<Strategy>,
 }
 
+impl From<&CompressionParameters> for CParamOverrides {
+    /// Every one of `c_params` set, as libzstd's `cParams` of the requested
+    /// parameters hold them all (`ZSTD_createCDict_advanced`); a target
+    /// length of 0 is left to the level's.
+    fn from(c_params: &CompressionParameters) -> Self {
+        CParamOverrides {
+            window_log: c_params.window_log,
+            hash_log: c_params.hash_log,
+            chain_log: c_params.chain_log,
+            search_log: c_params.search_log,
+            min_match: c_params.min_match,
+            target_length: c_params.target_length,
+            strategy: Some(c_params.strategy),
+        }
+    }
+}
+
 /// `ZSTD_overrideCParams`: the parameters set, over the level's.
 fn zstd_override_cparams(c_params: &mut CompressionParameters, overrides: &CParamOverrides) {
     if overrides.window_log != 0 {
@@ -1504,6 +1703,9 @@ pub(crate) struct CCtxParams {
     /// matching, 0 for those left to `ZSTD_ldm_adjustParameters`, which a
     /// frame with it applies.
     pub(crate) ldm: LdmParams,
+    /// `attachDictPref`: whether a frame with a `CDict` attaches it, copies
+    /// it or loads it again (`ZSTD_c_forceAttachDict`).
+    pub(crate) attach_dict_pref: DictAttachPref,
 }
 
 impl CCtxParams {
@@ -1528,13 +1730,14 @@ impl CCtxParams {
             post_block_splitter: zstd_resolve_block_splitter_mode(ParamSwitch::Auto, &c_params),
             ldm_enable: zstd_resolve_enable_ldm(ParamSwitch::Auto, &c_params),
             ldm: LdmParams::default(),
+            attach_dict_pref: DictAttachPref::DefaultAttach,
         }
     }
 
     /// `ZSTD_CCtxParams_init`, at the default level: the requested
     /// parameters of a new context. Their `c_params` are not used, but
     /// those set, the overrides.
-    fn requested_default() -> (Self, CParamOverrides) {
+    pub(crate) fn requested_default() -> (Self, CParamOverrides) {
         let (c_params, f_params) = zstd_get_params_internal(
             ZSTD_CLEVEL_DEFAULT,
             ZSTD_CONTENTSIZE_UNKNOWN,
@@ -1552,7 +1755,7 @@ impl CCtxParams {
 /// `ZSTD_getCParamsFromCCtxParams`: the compression parameters of a frame:
 /// the level's, for about `src_size_hint` bytes, with those set over them,
 /// fitted to the input.
-fn zstd_get_cparams_from_cctx_params(
+pub(crate) fn zstd_get_cparams_from_cctx_params(
     params: &CCtxParams,
     overrides: &CParamOverrides,
     mut src_size_hint: u64,
@@ -1606,7 +1809,7 @@ fn zstd_frameheadersize_min(format: Format) -> usize {
 /// `ZSTD_overflowCorrectIfNeeded`: lowers every index when those of the
 /// block from `ip` to `iend` (positions in the prefix's buffer) near 2^32,
 /// keeping the window.
-fn zstd_overflow_correct_if_needed(
+pub(crate) fn zstd_overflow_correct_if_needed(
     ms: &mut MatchState,
     params: &CCtxParams,
     ip: usize,
@@ -1623,9 +1826,13 @@ fn zstd_overflow_correct_if_needed(
     {
         let correction = ms.window.correct_overflow(cycle_log, max_dist, src);
         // ZSTD_reduceIndex. The row match finder's tags stay as they are
-        // (see reset_cctx_internal).
+        // (see zstd_reset_match_state).
         zstd_reduce_table(&mut ms.hash_table, correction);
-        if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
+        if zstd_allocate_chain_table(
+            c_params.strategy,
+            params.use_row_match_finder,
+            ms.dedicated_dict_search,
+        ) {
             if c_params.strategy == Strategy::Btlazy2 {
                 zstd_reduce_table_btlazy2(&mut ms.chain_table, correction);
             } else {
@@ -1638,6 +1845,7 @@ fn zstd_overflow_correct_if_needed(
         ms.next_to_update = ms.next_to_update.saturating_sub(correction);
         // Dictionaries are invalid after a correction.
         ms.loaded_dict_end = 0;
+        ms.dict_match_state = false;
     }
 }
 
@@ -1658,9 +1866,13 @@ fn zstd_window_in_buffers(window: &Window, bufs: &Buffers<'_>) -> bool {
 }
 
 /// `ZSTD_selectBlockCompressor`'s choice: the block compressor of the
-/// strategy, without a dictionary or with the window's older segment
-/// (`ZSTD_noDict`, `ZSTD_extDict`), over the buffers of a block: `src`, the
-/// prefix's, and `dict`, the older segment's when it has one.
+/// strategy, without a dictionary, with the window's older segment, or
+/// with the match state of an attached `CDict` (`ZSTD_noDict`,
+/// `ZSTD_extDict`, `ZSTD_dictMatchState`: `ZSTD_matchState_dictMode`), over
+/// the buffers of a block: `src`, the prefix's, and `dict`, the older
+/// segment's when it has one, or `dms`, the `CDict`'s, when the frame is
+/// attached to one. The older segment comes first: a frame attached to a
+/// `CDict` drops it when its window gets one.
 ///
 /// Differs from libzstd: what picks the function, kept as a value, instead
 /// of a pointer to it; [`BlockCompressor::compress`] calls the same one.
@@ -1670,6 +1882,9 @@ pub(crate) struct BlockCompressor<'a> {
     pub(crate) use_row_match_finder: ParamSwitch,
     pub(crate) src: &'a [u8],
     pub(crate) dict: Option<&'a [u8]>,
+    /// `ms->dictMatchState`, when the frame is attached to a `CDict` and
+    /// the window has no older segment.
+    pub(crate) dms: Option<DictMatchState<'a>>,
     /// For the optimal parser: the tables of the block before
     /// (`ms->opt.symbolCosts`), and how the literals will be compressed.
     pub(crate) symbol_costs: &'a EntropyCTables,
@@ -1679,8 +1894,8 @@ pub(crate) struct BlockCompressor<'a> {
 impl BlockCompressor<'_> {
     /// `ZSTD_BlockCompressor_f`: the sequences of `src[istart..iend]` into
     /// `seq_store`. Returns the size of the literals left after the last
-    /// sequence. Fails for the strategies the port does not have yet; the
-    /// context does not take them.
+    /// sequence. Fails for the block compressors the port does not have
+    /// yet; the context does not start the frames that need them.
     pub(crate) fn compress(
         &self,
         ms: &mut MatchState,
@@ -1690,6 +1905,10 @@ impl BlockCompressor<'_> {
         iend: usize,
     ) -> Result<usize> {
         let src = self.src;
+        if let Some(dms) = self.dms {
+            debug_assert!(self.dict.is_none());
+            return self.compress_dict_match_state(ms, seq_store, rep, istart, iend, dms, None);
+        }
         Ok(match (self.strategy, self.dict) {
             (Strategy::Fast, None) => {
                 zstd_compress_block_fast(ms, seq_store, rep, src, istart, iend)
@@ -1715,7 +1934,7 @@ impl BlockCompressor<'_> {
                 zstd_compress_block_btlazy2(ms, seq_store, rep, src, dict, istart, iend)
             }
             (Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2, _) => {
-                self.compress_opt(ms, seq_store, rep, istart, iend, None)
+                return self.compress_opt(ms, seq_store, rep, istart, iend, None);
             }
         })
     }
@@ -1731,8 +1950,12 @@ impl BlockCompressor<'_> {
         istart: usize,
         iend: usize,
         ldm: Option<&RawSeqStore>,
-    ) -> usize {
-        zstd_compress_block_opt(
+    ) -> Result<usize> {
+        if let Some(dms) = self.dms {
+            debug_assert!(self.dict.is_none());
+            return self.compress_dict_match_state(ms, seq_store, rep, istart, iend, dms, ldm);
+        }
+        Ok(zstd_compress_block_opt(
             self.strategy,
             ms,
             seq_store,
@@ -1744,7 +1967,45 @@ impl BlockCompressor<'_> {
             self.symbol_costs,
             self.literal_compression_mode,
             ldm,
-        )
+        ))
+    }
+
+    /// The `dictMatchState` block compressors (and, for a `CDict` with
+    /// `ms.dedicated_dict_search`, the `dedicatedDictSearch` ones of the
+    /// lazy strategies): the sequences of `src[istart..iend]`, with matches
+    /// in the window and in `dms`, the attached `CDict`'s match state; for
+    /// the optimal parser, `ldm` as in [`BlockCompressor::compress_opt`].
+    ///
+    /// Phase 1 ports them, a group of strategies each, and
+    /// [`zstd_dict_match_state_ported`] with them; until then the frames
+    /// that would need them are refused at their start, and these fail.
+    #[allow(clippy::too_many_arguments)]
+    fn compress_dict_match_state(
+        &self,
+        ms: &mut MatchState,
+        seq_store: &mut SeqStore,
+        rep: &mut [u32; ZSTD_REP_NUM],
+        istart: usize,
+        iend: usize,
+        dms: DictMatchState<'_>,
+        ldm: Option<&RawSeqStore>,
+    ) -> Result<usize> {
+        let _ = (ms, seq_store, rep, istart, iend, dms, ldm);
+        match self.strategy {
+            // Phase 1: ZSTD_compressBlock_fast_dictMatchState and
+            // ZSTD_compressBlock_doubleFast_dictMatchState.
+            Strategy::Fast | Strategy::Dfast => error!(ParameterUnsupported),
+            // Phase 1: ZSTD_compressBlock_{greedy,lazy,lazy2}_dictMatchState,
+            // their _row variants (self.use_row_match_finder), and
+            // _dedicatedDictSearch (dms.ms.dedicated_dict_search).
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => error!(ParameterUnsupported),
+            // Phase 1: ZSTD_compressBlock_btlazy2_dictMatchState and
+            // ZSTD_compressBlock_{btopt,btultra}_dictMatchState (btultra2
+            // takes btultra's), with `ldm`.
+            Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+                error!(ParameterUnsupported)
+            }
+        }
     }
 }
 
@@ -1897,6 +2158,11 @@ pub enum CParameter {
     /// window log less the hash log when that is set, otherwise from 7 for
     /// `fast` to 4 for `btultra2`.
     LdmHashRateLog(u32),
+    /// Whether a frame with a [`CDict`] (referenced, or the dictionary
+    /// loaded) searches its tables where they are, copies them, or loads
+    /// its content again (`ZSTD_c_forceAttachDict`). The default leaves it
+    /// to the input's size.
+    ForceAttachDict(DictAttachPref),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -1927,6 +2193,7 @@ pub enum CParameterKind {
     LdmMinMatch,
     LdmBucketSizeLog,
     LdmHashRateLog,
+    ForceAttachDict,
 }
 
 impl CParameter {
@@ -1958,6 +2225,7 @@ impl CParameter {
             CParameter::LdmMinMatch(_) => CParameterKind::LdmMinMatch,
             CParameter::LdmBucketSizeLog(_) => CParameterKind::LdmBucketSizeLog,
             CParameter::LdmHashRateLog(_) => CParameterKind::LdmHashRateLog,
+            CParameter::ForceAttachDict(_) => CParameterKind::ForceAttachDict,
         }
     }
 }
@@ -1987,12 +2255,183 @@ fn bound_check(value: u32, bounds: std::ops::RangeInclusive<u32>) -> Result<()> 
     }
 }
 
+/// `ZSTD_CCtxParams_setParameter`: `parameter` into `params`, and into
+/// `c_params` for the compression parameters. Values out of range fail
+/// with `ParameterOutOfBound`, but the level's, which are clamped.
+pub(crate) fn set_cctx_parameter(
+    params: &mut CCtxParams,
+    c_params: &mut CParamOverrides,
+    parameter: CParameter,
+) -> Result<()> {
+    match parameter {
+        CParameter::CompressionLevel(level) => {
+            let level = level.clamp(zstd_min_clevel(), ZSTD_MAX_CLEVEL);
+            params.compression_level = if level == 0 {
+                ZSTD_CLEVEL_DEFAULT
+            } else {
+                level
+            };
+        }
+        CParameter::WindowLog(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_WINDOWLOG_MIN..=ZSTD_WINDOWLOG_MAX)?;
+            }
+            c_params.window_log = value;
+        }
+        CParameter::HashLog(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_HASHLOG_MIN..=ZSTD_HASHLOG_MAX)?;
+            }
+            c_params.hash_log = value;
+        }
+        CParameter::ChainLog(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_CHAINLOG_MIN..=ZSTD_CHAINLOG_MAX)?;
+            }
+            c_params.chain_log = value;
+        }
+        CParameter::SearchLog(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_SEARCHLOG_MIN..=ZSTD_SEARCHLOG_MAX)?;
+            }
+            c_params.search_log = value;
+        }
+        CParameter::MinMatch(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_MINMATCH_MIN..=ZSTD_MINMATCH_MAX)?;
+            }
+            c_params.min_match = value;
+        }
+        CParameter::TargetLength(value) => {
+            bound_check(value, ZSTD_TARGETLENGTH_MIN..=ZSTD_TARGETLENGTH_MAX)?;
+            c_params.target_length = value;
+        }
+        CParameter::Strategy(strategy) => c_params.strategy = strategy,
+        CParameter::ContentSizeFlag(flag) => params.f_params.content_size_flag = flag,
+        CParameter::ChecksumFlag(flag) => params.f_params.checksum_flag = flag,
+        CParameter::DictIdFlag(flag) => params.f_params.no_dict_id_flag = !flag,
+        CParameter::Format(format) => params.format = format,
+        CParameter::LiteralCompressionMode(mode) => params.literal_compression_mode = mode,
+        CParameter::SrcSizeHint(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_SRCSIZEHINT_MIN..=ZSTD_SRCSIZEHINT_MAX)?;
+            }
+            params.src_size_hint = value;
+        }
+        CParameter::StableInBuffer(stable) => {
+            params.in_buffer_mode = if stable {
+                BufferMode::Stable
+            } else {
+                BufferMode::Buffered
+            };
+        }
+        CParameter::StableOutBuffer(stable) => {
+            params.out_buffer_mode = if stable {
+                BufferMode::Stable
+            } else {
+                BufferMode::Buffered
+            };
+        }
+        CParameter::BlockSplitterLevel(value) => {
+            bound_check(value, 0..=ZSTD_BLOCKSPLITTER_LEVEL_MAX)?;
+            params.pre_block_splitter_level = value as i32;
+        }
+        CParameter::MaxBlockSize(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_BLOCKSIZE_MAX_MIN..=ZSTD_BLOCKSIZE_MAX as u32)?;
+            }
+            params.max_block_size = value as usize;
+        }
+        CParameter::UseRowMatchFinder(mode) => params.use_row_match_finder = mode,
+        CParameter::SplitAfterSequences(mode) => params.post_block_splitter = mode,
+        CParameter::EnableLongDistanceMatching(mode) => params.ldm_enable = mode,
+        CParameter::LdmHashLog(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_LDM_HASHLOG_MIN..=ZSTD_LDM_HASHLOG_MAX)?;
+            }
+            params.ldm.hash_log = value;
+        }
+        CParameter::LdmMinMatch(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_LDM_MINMATCH_MIN..=ZSTD_LDM_MINMATCH_MAX)?;
+            }
+            params.ldm.min_match_length = value;
+        }
+        CParameter::LdmBucketSizeLog(value) => {
+            if value != 0 {
+                bound_check(
+                    value,
+                    ZSTD_LDM_BUCKETSIZELOG_MIN..=ZSTD_LDM_BUCKETSIZELOG_MAX,
+                )?;
+            }
+            params.ldm.bucket_size_log = value;
+        }
+        CParameter::LdmHashRateLog(value) => {
+            if value != 0 {
+                bound_check(value, ZSTD_LDM_HASHRATELOG_MIN..=ZSTD_LDM_HASHRATELOG_MAX)?;
+            }
+            params.ldm.hash_rate_log = value;
+        }
+        CParameter::ForceAttachDict(pref) => params.attach_dict_pref = pref,
+    }
+    Ok(())
+}
+
+/// The content of the frame's dictionary, which the window's
+/// [`WindowBuffer::Dict`] segment lies in while the frame is streamed: the
+/// prefix, or the `CDict` (copied, loaded again, or attached).
+#[derive(Default)]
+enum FrameDict {
+    #[default]
+    None,
+    /// The prefix of `CCtx::ref_prefix`, copied.
+    Prefix(Box<[u8]>),
+    /// The `CDict` the frame was started with: its content is the window's
+    /// when copied or loaded again; attached, its match state is the
+    /// frame's `dictMatchState`.
+    CDict(Arc<CDict>),
+}
+
+impl FrameDict {
+    /// The buffers of a call: the dictionary's with the input's.
+    fn buffers<'a>(&'a self, input: &'a [u8], in_buff: &'a [u8]) -> Buffers<'a> {
+        let mut bufs = Buffers::new(input, in_buff);
+        match self {
+            FrameDict::None => {}
+            FrameDict::Prefix(prefix) => bufs.dict = prefix,
+            FrameDict::CDict(cdict) => {
+                bufs.dict = &cdict.content;
+                bufs.cdict = Some(cdict);
+            }
+        }
+        bufs
+    }
+}
+
+/// `ZSTD_localDict`: the dictionary of `CCtx::load_dictionary`, copied in,
+/// and the `CDict` made from it at the first frame that uses it.
+struct LocalDict {
+    dict: Box<[u8]>,
+    content_type: DictContentType,
+    cdict: Option<Arc<CDict>>,
+}
+
 /// `ZSTD_CCtx`: a compression context, reused across frames.
 ///
 /// Create one with [`CCtx::new`] and keep it: it holds tables and buffers
 /// that would otherwise be set up for every call. It compresses whole
 /// frames in one call ([`CCtx::compress`], [`CCtx::compress2`]) or
-/// streaming ([`CCtx::compress_stream2`]), without a dictionary so far.
+/// streaming ([`CCtx::compress_stream2`]); with a dictionary loaded
+/// ([`CCtx::load_dictionary`]), referenced ([`CCtx::ref_cdict`]), or a
+/// prefix for the next frame ([`CCtx::ref_prefix`]), or in one call with
+/// one ([`CCtx::compress_using_dict`], [`CCtx::compress_using_cdict`]).
+///
+/// Not yet: frames that would attach a [`CDict`], searching its tables
+/// where they are (`dictMatchState`), which libzstd does for small inputs
+/// and inputs of unknown size. They fail with
+/// [`ErrorCode::ParameterUnsupported`] when they start; with
+/// [`CParameter::ForceAttachDict`] set to [`DictAttachPref::ForceCopy`] or
+/// [`DictAttachPref::ForceLoad`], they compress as libzstd does.
 pub struct CCtx {
     stage: CompressionStage,
     /// The parameters set for the next frames (`requestedParams`); the
@@ -2018,6 +2457,21 @@ pub struct CCtx {
     produced_csize: u64,
     xxh_state: Xxh64State,
     dict_id: u32,
+
+    // Dictionaries.
+    /// `localDict`: the dictionary loaded, for every frame until another
+    /// is set.
+    local_dict: Option<LocalDict>,
+    /// `cdict`: the `CDict` the next frames use: the one referenced, or
+    /// the loaded dictionary's once made.
+    cdict: Option<Arc<CDict>>,
+    /// `prefixDict`: the prefix for the next frame only, copied in, and how
+    /// to read it.
+    prefix_dict: Option<(Box<[u8]>, DictContentType)>,
+    /// The dictionary of the frame being compressed: its content is the
+    /// window's [`WindowBuffer::Dict`] (the prefix, or a `CDict` copied or
+    /// loaded again), or its match state the frame's `dictMatchState`.
+    frame_dict: FrameDict,
 
     // Streaming.
     /// The input taken and not compressed yet, and the window, when
@@ -2053,32 +2507,9 @@ impl CCtx {
             requested_params,
             requested_c_params,
             applied_params: requested_params,
-            prev_cblock: CompressedBlockState {
-                entropy: EntropyCTables::filled(0),
-                rep: REP_START_VALUE,
-            },
-            next_cblock: CompressedBlockState {
-                entropy: EntropyCTables::filled(0),
-                rep: REP_START_VALUE,
-            },
-            match_state: MatchState {
-                window: Window::new(),
-                hash_table: Vec::new(),
-                chain_table: Vec::new(),
-                next_to_update: 0,
-                loaded_dict_end: 0,
-                lazy_skipping: false,
-                c_params,
-                row_hash_log: 0,
-                tag_table: Vec::new(),
-                hash_cache: [0; ZSTD_ROW_HASH_CACHE_SIZE],
-                // A new context's salt, before the first frame advances it.
-                hash_salt: 0,
-                hash_salt_entropy: 0,
-                hash_log3: 0,
-                hash_table3: Vec::new(),
-                opt: None,
-            },
+            prev_cblock: CompressedBlockState::new(0),
+            next_cblock: CompressedBlockState::new(0),
+            match_state: MatchState::new(c_params),
             seq_store: SeqStore::with_capacity(0, 0),
             ldm_state: LdmState::new(),
             ldm_sequences: RawSeqStore::default(),
@@ -2089,6 +2520,10 @@ impl CCtx {
             produced_csize: 0,
             xxh_state: Xxh64State::new(0),
             dict_id: 0,
+            local_dict: None,
+            cdict: None,
+            prefix_dict: None,
+            frame_dict: FrameDict::None,
             in_buff: Vec::new(),
             in_to_compress: 0,
             in_buff_pos: 0,
@@ -2105,9 +2540,21 @@ impl CCtx {
     }
 
     /// `ZSTD_resetCCtx_internal`, for a frame of `pledged_src_size` bytes,
-    /// with clean tables, and the streaming buffers if `buffered`. The
-    /// indices start again at `ZSTD_WINDOW_START_INDEX`: libzstd continues
-    /// them in a context used again, which compresses the same.
+    /// with clean tables (or tables a `CDict`'s copy will write over), and
+    /// the streaming buffers if `buffered`. The indices start again at
+    /// `ZSTD_WINDOW_START_INDEX`.
+    ///
+    /// Differs from libzstd: libzstd goes on with the indices of the frame
+    /// before in a context used again (`ZSTDirp_continue`), and starts them
+    /// again only when they near `ZSTD_CURRENT_MAX` (`ZSTD_indexTooCloseToMax`),
+    /// for a dictionary over `ZSTD_CHUNKSIZE_MAX` (`ZSTD_dictTooBig`), or
+    /// for a new workspace. A frame compresses the same: what it reads of
+    /// the tables are this frame's entries, all at indices relative to its
+    /// window, the others (0, or below the window) never matching. Only
+    /// overflow corrections come at other points: with indices that went
+    /// on past 3.5 GB of input in one context, libzstd lowers them within a
+    /// frame where the port does not, which invalidates a dictionary still
+    /// in the window there (and only there).
     ///
     /// Fails with `ParameterUnsupported` for the strategies the port does
     /// not have yet, where libzstd would compress.
@@ -2115,6 +2562,7 @@ impl CCtx {
         &mut self,
         params: &CCtxParams,
         pledged_src_size: u64,
+        crp: TableReset,
         buffered: bool,
     ) -> Result<()> {
         if !zstd_frame_ported(params) {
@@ -2162,85 +2610,14 @@ impl CCtx {
         self.stage = CompressionStage::Init;
         self.dict_id = 0;
 
-        // ZSTD_reset_compressedBlockState
-        self.prev_cblock.rep = REP_START_VALUE;
-        self.prev_cblock.entropy.huf.repeat_mode = HufRepeat::None;
-        self.prev_cblock.entropy.fse.offcode_repeat_mode = FseRepeat::None;
-        self.prev_cblock.entropy.fse.matchlength_repeat_mode = FseRepeat::None;
-        self.prev_cblock.entropy.fse.litlength_repeat_mode = FseRepeat::None;
-
-        // ZSTD_reset_matchState
-        let ms = &mut self.match_state;
-        ms.window = Window::new();
-        // The 3-byte hash table, for a shortest match of 3 bytes.
-        ms.hash_log3 = if c_params.min_match == 3 {
-            ZSTD_HASHLOG3_MAX.min(c_params.window_log)
-        } else {
-            0
-        };
-        ms.lazy_skipping = false;
-        // ZSTD_invalidateMatchState
-        ms.next_to_update = ms.window.dict_limit;
-        ms.loaded_dict_end = 0;
-        if let Some(opt) = &mut ms.opt {
-            // The optimal parser's statistics start again.
-            opt.lit_length_sum = 0;
-        }
-        ms.hash_table.clear();
-        ms.hash_table.resize(1 << c_params.hash_log, 0);
-        // ZSTD_allocateChainTable: none for fast, nor for the row match
-        // finder.
-        let chain_size =
-            if zstd_allocate_chain_table(c_params.strategy, params.use_row_match_finder) {
-                1 << c_params.chain_log
-            } else {
-                0
-            };
-        ms.chain_table.clear();
-        ms.chain_table.resize(chain_size, 0);
-        let h3_size = if ms.hash_log3 != 0 {
-            1 << ms.hash_log3
-        } else {
-            0
-        };
-        ms.hash_table3.clear();
-        ms.hash_table3.resize(h3_size, 0);
-        if zstd_row_match_finder_used(c_params.strategy, params.use_row_match_finder) {
-            // The row match finder's table of tags, and a new salt. Unlike
-            // the window, the salt goes on from frame to frame, as libzstd's
-            // does. It changes no output: XORed into the hashes before
-            // their shift, it changes which row and which tag a position
-            // gets, never which positions share them.
-            //
-            // Differs from libzstd: the tags are zeroed at every frame, where
-            // libzstd zeroes them only the first time its workspace holds
-            // them (ZSTD_cwksp_reserve_aligned_init_once): later frames find
-            // the tags and heads of earlier ones, or other bytes. They
-            // change nothing. A search goes through a row from its head,
-            // newest entry first, so the entries written in this frame come
-            // first, wherever the head is. Every other entry holds an index
-            // below the window: an earlier frame's in libzstd, whose
-            // indices go on from frame to frame, or 0. A search stops at
-            // the first entry below the window that has its tag, after
-            // taking those with its tag before it; so it takes the same
-            // candidates in the same order, whatever the other entries'
-            // tags and the head. Lowering the indices (ZSTD_reduceIndex)
-            // leaves the tags too: the entries it sets to 0 held indices
-            // below the window already, the oldest of their rows.
-            ms.tag_table.clear();
-            ms.tag_table.resize(1 << c_params.hash_log, 0);
-            zstd_advance_hash_salt(ms);
-            // Rows of 16 entries, 32 from a search log of 5, 64 from 6.
-            let row_log = c_params.search_log.clamp(4, 6);
-            debug_assert!(c_params.hash_log >= row_log);
-            ms.row_hash_log = c_params.hash_log - row_log;
-        }
-        // The optimal parser's state. libzstd reserves it in the workspace
-        // at every frame; the port keeps it from frame to frame.
-        if c_params.strategy >= Strategy::Btopt && ms.opt.is_none() {
-            ms.opt = Some(Box::new(OptState::new()));
-        }
-        ms.c_params = c_params;
+        self.prev_cblock.reset();
+        zstd_reset_match_state(
+            &mut self.match_state,
+            &c_params,
+            params.use_row_match_finder,
+            crp,
+            ResetTarget::CCtx,
+        );
 
         self.seq_store = SeqStore::with_capacity(block_size, max_nb_seq);
 
@@ -2282,15 +2659,204 @@ impl CCtx {
         Ok(())
     }
 
-    /// `ZSTD_compressBegin_internal`, without a dictionary.
-    fn compress_begin_internal(
+    /// `ZSTD_resetCCtx_byAttachingCDict`: the context reset for a frame
+    /// attached to `cdict`: its tables sized for the input only (the
+    /// `CDict` has its own), its match state attached to the `CDict`'s
+    /// (`dictMatchState`), its window starting where the `CDict`'s ends,
+    /// and the `CDict`'s block state as the block before.
+    ///
+    /// The `dictMatchState` block compressors are phase 1's: until then the
+    /// frames that would use them fail here with `ParameterUnsupported`
+    /// ([`zstd_dict_match_state_ported`]). A `CDict` with no content (of
+    /// under 8 bytes) is not attached, and those frames compress.
+    fn reset_cctx_by_attaching_cdict(
         &mut self,
+        cdict: &CDict,
+        mut params: CCtxParams,
+        pledged_src_size: u64,
+        buffered: bool,
+    ) -> Result<()> {
+        {
+            let adjusted_cdict_c_params = *cdict.c_params();
+            let window_log = params.c_params.window_log;
+            debug_assert!(window_log != 0);
+            // The tables for the input only, the dictionary has its own. A
+            // pledged size of 0 means 0. Phase 1: a CDict with the dedicated
+            // dictionary search first takes its parameters back
+            // (ZSTD_dedicatedDictSearch_revertCParams).
+            params.c_params = zstd_adjust_cparams_internal(
+                adjusted_cdict_c_params,
+                pledged_src_size,
+                cdict.dict_size(),
+                CParamMode::AttachDict,
+                params.use_row_match_finder,
+            );
+            params.c_params.window_log = window_log;
+            // The CDict's.
+            params.use_row_match_finder = cdict.use_row_match_finder;
+            self.reset_cctx_internal(&params, pledged_src_size, TableReset::MakeClean, buffered)?;
+            debug_assert!(
+                self.applied_params.c_params.strategy == adjusted_cdict_c_params.strategy
+            );
+        }
+
+        let (cdict_end, cdict_len) = cdict.window_end_and_len();
+        if cdict_len != 0 {
+            // Attached: the CDict's window comes before the frame's, whose
+            // indices start past it, so that its matches never have
+            // negative indices once in the frame's.
+            let ms = &mut self.match_state;
+            ms.dict_match_state = true;
+            if ms.window.dict_limit < cdict_end {
+                ms.window.next_src = i64::from(cdict_end);
+                ms.window.clear();
+            }
+            // In the frame's indices.
+            ms.loaded_dict_end = ms.window.dict_limit;
+            // Phase 1 ports the dictMatchState block compressors.
+            if !zstd_dict_match_state_ported(
+                &self.applied_params,
+                cdict.match_state.dedicated_dict_search,
+            ) {
+                return error!(ParameterUnsupported);
+            }
+        }
+
+        self.dict_id = cdict.dict_id;
+        // The CDict's block state as the block before.
+        self.prev_cblock.copy_from(&cdict.c_block_state);
+        Ok(())
+    }
+
+    /// `ZSTD_resetCCtx_byCopyingCDict`: the context reset with the
+    /// parameters of `cdict`'s tables, and its tables, window and block
+    /// state copied in. The indices of `fast` and `dfast` lose their tags
+    /// (`ZSTD_copyCDictTableIntoCCtx`). The window's older segment, once
+    /// the input comes, is then the `CDict`'s content, which the frame's
+    /// buffers must give as the dictionary's.
+    fn reset_cctx_by_copying_cdict(
+        &mut self,
+        cdict: &CDict,
+        mut params: CCtxParams,
+        pledged_src_size: u64,
+        buffered: bool,
+    ) -> Result<()> {
+        let cdict_c_params = *cdict.c_params();
+        debug_assert!(!cdict.match_state.dedicated_dict_search);
+        {
+            let window_log = params.c_params.window_log;
+            debug_assert!(window_log != 0);
+            // Only the parameters of the tables.
+            params.c_params = cdict_c_params;
+            params.c_params.window_log = window_log;
+            params.use_row_match_finder = cdict.use_row_match_finder;
+            // The tables are written over.
+            self.reset_cctx_internal(&params, pledged_src_size, TableReset::LeaveDirty, buffered)?;
+            debug_assert!(self.applied_params.c_params.strategy == cdict_c_params.strategy);
+            debug_assert!(self.applied_params.c_params.hash_log == cdict_c_params.hash_log);
+            debug_assert!(self.applied_params.c_params.chain_log == cdict_c_params.chain_log);
+        }
+        debug_assert!(params.use_row_match_finder != ParamSwitch::Auto);
+
+        // The tables.
+        let ms = &mut self.match_state;
+        let src_ms = &cdict.match_state;
+        let tagged = zstd_cdict_indices_are_tagged(&cdict_c_params);
+        zstd_copy_cdict_table_into_cctx(&mut ms.hash_table, &src_ms.hash_table, tagged);
+        // Not the chain table, if the context's parameters have none.
+        if zstd_allocate_chain_table(
+            self.applied_params.c_params.strategy,
+            self.applied_params.use_row_match_finder,
+            false,
+        ) {
+            zstd_copy_cdict_table_into_cctx(&mut ms.chain_table, &src_ms.chain_table, tagged);
+        }
+        // The tags.
+        if zstd_row_match_finder_used(cdict_c_params.strategy, cdict.use_row_match_finder) {
+            ms.tag_table.copy_from_slice(&src_ms.tag_table);
+            ms.hash_salt = src_ms.hash_salt;
+        }
+        // The CDict never fills the 3-byte hash table.
+        debug_assert!(src_ms.hash_log3 == 0);
+        ms.hash_table3.fill(0);
+
+        // The dictionary's window and indices.
+        ms.window = src_ms.window;
+        ms.next_to_update = src_ms.next_to_update;
+        ms.loaded_dict_end = src_ms.loaded_dict_end;
+
+        self.dict_id = cdict.dict_id;
+        // The CDict's block state as the block before.
+        self.prev_cblock.copy_from(&cdict.c_block_state);
+        Ok(())
+    }
+
+    /// `ZSTD_resetCCtx_usingCDict`: the context reset for a frame with
+    /// `cdict`, attached or copied in.
+    fn reset_cctx_using_cdict(
+        &mut self,
+        cdict: &CDict,
         params: &CCtxParams,
         pledged_src_size: u64,
         buffered: bool,
     ) -> Result<()> {
-        self.reset_cctx_internal(params, pledged_src_size, buffered)?;
-        self.dict_id = 0;
+        if zstd_should_attach_dict(cdict, params, pledged_src_size) {
+            self.reset_cctx_by_attaching_cdict(cdict, *params, pledged_src_size, buffered)
+        } else {
+            self.reset_cctx_by_copying_cdict(cdict, *params, pledged_src_size, buffered)
+        }
+    }
+
+    /// `ZSTD_compressBegin_internal`: the context reset for a frame of
+    /// `pledged_src_size` bytes with `params`, with `dict` loaded (a
+    /// dictionary read as its content type says), or with `cdict`: copied
+    /// in or attached, or its content loaded again for a large input with a
+    /// `CDict` made for a level (or as `ZSTD_c_forceAttachDict` says). Not
+    /// both.
+    ///
+    /// The window's [`WindowBuffer::Dict`] is then `dict`, or `cdict`'s
+    /// content: the frame's buffers must give it as the dictionary's.
+    fn compress_begin_internal(
+        &mut self,
+        dict: Option<(&[u8], DictContentType)>,
+        cdict: Option<&CDict>,
+        params: &CCtxParams,
+        pledged_src_size: u64,
+        buffered: bool,
+    ) -> Result<()> {
+        // ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF,
+        // ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER
+        const SRC_SIZE_CUTOFF: u64 = 128 << 10;
+        const DICT_SIZE_MULTIPLIER: u64 = 6;
+        debug_assert!(dict.is_none() || cdict.is_none());
+        if let Some(cdict) = cdict
+            && cdict.dict_size() > 0
+            && (pledged_src_size < SRC_SIZE_CUTOFF
+                || pledged_src_size < (cdict.dict_size() as u64).wrapping_mul(DICT_SIZE_MULTIPLIER)
+                || pledged_src_size == ZSTD_CONTENTSIZE_UNKNOWN
+                || cdict.compression_level == 0)
+            && params.attach_dict_pref != DictAttachPref::ForceLoad
+        {
+            return self.reset_cctx_using_cdict(cdict, params, pledged_src_size, buffered);
+        }
+
+        self.reset_cctx_internal(params, pledged_src_size, TableReset::MakeClean, buffered)?;
+        let (dict, content_type) = match (cdict, dict) {
+            (Some(cdict), _) => (&*cdict.content, cdict.content_type),
+            (None, Some(dict)) => dict,
+            (None, None) => return Ok(()),
+        };
+        let params = self.applied_params;
+        self.dict_id = zstd_compress_insert_dictionary(
+            &mut self.prev_cblock,
+            &mut self.match_state,
+            Some(&mut self.ldm_state),
+            &params,
+            dict,
+            content_type,
+            DictTableLoadMethod::Fast,
+            TableFillPurpose::ForCCtx,
+        )?;
         Ok(())
     }
 
@@ -2316,10 +2882,18 @@ impl CCtx {
         }
 
         // Find and store the sequences, with the window's older segment if
-        // it has one.
+        // it has one, or else the attached CDict's match state if the
+        // frame has one (ZSTD_matchState_dictMode).
         let src = bufs.get(ms.window.buffer);
         let dict = bufs.get(ms.window.dict_buffer);
         let ext_dict = ms.window.has_ext_dict();
+        // An attached dictionary is right before the window.
+        debug_assert!(!ms.dict_match_state || ms.loaded_dict_end == ms.window.dict_limit);
+        let dms = if ext_dict {
+            None
+        } else {
+            bufs.dict_match_state(ms)
+        };
         self.next_cblock.rep = self.prev_cblock.rep;
         let rep = &mut self.next_cblock.rep;
         let seq_store = &mut self.seq_store;
@@ -2329,6 +2903,7 @@ impl CCtx {
             use_row_match_finder: params.use_row_match_finder,
             src,
             dict: ext_dict.then_some(dict),
+            dms,
             symbol_costs: &self.prev_cblock.entropy,
             literal_compression_mode: params.literal_compression_mode,
         };
@@ -2784,10 +3359,12 @@ impl CCtx {
                 return error!(DstSizeTooSmall);
             }
 
-            // Without a dictionary, ZSTD_checkDictValidity changes nothing.
+            // The indices lowered if needed, and a dictionary dropped once
+            // out of the window.
             let ms = &mut self.match_state;
             zstd_overflow_correct_if_needed(ms, &self.applied_params, ip, ip + block_size);
-            ms.window.enforce_max_dist(ms.window.index(ip), max_dist);
+            ms.check_dict_validity(ms.window.index(ip + block_size), max_dist);
+            ms.enforce_max_dist(ms.window.index(ip), max_dist);
 
             // Table updates resume no sooner than lowLimit.
             if ms.next_to_update < ms.window.low_limit {
@@ -3075,18 +3652,27 @@ impl CCtx {
         Ok(c_size + end_result)
     }
 
-    /// `ZSTD_compress_advanced_internal`, without a dictionary.
+    /// `ZSTD_compress_advanced_internal`: `src` as one frame with `params`,
+    /// with `dict` (none if empty) loaded, read as a zstd dictionary if it
+    /// is one, as raw content otherwise.
     pub(crate) fn compress_advanced_internal(
         &mut self,
         dst: &mut [u8],
         src: &[u8],
+        dict: &[u8],
         params: &CCtxParams,
     ) -> Result<usize> {
-        self.compress_begin_internal(params, src.len() as u64, false)?;
-        let bufs = Buffers {
-            input: src,
-            in_buff: &[],
-        };
+        // The window's dictionary is `dict`, for this call only.
+        self.frame_dict = FrameDict::None;
+        self.compress_begin_internal(
+            Some((dict, DictContentType::Auto)),
+            None,
+            params,
+            src.len() as u64,
+            false,
+        )?;
+        let mut bufs = Buffers::new(src, &[]);
+        bufs.dict = dict;
         self.compress_end(dst, bufs, WindowBuffer::Input, 0, src.len())
     }
 
@@ -3097,18 +3683,46 @@ impl CCtx {
     /// byte for byte the frame libzstd 1.5.7 writes. Levels go from
     /// [`min_c_level`] to [`max_c_level`]; 0 is [`default_c_level`]. Room
     /// for [`compress_bound`] bytes is always enough. The parameters set
-    /// with [`CCtx::set_parameter`] do not apply; [`CCtx::compress2`] takes
-    /// them.
+    /// with [`CCtx::set_parameter`] do not apply, nor the dictionaries;
+    /// [`CCtx::compress2`] takes them.
     pub fn compress(
         &mut self,
         dst: &mut [u8],
         src: &[u8],
         compression_level: i32,
     ) -> Result<usize> {
+        self.compress_using_dict(dst, src, &[], compression_level)
+    }
+
+    /// `ZSTD_compress_usingDict`: `src` as one frame, at
+    /// `compression_level`, with `dict`, into `dst`. Returns the frame's
+    /// size. An empty `dict` is none: [`CCtx::compress`].
+    ///
+    /// `dict` is read as a zstd dictionary if it starts with the
+    /// dictionary magic number, as raw content otherwise (of under 8
+    /// bytes, it is left out); its content is loaded for this frame, with
+    /// parameters for the input and the dictionary. Read once, a dictionary
+    /// for many frames is quicker as a [`CDict`]
+    /// ([`CCtx::compress_using_cdict`]). As [`CCtx::compress`], the
+    /// parameters set and the dictionaries loaded or referenced do not
+    /// apply. A zstd dictionary it cannot read fails with
+    /// [`ErrorCode::DictionaryCorrupted`].
+    ///
+    /// Differs from libzstd: libzstd takes a dictionary that ends where
+    /// `src` starts in memory as part of the input's segment of the
+    /// window, which can change the frame; the port always takes it as the
+    /// segment before.
+    pub fn compress_using_dict(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        dict: &[u8],
+        compression_level: i32,
+    ) -> Result<usize> {
         let (c_params, f_params) = zstd_get_params_internal(
             compression_level,
             src.len() as u64,
-            0,
+            dict.len(),
             CParamMode::NoAttachDict,
         );
         debug_assert!(f_params.content_size_flag);
@@ -3118,7 +3732,95 @@ impl CCtx {
             compression_level
         };
         let params = CCtxParams::new(c_params, f_params, level);
-        self.compress_advanced_internal(dst, src, &params)
+        self.compress_advanced_internal(dst, src, dict, &params)
+    }
+
+    /// `ZSTD_compress_usingCDict`: `src` as one frame with `cdict`, into
+    /// `dst`, with the content size and without a checksum. Returns the
+    /// frame's size.
+    ///
+    /// The compression parameters are the `CDict`'s, but for an input of
+    /// 128 KB or more (and 6 times the dictionary), with a `CDict` made for
+    /// a level: those of the level for the input and the dictionary, the
+    /// dictionary's content then loaded again. The window is at least as
+    /// large as the input, up to 512 KB. As [`CCtx::compress`], the
+    /// parameters set and the dictionaries loaded or referenced do not
+    /// apply.
+    ///
+    /// Not yet for inputs small enough to attach the `CDict` (up to 8 to
+    /// 32 KB, by strategy, when it has content): see [`CCtx`].
+    pub fn compress_using_cdict(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        cdict: &CDict,
+    ) -> Result<usize> {
+        let f_params = FrameParameters {
+            content_size_flag: true,
+            checksum_flag: false,
+            no_dict_id_flag: false,
+        };
+        self.compress_using_cdict_internal(dst, src, cdict, f_params)
+    }
+
+    /// `ZSTD_compress_usingCDict_internal`, with `f_params`.
+    fn compress_using_cdict_internal(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        cdict: &CDict,
+        f_params: FrameParameters,
+    ) -> Result<usize> {
+        // The window's dictionary is the CDict's content, for this call only.
+        self.frame_dict = FrameDict::None;
+        self.compress_begin_using_cdict_internal(cdict, f_params, src.len() as u64)?;
+        let mut bufs = Buffers::new(src, &[]);
+        bufs.dict = &cdict.content;
+        bufs.cdict = Some(cdict);
+        self.compress_end(dst, bufs, WindowBuffer::Input, 0, src.len())
+    }
+
+    /// `ZSTD_compressBegin_usingCDict_internal`: the context reset for a
+    /// frame of `pledged_src_size` bytes with `cdict`, without buffers.
+    fn compress_begin_using_cdict_internal(
+        &mut self,
+        cdict: &CDict,
+        f_params: FrameParameters,
+        pledged_src_size: u64,
+    ) -> Result<()> {
+        // ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF,
+        // ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER
+        const SRC_SIZE_CUTOFF: u64 = 128 << 10;
+        const DICT_SIZE_MULTIPLIER: u64 = 6;
+        // The parameters: the CDict's, or the level's for a large input.
+        let c_params = if pledged_src_size < SRC_SIZE_CUTOFF
+            || pledged_src_size < (cdict.dict_size() as u64).wrapping_mul(DICT_SIZE_MULTIPLIER)
+            || pledged_src_size == ZSTD_CONTENTSIZE_UNKNOWN
+            || cdict.compression_level == 0
+        {
+            *cdict.c_params()
+        } else {
+            // ZSTD_getCParams, its size known here.
+            zstd_get_cparams_internal(
+                cdict.compression_level,
+                pledged_src_size,
+                cdict.dict_size(),
+                CParamMode::Unknown,
+            )
+        };
+        let mut params = CCtxParams::new(c_params, f_params, cdict.compression_level);
+        // A window large enough for the input, if its size is known, up to
+        // 2^19, the window of level 1 for the largest inputs.
+        if pledged_src_size != ZSTD_CONTENTSIZE_UNKNOWN {
+            let limited_src_size = pledged_src_size.min(1 << 19) as u32;
+            let limited_src_log = if limited_src_size > 1 {
+                highbit32(limited_src_size - 1) + 1
+            } else {
+                1
+            };
+            params.c_params.window_log = params.c_params.window_log.max(limited_src_log);
+        }
+        self.compress_begin_internal(None, Some(cdict), &params, pledged_src_size, false)
     }
 
     // -----------------------------------------------------------------------
@@ -3135,125 +3837,18 @@ impl CCtx {
             // Only in the init stage.
             return error!(StageWrong);
         }
-        let params = &mut self.requested_params;
-        let c_params = &mut self.requested_c_params;
-        match parameter {
-            CParameter::CompressionLevel(level) => {
-                let level = level.clamp(zstd_min_clevel(), ZSTD_MAX_CLEVEL);
-                params.compression_level = if level == 0 {
-                    ZSTD_CLEVEL_DEFAULT
-                } else {
-                    level
-                };
-            }
-            CParameter::WindowLog(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_WINDOWLOG_MIN..=ZSTD_WINDOWLOG_MAX)?;
-                }
-                c_params.window_log = value;
-            }
-            CParameter::HashLog(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_HASHLOG_MIN..=ZSTD_HASHLOG_MAX)?;
-                }
-                c_params.hash_log = value;
-            }
-            CParameter::ChainLog(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_CHAINLOG_MIN..=ZSTD_CHAINLOG_MAX)?;
-                }
-                c_params.chain_log = value;
-            }
-            CParameter::SearchLog(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_SEARCHLOG_MIN..=ZSTD_SEARCHLOG_MAX)?;
-                }
-                c_params.search_log = value;
-            }
-            CParameter::MinMatch(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_MINMATCH_MIN..=ZSTD_MINMATCH_MAX)?;
-                }
-                c_params.min_match = value;
-            }
-            CParameter::TargetLength(value) => {
-                bound_check(value, ZSTD_TARGETLENGTH_MIN..=ZSTD_TARGETLENGTH_MAX)?;
-                c_params.target_length = value;
-            }
-            CParameter::Strategy(strategy) => c_params.strategy = strategy,
-            CParameter::ContentSizeFlag(flag) => params.f_params.content_size_flag = flag,
-            CParameter::ChecksumFlag(flag) => params.f_params.checksum_flag = flag,
-            CParameter::DictIdFlag(flag) => params.f_params.no_dict_id_flag = !flag,
-            CParameter::Format(format) => params.format = format,
-            CParameter::LiteralCompressionMode(mode) => params.literal_compression_mode = mode,
-            CParameter::SrcSizeHint(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_SRCSIZEHINT_MIN..=ZSTD_SRCSIZEHINT_MAX)?;
-                }
-                params.src_size_hint = value;
-            }
-            CParameter::StableInBuffer(stable) => {
-                params.in_buffer_mode = if stable {
-                    BufferMode::Stable
-                } else {
-                    BufferMode::Buffered
-                };
-            }
-            CParameter::StableOutBuffer(stable) => {
-                params.out_buffer_mode = if stable {
-                    BufferMode::Stable
-                } else {
-                    BufferMode::Buffered
-                };
-            }
-            CParameter::BlockSplitterLevel(value) => {
-                bound_check(value, 0..=ZSTD_BLOCKSPLITTER_LEVEL_MAX)?;
-                params.pre_block_splitter_level = value as i32;
-            }
-            CParameter::MaxBlockSize(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_BLOCKSIZE_MAX_MIN..=ZSTD_BLOCKSIZE_MAX as u32)?;
-                }
-                params.max_block_size = value as usize;
-            }
-            CParameter::UseRowMatchFinder(mode) => params.use_row_match_finder = mode,
-            CParameter::SplitAfterSequences(mode) => params.post_block_splitter = mode,
-            CParameter::EnableLongDistanceMatching(mode) => params.ldm_enable = mode,
-            CParameter::LdmHashLog(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_LDM_HASHLOG_MIN..=ZSTD_LDM_HASHLOG_MAX)?;
-                }
-                params.ldm.hash_log = value;
-            }
-            CParameter::LdmMinMatch(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_LDM_MINMATCH_MIN..=ZSTD_LDM_MINMATCH_MAX)?;
-                }
-                params.ldm.min_match_length = value;
-            }
-            CParameter::LdmBucketSizeLog(value) => {
-                if value != 0 {
-                    bound_check(
-                        value,
-                        ZSTD_LDM_BUCKETSIZELOG_MIN..=ZSTD_LDM_BUCKETSIZELOG_MAX,
-                    )?;
-                }
-                params.ldm.bucket_size_log = value;
-            }
-            CParameter::LdmHashRateLog(value) => {
-                if value != 0 {
-                    bound_check(value, ZSTD_LDM_HASHRATELOG_MIN..=ZSTD_LDM_HASHRATELOG_MAX)?;
-                }
-                params.ldm.hash_rate_log = value;
-            }
-        }
-        Ok(())
+        set_cctx_parameter(
+            &mut self.requested_params,
+            &mut self.requested_c_params,
+            parameter,
+        )
     }
 
     /// `ZSTD_CCtx_getParameter`: the value set for a parameter, as libzstd
-    /// gives it: flags are 0 or 1, the strategy and the format their
-    /// number, the literal compression mode 0 (auto), 1 (on) or 2 (off),
-    /// compression parameters not set 0.
+    /// gives it: flags are 0 or 1, the strategy, the format and the
+    /// preference to attach dictionaries their number, the literal
+    /// compression mode 0 (auto), 1 (on) or 2 (off), compression parameters
+    /// not set 0.
     pub fn get_parameter(&self, parameter: CParameterKind) -> i32 {
         let params = &self.requested_params;
         let c_params = &self.requested_c_params;
@@ -3287,6 +3882,7 @@ impl CCtx {
             CParameterKind::LdmMinMatch => params.ldm.min_match_length as i32,
             CParameterKind::LdmBucketSizeLog => params.ldm.bucket_size_log as i32,
             CParameterKind::LdmHashRateLog => params.ldm.hash_rate_log as i32,
+            CParameterKind::ForceAttachDict => params.attach_dict_pref as i32,
         }
     }
 
@@ -3306,9 +3902,9 @@ impl CCtx {
     }
 
     /// `ZSTD_CCtx_reset`: abandons the frame being streamed (and the input
-    /// taken for it), and the pledged size; or sets the parameters back to their defaults, which
-    /// only works between frames (or fails with [`ErrorCode::StageWrong`]);
-    /// or both.
+    /// taken for it), and the pledged size; or sets the parameters back to
+    /// their defaults and drops the dictionaries, which only works between
+    /// frames (or fails with [`ErrorCode::StageWrong`]); or both.
     pub fn reset(&mut self, reset: ResetDirective) -> Result<()> {
         if matches!(
             reset,
@@ -3324,7 +3920,154 @@ impl CCtx {
                 // Only in the init stage.
                 return error!(StageWrong);
             }
+            self.clear_all_dicts();
             (self.requested_params, self.requested_c_params) = CCtxParams::requested_default();
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Dictionaries
+
+    /// `ZSTD_clearAllDicts`: no dictionary, prefix nor `CDict` for the next
+    /// frames.
+    fn clear_all_dicts(&mut self) {
+        self.local_dict = None;
+        self.prefix_dict = None;
+        self.cdict = None;
+    }
+
+    /// `ZSTD_initLocalDict`: the dictionary loaded made a `CDict`, with the
+    /// parameters set, for the frame about to start and those after (until
+    /// another dictionary is set). Not again for later frames, even with
+    /// other parameters set since.
+    ///
+    /// libzstd reports any failure to make it, a zstd dictionary it cannot
+    /// read included, as an allocation failure; so does the port.
+    fn init_local_dict(&mut self) -> Result<()> {
+        let Some(local_dict) = &mut self.local_dict else {
+            // No dictionary loaded.
+            return Ok(());
+        };
+        if local_dict.cdict.is_some() {
+            // Made already.
+            debug_assert!(self.cdict.is_some());
+            return Ok(());
+        }
+        debug_assert!(!local_dict.dict.is_empty());
+        debug_assert!(self.cdict.is_none());
+        debug_assert!(self.prefix_dict.is_none());
+        let Ok(cdict) = CDict::create_advanced2(
+            &local_dict.dict,
+            local_dict.content_type,
+            &self.requested_params,
+            &self.requested_c_params,
+        ) else {
+            return error!(MemoryAllocation);
+        };
+        let cdict = Arc::new(cdict);
+        local_dict.cdict = Some(cdict.clone());
+        self.cdict = Some(cdict);
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_loadDictionary`: `dict` copied in, the dictionary of the
+    /// frames that follow (through [`CCtx::compress_stream2`] and
+    /// [`CCtx::compress2`]), until another is set; an empty one means none.
+    /// Read as a zstd dictionary if it starts with the dictionary magic
+    /// number, as raw content otherwise.
+    ///
+    /// It drops the dictionary, prefix or [`CDict`] set before. The first
+    /// frame that uses it makes it a `CDict` with the parameters set then,
+    /// which the later frames keep using; a zstd dictionary that cannot be
+    /// read then fails that frame with [`ErrorCode::MemoryAllocation`], as
+    /// in libzstd. Only between frames (or fails with
+    /// [`ErrorCode::StageWrong`]).
+    pub fn load_dictionary(&mut self, dict: &[u8]) -> Result<()> {
+        self.load_dictionary_advanced(dict, DictContentType::Auto)
+    }
+
+    /// `ZSTD_CCtx_loadDictionary_advanced`, with the dictionary copied in:
+    /// [`CCtx::load_dictionary`], `dict` read as `content_type` says.
+    pub fn load_dictionary_advanced(
+        &mut self,
+        dict: &[u8],
+        content_type: DictContentType,
+    ) -> Result<()> {
+        if self.stream_stage != StreamStage::Init {
+            // Only in the init stage.
+            return error!(StageWrong);
+        }
+        // Drops any dictionary set before.
+        self.clear_all_dicts();
+        if dict.is_empty() {
+            // No dictionary.
+            return Ok(());
+        }
+        self.local_dict = Some(LocalDict {
+            dict: dict.into(),
+            content_type,
+            cdict: None,
+        });
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_refCDict`: `cdict` for the frames that follow (through
+    /// [`CCtx::compress_stream2`] and [`CCtx::compress2`]), until another
+    /// dictionary is set; `None` for none. The frames take the `CDict`'s
+    /// level over the level set (the default level for a `CDict` made from
+    /// parameters), with the compression parameters set over it; sized for
+    /// the input only when they attach it, for the input and the dictionary
+    /// otherwise. Copied in, its tables keep their own sizes. It drops the
+    /// dictionary, prefix or `CDict` set before. Only between frames (or
+    /// fails with [`ErrorCode::StageWrong`]).
+    ///
+    /// Not yet for frames that attach it: see [`CCtx`].
+    pub fn ref_cdict(&mut self, cdict: Option<Arc<CDict>>) -> Result<()> {
+        if self.stream_stage != StreamStage::Init {
+            // Only in the init stage.
+            return error!(StageWrong);
+        }
+        // Drops any dictionary set before.
+        self.clear_all_dicts();
+        self.cdict = cdict;
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_refPrefix`: `prefix` as raw content before the next
+    /// frame's input, for that frame only, which the decoder must have
+    /// too ([`DCtx::ref_prefix`](crate::DCtx::ref_prefix)). Its content is
+    /// loaded for the frame, as a dictionary's, with parameters for the
+    /// input and the prefix. An empty one means none. It drops the
+    /// dictionary, prefix or [`CDict`] set before; and the next frame drops
+    /// it. Only between frames (or fails with [`ErrorCode::StageWrong`]).
+    ///
+    /// libzstd references the prefix; the port copies it.
+    ///
+    /// Differs from libzstd: libzstd takes a prefix that ends where the
+    /// input starts in memory as part of the input's segment of the
+    /// window, which can change the frame; the port always takes it as the
+    /// segment before.
+    pub fn ref_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+        self.ref_prefix_advanced(prefix, DictContentType::RawContent)
+    }
+
+    /// `ZSTD_CCtx_refPrefix_advanced`: [`CCtx::ref_prefix`], the prefix
+    /// read as `content_type` says: a zstd dictionary's tables are then the
+    /// frame's first.
+    pub fn ref_prefix_advanced(
+        &mut self,
+        prefix: &[u8],
+        content_type: DictContentType,
+    ) -> Result<()> {
+        if self.stream_stage != StreamStage::Init {
+            // Only in the init stage.
+            return error!(StageWrong);
+        }
+        // Drops any dictionary set before.
+        self.clear_all_dicts();
+        if !prefix.is_empty() {
+            self.prefix_dict = Some((prefix.into(), content_type));
         }
         Ok(())
     }
@@ -3456,10 +4199,12 @@ impl CCtx {
         result
     }
 
-    /// `ZSTD_initCStream`: abandons any frame being streamed, and sets the
-    /// compression level. The other parameters stay.
+    /// `ZSTD_initCStream`: abandons any frame being streamed, drops the
+    /// dictionaries, and sets the compression level. The other parameters
+    /// stay.
     pub fn init_cstream(&mut self, compression_level: i32) -> Result<()> {
         self.reset(ResetDirective::SessionOnly)?;
+        self.ref_cdict(None)?;
         self.set_parameter(CParameter::CompressionLevel(compression_level))
     }
 
@@ -3521,18 +4266,39 @@ impl CCtx {
     /// set. With [`EndDirective::End`], `in_size` is its size.
     fn init_compress_stream2(&mut self, end_op: EndDirective, in_size: usize) -> Result<()> {
         let mut params = self.requested_params;
+        // The dictionary loaded, made a CDict if not yet.
+        self.init_local_dict()?;
+        // A prefix serves one frame.
+        let prefix_dict = self.prefix_dict.take();
+        debug_assert!(prefix_dict.is_none() || self.cdict.is_none());
+        let cdict = self.cdict.clone();
+        if let Some(cdict) = &cdict
+            && self.local_dict.is_none()
+        {
+            // A CDict referenced, not the dictionary loaded: its level over
+            // the level set (0 for one made from parameters).
+            params.compression_level = cdict.compression_level;
+        }
         if end_op == EndDirective::End {
             // The size, known.
             self.pledged_src_size_plus_one = in_size as u64 + 1;
         }
         let pledged_src_size = self.pledged_src_size_plus_one.wrapping_sub(1);
-        params.c_params = zstd_get_cparams_from_cctx_params(
-            &params,
-            &self.requested_c_params,
-            pledged_src_size,
-            0,
-            CParamMode::NoAttachDict,
-        );
+        {
+            let dict_size = match (&prefix_dict, &cdict) {
+                (Some((prefix, _)), _) => prefix.len(),
+                (None, Some(cdict)) => cdict.dict_size(),
+                (None, None) => 0,
+            };
+            let mode = zstd_get_cparam_mode(cdict.as_deref(), &params, pledged_src_size);
+            params.c_params = zstd_get_cparams_from_cctx_params(
+                &params,
+                &self.requested_c_params,
+                pledged_src_size,
+                dict_size,
+                mode,
+            );
+        }
         // ZSTD_CCtx_init_compressStream2, in libzstd's order.
         params.post_block_splitter =
             zstd_resolve_block_splitter_mode(params.post_block_splitter, &params.c_params);
@@ -3541,7 +4307,29 @@ impl CCtx {
             zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
 
-        self.compress_begin_internal(&params, pledged_src_size, true)?;
+        // The frame's dictionary, kept through the frame: the window's
+        // dictionary segment, or the dictMatchState.
+        self.frame_dict = FrameDict::None;
+        self.frame_dict = match (prefix_dict, cdict) {
+            (Some((prefix, content_type)), _) => {
+                self.compress_begin_internal(
+                    Some((&prefix, content_type)),
+                    None,
+                    &params,
+                    pledged_src_size,
+                    true,
+                )?;
+                FrameDict::Prefix(prefix)
+            }
+            (None, Some(cdict)) => {
+                self.compress_begin_internal(None, Some(&cdict), &params, pledged_src_size, true)?;
+                FrameDict::CDict(cdict)
+            }
+            (None, None) => {
+                self.compress_begin_internal(None, None, &params, pledged_src_size, true)?;
+                FrameDict::None
+            }
+        };
         if self.applied_params.in_buffer_mode == BufferMode::Buffered {
             // Input a stable buffer was said to give, with the mode changed
             // since: libzstd leaves it out of the frame, and counts it in
@@ -3623,25 +4411,29 @@ impl CCtx {
     ) -> Result<usize> {
         let mut in_buff = std::mem::take(&mut self.in_buff);
         let mut out_buff = std::mem::take(&mut self.out_buff);
+        let frame_dict = std::mem::take(&mut self.frame_dict);
         let result = self.compress_stream_generic_with(
             &mut in_buff,
             &mut out_buff,
+            &frame_dict,
             output,
             input,
             flush_mode,
         );
         self.in_buff = in_buff;
         self.out_buff = out_buff;
+        self.frame_dict = frame_dict;
         result
     }
 
-    /// `ZSTD_compressStream_generic`, with the context's buffers apart.
-    /// Returns a hint of the input to give next.
-    #[allow(clippy::too_many_lines)]
+    /// `ZSTD_compressStream_generic`, with the context's buffers and the
+    /// frame's dictionary apart. Returns a hint of the input to give next.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn compress_stream_generic_with(
         &mut self,
         in_buff: &mut [u8],
         out_buff: &mut [u8],
+        frame_dict: &FrameDict,
         output: &mut OutBuffer<'_>,
         input: &mut InBuffer<'_>,
         flush_mode: EndDirective,
@@ -3678,10 +4470,7 @@ impl CCtx {
                         // Enough room, or leave to fail with
                         // DstSizeTooSmall: compress straight into the
                         // output.
-                        let bufs = Buffers {
-                            input: input.src,
-                            in_buff,
-                        };
+                        let bufs = frame_dict.buffers(input.src, in_buff);
                         let c_size = self.compress_end(
                             &mut output.dst[op..],
                             bufs,
@@ -3754,10 +4543,7 @@ impl CCtx {
                         || self.applied_params.out_buffer_mode == BufferMode::Stable;
                     let c_size;
                     {
-                        let bufs = Buffers {
-                            input: input.src,
-                            in_buff,
-                        };
+                        let bufs = frame_dict.buffers(input.src, in_buff);
                         let c_dst: &mut [u8] = if into_output {
                             &mut output.dst[op..]
                         } else {
@@ -3873,6 +4659,21 @@ impl CCtx {
     /// in the last frame.
     pub(crate) fn nb_ldm_overflow_corrections(&self) -> u32 {
         self.ldm_state.window.nb_overflow_corrections
+    }
+
+    /// `ZSTD_createCDict_advanced2` with the parameters set on the context
+    /// (`cctx->requestedParams`), as the oracle makes it.
+    pub(crate) fn cdict_with_requested_parameters(
+        &self,
+        dict: &[u8],
+        content_type: DictContentType,
+    ) -> Result<CDict> {
+        CDict::create_advanced2(
+            dict,
+            content_type,
+            &self.requested_params,
+            &self.requested_c_params,
+        )
     }
 }
 

@@ -630,6 +630,24 @@ fn update_tree_internal<const MLS: u32, const EXT: bool>(
     ms.next_to_update = target;
 }
 
+/// `ZSTD_updateTree`: inserts the positions from `next_to_update` up to
+/// `ip`, not included, into the tree, sorted, without an older segment, as
+/// loading a dictionary does for `btlazy2` and the optimal parser. The
+/// positions are in `src`, whose bytes end at `iend`.
+///
+/// libzstd hashes with `ZSTD_hashPtr` of `minMatch` itself here, 7 bytes
+/// included (3 takes 4), where the block compressors take 3 to 6 (4 to 6
+/// for `btlazy2`): the port does the same.
+pub(crate) fn zstd_update_tree(ms: &mut MatchState, src: &[u8], ip: usize, iend: usize) {
+    match ms.c_params.min_match {
+        5 => update_tree_internal::<5, false>(ms, src, &[], ip, iend),
+        6 => update_tree_internal::<6, false>(ms, src, &[], ip, iend),
+        7 => update_tree_internal::<7, false>(ms, src, &[], ip, iend),
+        // 3 and 4, and anything else, as ZSTD_hashPtr.
+        _ => update_tree_internal::<4, false>(ms, src, &[], ip, iend),
+    }
+}
+
 /// `ZSTD_insertBtAndGetAllMatches`: inserts `ip` into the tree, and writes
 /// into `matches` the matches it finds, each longer than the one before
 /// and than `length_to_beat - 1`: first the repcodes (with a literal

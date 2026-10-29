@@ -8,9 +8,12 @@
 //! splitter after the sequences and long distance matching, in one call
 //! ([`compress`], [`CCtx::compress`], [`CCtx::compress2`]) or streaming
 //! ([`CCtx::compress_stream2`]), with libzstd's parameters
-//! ([`CCtx::set_parameter`]), giving the frames libzstd gives; compressing
-//! with a dictionary comes next. The plan, and the rules the port follows,
-//! are in the repository: `docs/porting.md` and `docs/safety.md`.
+//! ([`CCtx::set_parameter`]), giving the frames libzstd gives; with
+//! dictionaries too ([`CCtx::load_dictionary`], [`CDict`],
+//! [`CCtx::ref_prefix`], [`CCtx::compress_using_dict`]), but for frames
+//! that attach a [`CDict`] (see [`CCtx`]), which come next. The plan, and
+//! the rules the port follows, are in the repository: `docs/porting.md` and
+//! `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -131,11 +134,12 @@ mod oracle;
 mod oracle_compress;
 
 pub use common::error_private::{Error, ErrorCode, Result};
+pub use compress::zstd_cdict::CDict;
 pub use compress::zstd_compress::{
     CCtx, CParameter, CParameterKind, EndDirective, compress, compress_bound, cstream_in_size,
     cstream_out_size, default_c_level, max_c_level, min_c_level,
 };
-pub use compress::zstd_compress_internal::{ParamSwitch, Strategy};
+pub use compress::zstd_compress_internal::{DictAttachPref, ParamSwitch, Strategy};
 pub use decompress::zstd_ddict::{DDict, DictContentType};
 pub use decompress::zstd_decompress::{
     BLOCKSIZE_MAX_MIN, ContentSize, DParameter, DParameterKind, FRAMEHEADER_SIZE_MAX,

@@ -1,5 +1,4 @@
-//! Long distance matching: port of `compress/zstd_ldm.c`, without a
-//! dictionary.
+//! Long distance matching: port of `compress/zstd_ldm.c`.
 //!
 //! A gear hash over the input picks split points, about one in
 //! `1 << hashRateLog`; the `minMatchLength` bytes before each one go into a
@@ -196,6 +195,48 @@ fn zstd_ldm_insert_entry(
     ldm_state.hash_table[zstd_ldm_get_bucket(hash, bucket_size_log) + usize::from(offset)] = entry;
     ldm_state.bucket_offsets[hash as usize] =
         ((u32::from(offset) + 1) & ((1u32 << bucket_size_log) - 1)) as u8;
+}
+
+/// `ZSTD_ldm_fillHashTable`: the split points of `src[ip..iend]` into the
+/// hash table, as loading a dictionary does, but those less than
+/// `minMatchLength` from `ip`.
+pub(crate) fn zstd_ldm_fill_hash_table(
+    ldm_state: &mut LdmState,
+    src: &[u8],
+    mut ip: usize,
+    iend: usize,
+    params: &LdmParams,
+) {
+    let min_match_length = params.min_match_length as usize;
+    let bucket_size_log = params.bucket_size_log;
+    let h_bits = params.hash_log - bucket_size_log;
+    let base = ldm_state.window.base;
+    let istart = ip;
+    let mut splits = [0usize; LDM_BATCH_SIZE];
+
+    let mut hash_state = zstd_ldm_gear_init(params);
+    while ip < iend {
+        let mut num_splits = 0;
+        let hashed = zstd_ldm_gear_feed(
+            &mut hash_state,
+            &src[ip..iend],
+            &mut splits,
+            &mut num_splits,
+        );
+        for &split in &splits[..num_splits] {
+            if ip + split >= istart + min_match_length {
+                let split = ip + split - min_match_length;
+                let xxhash = xxh64(&src[split..split + min_match_length], 0);
+                let hash = (xxhash as u32) & ((1u32 << h_bits) - 1);
+                let entry = LdmEntry {
+                    offset: (split as i64 + base) as u32,
+                    checksum: (xxhash >> 32) as u32,
+                };
+                zstd_ldm_insert_entry(ldm_state, hash, entry, bucket_size_log);
+            }
+        }
+        ip += hashed;
+    }
 }
 
 /// `ZSTD_ldm_countBackwardsMatch`: how many bytes before `p_in` of `src`
@@ -578,9 +619,11 @@ pub(crate) fn zstd_ldm_generate_sequences(
         }
         // 2. The maximum distance, enforced by chunk, from its end. An
         // offset must be valid at the end of its sequence, which may be
-        // split in two; that holds here. Without a dictionary
-        // (loadedDictEnd is 0), as the port has none.
-        window.enforce_max_dist(window.index(chunk_end), max_dist);
+        // split in two; that holds here. A dictionary loaded is valid
+        // whole until the window is past its end.
+        if window.enforce_max_dist(window.index(chunk_end), max_dist, ldm_state.loaded_dict_end) {
+            ldm_state.loaded_dict_end = 0;
+        }
         // 3. The sequences of the chunk.
         let new_leftover_size = zstd_ldm_generate_sequences_internal(
             ldm_state,
@@ -715,7 +758,7 @@ pub(crate) fn zstd_ldm_block_compress(
     // compressor on the whole block, then moves past its bytes in them.
     if ms.c_params.strategy >= Strategy::Btopt {
         let last_ll_size =
-            block_compressor.compress_opt(ms, seq_store, rep, istart, iend, Some(raw_seq_store));
+            block_compressor.compress_opt(ms, seq_store, rep, istart, iend, Some(raw_seq_store))?;
         zstd_ldm_skip_raw_seq_store_bytes(raw_seq_store, iend - istart);
         return Ok(last_ll_size);
     }

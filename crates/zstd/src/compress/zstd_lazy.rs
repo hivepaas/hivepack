@@ -467,6 +467,36 @@ fn insert_and_find_first_index<const MLS: u32>(ms: &mut MatchState, src: &[u8], 
     ms.hash_table[zstd_hash_ptr(src, ip, hash_log, MLS)]
 }
 
+/// `ZSTD_insertAndFindFirstIndex`: [`insert_and_find_first_index`] with the
+/// hash of `minMatch` bytes, as loading a dictionary inserts its positions
+/// up to `ip`.
+///
+/// libzstd hashes with `ZSTD_hashPtr` of `minMatch` itself here, 7 bytes
+/// included (3 takes 4), where the block compressors take 4 to 6: a
+/// dictionary loaded with a shortest match of 7 is in the hash table under
+/// other hashes than they look for, and the port does the same.
+pub(crate) fn zstd_insert_and_find_first_index(ms: &mut MatchState, src: &[u8], ip: usize) -> u32 {
+    match ms.c_params.min_match {
+        5 => insert_and_find_first_index::<5>(ms, src, ip),
+        6 => insert_and_find_first_index::<6>(ms, src, ip),
+        7 => insert_and_find_first_index::<7>(ms, src, ip),
+        // 3 and 4, and anything else, as ZSTD_hashPtr.
+        _ => insert_and_find_first_index::<4>(ms, src, ip),
+    }
+}
+
+/// `ZSTD_dedicatedDictSearch_lazy_loadDictionary`: the tables of a `CDict`
+/// laid out for the dedicated dictionary search, from its content up to
+/// `ip`. Phase 1 ports it; until then no match state has
+/// `dedicated_dict_search` set.
+pub(crate) fn zstd_dedicated_dict_search_lazy_load_dictionary(
+    ms: &mut MatchState,
+    _src: &[u8],
+    _ip: usize,
+) {
+    debug_assert!(!ms.dedicated_dict_search);
+}
+
 /// `ZSTD_HcFindBestMatch`: the longest match at `ip`, up to `i_limit`, of
 /// those the hash chain gives, and its offset base; a length under 4 for
 /// none. With `EXT`, candidates below the prefix are in `dict`.
@@ -693,6 +723,73 @@ fn row_update_internal<const MLS: u32, const ROW_LOG: u32>(
     }
     debug_assert!(target >= idx);
     row_update_internal_impl::<MLS, ROW_LOG>(ms, src, idx, target);
+    ms.next_to_update = target;
+}
+
+/// `ZSTD_row_update`: inserts the positions from `nextToUpdate` up to
+/// `ip`, not included, all of them, as loading a dictionary does: without
+/// the hash cache (`ZSTD_row_update_internal` with `useCache` 0), each
+/// position hashed as it is inserted, with the salt.
+///
+/// The hashes are of `min(minMatch, 6)` bytes, 3 taking 4, as the block
+/// compressors'.
+pub(crate) fn zstd_row_update(ms: &mut MatchState, src: &[u8], ip: usize) {
+    macro_rules! with {
+        ($mls:literal, $row_log:literal) => {
+            row_update_uncached::<$mls, $row_log>(ms, src, ip)
+        };
+    }
+    let row_log = ms.c_params.search_log.clamp(4, 6);
+    match (ms.c_params.min_match.min(6), row_log) {
+        (5, 4) => with!(5, 4),
+        (5, 5) => with!(5, 5),
+        (5, 6) => with!(5, 6),
+        (6, 4) => with!(6, 4),
+        (6, 5) => with!(6, 5),
+        (6, 6) => with!(6, 6),
+        // 3 and 4, as ZSTD_hashPtrSalted.
+        (_, 4) => with!(4, 4),
+        (_, 5) => with!(4, 5),
+        _ => with!(4, 6),
+    }
+}
+
+/// `ZSTD_row_update_internal` without the hash cache: every position from
+/// `nextToUpdate` up to `ip`, not included, its hash made as it is
+/// inserted (`ZSTD_row_update_internalImpl` with `useCache` 0).
+fn row_update_uncached<const MLS: u32, const ROW_LOG: u32>(
+    ms: &mut MatchState,
+    src: &[u8],
+    ip: usize,
+) {
+    let row_mask = (1u32 << ROW_LOG) - 1;
+    let hash_log = ms.row_hash_log;
+    let base = ms.window.base;
+    let hash_salt = ms.hash_salt;
+    let target = ms.window.index(ip);
+    let MatchState {
+        hash_table,
+        tag_table,
+        ..
+    } = ms;
+    let mut idx = ms.next_to_update;
+    debug_assert!(target >= idx);
+    while idx < target {
+        let hash = zstd_hash_ptr_salted(
+            src,
+            (i64::from(idx) - base) as usize,
+            hash_log + ZSTD_ROW_HASH_TAG_BITS,
+            MLS,
+            hash_salt,
+        );
+        let rel_row = ((hash >> ZSTD_ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
+        let row = &mut hash_table[rel_row..][..1 << ROW_LOG];
+        let tag_row = &mut tag_table[rel_row..][..1 << ROW_LOG];
+        let pos = (row_next_index(tag_row, row_mask) & row_mask) as usize;
+        tag_row[pos] = (hash & ZSTD_ROW_HASH_TAG_MASK) as u8;
+        row[pos] = idx;
+        idx += 1;
+    }
     ms.next_to_update = target;
 }
 

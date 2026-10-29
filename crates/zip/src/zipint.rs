@@ -28,6 +28,21 @@ pub(crate) const BUFSIZE: usize = 8192;
 pub(crate) const EFZIP64SIZE: usize = 28;
 pub(crate) const EF_WINZIP_AES_SIZE: usize = 7;
 
+/// `ZIP_CRYPTO_PKWARE_HEADERLEN`: ZipCrypto's encryption header.
+pub(crate) const CRYPTO_PKWARE_HEADERLEN: usize = 12;
+pub(crate) const WINZIP_AES_PASSWORD_VERIFY_LENGTH: usize = 2;
+pub(crate) const WINZIP_AES_MAX_HEADER_LENGTH: usize = 16 + WINZIP_AES_PASSWORD_VERIFY_LENGTH;
+pub(crate) const HMAC_LENGTH: usize = 10;
+
+/// `SALT_LENGTH`: the salt of a WinZip AES entry, by its method.
+pub(crate) fn salt_length(method: u16) -> usize {
+    match method {
+        crate::zip::em::AES_128 => 8,
+        crate::zip::em::AES_192 => 12,
+        _ => 16,
+    }
+}
+
 pub(crate) const TORRENTZIP_SIGNATURE: &[u8; 14] = b"TORRENTZIPPED-";
 pub(crate) const TORRENTZIP_SIGNATURE_LENGTH: usize = 14;
 pub(crate) const TORRENTZIP_CRC_LENGTH: usize = 8;

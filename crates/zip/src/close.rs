@@ -15,6 +15,7 @@ use crate::buffer::Buffer;
 use crate::dirent::{Dirent, DosTime, cm_actual, u2d_time};
 use crate::error::{Error, ErrorCode, Result};
 use crate::file_get_offset::file_get_offset;
+use crate::get_encryption_implementation::Decrypt;
 use crate::hash::c_string;
 use crate::io_util::read;
 use crate::open::Archive;
@@ -252,7 +253,14 @@ impl<R: ReadAt> Archive<R> {
             };
             let check_consistency = self.open_flags.intersects(OpenFlags::CHECKCONS);
             // add_data writes dirent
-            let added = add_data(base, &mut de, out, want_torrentzip, check_consistency);
+            let added = add_data(
+                base,
+                &mut de,
+                out,
+                want_torrentzip,
+                check_consistency,
+                self.default_password.as_deref(),
+            );
             if let Some(changes) = self.entry[i].changes.as_deref_mut() {
                 *changes = de;
             }
@@ -323,16 +331,17 @@ fn torrentzip_compare_names(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>) -> Orderin
 }
 
 /// Writes the local header of `de`, the data of `src` through the layers
-/// that decompress, compute the CRC and compress it as `de` asks, and the
-/// data descriptor if it has one, and fills in what the data tells: port
-/// of `add_data`. The header is written again once the sizes are known, if
-/// they changed it.
+/// that decrypt (with `default_password`), decompress, compute the CRC and
+/// compress it as `de` asks, and the data descriptor if it has one, and
+/// fills in what the data tells: port of `add_data`. The header is written
+/// again once the sizes are known, if they changed it.
 fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
     src: Base<'_, R>,
     de: &mut Dirent,
     out: &mut Output<W>,
     want_torrentzip: bool,
     check_consistency: bool,
+    default_password: Option<&[u8]>,
 ) -> Result<()> {
     let mut st = src.stat()?;
 
@@ -430,11 +439,14 @@ fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
         de.changed &= !changed::LAST_MOD;
     }
 
-    if needs_decrypt {
-        // Differs from libzip, for now: encryption comes with step 4, as in
-        // a libzip built without it.
-        return Err(Error::new(ErrorCode::EncrNotSupp, 0));
-    }
+    let decrypt = match needs_decrypt {
+        true => Some(Layer::new(Decrypt::new(
+            st.encryption_method,
+            default_password,
+            &src.stat()?,
+        )?)),
+        false => None,
+    };
     let decompress = match needs_decompress {
         true => Some(Layer::new(Decompress::new(
             st.comp_method,
@@ -451,11 +463,13 @@ fn add_data<R: ReadAt + ?Sized, W: Write + Seek>(
         false => None,
     };
     if needs_encrypt {
+        // Differs from libzip, for now: encrypting comes later.
         return Err(Error::new(ErrorCode::EncrNotSupp, 0));
     }
 
     let mut src_final = WriteStack {
         base: src,
+        decrypt,
         decompress,
         crc,
         compress,

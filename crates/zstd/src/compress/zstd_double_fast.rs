@@ -1,5 +1,5 @@
 //! The `dfast` strategy's match finder: port of
-//! `compress/zstd_double_fast.c`, without a dictionary so far.
+//! `compress/zstd_double_fast.c`.
 //!
 //! Two hash tables: a long one, of 8-byte hashes (the match state's hash
 //! table), and a short one of `minMatch`-byte hashes (its chain table).
@@ -7,14 +7,17 @@
 //! and `dict`, the one its older segment is in; the tables hold window
 //! indices, `position + window.base` (or `window.dict_base`). The extDict
 //! variant cuts the two segments out of those buffers, and its positions
-//! are in the segments.
+//! are in the segments. The dictMatchState variant also reads the content
+//! of the `CDict` the frame is attached to, at its own indices.
 
 use crate::common::mem::idx;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
-    HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
-    mem_read32, mem_read32_within, mem_read64, mem_read64_within, offset_to_offbase, zstd_count,
-    zstd_count_2segments, zstd_hash_ptr,
+    DictMatchState, HASH_READ_SIZE, HashTable, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE,
+    SeqStore, ZSTD_SHORT_CACHE_TAG_BITS, mem_read32, mem_read32_within, mem_read64,
+    mem_read64_within, offset_to_offbase, zstd_compare_packed_tags, zstd_count,
+    zstd_count_2segments, zstd_hash_ptr, zstd_hash_u64, zstd_index_overlap_check,
+    zstd_write_tagged_index,
 };
 
 /// `ZSTD_fillDoubleHashTable` for a context
@@ -40,6 +43,46 @@ pub(crate) fn zstd_fill_double_hash_table(ms: &mut MatchState, src: &[u8], end: 
         let lg_hash = zstd_hash_ptr(src, ip as usize, h_bits_l, 8);
         ms.chain_table[sm_hash] = curr;
         ms.hash_table[lg_hash] = curr;
+        ip += FAST_HASH_FILL_STEP;
+    }
+}
+
+/// `ZSTD_fillDoubleHashTable` for a `CDict`
+/// (`ZSTD_fillDoubleHashTableForCDict`), with `ZSTD_dtlm_full`, the only way
+/// libzstd calls it for one: every third position from `nextToUpdate` into
+/// both tables, and the two after it into the long one where their entry
+/// is still empty, while 8 bytes from the third fit before `end`, a
+/// position of `src`, the buffer of the `CDict`'s window. The entries hold
+/// tagged indices (see [`ZSTD_SHORT_CACHE_TAG_BITS`]). `nextToUpdate`
+/// stays.
+pub(crate) fn zstd_fill_double_hash_table_for_cdict(ms: &mut MatchState, src: &[u8], end: usize) {
+    const FAST_HASH_FILL_STEP: i64 = 3;
+    let h_bits_l = ms.c_params.hash_log + ZSTD_SHORT_CACHE_TAG_BITS;
+    let mls = ms.c_params.min_match;
+    let h_bits_s = ms.c_params.chain_log + ZSTD_SHORT_CACHE_TAG_BITS;
+    let base = ms.window.base;
+    let mut ip = i64::from(ms.next_to_update) - base;
+    debug_assert!(ip >= 0);
+    // libzstd's iend, end - HASH_READ_SIZE, which can be before the buffer.
+    let iend = end as i64 - HASH_READ_SIZE as i64;
+    let MatchState {
+        hash_table: hash_large,
+        chain_table: hash_small,
+        ..
+    } = ms;
+    while ip + FAST_HASH_FILL_STEP - 1 <= iend {
+        let curr = (ip + base) as u32;
+        for i in 0..FAST_HASH_FILL_STEP {
+            let at = (ip + i) as usize;
+            let sm_hash_and_tag = zstd_hash_ptr(src, at, h_bits_s, mls);
+            let lg_hash_and_tag = zstd_hash_ptr(src, at, h_bits_l, 8);
+            if i == 0 {
+                zstd_write_tagged_index(hash_small, sm_hash_and_tag, curr);
+            }
+            if i == 0 || hash_large[lg_hash_and_tag >> ZSTD_SHORT_CACHE_TAG_BITS] == 0 {
+                zstd_write_tagged_index(hash_large, lg_hash_and_tag, curr + i as u32);
+            }
+        }
         ip += FAST_HASH_FILL_STEP;
     }
 }
@@ -718,4 +761,427 @@ pub(crate) fn zstd_compress_block_double_fast_ext_dict(
         _ => zstd_compress_block_double_fast_ext_dict_generic::<4>,
     };
     f(ms, seq_store, rep, src, dict, istart, iend)
+}
+
+/// `ZSTD_compressBlock_doubleFast_dictMatchState_generic`: the sequences
+/// of the block `src[istart..iend]`, with matches in the window's prefix
+/// and in `dms`, the `CDict` the frame is attached to: its two tables, of
+/// tagged indices, over its content, which comes right before the prefix
+/// in the frame's indices. A match in the dictionary may run on into the
+/// prefix. Returns the size of the literals left after the last sequence.
+///
+/// As in libzstd, at each position: the repcode at the next one; a long
+/// match in the prefix, else one in the dictionary; then a short match, in
+/// the prefix if its candidate is in the window, else in the dictionary;
+/// a short match is followed by a look for a long one at the next
+/// position, in the prefix, else in the dictionary. The dictionary's bytes
+/// are read only where the tags match (`ZSTD_comparePackedTags`). The
+/// repcodes are not checked against the window first: libzstd asserts
+/// that they reach no further back than the dictionary's start (see the
+/// fast strategy's variant).
+///
+/// Differs from libzstd: positions are indices into `src`, the prefix's
+/// buffer, and into the `CDict`'s content, `dms.content`; libzstd's
+/// `dictBase` is `dms.ms.window.base` there. A repcode is read where
+/// libzstd reads it, and one out of the content is no match, as in the
+/// fast strategy's variant. The 8 bytes at each position searched, and at
+/// the one after it for a long match there, are read once, for the hashes
+/// and the comparisons; the bytes are the same. The dictionary's tables
+/// are not prefetched (`ms->prefetchCDictTables`), which changes nothing
+/// they read.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn zstd_compress_block_double_fast_dict_match_state_generic<const MLS: u32>(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    // The shortest match, a constant in each copy, as libzstd's templates
+    // make it.
+    let mls = MLS;
+    let c_params = ms.c_params;
+    let h_bits_l = c_params.hash_log;
+    let h_bits_s = c_params.chain_log;
+    let base = ms.window.base;
+    // Nothing past the block is read, as in libzstd.
+    let src = &src[..iend];
+    let mut ip = istart;
+    let mut anchor = istart;
+    let end_index = ms.window.index(iend);
+    // With a dictionary, it is attached: the prefix starts at dictLimit.
+    let prefix_lowest_index = ms.lowest_prefix_index(end_index, c_params.window_log);
+    let prefix_lowest = (i64::from(prefix_lowest_index) - base) as usize;
+    // Before the block for blocks under 8 bytes; see the noDict variant.
+    let ilimit = iend.saturating_sub(HASH_READ_SIZE);
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    // The dictionary: its tables, its window over its content (one
+    // segment, from dictStartIndex to dictEnd), and how far its indices are
+    // below the frame's.
+    // Differs from libzstd: an entry's index, the hash with its tag
+    // shifted out, is masked with the table's size, which changes none and
+    // saves the bounds check.
+    let dict_mask_l = (1usize << dms.ms.c_params.hash_log) - 1;
+    let dict_mask_s = (1usize << dms.ms.c_params.chain_log) - 1;
+    let dict_hash_long = &dms.ms.hash_table[..=dict_mask_l];
+    let dict_hash_small = &dms.ms.chain_table[..=dict_mask_s];
+    let dict_entry_l = |hash_and_tag: usize| {
+        dict_hash_long[(hash_and_tag >> ZSTD_SHORT_CACHE_TAG_BITS) & dict_mask_l]
+    };
+    let dict_entry_s = |hash_and_tag: usize| {
+        dict_hash_small[(hash_and_tag >> ZSTD_SHORT_CACHE_TAG_BITS) & dict_mask_s]
+    };
+    let dict_start_index = dms.ms.window.dict_limit;
+    let dict_base = dms.ms.window.base;
+    let dict_end_index = dms.ms.window.next_src as u32;
+    let dict_start = (i64::from(dict_start_index) - dict_base) as usize;
+    let dict_end = (i64::from(dict_end_index) - dict_base) as usize;
+    let dict = &dms.content[..dict_end];
+    // The frame's window starts at or past the dictionary's end.
+    debug_assert!(prefix_lowest_index >= dict_end_index);
+    let dict_index_delta = prefix_lowest_index.wrapping_sub(dict_end_index);
+    let dict_h_bits_l = dms.ms.c_params.hash_log + ZSTD_SHORT_CACHE_TAG_BITS;
+    let dict_h_bits_s = dms.ms.c_params.chain_log + ZSTD_SHORT_CACHE_TAG_BITS;
+    let dict_and_prefix_length = (ip - prefix_lowest + dict_end - dict_start) as u32;
+
+    // A dictionary still attached is within the window.
+    debug_assert!(
+        u64::from(ms.window.dict_limit) + (1u64 << c_params.window_log) >= u64::from(end_index)
+    );
+
+    let index = |position: usize| (position as i64 + base) as u32;
+    let at = |index: u32| (i64::from(index) - base) as usize;
+    // The position in the content of the dictionary's index `i`.
+    let dict_at = |i: u32| (i64::from(i) - dict_base) as usize;
+    // Where the frame's index `i` is: its segment, its position there, and
+    // where the segment ends; see the fast strategy's variant.
+    let locate = |i: u32| {
+        if i < prefix_lowest_index {
+            let at = i64::from(i) - i64::from(dict_index_delta) - dict_base;
+            (dict, at as usize, dict_end)
+        } else {
+            (src, at(i), iend)
+        }
+    };
+    // The tag in an entry of the dictionary's tables, and its index.
+    let tags_match =
+        |entry: u32, hash_and_tag: usize| zstd_compare_packed_tags(entry as usize, hash_and_tag);
+    let entry_index = |entry: u32| entry >> ZSTD_SHORT_CACHE_TAG_BITS;
+
+    // Init.
+    ip += usize::from(dict_and_prefix_length == 0);
+    // The repcode checks do not disable a repcode of 0, or one out of
+    // reach.
+    debug_assert!(offset_1 <= dict_and_prefix_length);
+    debug_assert!(offset_2 <= dict_and_prefix_length);
+
+    let mut hash_long = HashTable::new(&mut ms.hash_table, h_bits_l);
+    let mut hash_small = HashTable::new(&mut ms.chain_table, h_bits_s);
+
+    // The main search loop: < instead of <=, because of the repcode check
+    // at ip + 1.
+    'search: while ip < ilimit {
+        // The 8 bytes at ip, before ilimit.
+        let val0 = mem_read64(src, ip);
+        let h2 = hash_long.hash_u64(val0, 8);
+        let h = hash_small.hash_u64(val0, mls);
+        let dict_hash_and_tag_l = zstd_hash_u64(val0, dict_h_bits_l, 8);
+        let dict_hash_and_tag_s = zstd_hash_u64(val0, dict_h_bits_s, mls);
+        let dict_match_index_and_tag_l = dict_entry_l(dict_hash_and_tag_l);
+        let dict_match_index_and_tag_s = dict_entry_s(dict_hash_and_tag_s);
+        let dict_tags_match_l = tags_match(dict_match_index_and_tag_l, dict_hash_and_tag_l);
+        let dict_tags_match_s = tags_match(dict_match_index_and_tag_s, dict_hash_and_tag_s);
+        let curr = index(ip);
+        let match_index_l = hash_long.get(h2);
+        let mut match_index_s = hash_small.get(h);
+        let rep_index = (curr + 1).wrapping_sub(offset_1);
+        // Update the hash tables.
+        hash_long.set(h2, curr);
+        hash_small.set(h, curr);
+
+        // The match's length, once stored (_match_stored).
+        let m_length = 'match_stored: {
+            // The repcode.
+            let (rbuf, rpos, rep_match_end) = locate(rep_index);
+            if zstd_index_overlap_check(prefix_lowest_index, rep_index)
+                && mem_read32_within(rbuf, rpos) == Some((val0 >> 8) as u32)
+            {
+                let m_length = zstd_count_2segments(
+                    src,
+                    ip + 1 + 4,
+                    rbuf,
+                    rpos + 4,
+                    iend,
+                    rep_match_end,
+                    prefix_lowest,
+                ) + 4;
+                ip += 1;
+                seq_store.store_seq(src, anchor, ip - anchor, REPCODE1_TO_OFFBASE, m_length);
+                break 'match_stored m_length;
+            }
+
+            // The match's offset and length, before it is stored
+            // (_match_found). ip moves back with the catch-ups.
+            let (offset, m_length) = 'match_found: {
+                if match_index_l >= prefix_lowest_index
+                    && mem_read64(src, at(match_index_l)) == val0
+                {
+                    // A long match in the prefix.
+                    let mut match_long = at(match_index_l);
+                    let mut m_length = zstd_count(src, ip + 8, match_long + 8, iend) + 8;
+                    let offset = (ip - match_long) as u32;
+                    // Catch up.
+                    while (ip > anchor) & (match_long > prefix_lowest)
+                        && src[ip - 1] == src[match_long - 1]
+                    {
+                        ip -= 1;
+                        match_long -= 1;
+                        m_length += 1;
+                    }
+                    break 'match_found (offset, m_length);
+                } else if dict_tags_match_l {
+                    // A long match in the dictionary. Its tables hold
+                    // positions with 8 bytes in the content, or 0, which is
+                    // not above dictStartIndex.
+                    let dict_match_index_l = entry_index(dict_match_index_and_tag_l);
+                    let mut dict_match_l = dict_at(dict_match_index_l);
+                    debug_assert!(dict_match_index_l < dict_end_index);
+                    if dict_match_index_l > dict_start_index
+                        && mem_read64(dict, dict_match_l) == val0
+                    {
+                        let mut m_length = zstd_count_2segments(
+                            src,
+                            ip + 8,
+                            dict,
+                            dict_match_l + 8,
+                            iend,
+                            dict_end,
+                            prefix_lowest,
+                        ) + 8;
+                        let offset = curr
+                            .wrapping_sub(dict_match_index_l)
+                            .wrapping_sub(dict_index_delta);
+                        // Catch up.
+                        while (ip > anchor) & (dict_match_l > dict_start)
+                            && src[ip - 1] == dict[dict_match_l - 1]
+                        {
+                            ip -= 1;
+                            dict_match_l -= 1;
+                            m_length += 1;
+                        }
+                        break 'match_found (offset, m_length);
+                    }
+                }
+
+                // A short match: its position, in the prefix, or in the
+                // dictionary where match_index_s is then below the prefix,
+                // as libzstd moves it to the frame's indices.
+                let short_match = if match_index_s > prefix_lowest_index {
+                    // A short candidate in the prefix.
+                    let match0 = at(match_index_s);
+                    (mem_read32(src, match0) == val0 as u32).then_some(match0)
+                } else if dict_tags_match_s {
+                    // A short match in the dictionary.
+                    let dict_match_index_s = entry_index(dict_match_index_and_tag_s);
+                    let match0 = dict_at(dict_match_index_s);
+                    match_index_s = dict_match_index_s.wrapping_add(dict_index_delta);
+                    (dict_match_index_s > dict_start_index
+                        && mem_read32(dict, match0) == val0 as u32)
+                        .then_some(match0)
+                } else {
+                    None
+                };
+                let Some(mut match0) = short_match else {
+                    ip += ((ip - anchor) >> K_SEARCH_STRENGTH) + 1;
+                    continue 'search;
+                };
+
+                // _search_next_long. The 8 bytes at ip + 1, at or before
+                // ilimit.
+                let val1 = mem_read64(src, ip + 1);
+                let hl3 = hash_long.hash_u64(val1, 8);
+                let dict_hash_and_tag_l3 = zstd_hash_u64(val1, dict_h_bits_l, 8);
+                let match_index_l3 = hash_long.get(hl3);
+                let dict_match_index_and_tag_l3 = dict_entry_l(dict_hash_and_tag_l3);
+                let dict_tags_match_l3 =
+                    tags_match(dict_match_index_and_tag_l3, dict_hash_and_tag_l3);
+                hash_long.set(hl3, curr + 1);
+
+                if match_index_l3 >= prefix_lowest_index
+                    && mem_read64(src, at(match_index_l3)) == val1
+                {
+                    // A long match in the prefix, at the next position.
+                    let mut match_l3 = at(match_index_l3);
+                    let mut m_length = zstd_count(src, ip + 9, match_l3 + 8, iend) + 8;
+                    ip += 1;
+                    let offset = (ip - match_l3) as u32;
+                    // Catch up.
+                    while (ip > anchor) & (match_l3 > prefix_lowest)
+                        && src[ip - 1] == src[match_l3 - 1]
+                    {
+                        ip -= 1;
+                        match_l3 -= 1;
+                        m_length += 1;
+                    }
+                    break 'match_found (offset, m_length);
+                } else if dict_tags_match_l3 {
+                    // A long match in the dictionary, at the next position.
+                    let dict_match_index_l3 = entry_index(dict_match_index_and_tag_l3);
+                    let mut dict_match_l3 = dict_at(dict_match_index_l3);
+                    debug_assert!(dict_match_index_l3 < dict_end_index);
+                    if dict_match_index_l3 > dict_start_index
+                        && mem_read64(dict, dict_match_l3) == val1
+                    {
+                        let mut m_length = zstd_count_2segments(
+                            src,
+                            ip + 1 + 8,
+                            dict,
+                            dict_match_l3 + 8,
+                            iend,
+                            dict_end,
+                            prefix_lowest,
+                        ) + 8;
+                        ip += 1;
+                        let offset = (curr + 1)
+                            .wrapping_sub(dict_match_index_l3)
+                            .wrapping_sub(dict_index_delta);
+                        // Catch up.
+                        while (ip > anchor) & (dict_match_l3 > dict_start)
+                            && src[ip - 1] == dict[dict_match_l3 - 1]
+                        {
+                            ip -= 1;
+                            dict_match_l3 -= 1;
+                            m_length += 1;
+                        }
+                        break 'match_found (offset, m_length);
+                    }
+                }
+
+                // No long match at the next position: the short match.
+                if match_index_s < prefix_lowest_index {
+                    // In the dictionary.
+                    let mut m_length = zstd_count_2segments(
+                        src,
+                        ip + 4,
+                        dict,
+                        match0 + 4,
+                        iend,
+                        dict_end,
+                        prefix_lowest,
+                    ) + 4;
+                    let offset = curr.wrapping_sub(match_index_s);
+                    // Catch up.
+                    while (ip > anchor) & (match0 > dict_start) && src[ip - 1] == dict[match0 - 1] {
+                        ip -= 1;
+                        match0 -= 1;
+                        m_length += 1;
+                    }
+                    (offset, m_length)
+                } else {
+                    // In the prefix.
+                    let mut m_length = zstd_count(src, ip + 4, match0 + 4, iend) + 4;
+                    let offset = (ip - match0) as u32;
+                    // Catch up.
+                    while (ip > anchor) & (match0 > prefix_lowest) && src[ip - 1] == src[match0 - 1]
+                    {
+                        ip -= 1;
+                        match0 -= 1;
+                        m_length += 1;
+                    }
+                    (offset, m_length)
+                }
+            };
+
+            // _match_found
+            offset_2 = offset_1;
+            offset_1 = offset;
+            seq_store.store_seq(
+                src,
+                anchor,
+                ip - anchor,
+                offset_to_offbase(offset),
+                m_length,
+            );
+            m_length
+        };
+
+        // _match_stored
+        ip += m_length;
+        anchor = ip;
+
+        if ip <= ilimit {
+            // Complementary insertion, after the ilimit test, as candidates
+            // could be past iend - 8.
+            {
+                let index_to_insert = curr + 2;
+                hash_long.set(hash_long.hash(src, at(index_to_insert), 8), index_to_insert);
+                hash_long.set(hash_long.hash(src, ip - 2, 8), index(ip - 2));
+                hash_small.set(
+                    hash_small.hash(src, at(index_to_insert), mls),
+                    index_to_insert,
+                );
+                hash_small.set(hash_small.hash(src, ip - 1, mls), index(ip - 1));
+            }
+
+            // An immediate repcode.
+            while ip <= ilimit {
+                let current2 = index(ip);
+                let rep_index2 = current2.wrapping_sub(offset_2);
+                let (rbuf, rpos, rep_end2) = locate(rep_index2);
+                if zstd_index_overlap_check(prefix_lowest_index, rep_index2)
+                    && mem_read32_within(rbuf, rpos) == Some(mem_read32(src, ip))
+                {
+                    let rep_length2 = zstd_count_2segments(
+                        src,
+                        ip + 4,
+                        rbuf,
+                        rpos + 4,
+                        iend,
+                        rep_end2,
+                        prefix_lowest,
+                    ) + 4;
+                    // Swap offset_2 and offset_1.
+                    std::mem::swap(&mut offset_1, &mut offset_2);
+                    seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, rep_length2);
+                    hash_small.set(hash_small.hash(src, ip, mls), current2);
+                    hash_long.set(hash_long.hash(src, ip, 8), current2);
+                    ip += rep_length2;
+                    anchor = ip;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    // The repcodes for the next block.
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+
+    // The size of the last literals.
+    iend - anchor
+}
+
+/// `ZSTD_compressBlock_doubleFast_dictMatchState`: dispatches on the
+/// shortest match, 4 to 7 bytes (3 counts as 4).
+pub(crate) fn zstd_compress_block_double_fast_dict_match_state(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    let f = match ms.c_params.min_match {
+        5 => zstd_compress_block_double_fast_dict_match_state_generic::<5>,
+        6 => zstd_compress_block_double_fast_dict_match_state_generic::<6>,
+        7 => zstd_compress_block_double_fast_dict_match_state_generic::<7>,
+        _ => zstd_compress_block_double_fast_dict_match_state_generic::<4>,
+    };
+    f(ms, seq_store, rep, src, dms, istart, iend)
 }

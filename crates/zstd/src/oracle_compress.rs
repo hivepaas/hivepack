@@ -36,19 +36,22 @@ use crate::compress::huf_compress::{
     huf_compress1x_repeat, huf_compress4x_repeat, huf_optimal_table_log, huf_read_ctable,
     huf_read_ctable_header, huf_write_ctable_wksp,
 };
+use crate::compress::zstd_cdict::CDict;
 use crate::compress::zstd_compress::{
     CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_entropy_compress_seq_store,
     zstd_level_ported,
 };
 use crate::compress::zstd_compress_internal::{
-    EntropyCTables, FseRepeat, LongLengthType, ParamSwitch, SeqDef, SeqStore, Strategy,
-    zstd_literals_compression_is_disabled,
+    DictAttachPref, EntropyCTables, FseRepeat, LongLengthType, ParamSwitch, SeqDef, SeqStore,
+    Strategy, zstd_literals_compression_is_disabled,
 };
+use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
 use crate::oracle::{
     Oracle, Rng, failed, fnv64, hex, list, mutate, recorded_form, repository, unhex, unlist,
 };
+use std::sync::Arc;
 
 /// The fillers the oracle starts its tables with.
 const FILLER_WORD: u32 = 0xdead_beef;
@@ -438,7 +441,8 @@ pub(crate) fn answer(request: &str) -> String {
                 },
             )
         }
-        ["cstream", capacity, steps, src] => cstream(capacity, steps, src),
+        ["cstream", capacity, steps, src] => cstream(capacity, steps, src, "-"),
+        ["cstream", capacity, steps, src, dict] => cstream(capacity, steps, src, dict),
         ["seqreset"] => {
             SEQ_ENTROPY.with(|state| {
                 *state.borrow_mut() = (
@@ -531,23 +535,72 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         164 => CParameter::LdmHashRateLog(unsigned()),
         // ZSTD_c_useRowMatchFinder
         1011 => CParameter::UseRowMatchFinder(switch()),
+        // ZSTD_c_enableDedicatedDictSearch
+        1005 => CParameter::EnableDedicatedDictSearch(flag),
+        // ZSTD_c_forceAttachDict
+        1001 => CParameter::ForceAttachDict(match value {
+            0 => DictAttachPref::DefaultAttach,
+            1 => DictAttachPref::ForceAttach,
+            2 => DictAttachPref::ForceCopy,
+            3 => DictAttachPref::ForceLoad,
+            _ => panic!("dictionary attach preference {value}"),
+        }),
         _ => panic!("parameter {number}"),
     }
 }
 
 /// `cstream`: a new context through the steps, as the oracle takes it
 /// through them; reset after a failed call, but for buffers not as stable
-/// as promised, which is found before anything changes.
-fn cstream(capacity: &str, steps: &str, src: &str) -> String {
+/// as promised, which is found before anything changes. `dict` is the
+/// dictionary bytes of the steps that set one.
+#[allow(clippy::too_many_lines)]
+fn cstream(capacity: &str, steps: &str, src: &str, dict: &str) -> String {
     let capacity: usize = number(capacity);
     let steps = unlist(steps);
     let src = unhex(src);
+    let dict = unhex(dict);
     let mut cctx = CCtx::new();
     let mut out = vec![0u8; capacity];
     let (mut in_pos, mut out_pos) = (0usize, 0usize);
     let mut text = String::from("ok");
     for step in steps.chunks(3) {
         let (op, a, b) = (step[0], step[1], step[2]);
+        // The dictionary's bytes: b at a, or the first a.
+        let dict_at = (a.max(0) as usize).min(dict.len());
+        let dict_piece = &dict[dict_at..dict_at + (b.max(0) as usize).min(dict.len() - dict_at)];
+        let dict_head = &dict[..(a.max(0) as usize).min(dict.len())];
+        if (11..=18).contains(&op) {
+            let content_type = |which| match which {
+                1 => DictContentType::RawContent,
+                2 => DictContentType::FullDict,
+                _ => DictContentType::Auto,
+            };
+            let result = match op {
+                11..=13 => cctx.load_dictionary_advanced(dict_piece, content_type(op - 11)),
+                14 => cctx.ref_prefix(dict_piece),
+                15 => cctx.ref_prefix_advanced(dict_piece, DictContentType::Auto),
+                16 | 17 => {
+                    let cdict = if op == 16 {
+                        CDict::new(dict_head, b as i32)
+                    } else {
+                        cctx.cdict_with_requested_parameters(dict_head, content_type(b))
+                    };
+                    match cdict {
+                        Ok(cdict) => cctx.ref_cdict(Some(Arc::new(cdict))),
+                        Err(_) => {
+                            text.push_str(" n");
+                            continue;
+                        }
+                    }
+                }
+                _ => cctx.ref_cdict(None),
+            };
+            let _ = match result {
+                Err(error) => write!(text, " e{}/{in_pos}/{out_pos}", error.code().number()),
+                Ok(()) => write!(text, " s"),
+            };
+            continue;
+        }
         let in_end = (in_pos + a.max(0) as usize).min(src.len());
         let out_end = if op == 10 {
             capacity
@@ -1210,6 +1263,17 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
     }
     steps.extend([7, 1006, i64::from(stable_in)]);
     steps.extend([7, 1007, i64::from(stable_out)]);
+    // A dictionary, a third of the time: loaded, a prefix, or a CDict, made
+    // for a level or with the parameters set. Copied in or loaded again:
+    // the port does not attach CDicts yet.
+    let dict = if rng.range(0, 2) == 0 {
+        cstream_dict(rng, &src)
+    } else {
+        Vec::new()
+    };
+    if !dict.is_empty() {
+        steps.extend(cstream_dict_steps(rng, dict.len(), stable_in));
+    }
     if rng.range(0, 3) == 0 {
         // Not a size just short with a stable input buffer: the hint of
         // the next frame's ZSTD_compressStream then wraps around to what
@@ -1258,6 +1322,10 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
             17 => 7,
             _ => 8,
         };
+        if !dict.is_empty() && rng.range(0, 30) == 0 {
+            // Another dictionary: refused while a frame is open.
+            steps.extend(cstream_dict_steps(rng, dict.len(), stable_in));
+        }
         match op {
             7 => {
                 // While streaming: allowed for the level, not the window.
@@ -1305,7 +1373,95 @@ fn cstream_request(rng: &mut Rng, i: usize) -> String {
         1 => rng.range(len as u64 / 3, bound + 30),
         _ => 2 * bound + 64,
     };
-    format!("cstream {capacity} {} {}", list(steps), hex(&src))
+    if dict.is_empty() {
+        format!("cstream {capacity} {} {}", list(steps), hex(&src))
+    } else {
+        format!(
+            "cstream {capacity} {} {} {}",
+            list(steps),
+            hex(&src),
+            hex(&dict)
+        )
+    }
+}
+
+/// The dictionary bytes of a `cstream` request: a zstd dictionary libzstd
+/// trains on pieces of `src` (or of data like it), some cut short; raw
+/// content, a piece of `src`; or random bytes.
+fn cstream_dict(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
+    match rng.range(0, 4) {
+        0 | 1 => {
+            let corpus = if src.len() > 20_000 {
+                src.to_vec()
+            } else {
+                frame_data(rng, 60_000)
+            };
+            let samples: Vec<&[u8]> = corpus.chunks(rng.range(100, 600) as usize).collect();
+            let size = rng.range(256, 12_000) as usize;
+            match zstd::dict::from_samples(&samples, size) {
+                Ok(mut dict) => {
+                    if rng.range(0, 7) == 0 {
+                        // Cut short: no longer a zstd dictionary to read.
+                        dict.truncate(rng.range(8, 200) as usize);
+                    }
+                    dict
+                }
+                Err(_) => corpus[..corpus.len().min(5000)].to_vec(),
+            }
+        }
+        2 if !src.is_empty() => {
+            let at = rng.range(0, src.len() as u64 - 1) as usize;
+            let len = (rng.range(1, 60_000) as usize).min(src.len() - at);
+            src[at..at + len].to_vec()
+        }
+        _ => {
+            let len = rng.range(1, 3000) as usize;
+            rng.bytes(len)
+        }
+    }
+}
+
+/// Steps that set a dictionary from `dict_len` bytes for the next frames:
+/// first the attach preference (as libzstd decides, attach, copy, or load
+/// again), then one of the dictionary steps, mostly with all the bytes.
+///
+/// With a stable input buffer, none that can fail as the frame starts (a
+/// dictionary read as a zstd one): the oracle then resets the context,
+/// which drops the input waiting in the port (see `CCtx::reset_session`).
+fn cstream_dict_steps(rng: &mut Rng, dict_len: usize, stable_in: bool) -> Vec<i64> {
+    let len = dict_len as i64;
+    let (at, size) = if rng.range(0, 3) == 0 {
+        let at = rng.range(0, dict_len as u64) as i64;
+        (
+            at,
+            rng.range(0, (dict_len as u64).saturating_sub(at as u64)) as i64,
+        )
+    } else {
+        (0, len)
+    };
+    // Every attach preference: default, attach, copy, load.
+    let mut steps = vec![7, 1001, rng.range(0, 3) as i64];
+    match rng.range(0, 9) {
+        0 | 2 | 4 if stable_in => steps.extend([12, at, size]),
+        0 => steps.extend([11, at, size]),
+        1 => steps.extend([12, at, size]),
+        2 => steps.extend([13, at, size]),
+        3 => steps.extend([14, at, size]),
+        4 => steps.extend([15, at, size]),
+        // CDicts of a byte or more: one made for an empty dictionary takes
+        // the level's tables for an input of unknown size, up to 640 MB.
+        5 | 6 => {
+            let level = match rng.range(0, 4) {
+                0 => -(rng.range(1, 5) as i64),
+                1 => 0,
+                _ => rng.range(1, 22) as i64,
+            };
+            steps.extend([16, size.max(1), level]);
+        }
+        7 => steps.extend([17, size.max(1), rng.range(0, 2) as i64]),
+        _ => steps.extend([18, 0, 0]),
+    }
+    steps
 }
 
 /// How a run of blocks draws its sequences.
@@ -1546,9 +1702,16 @@ fn port_matches_libzstd_compression() {
             }
         }
         if command == "cstream" && words[0] == "ok" {
+            if request.split(' ').count() == 5 {
+                *outcomes
+                    .entry("cstream with a dictionary".into())
+                    .or_default() += 1;
+            }
             for word in &words[1..words.len() - 1] {
                 let outcome = match word.split_once('/') {
                     Some((code, _)) if code.starts_with('e') => format!("cstream step {code}"),
+                    // No CDict made, from a dictionary that cannot be read.
+                    None if *word == "n" => "cstream step n".to_string(),
                     _ => "cstream step ok".to_string(),
                 };
                 *outcomes.entry(outcome).or_default() += 1;

@@ -2,11 +2,18 @@
 //! parameters, in the same pieces, with the same directives and the same
 //! room for output, all picked by its first 8 bytes, and checks that every
 //! call returns the same, moves as far and writes the same, and that the
-//! port decodes the frame back. A panic or a difference is a bug.
+//! port decodes the frame back. A third of the time with a dictionary
+//! from the start of the input, loaded, a prefix or a `CDict`, attached,
+//! copied in or loaded again. A panic or a difference is a bug.
 
 #![no_main]
 
-use hivepack_zstd::{CCtx, CParameter as P, EndDirective, ParamSwitch, Strategy};
+use std::sync::Arc;
+
+use hivepack_zstd::{
+    CCtx, CDict, CParameter as P, DCtx, DictAttachPref, EndDirective, ParamSwitch,
+    Strategy,
+};
 use libfuzzer_sys::fuzz_target;
 use zstd::zstd_safe::{self, CParameter as C, zstd_sys::ZSTD_EndDirective};
 
@@ -127,6 +134,55 @@ fuzz_target!(|input: &[u8]| {
         C::UseBlockSplitter(c_split),
     ));
 
+    // A dictionary, a third of the time: the start of the input, copied
+    // apart (libzstd takes a dictionary that ends where the input starts
+    // in memory as part of the input's segment), behind the dictionary
+    // magic number sometimes; loaded, a prefix, or a CDict, attached as
+    // libzstd decides or forced to attach, copy or load.
+    let dict_pick = rng.next();
+    let mut dict = Vec::new();
+    let mut src = src;
+    if dict_pick % 3 == 0 {
+        let dict_len = ((dict_pick >> 8) % 70_000) as usize % (src.len() + 1);
+        dict.reserve(dict_len + 8 + 64);
+        if dict_pick >> 32 & 7 == 0 {
+            dict.extend_from_slice(&0xEC30_A437u32.to_le_bytes());
+        }
+        dict.extend_from_slice(&src[..dict_len]);
+        src = &src[dict_len..];
+        let (pp, cp) = match dict_pick >> 40 & 7 {
+            0..=2 => (
+                DictAttachPref::DefaultAttach,
+                zstd_safe::DictAttachPref::DefaultAttach,
+            ),
+            3 => (
+                DictAttachPref::ForceAttach,
+                zstd_safe::DictAttachPref::ForceAttach,
+            ),
+            4..=5 => (
+                DictAttachPref::ForceCopy,
+                zstd_safe::DictAttachPref::ForceCopy,
+            ),
+            _ => (
+                DictAttachPref::ForceLoad,
+                zstd_safe::DictAttachPref::ForceLoad,
+            ),
+        };
+        parameters.push((P::ForceAttachDict(pp), C::ForceAttachDict(cp)));
+    }
+    let dict_way = dict_pick >> 48 & 3;
+    let cdict_level = [1, 3, 7, 19][(dict_pick >> 52 & 3) as usize];
+    let c_cdict = (!dict.is_empty() && dict_way == 2)
+        .then(|| zstd_safe::CDict::try_create(&dict, cdict_level))
+        .flatten();
+    let p_cdict = (!dict.is_empty() && dict_way == 2)
+        .then(|| CDict::new(&dict, cdict_level).ok().map(Arc::new))
+        .flatten();
+    assert!(
+        c_cdict.is_some() == p_cdict.is_some(),
+        "one makes a CDict, the other not"
+    );
+
     let mut c = zstd_safe::CCtx::create();
     let mut p = CCtx::new();
     for (pp, cp) in parameters {
@@ -139,6 +195,30 @@ fuzz_target!(|input: &[u8]| {
             "setting {pp:?}: libzstd {want:?}, port {got:?}"
         );
     }
+    if !dict.is_empty() {
+        let (want, got) = match (dict_way, &c_cdict, &p_cdict) {
+            (2, Some(c_cdict), p_cdict) => (
+                c.ref_cdict(c_cdict).map(|_| ()).map_err(name),
+                p.ref_cdict(p_cdict.clone())
+                    .map_err(|error| error.code().message().to_string()),
+            ),
+            (1, ..) => (
+                c.ref_prefix(&dict).map(|_| ()).map_err(name),
+                p.ref_prefix(&dict)
+                    .map_err(|error| error.code().message().to_string()),
+            ),
+            _ => (
+                c.load_dictionary(&dict).map(|_| ()).map_err(name),
+                p.load_dictionary(&dict)
+                    .map_err(|error| error.code().message().to_string()),
+            ),
+        };
+        assert!(
+            want == got,
+            "the dictionary: libzstd {want:?}, port {got:?}"
+        );
+    }
+    let prefix = dict_way == 1;
 
     // With a stable output buffer, one buffer whose room stays the same.
     let room = hivepack_zstd::compress_bound(src.len()).unwrap_or(0) + 64;
@@ -211,7 +291,14 @@ fuzz_target!(|input: &[u8]| {
             Err(_) => return,
             Ok(0) if directive == EndDirective::End => {
                 let mut back = vec![0u8; src.len()];
-                let size = hivepack_zstd::decompress(&mut back, &frame).expect("the frame decodes");
+                let mut dctx = DCtx::new();
+                let size = if prefix {
+                    dctx.ref_prefix(&dict)
+                        .and_then(|()| dctx.decompress(&mut back, &frame))
+                } else {
+                    dctx.decompress_using_dict(&mut back, &frame, &dict)
+                }
+                .expect("the frame decodes");
                 assert!(back[..size] == *src, "does not decode back");
                 return;
             }

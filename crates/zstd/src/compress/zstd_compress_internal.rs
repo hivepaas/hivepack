@@ -6,10 +6,11 @@ use crate::common::error_private::{Result, error};
 use crate::common::fse::fse_ctable_size_u32;
 use crate::common::mem::{idx, read_le16, read_le32, read_le64};
 use crate::common::zstd_internal::{
-    LITBITS, LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG, ZSTD_BLOCKHEADERSIZE,
-    ZSTD_OPT_NUM, ZSTD_REP_NUM,
+    LITBITS, LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG, REP_START_VALUE,
+    ZSTD_BLOCKHEADERSIZE, ZSTD_OPT_NUM, ZSTD_REP_NUM,
 };
 use crate::compress::huf_compress::{HUF_CTABLE_SIZE, HufCTable, HufRepeat};
+use crate::compress::zstd_cdict::CDict;
 
 /// `ZSTD_strategy`: how hard the match finder searches, from `Fast` (1) to
 /// `Btultra2` (9).
@@ -60,6 +61,26 @@ pub enum ParamSwitch {
     Auto = 0,
     Enable = 1,
     Disable = 2,
+}
+
+/// `ZSTD_dictAttachPref_e`: whether a frame compressed with a [`CDict`]
+/// uses its tables where they are (attaches it), copies them into the
+/// context, or loads its content again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DictAttachPref {
+    /// The library's choice: attached for small inputs (up to 8 to 32 KB,
+    /// by strategy) and inputs of unknown size, copied otherwise; loaded
+    /// again for large inputs, when the `CDict` was made for a level
+    /// (`ZSTD_dictDefaultAttach`).
+    #[default]
+    DefaultAttach = 0,
+    /// Attached, whatever the size (`ZSTD_dictForceAttach`).
+    ForceAttach = 1,
+    /// Copied, whatever the size (`ZSTD_dictForceCopy`).
+    ForceCopy = 2,
+    /// Its content loaded again, with the frame's parameters
+    /// (`ZSTD_dictForceLoad`).
+    ForceLoad = 3,
 }
 
 /// `FSE_repeat`: whether a block's FSE table may be used again.
@@ -327,26 +348,49 @@ pub(crate) fn zstd_new_rep(
 // ---------------------------------------------------------------------------
 // The window and the match state
 
-/// Which buffer a window's segment lies in: the caller's input, or the
-/// context's own input buffer when streaming with one.
+/// Which buffer a window's segment lies in: the caller's input, the
+/// context's own input buffer when streaming with one, or the content of
+/// the frame's dictionary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WindowBuffer {
     /// None yet: the window is new.
     None,
     Input,
     InBuff,
+    /// The dictionary's content, loaded into the window or copied in with a
+    /// `CDict`'s window: the dictionary given to `CCtx::compress_using_dict`,
+    /// the prefix of `CCtx::ref_prefix`, or a `CDict`'s content. In a
+    /// `CDict`'s own window, its content.
+    Dict,
 }
 
-/// The buffers a window's segments can lie in, for one call.
+/// The buffers a window's segments can lie in, for one call, and the
+/// `CDict` of the frame.
 #[derive(Clone, Copy)]
 pub(crate) struct Buffers<'a> {
     /// The caller's input.
     pub(crate) input: &'a [u8],
     /// The context's input buffer.
     pub(crate) in_buff: &'a [u8],
+    /// The dictionary's content, [`WindowBuffer::Dict`]; empty without one.
+    pub(crate) dict: &'a [u8],
+    /// The `CDict` the frame was started with, if any: the one its match
+    /// state is attached to, when it is ([`MatchState::dict_match_state`]).
+    pub(crate) cdict: Option<&'a CDict>,
 }
 
 impl<'a> Buffers<'a> {
+    /// The caller's input, and the context's input buffer, without a
+    /// dictionary.
+    pub(crate) fn new(input: &'a [u8], in_buff: &'a [u8]) -> Self {
+        Buffers {
+            input,
+            in_buff,
+            dict: &[],
+            cdict: None,
+        }
+    }
+
     /// The buffer `which` names.
     #[inline(always)]
     pub(crate) fn get(&self, which: WindowBuffer) -> &'a [u8] {
@@ -354,9 +398,61 @@ impl<'a> Buffers<'a> {
             WindowBuffer::None => &[],
             WindowBuffer::Input => self.input,
             WindowBuffer::InBuff => self.in_buff,
+            WindowBuffer::Dict => self.dict,
         }
     }
+
+    /// The match state the frame's match state `ms` is attached to
+    /// (`ms->dictMatchState`), with the content its window indexes: `None`
+    /// without one, or once the input is a window past it.
+    #[inline(always)]
+    pub(crate) fn dict_match_state(&self, ms: &MatchState) -> Option<DictMatchState<'a>> {
+        if !ms.dict_match_state {
+            return None;
+        }
+        // The frame's buffers come with the CDict it is attached to.
+        debug_assert!(self.cdict.is_some());
+        self.cdict.map(|cdict| DictMatchState {
+            ms: &cdict.match_state,
+            content: &cdict.content,
+        })
+    }
 }
+
+/// `ms->dictMatchState`: the match state of the `CDict` a frame's match
+/// state is attached to, read only, and the content its window indexes.
+///
+/// Differs from libzstd: there a pointer in the match state. Here the match
+/// state only says whether it is attached ([`MatchState::dict_match_state`]),
+/// and the `CDict` comes with the buffers of each call ([`Buffers::cdict`]):
+/// the match state and the `CDict` are then borrowed apart. It gives the
+/// same match state.
+///
+/// For the `dictMatchState` block compressors: the dictionary's
+/// tables are `ms.hash_table`, `ms.chain_table` and `ms.tag_table`, its
+/// parameters `ms.c_params` (`fast` and `dfast` tables hold indices tagged
+/// with `ZSTD_SHORT_CACHE_TAG_BITS`: see [`zstd_write_tagged_index`]),
+/// its window `ms.window`, one segment of [`WindowBuffer::Dict`]: index `i`,
+/// from `ms.window.dict_limit` to `ms.window.next_src`, is byte
+/// `i - ms.window.base` of `content`. The frame's window starts where the
+/// dictionary's ends (its `dict_limit` is at least the dictionary's
+/// `next_src`), and its `loaded_dict_end` is its `dict_limit`.
+#[derive(Clone, Copy)]
+pub(crate) struct DictMatchState<'a> {
+    pub(crate) ms: &'a MatchState,
+    pub(crate) content: &'a [u8],
+}
+
+/// `ZSTD_dictMode_e`, as the const parameter of the block compressors and
+/// their searches: where matches are besides the window's prefix. Nowhere
+/// (`ZSTD_noDict`), in the window's older segment (`ZSTD_extDict`), or in
+/// the attached `CDict`'s match state (`ZSTD_dictMatchState`, a
+/// [`DictMatchState`]), whose tables may be laid out for the dedicated
+/// dictionary search (`ZSTD_dedicatedDictSearch`).
+pub(crate) const ZSTD_NO_DICT: u8 = 0;
+pub(crate) const ZSTD_EXT_DICT: u8 = 1;
+pub(crate) const ZSTD_DICT_MATCH_STATE: u8 = 2;
+pub(crate) const ZSTD_DEDICATED_DICT_SEARCH: u8 = 3;
 
 /// `ZSTD_window_t`: the input seen so far, in two segments. Index `i` of
 /// the prefix, from `dict_limit` on, is byte `i - base` of its buffer;
@@ -410,6 +506,21 @@ impl Window {
         self.low_limit < self.dict_limit
     }
 
+    /// `ZSTD_window_clear`: empty, its indices going on from the end of
+    /// the bytes seen so far.
+    pub(crate) fn clear(&mut self) {
+        let end = self.next_src as u32;
+        self.low_limit = end;
+        self.dict_limit = end;
+    }
+
+    /// `ZSTD_window_isEmpty`: as new.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.dict_limit == ZSTD_WINDOW_START_INDEX
+            && self.low_limit == ZSTD_WINDOW_START_INDEX
+            && self.next_src == i64::from(ZSTD_WINDOW_START_INDEX)
+    }
+
     /// `ZSTD_window_update`: the window after `size` bytes at `position` of
     /// `buffer`. Returns whether they follow the bytes before. When they do
     /// not, the prefix becomes the older segment.
@@ -460,18 +571,32 @@ impl Window {
         contiguous
     }
 
-    /// `ZSTD_window_enforceMaxDist`, without a dictionary: makes indices
-    /// more than `max_dist` before `block_end_idx` invalid.
-    pub(crate) fn enforce_max_dist(&mut self, block_end_idx: u32, max_dist: u32) {
-        if block_end_idx > max_dist {
-            let new_low_limit = block_end_idx - max_dist;
-            if self.low_limit < new_low_limit {
-                self.low_limit = new_low_limit;
-            }
-            if self.dict_limit < self.low_limit {
-                self.dict_limit = self.low_limit;
-            }
+    /// `ZSTD_window_enforceMaxDist`: makes indices more than `max_dist`
+    /// before `block_end_idx` invalid, once past a dictionary that ends at
+    /// `loaded_dict_end` (0 for none): a dictionary can be reached whole as
+    /// long as its last byte is in the window. Returns whether the window
+    /// has moved past it: the caller then drops the dictionary (libzstd's
+    /// `*loadedDictEndPtr = 0` and `*dictMatchStatePtr = NULL`).
+    ///
+    /// `max_dist + loaded_dict_end` is on 32 bits, as in libzstd.
+    pub(crate) fn enforce_max_dist(
+        &mut self,
+        block_end_idx: u32,
+        max_dist: u32,
+        loaded_dict_end: u32,
+    ) -> bool {
+        if block_end_idx <= max_dist.wrapping_add(loaded_dict_end) {
+            return false;
         }
+        let new_low_limit = block_end_idx - max_dist;
+        if self.low_limit < new_low_limit {
+            self.low_limit = new_low_limit;
+        }
+        if self.dict_limit < self.low_limit {
+            self.dict_limit = self.low_limit;
+        }
+        // On reaching the window's size, dictionaries are invalid.
+        true
     }
 
     /// `ZSTD_window_canOverflowCorrect`: whether the indices are large
@@ -564,6 +689,9 @@ impl Window {
 /// `ZSTD_CURRENT_MAX` on 64-bit machines: the largest index before the
 /// indices are lowered.
 pub(crate) const ZSTD_CURRENT_MAX: u32 = 3500 << 20;
+/// `ZSTD_CHUNKSIZE_MAX`: the most input before the indices must be checked
+/// again: from the largest index allowed at its start to the largest.
+pub(crate) const ZSTD_CHUNKSIZE_MAX: u32 = u32::MAX - ZSTD_CURRENT_MAX;
 
 #[cfg(test)]
 thread_local! {
@@ -766,9 +894,76 @@ pub(crate) struct MatchState {
     /// that the parser can change it while the match finder changes the
     /// rest of the match state.
     pub(crate) opt: Option<Box<OptState>>,
+
+    // Dictionaries.
+    /// `dictMatchState`: whether the match state is attached to a `CDict`'s,
+    /// whose tables the `dictMatchState` block compressors search as a
+    /// window before this one (see [`Buffers::dict_match_state`]). Dropped
+    /// with `loaded_dict_end`, once the input is a window past it.
+    pub(crate) dict_match_state: bool,
+    /// `dedicatedDictSearch`: for a `CDict`'s match state, whether its
+    /// tables are laid out for `ZSTD_dedicatedDictSearch`
+    /// (`ZSTD_c_enableDedicatedDictSearch`; see
+    /// `zstd_dedicated_dict_search_lazy_load_dictionary`). Never set for a
+    /// context's.
+    pub(crate) dedicated_dict_search: bool,
 }
 
 impl MatchState {
+    /// A match state without tables, for `c_params`, until a frame (or a
+    /// dictionary) sets them up.
+    pub(crate) fn new(c_params: CompressionParameters) -> Self {
+        MatchState {
+            window: Window::new(),
+            hash_table: Vec::new(),
+            chain_table: Vec::new(),
+            next_to_update: 0,
+            loaded_dict_end: 0,
+            lazy_skipping: false,
+            c_params,
+            row_hash_log: 0,
+            tag_table: Vec::new(),
+            hash_cache: [0; ZSTD_ROW_HASH_CACHE_SIZE],
+            // A new context's salt, before the first frame advances it.
+            hash_salt: 0,
+            hash_salt_entropy: 0,
+            hash_log3: 0,
+            hash_table3: Vec::new(),
+            opt: None,
+            dict_match_state: false,
+            dedicated_dict_search: false,
+        }
+    }
+
+    /// `ZSTD_window_enforceMaxDist` on the match state's window, with its
+    /// dictionary, which it drops once past it.
+    pub(crate) fn enforce_max_dist(&mut self, block_end_idx: u32, max_dist: u32) {
+        if self
+            .window
+            .enforce_max_dist(block_end_idx, max_dist, self.loaded_dict_end)
+        {
+            self.loaded_dict_end = 0;
+            self.dict_match_state = false;
+        }
+    }
+
+    /// `ZSTD_checkDictValidity`: drops the dictionary for the whole block
+    /// that ends at `block_end_idx` if the window moves past it within the
+    /// block (for simplicity), or if the input no longer follows it: the
+    /// window has a new segment, and `loaded_dict_end` is no longer its
+    /// `dict_limit`.
+    ///
+    /// `loaded_dict_end + max_dist` is on 32 bits, as in libzstd.
+    pub(crate) fn check_dict_validity(&mut self, block_end_idx: u32, max_dist: u32) {
+        let loaded_dict_end = self.loaded_dict_end;
+        if block_end_idx > loaded_dict_end.wrapping_add(max_dist)
+            || loaded_dict_end != self.window.dict_limit
+        {
+            self.loaded_dict_end = 0;
+            self.dict_match_state = false;
+        }
+    }
+
     /// `ZSTD_getLowestMatchIndex`: the lowest index a match at `curr` may
     /// reach, in either segment, at most `1 << window_log` back.
     #[inline(always)]
@@ -814,6 +1009,33 @@ impl MatchState {
 pub(crate) struct CompressedBlockState {
     pub(crate) entropy: Box<EntropyCTables>,
     pub(crate) rep: [u32; ZSTD_REP_NUM],
+}
+
+impl CompressedBlockState {
+    /// A new state: the tables filled with `fill`, none to be used again,
+    /// and the first repeat offsets.
+    pub(crate) fn new(fill: u32) -> Self {
+        CompressedBlockState {
+            entropy: EntropyCTables::filled(fill),
+            rep: REP_START_VALUE,
+        }
+    }
+
+    /// `other` copied in, without a new allocation.
+    pub(crate) fn copy_from(&mut self, other: &CompressedBlockState) {
+        self.entropy.clone_from(&other.entropy);
+        self.rep = other.rep;
+    }
+
+    /// `ZSTD_reset_compressedBlockState`: the first repeat offsets, and no
+    /// table to use again. The tables stay as they are.
+    pub(crate) fn reset(&mut self) {
+        self.rep = REP_START_VALUE;
+        self.entropy.huf.repeat_mode = HufRepeat::None;
+        self.entropy.fse.offcode_repeat_mode = FseRepeat::None;
+        self.entropy.fse.matchlength_repeat_mode = FseRepeat::None;
+        self.entropy.fse.litlength_repeat_mode = FseRepeat::None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1206,14 @@ pub(crate) fn zstd_hash_ptr(src: &[u8], at: usize, h_bits: u32, mls: u32) -> usi
     (zstd_hash_top(src, at, mls) >> (64 - h_bits)) as usize
 }
 
+/// [`zstd_hash_ptr`] of the 8 bytes `u`, read at a position already: the
+/// hash of their low `mls` bytes, `h_bits` long.
+#[inline(always)]
+pub(crate) fn zstd_hash_u64(u: u64, h_bits: u32, mls: u32) -> usize {
+    debug_assert!(h_bits <= 32);
+    (zstd_hash_top_u64(u, mls) >> (64 - h_bits)) as usize
+}
+
 /// The hash of the `mls` bytes at `at` before its shift: the hash `h_bits`
 /// long is the top `h_bits` of it.
 ///
@@ -1095,6 +1325,39 @@ impl<'a> HashTable<'a> {
         let mask = self.table.len() - 1;
         self.table[hash & mask] = value;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Short cache
+
+/// `ZSTD_SHORT_CACHE_TAG_BITS`: the low bits of each entry of the hash
+/// tables of a `CDict` for `fast` and `dfast` hold a tag, 8 more bits of the
+/// position's hash, above them its index. The `dictMatchState` block
+/// compressors then read the dictionary's bytes only when the tags match.
+/// The hashes of those tables are `ZSTD_SHORT_CACHE_TAG_BITS` longer than
+/// the table's log: the entry is at the hash shifted down by the tag's
+/// bits. Indices then fit in 24 bits, which bounds the dictionary.
+pub(crate) const ZSTD_SHORT_CACHE_TAG_BITS: u32 = 8;
+/// `ZSTD_SHORT_CACHE_TAG_MASK`
+pub(crate) const ZSTD_SHORT_CACHE_TAG_MASK: u32 = (1 << ZSTD_SHORT_CACHE_TAG_BITS) - 1;
+
+/// `ZSTD_writeTaggedIndex`: `index` and the tag of `hash_and_tag` into
+/// the entry of its hash.
+#[inline(always)]
+pub(crate) fn zstd_write_tagged_index(hash_table: &mut [u32], hash_and_tag: usize, index: u32) {
+    let hash = hash_and_tag >> ZSTD_SHORT_CACHE_TAG_BITS;
+    let tag = hash_and_tag as u32 & ZSTD_SHORT_CACHE_TAG_MASK;
+    debug_assert!(index >> (32 - ZSTD_SHORT_CACHE_TAG_BITS) == 0);
+    hash_table[hash] = (index << ZSTD_SHORT_CACHE_TAG_BITS) | tag;
+}
+
+/// `ZSTD_comparePackedTags`: whether the tags in the low bits of the two
+/// are the same.
+#[inline(always)]
+pub(crate) fn zstd_compare_packed_tags(packed_tag1: usize, packed_tag2: usize) -> bool {
+    let tag1 = packed_tag1 as u32 & ZSTD_SHORT_CACHE_TAG_MASK;
+    let tag2 = packed_tag2 as u32 & ZSTD_SHORT_CACHE_TAG_MASK;
+    tag1 == tag2
 }
 
 /// `ZSTD_count`: how many bytes from `p_in` equal those from `p_match`,

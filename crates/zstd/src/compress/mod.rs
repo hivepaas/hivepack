@@ -6,6 +6,9 @@ pub(crate) mod hist;
 pub(crate) mod huf_compress;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_dict_lazy;
+pub(crate) mod zstd_cdict;
 pub(crate) mod zstd_compress;
 pub(crate) mod zstd_compress_internal;
 pub(crate) mod zstd_compress_literals;

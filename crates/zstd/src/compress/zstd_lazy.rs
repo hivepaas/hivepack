@@ -1,18 +1,23 @@
 //! The `greedy`, `lazy`, `lazy2` and `btlazy2` strategies: port of
-//! `compress/zstd_lazy.c`, without a dictionary so far: the parser they
-//! share, the hash chain match finder, the row match finder, and
-//! `btlazy2`'s binary tree.
+//! `compress/zstd_lazy.c`: the parser they share, the hash chain match
+//! finder, the row match finder, and `btlazy2`'s binary tree; without a
+//! dictionary, with the window's older segment (`extDict`), and with an
+//! attached `CDict` (`dictMatchState`, and `dedicatedDictSearch` for a
+//! `CDict` made with `ZSTD_c_enableDedicatedDictSearch`).
 //!
 //! Positions are indices into `src`, the buffer the window's prefix is in,
 //! and `dict`, the one its older segment is in; the tables hold window
-//! indices, `position + window.base` (or `window.dict_base`).
+//! indices, `position + window.base` (or `window.dict_base`). An attached
+//! `CDict`'s tables hold indices of its own window, over its content (see
+//! [`DictMatchState`]).
 
 use crate::common::bits::highbit32;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
-    K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore, ZSTD_DUBT_UNSORTED_MARK,
-    ZSTD_ROW_HASH_CACHE_SIZE, mem_read32, offset_to_offbase, zstd_count, zstd_count_2segments,
-    zstd_hash_ptr, zstd_hash_ptr_salted, zstd_index_overlap_check,
+    DictMatchState, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
+    ZSTD_DEDICATED_DICT_SEARCH, ZSTD_DICT_MATCH_STATE, ZSTD_DUBT_UNSORTED_MARK, ZSTD_EXT_DICT,
+    ZSTD_NO_DICT, ZSTD_ROW_HASH_CACHE_SIZE, mem_read32, offset_to_offbase, zstd_count,
+    zstd_count_2segments, zstd_hash_ptr, zstd_hash_ptr_salted, zstd_index_overlap_check,
 };
 
 /// `kLazySkippingStep`: past steps this long over input without matches,
@@ -22,6 +27,21 @@ const K_LAZY_SKIPPING_STEP: usize = 8;
 /// `searchMethod_e`, as the const parameter of the parser.
 pub(crate) const SEARCH_HASH_CHAIN: u8 = 0;
 pub(crate) const SEARCH_ROW_HASH: u8 = 2;
+
+/// `ZSTD_dictMode_e`, as the const parameter of the parser and the search
+/// functions: no dictionary, the window's older segment, an attached
+/// `CDict`'s tables, or an attached `CDict`'s tables laid out for the
+/// dedicated dictionary search.
+pub(crate) const NO_DICT: u8 = ZSTD_NO_DICT;
+pub(crate) const EXT_DICT: u8 = ZSTD_EXT_DICT;
+pub(crate) const DICT_MATCH_STATE: u8 = ZSTD_DICT_MATCH_STATE;
+pub(crate) const DEDICATED_DICT_SEARCH: u8 = ZSTD_DEDICATED_DICT_SEARCH;
+
+/// `ZSTD_LAZY_DDSS_BUCKET_LOG`: a `CDict` with the dedicated dictionary
+/// search has buckets of `1 << ZSTD_LAZY_DDSS_BUCKET_LOG` entries in its
+/// hash table, rather than one entry per hash: the latest positions of the
+/// hash, and where the rest of its chain is in the chain table.
+pub(crate) const ZSTD_LAZY_DDSS_BUCKET_LOG: u32 = 2;
 
 /// The offset base the parser sets before each search, 999999999: what
 /// `ZSTD_searchMax` gives when it finds no match, with a length under 4.
@@ -90,12 +110,13 @@ fn update_dubt<const MLS: u32>(ms: &mut MatchState, src: &[u8], ip: usize) {
 
 /// `ZSTD_insertDUBT1`: sorts `curr`, inserted but unsorted, into the tree,
 /// comparing at most `nb_compares` positions, down to `bt_low`. Its bytes
-/// end at `input_end` of `src` in the prefix. With `EXT`, `curr` and the
-/// positions it is compared with may be in the older segment, `dict`,
-/// where its bytes end at the segment's end.
+/// end at `input_end` of `src` in the prefix. With `DICT_MODE`
+/// [`ZSTD_EXT_DICT`], `curr` and the positions it is compared with may be
+/// in the older segment, `dict`, where its bytes end at the segment's end;
+/// the tree holds no position of an attached `CDict`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn insert_dubt1<const EXT: bool>(
+fn insert_dubt1<const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
@@ -113,7 +134,8 @@ fn insert_dubt1<const EXT: bool>(
     let dict_end = (i64::from(dict_limit) - dict_base) as usize;
     // Where `curr` is: its segment, the index of the segment's first byte,
     // and where the bytes after `curr` end.
-    let (ibuf, ibase, iend) = if !EXT || curr >= dict_limit {
+    let ext = DICT_MODE == ZSTD_EXT_DICT;
+    let (ibuf, ibase, iend) = if !ext || curr >= dict_limit {
         (src, base, input_end)
     } else {
         (dict, dict_base, dict_end)
@@ -146,7 +168,7 @@ fn insert_dubt1<const EXT: bool>(
 
         // The candidate's segment, and the index of its first byte, for
         // the byte after the common run.
-        let (mbuf, mbase) = if !EXT
+        let (mbuf, mbase) = if !ext
             || match_index as usize + match_length >= dict_limit as usize
             || curr < dict_limit
         {
@@ -160,7 +182,7 @@ fn insert_dubt1<const EXT: bool>(
             // run ends before the segment's end, as `curr`'s bytes do, and
             // the candidate is before `curr`.
             debug_assert!(
-                !EXT || curr >= dict_limit
+                !ext || curr >= dict_limit
                     || match_index as usize + match_length < dict_limit as usize
             );
             let m = (i64::from(match_index) + match_length as i64 - ibase) as usize;
@@ -231,20 +253,141 @@ fn insert_dubt1<const EXT: bool>(
     }
 }
 
+/// `ZSTD_DUBT_findBetterDictMatch`: the search of the binary tree goes on
+/// in the attached `CDict`'s, `dms`, for a match at `ip` longer than
+/// `best_length`, the longest found in the frame's, with at most
+/// `nb_compares` comparisons, the rest of the search's. A match there is
+/// weighed as in the frame's tree against `off_base`, the best so far,
+/// which it then replaces. Returns the best length.
+///
+/// The `CDict`'s tree is sorted: its content was inserted with
+/// `ZSTD_updateTree`, as the optimal parser's are. It is read only. Its
+/// indices, from its `low_limit` to its `next_src`, are the frame's less
+/// `dict_index_delta`: the frame's window starts where the `CDict`'s ends.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn dubt_find_better_dict_match<const MLS: u32>(
+    ms: &MatchState,
+    dms: DictMatchState<'_>,
+    src: &[u8],
+    ip: usize,
+    iend: usize,
+    off_base: &mut u32,
+    mut best_length: usize,
+    mut nb_compares: u32,
+) -> usize {
+    let dms_c_params = dms.ms.c_params;
+    let h = zstd_hash_ptr(src, ip, dms_c_params.hash_log, MLS);
+    let mut dict_match_index = dms.ms.hash_table[h];
+
+    let base = ms.window.base;
+    let prefix_start = (i64::from(ms.window.dict_limit) - base) as usize;
+    let curr = ms.window.index(ip);
+    let dict_base = dms.ms.window.base;
+    let content = dms.content;
+    // The content's end, in it and as an index.
+    let dict_end = (dms.ms.window.next_src - dict_base) as usize;
+    let dict_high_limit = dms.ms.window.next_src as u32;
+    let dict_low_limit = dms.ms.window.low_limit;
+    let dict_index_delta = ms.window.low_limit.wrapping_sub(dict_high_limit);
+
+    let dict_bt = &dms.ms.chain_table;
+    let bt_mask = (1u32 << (dms_c_params.chain_log - 1)) - 1;
+    let bt_low = if bt_mask >= dict_high_limit - dict_low_limit {
+        dict_low_limit
+    } else {
+        dict_high_limit - bt_mask
+    };
+
+    let mut common_length_smaller = 0;
+    let mut common_length_larger = 0;
+
+    while nb_compares > 0 && dict_match_index > dict_low_limit {
+        let next_ptr = 2 * (dict_match_index & bt_mask) as usize;
+        // The bytes it has in common with `ip` at least.
+        let mut match_length = common_length_smaller.min(common_length_larger);
+        let m = (i64::from(dict_match_index) - dict_base) as usize;
+        // Past the content's end, on into the frame's prefix.
+        match_length += zstd_count_2segments(
+            src,
+            ip + match_length,
+            content,
+            m + match_length,
+            iend,
+            dict_end,
+            prefix_start,
+        );
+
+        if match_length > best_length {
+            let match_index = dict_match_index.wrapping_add(dict_index_delta);
+            // Longer, unless its offset costs more than the bytes gained;
+            // the best so far weighs as `off_base + 1` here.
+            if 4 * (match_length - best_length) as i32
+                > highbit32(curr - match_index + 1) as i32 - highbit32(*off_base + 1) as i32
+            {
+                best_length = match_length;
+                *off_base = offset_to_offbase(curr - match_index);
+            }
+            if ip + match_length == iend {
+                // Equal up to the end: no way to know if smaller or
+                // larger. Dropped.
+                break;
+            }
+        }
+
+        // The byte after the common run: in the prefix, when the run went
+        // past the content.
+        let match_byte = if dict_match_index as usize + match_length >= dict_high_limit as usize {
+            let at =
+                i64::from(dict_match_index.wrapping_add(dict_index_delta)) + match_length as i64;
+            src[(at - base) as usize]
+        } else {
+            content[m + match_length]
+        };
+        if match_byte < src[ip + match_length] {
+            // The candidate is smaller than `ip`.
+            if dict_match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                break;
+            }
+            // Every smaller one has at least this in common.
+            common_length_smaller = match_length;
+            // The next one is larger than the candidate.
+            dict_match_index = dict_bt[next_ptr + 1];
+        } else {
+            // The candidate is larger than `ip`.
+            if dict_match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                break;
+            }
+            common_length_larger = match_length;
+            dict_match_index = dict_bt[next_ptr];
+        }
+        nb_compares -= 1;
+    }
+
+    best_length
+}
+
 /// `ZSTD_DUBT_findBestMatch`: sorts the unsorted positions of `ip`'s hash
 /// (up to `1 << search_log` of them, the oldest first), then inserts `ip`
 /// into the tree, sorted, and returns the best match the way down gave, up
-/// to `iend`, and its offset base. With `EXT`, candidates below the prefix
-/// are in `dict`.
+/// to `iend`, and its offset base. With `DICT_MODE` [`ZSTD_EXT_DICT`],
+/// candidates below the prefix are in `dict`; with
+/// [`ZSTD_DICT_MATCH_STATE`], the comparisons left go on in the tree of the
+/// attached `CDict`, `dms` ([`dubt_find_better_dict_match`]).
 #[allow(clippy::too_many_lines)]
 #[inline(always)]
-fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
+fn dubt_find_best_match<const MLS: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     iend: usize,
 ) -> (usize, u32) {
+    debug_assert!(DICT_MODE != ZSTD_DEDICATED_DICT_SEARCH);
+    let ext = DICT_MODE == ZSTD_EXT_DICT;
     let c_params = ms.c_params;
     let h = zstd_hash_ptr(src, ip, c_params.hash_log, MLS);
     let mut match_index = ms.hash_table[h];
@@ -294,7 +437,7 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
     match_index = previous_candidate;
     while match_index != 0 {
         let next_candidate_idx = ms.chain_table[2 * (match_index & bt_mask) as usize + 1];
-        insert_dubt1::<EXT>(
+        insert_dubt1::<DICT_MODE>(
             ms,
             src,
             dict,
@@ -333,7 +476,7 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
 
         // The candidate's segment, and the index of its first byte, for
         // the byte after the common run.
-        let (mbuf, mbase) = if !EXT || match_index as usize + match_length >= dict_limit as usize {
+        let (mbuf, mbase) = if !ext || match_index as usize + match_length >= dict_limit as usize {
             let m = (i64::from(match_index) + match_length as i64 - base) as usize;
             match_length += zstd_count(src, ip + match_length, m, iend);
             (src, base)
@@ -370,7 +513,11 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
             }
             if ip + match_length == iend {
                 // Equal up to the end: no way to know if smaller or
-                // larger. Dropped, to keep the tree consistent.
+                // larger. Dropped, to keep the tree consistent; nor is an
+                // attached dictionary searched.
+                if DICT_MODE == ZSTD_DICT_MATCH_STATE {
+                    nb_compares = 0;
+                }
                 break;
             }
         }
@@ -411,6 +558,23 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
         }
     }
 
+    // The comparisons left, in the attached CDict's tree.
+    if DICT_MODE == ZSTD_DICT_MATCH_STATE
+        && nb_compares > 0
+        && let Some(dms) = dms
+    {
+        best_length = dubt_find_better_dict_match::<MLS>(
+            ms,
+            dms,
+            src,
+            ip,
+            iend,
+            &mut off_base,
+            best_length,
+            nb_compares,
+        );
+    }
+
     // Past the longest match: repetitive data is not inserted again.
     debug_assert!(match_end_idx > curr + 8);
     ms.next_to_update = match_end_idx - 8;
@@ -422,10 +586,11 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
 /// libzstd's search functions: one copy serves the parser's three
 /// searches.
 #[inline(never)]
-fn bt_find_best_match<const MLS: u32, const EXT: bool>(
+fn bt_find_best_match<const MLS: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     i_limit: usize,
 ) -> (usize, u32) {
@@ -434,7 +599,7 @@ fn bt_find_best_match<const MLS: u32, const EXT: bool>(
         return (0, NO_OFFBASE);
     }
     update_dubt::<MLS>(ms, src, ip);
-    dubt_find_best_match::<MLS, EXT>(ms, src, dict, ip, i_limit)
+    dubt_find_best_match::<MLS, DICT_MODE>(ms, src, dict, dms, ip, i_limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,14 +632,262 @@ fn insert_and_find_first_index<const MLS: u32>(ms: &mut MatchState, src: &[u8], 
     ms.hash_table[zstd_hash_ptr(src, ip, hash_log, MLS)]
 }
 
+/// `ZSTD_insertAndFindFirstIndex`: [`insert_and_find_first_index`] with the
+/// hash of `minMatch` bytes, as loading a dictionary inserts its positions
+/// up to `ip`.
+///
+/// libzstd hashes with `ZSTD_hashPtr` of `minMatch` itself here, 7 bytes
+/// included (3 takes 4), where the block compressors take 4 to 6: a
+/// dictionary loaded with a shortest match of 7 is in the hash table under
+/// other hashes than they look for, and the port does the same.
+pub(crate) fn zstd_insert_and_find_first_index(ms: &mut MatchState, src: &[u8], ip: usize) -> u32 {
+    match ms.c_params.min_match {
+        5 => insert_and_find_first_index::<5>(ms, src, ip),
+        6 => insert_and_find_first_index::<6>(ms, src, ip),
+        7 => insert_and_find_first_index::<7>(ms, src, ip),
+        // 3 and 4, and anything else, as ZSTD_hashPtr.
+        _ => insert_and_find_first_index::<4>(ms, src, ip),
+    }
+}
+
+/// `ZSTD_dedicatedDictSearch_lazy_loadDictionary`: the tables of a `CDict`
+/// laid out for the dedicated dictionary search, with the positions of its
+/// content from `next_to_update` up to `ip`, not included; `src` is the
+/// buffer of its window.
+///
+/// The hash table, of `hash_log` bits (2 more than the level's: see
+/// `zstd_dedicated_dict_search_get_cparams`), is cut into buckets of
+/// `1 << ZSTD_LAZY_DDSS_BUCKET_LOG` entries, one bucket per hash of
+/// `hash_log - ZSTD_LAZY_DDSS_BUCKET_LOG` bits: the 3 latest positions of
+/// the hash, newest first (0 for none), then where the rest of its chain
+/// is in the chain table: its start shifted by 8, plus its length, up to
+/// 255. The chains lie one after another in the chain table, each newest
+/// first, and hold no more positions in all than the chain table's size.
+pub(crate) fn zstd_dedicated_dict_search_lazy_load_dictionary(
+    ms: &mut MatchState,
+    src: &[u8],
+    ip: usize,
+) {
+    let base = ms.window.base;
+    let target = ms.window.index(ip);
+    let chain_size = 1u32 << ms.c_params.chain_log;
+    let mut idx = ms.next_to_update;
+    let min_chain = if chain_size < target - idx {
+        target - chain_size
+    } else {
+        idx
+    };
+    let bucket_size = 1u32 << ZSTD_LAZY_DDSS_BUCKET_LOG;
+    let cache_size = bucket_size - 1;
+    // On 32 bits: 2 - 3 for a search log of 1, which the cap takes to 255.
+    let chain_attempts = (1u32 << ms.c_params.search_log).wrapping_sub(cache_size);
+    let chain_limit = chain_attempts.min(255);
+    let min_match = ms.c_params.min_match;
+
+    // The hash table is 1 << ZSTD_LAZY_DDSS_BUCKET_LOG times too large for
+    // one entry per hash. First, with one entry per hash at its start, the
+    // rest of it is a chain table of the latest positions.
+    let hash_log = ms.c_params.hash_log - ZSTD_LAZY_DDSS_BUCKET_LOG;
+    let tmp_chain_start = 1usize << hash_log;
+    let tmp_chain_size = ((1u32 << ZSTD_LAZY_DDSS_BUCKET_LOG) - 1) << hash_log;
+    let tmp_min_chain = if tmp_chain_size < target {
+        target - tmp_chain_size
+    } else {
+        idx
+    };
+    debug_assert!(ms.c_params.chain_log <= 24);
+    debug_assert!(ms.c_params.hash_log > ms.c_params.chain_log);
+    debug_assert!(idx != 0);
+    debug_assert!(tmp_min_chain <= min_chain);
+
+    let MatchState {
+        hash_table,
+        chain_table,
+        ..
+    } = ms;
+
+    // A hash table and a chain table, as the hash chain's, with the hash of
+    // `minMatch` bytes as ZSTD_hashPtr makes it (3 takes 4).
+    while idx < target {
+        let h = zstd_hash_ptr(src, (i64::from(idx) - base) as usize, hash_log, min_match);
+        if idx >= tmp_min_chain {
+            hash_table[tmp_chain_start + (idx - tmp_min_chain) as usize] = hash_table[h];
+        }
+        hash_table[h] = idx;
+        idx += 1;
+    }
+
+    // Each chain, past the positions its bucket will hold, into the chain
+    // table; and in the entry of its hash, where it went.
+    {
+        let mut chain_pos = 0u32;
+        for hash_idx in 0..1usize << hash_log {
+            let mut count = 0;
+            let mut count_beyond_min_chain = 0;
+            let mut i = hash_table[hash_idx];
+            // Past the first positions, which the bucket holds.
+            while i >= tmp_min_chain && count < cache_size {
+                if i < min_chain {
+                    count_beyond_min_chain += 1;
+                }
+                i = hash_table[tmp_chain_start + (i - tmp_min_chain) as usize];
+                count += 1;
+            }
+            if count == cache_size {
+                count = 0;
+                while count < chain_limit {
+                    if i < min_chain {
+                        // Only as many positions before `min_chain`, in the
+                        // bucket and the chain, as the bucket took from
+                        // after it: the chains then reach further back, and
+                        // still fit in the chain table.
+                        if i == 0 {
+                            break;
+                        }
+                        count_beyond_min_chain += 1;
+                        if count_beyond_min_chain > cache_size {
+                            break;
+                        }
+                    }
+                    chain_table[chain_pos as usize] = i;
+                    chain_pos += 1;
+                    count += 1;
+                    if i < tmp_min_chain {
+                        break;
+                    }
+                    i = hash_table[tmp_chain_start + (i - tmp_min_chain) as usize];
+                }
+            } else {
+                count = 0;
+            }
+            hash_table[hash_idx] = if count != 0 {
+                ((chain_pos - count) << 8) + count
+            } else {
+                0
+            };
+        }
+        debug_assert!(chain_pos <= chain_size);
+    }
+
+    // Each hash's entry into the last of its bucket, from the last hash
+    // down: a bucket is written over entries already read.
+    for hash_idx in (0..1usize << hash_log).rev() {
+        let bucket_idx = hash_idx << ZSTD_LAZY_DDSS_BUCKET_LOG;
+        let chain_packed_pointer = hash_table[hash_idx];
+        hash_table[bucket_idx..bucket_idx + cache_size as usize].fill(0);
+        hash_table[bucket_idx + bucket_size as usize - 1] = chain_packed_pointer;
+    }
+
+    // The buckets: each position in front of its hash's, the oldest
+    // falling off.
+    for idx in ms.next_to_update..target {
+        let h = zstd_hash_ptr(src, (i64::from(idx) - base) as usize, hash_log, min_match)
+            << ZSTD_LAZY_DDSS_BUCKET_LOG;
+        hash_table.copy_within(h..h + cache_size as usize - 1, h + 1);
+        hash_table[h] = idx;
+    }
+
+    ms.next_to_update = target;
+}
+
+/// `ZSTD_dedicatedDictSearch_lazy_search`: the longest match at `ip` of
+/// those in the bucket at `dds_idx` of the attached `CDict`'s hash table,
+/// then in its chain, if longer than `ml`, up to `i_limit`, in at most
+/// `nb_attempts` candidates; and its offset base, or `ml` and `off_base`
+/// as they were. `curr` is `ip`'s index; the frame's prefix starts at
+/// index `dict_limit`, at `prefix_start` in `src`, where a match through
+/// the end of the content goes on.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn dedicated_dict_search_lazy_search(
+    mut ml: usize,
+    mut off_base: u32,
+    nb_attempts: u32,
+    dms: DictMatchState<'_>,
+    src: &[u8],
+    ip: usize,
+    i_limit: usize,
+    prefix_start: usize,
+    curr: u32,
+    dict_limit: u32,
+    dds_idx: usize,
+) -> (usize, u32) {
+    let window = &dms.ms.window;
+    let dds_lowest_index = window.dict_limit;
+    let dds_base = window.base;
+    let dds_size = window.next_src as u32;
+    let dds_end = (window.next_src - dds_base) as usize;
+    // From the CDict's indices to the frame's.
+    let dds_index_delta = dict_limit.wrapping_sub(dds_size);
+    let bucket_size = 1u32 << ZSTD_LAZY_DDSS_BUCKET_LOG;
+    let bucket_limit = nb_attempts.min(bucket_size - 1);
+    let hash_table = &dms.ms.hash_table;
+    let content = dms.content;
+
+    // The length of the match with index `match_index` of the CDict, or 0.
+    let match_length = |match_index: u32| {
+        // In the content, with 8 bytes after it, by the table's making.
+        debug_assert!(match_index >= dds_lowest_index);
+        let m = (i64::from(match_index) - dds_base) as usize;
+        debug_assert!(m + 4 <= dds_end);
+        if mem_read32(content, m) == mem_read32(src, ip) {
+            zstd_count_2segments(src, ip + 4, content, m + 4, i_limit, dds_end, prefix_start) + 4
+        } else {
+            0
+        }
+    };
+
+    // The bucket's positions, newest first, up to the first empty one.
+    let mut dds_attempt = 0;
+    while dds_attempt < bucket_limit {
+        let match_index = hash_table[dds_idx + dds_attempt as usize];
+        if match_index == 0 {
+            return (ml, off_base);
+        }
+        let current_ml = match_length(match_index);
+        // The best so far.
+        if current_ml > ml {
+            ml = current_ml;
+            off_base = offset_to_offbase(curr - (match_index + dds_index_delta));
+            if ip + current_ml == i_limit {
+                // As long as it can be, and the next test would read past
+                // the end.
+                return (ml, off_base);
+            }
+        }
+        dds_attempt += 1;
+    }
+
+    // Then its chain, with the attempts left.
+    let chain_packed_pointer = hash_table[dds_idx + bucket_size as usize - 1];
+    let chain_index = (chain_packed_pointer >> 8) as usize;
+    let chain_length = chain_packed_pointer & 0xFF;
+    let chain_attempts = nb_attempts - dds_attempt;
+    let chain_limit = chain_attempts.min(chain_length) as usize;
+    for &match_index in &dms.ms.chain_table[chain_index..chain_index + chain_limit] {
+        let current_ml = match_length(match_index);
+        if current_ml > ml {
+            ml = current_ml;
+            off_base = offset_to_offbase(curr - (match_index + dds_index_delta));
+            if ip + current_ml == i_limit {
+                break;
+            }
+        }
+    }
+    (ml, off_base)
+}
+
 /// `ZSTD_HcFindBestMatch`: the longest match at `ip`, up to `i_limit`, of
 /// those the hash chain gives, and its offset base; a length under 4 for
-/// none. With `EXT`, candidates below the prefix are in `dict`.
+/// none. With `EXT_DICT`, candidates below the prefix are in `dict`. With
+/// `DICT_MATCH_STATE` and `DEDICATED_DICT_SEARCH`, the attached `CDict`'s
+/// tables are searched next, with the attempts left, over `dms`.
 #[inline(always)]
-fn hc_find_best_match<const MLS: u32, const EXT: bool>(
+fn hc_find_best_match<const MLS: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     i_limit: usize,
 ) -> (usize, u32) {
@@ -497,7 +910,7 @@ fn hc_find_best_match<const MLS: u32, const EXT: bool>(
 
     while match_index >= low_limit && nb_attempts > 0 {
         let mut current_ml = 0;
-        if !EXT || match_index >= dict_limit {
+        if DICT_MODE != EXT_DICT || match_index >= dict_limit {
             let m = (i64::from(match_index) - base) as usize;
             // The 4 bytes that end one past the best length so far: a
             // match must have them to be longer.
@@ -531,6 +944,86 @@ fn hc_find_best_match<const MLS: u32, const EXT: bool>(
         }
         match_index = ms.chain_table[(match_index & chain_mask) as usize];
         nb_attempts -= 1;
+    }
+
+    if DICT_MODE == DEDICATED_DICT_SEARCH {
+        let Some(dms) = dms else {
+            unreachable!("the dedicated dictionary search without a CDict")
+        };
+        // The bucket of ip's hash in the CDict's table.
+        //
+        // Differs from libzstd: the bucket is found here, not before the
+        // search of the frame's tables, to prefetch it. The hash reads only
+        // the input.
+        let dds_hash_log = dms.ms.c_params.hash_log - ZSTD_LAZY_DDSS_BUCKET_LOG;
+        let dds_idx = zstd_hash_ptr(src, ip, dds_hash_log, MLS) << ZSTD_LAZY_DDSS_BUCKET_LOG;
+        (ml, off_base) = dedicated_dict_search_lazy_search(
+            ml,
+            off_base,
+            nb_attempts,
+            dms,
+            src,
+            ip,
+            i_limit,
+            prefix_start,
+            curr,
+            dict_limit,
+            dds_idx,
+        );
+    } else if DICT_MODE == DICT_MATCH_STATE {
+        let Some(dms) = dms else {
+            unreachable!("the dictMatchState search without a CDict")
+        };
+        // The CDict's hash chain, as the frame's, in its own indices: index
+        // i of its window is byte i - dms_base of its content, and index
+        // i + dms_index_delta of the frame's.
+        let dms_chain_table = &dms.ms.chain_table;
+        let dms_chain_size = 1u32 << dms.ms.c_params.chain_log;
+        let dms_chain_mask = dms_chain_size - 1;
+        let dms_lowest_index = dms.ms.window.dict_limit;
+        let dms_base = dms.ms.window.base;
+        let dms_size = dms.ms.window.next_src as u32;
+        let dms_end = (dms.ms.window.next_src - dms_base) as usize;
+        let dms_index_delta = dict_limit.wrapping_sub(dms_size);
+        let dms_min_chain = dms_size.saturating_sub(dms_chain_size);
+
+        match_index = dms.ms.hash_table[zstd_hash_ptr(src, ip, dms.ms.c_params.hash_log, MLS)];
+
+        while match_index >= dms_lowest_index && nb_attempts > 0 {
+            let m = (i64::from(match_index) - dms_base) as usize;
+            // In the content, with 8 bytes after it, by the table's making.
+            debug_assert!(m + 4 <= dms_end);
+            let mut current_ml = 0;
+            if mem_read32(dms.content, m) == mem_read32(src, ip) {
+                current_ml = zstd_count_2segments(
+                    src,
+                    ip + 4,
+                    dms.content,
+                    m + 4,
+                    i_limit,
+                    dms_end,
+                    prefix_start,
+                ) + 4;
+            }
+
+            // The best so far.
+            if current_ml > ml {
+                ml = current_ml;
+                debug_assert!(curr > match_index + dms_index_delta);
+                off_base = offset_to_offbase(curr - (match_index + dms_index_delta));
+                if ip + current_ml == i_limit {
+                    // As long as it can be, and the next test would read
+                    // past the end.
+                    break;
+                }
+            }
+
+            if match_index <= dms_min_chain {
+                break;
+            }
+            match_index = dms_chain_table[(match_index & dms_chain_mask) as usize];
+            nb_attempts -= 1;
+        }
     }
 
     (ml, off_base)
@@ -696,6 +1189,73 @@ fn row_update_internal<const MLS: u32, const ROW_LOG: u32>(
     ms.next_to_update = target;
 }
 
+/// `ZSTD_row_update`: inserts the positions from `nextToUpdate` up to
+/// `ip`, not included, all of them, as loading a dictionary does: without
+/// the hash cache (`ZSTD_row_update_internal` with `useCache` 0), each
+/// position hashed as it is inserted, with the salt.
+///
+/// The hashes are of `min(minMatch, 6)` bytes, 3 taking 4, as the block
+/// compressors'.
+pub(crate) fn zstd_row_update(ms: &mut MatchState, src: &[u8], ip: usize) {
+    macro_rules! with {
+        ($mls:literal, $row_log:literal) => {
+            row_update_uncached::<$mls, $row_log>(ms, src, ip)
+        };
+    }
+    let row_log = ms.c_params.search_log.clamp(4, 6);
+    match (ms.c_params.min_match.min(6), row_log) {
+        (5, 4) => with!(5, 4),
+        (5, 5) => with!(5, 5),
+        (5, 6) => with!(5, 6),
+        (6, 4) => with!(6, 4),
+        (6, 5) => with!(6, 5),
+        (6, 6) => with!(6, 6),
+        // 3 and 4, as ZSTD_hashPtrSalted.
+        (_, 4) => with!(4, 4),
+        (_, 5) => with!(4, 5),
+        _ => with!(4, 6),
+    }
+}
+
+/// `ZSTD_row_update_internal` without the hash cache: every position from
+/// `nextToUpdate` up to `ip`, not included, its hash made as it is
+/// inserted (`ZSTD_row_update_internalImpl` with `useCache` 0).
+fn row_update_uncached<const MLS: u32, const ROW_LOG: u32>(
+    ms: &mut MatchState,
+    src: &[u8],
+    ip: usize,
+) {
+    let row_mask = (1u32 << ROW_LOG) - 1;
+    let hash_log = ms.row_hash_log;
+    let base = ms.window.base;
+    let hash_salt = ms.hash_salt;
+    let target = ms.window.index(ip);
+    let MatchState {
+        hash_table,
+        tag_table,
+        ..
+    } = ms;
+    let mut idx = ms.next_to_update;
+    debug_assert!(target >= idx);
+    while idx < target {
+        let hash = zstd_hash_ptr_salted(
+            src,
+            (i64::from(idx) - base) as usize,
+            hash_log + ZSTD_ROW_HASH_TAG_BITS,
+            MLS,
+            hash_salt,
+        );
+        let rel_row = ((hash >> ZSTD_ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
+        let row = &mut hash_table[rel_row..][..1 << ROW_LOG];
+        let tag_row = &mut tag_table[rel_row..][..1 << ROW_LOG];
+        let pos = (row_next_index(tag_row, row_mask) & row_mask) as usize;
+        tag_row[pos] = (hash & ZSTD_ROW_HASH_TAG_MASK) as u8;
+        row[pos] = idx;
+        idx += 1;
+    }
+    ms.next_to_update = target;
+}
+
 /// `ZSTD_row_getMatchMask`: the entries of a row whose tag is `tag`, as a
 /// mask in which bit `i` is entry `(head + i) % entries`: from the newest
 /// entry to the oldest, around the row.
@@ -735,7 +1295,10 @@ pub(crate) fn row_get_match_mask<const ROW_LOG: u32>(tag_row: &[u8], tag: u8, he
 /// `ZSTD_RowFindBestMatch`: the longest match at `ip`, up to `i_limit`, of
 /// those in its row with its tag, and its offset base; a length under 4 for
 /// none. The row is first brought up to `ip`, and `ip` inserted after the
-/// search. With `EXT`, candidates below the prefix are in `dict`.
+/// search. With `EXT_DICT`, candidates below the prefix are in `dict`. With
+/// `DICT_MATCH_STATE`, the row of `ip`'s hash in the attached `CDict`'s
+/// tables is searched next, with the attempts left; with
+/// `DEDICATED_DICT_SEARCH`, its bucket and chain, with more attempts.
 ///
 /// Outlined, as libzstd's search functions are: inlined at each search of
 /// each parser, it would be many copies.
@@ -747,12 +1310,17 @@ pub(crate) fn row_get_match_mask<const ROW_LOG: u32>(tag_row: &[u8], tag: u8, he
 /// order, and the comparisons read nothing the insertion writes; the
 /// table's reads and writes come in libzstd's order, but for the reads of
 /// candidates after a match that reaches `i_limit`, which libzstd then
-/// leaves unused.
+/// leaves unused. Those candidates were attempts libzstd counts, and the
+/// port does not: the search of the `CDict` then has more attempts left
+/// here. It finds nothing longer either way, its matches ending at
+/// `i_limit` at most; and so the attached `CDict`'s row too, gathered and
+/// compared at once.
 #[inline(never)]
-fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const EXT: bool>(
+fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     i_limit: usize,
 ) -> (usize, u32) {
@@ -819,7 +1387,7 @@ fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const EXT: bool>(
 
         let mut current_ml = 0;
         debug_assert!(match_index < curr && match_index >= low_limit);
-        if !EXT || match_index >= dict_limit {
+        if DICT_MODE != EXT_DICT || match_index >= dict_limit {
             let m = (i64::from(match_index) - base) as usize;
             // The 4 bytes that end one past the best length so far: a
             // match must have them to be longer.
@@ -858,6 +1426,106 @@ fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const EXT: bool>(
         *next_to_update += 1;
     }
 
+    if DICT_MODE == DEDICATED_DICT_SEARCH {
+        let Some(dms) = dms else {
+            unreachable!("the dedicated dictionary search without a CDict")
+        };
+        // The bucket of ip's hash in the CDict's table. The frame's rows
+        // hold fewer candidates than the search log asks for: the CDict
+        // gets the difference.
+        //
+        // Differs from libzstd: the bucket is found here, not before the
+        // search of the frame's tables, to prefetch it. The hash reads only
+        // the input.
+        let dds_hash_log = dms.ms.c_params.hash_log - ZSTD_LAZY_DDSS_BUCKET_LOG;
+        let dds_idx = zstd_hash_ptr(src, ip, dds_hash_log, MLS) << ZSTD_LAZY_DDSS_BUCKET_LOG;
+        let dds_extra_attempts = if c_params.search_log > ROW_LOG {
+            1u32 << (c_params.search_log - ROW_LOG)
+        } else {
+            0
+        };
+        (ml, off_base) = dedicated_dict_search_lazy_search(
+            ml,
+            off_base,
+            nb_attempts + dds_extra_attempts,
+            dms,
+            src,
+            ip,
+            i_limit,
+            prefix_start,
+            curr,
+            dict_limit,
+            dds_idx,
+        );
+    } else if DICT_MODE == DICT_MATCH_STATE {
+        let Some(dms) = dms else {
+            unreachable!("the dictMatchState search without a CDict")
+        };
+        // The row of ip's hash in the CDict's tables, of rows as long as
+        // the frame's (they have the same search log), hashed without a
+        // salt: index i of its window is byte i - dms_base of its content,
+        // and index i + dms_index_delta of the frame's.
+        //
+        // Differs from libzstd: the row is found here, not before the
+        // search of the frame's tables, to prefetch it. The hash reads only
+        // the input.
+        let dms_hash =
+            zstd_hash_ptr(src, ip, dms.ms.row_hash_log + ZSTD_ROW_HASH_TAG_BITS, MLS) as u32;
+        let dms_rel_row = ((dms_hash >> ZSTD_ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
+        let dms_tag = dms_hash & ZSTD_ROW_HASH_TAG_MASK;
+        let dms_row = &dms.ms.hash_table[dms_rel_row..][..row_entries];
+        let dms_tag_row = &dms.ms.tag_table[dms_rel_row..][..row_entries];
+        let dms_lowest_index = dms.ms.window.dict_limit;
+        let dms_base = dms.ms.window.base;
+        let dms_size = dms.ms.window.next_src as u32;
+        let dms_end = (dms.ms.window.next_src - dms_base) as usize;
+        let dms_index_delta = dict_limit.wrapping_sub(dms_size);
+
+        let head = u32::from(dms_tag_row[0]) & row_mask;
+        let mut matches = row_get_match_mask::<ROW_LOG>(dms_tag_row, dms_tag as u8, head);
+        // As in the frame's row: newest first, up to the first out of the
+        // CDict's window.
+        while matches > 0 && nb_attempts > 0 {
+            let match_pos = (head + matches.trailing_zeros()) & row_mask;
+            let match_index = dms_row[match_pos as usize];
+            matches &= matches - 1;
+            if match_pos == 0 {
+                // The head, not an entry.
+                continue;
+            }
+            if match_index < dms_lowest_index {
+                break;
+            }
+            nb_attempts -= 1;
+
+            let m = (i64::from(match_index) - dms_base) as usize;
+            // In the content, with 8 bytes after it, by the table's making.
+            debug_assert!(m + 4 <= dms_end);
+            let mut current_ml = 0;
+            if mem_read32(dms.content, m) == mem_read32(src, ip) {
+                current_ml = zstd_count_2segments(
+                    src,
+                    ip + 4,
+                    dms.content,
+                    m + 4,
+                    i_limit,
+                    dms_end,
+                    prefix_start,
+                ) + 4;
+            }
+
+            // The best so far.
+            if current_ml > ml {
+                ml = current_ml;
+                debug_assert!(curr > match_index + dms_index_delta);
+                off_base = offset_to_offbase(curr - (match_index + dms_index_delta));
+                if ip + current_ml == i_limit {
+                    break;
+                }
+            }
+        }
+    }
+
     (ml, off_base)
 }
 
@@ -865,23 +1533,26 @@ fn row_find_best_match<const MLS: u32, const ROW_LOG: u32, const EXT: bool>(
 // The parser
 
 /// `ZSTD_searchMax`: the longest match at `ip` the search method finds,
-/// and its offset base; a length under 4 for none.
+/// and its offset base; a length under 4 for none. The window's older
+/// segment is `dict` with `EXT_DICT`; the attached `CDict` is `dms` with
+/// `DICT_MATCH_STATE` and `DEDICATED_DICT_SEARCH`.
 #[inline(always)]
-fn search_max<const SEARCH: u8, const MLS: u32, const EXT: bool>(
+fn search_max<const SEARCH: u8, const MLS: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     iend: usize,
 ) -> (usize, u32) {
     match SEARCH {
-        SEARCH_HASH_CHAIN => hc_find_best_match::<MLS, EXT>(ms, src, dict, ip, iend),
-        SEARCH_BINARY_TREE => bt_find_best_match::<MLS, EXT>(ms, src, dict, ip, iend),
+        SEARCH_HASH_CHAIN => hc_find_best_match::<MLS, DICT_MODE>(ms, src, dict, dms, ip, iend),
+        SEARCH_BINARY_TREE => bt_find_best_match::<MLS, DICT_MODE>(ms, src, dict, dms, ip, iend),
         // Rows of 16 entries up to a search log of 4, then 32, then 64.
         SEARCH_ROW_HASH => match ms.c_params.search_log.clamp(4, 6) {
-            5 => row_find_best_match::<MLS, 5, EXT>(ms, src, dict, ip, iend),
-            6 => row_find_best_match::<MLS, 6, EXT>(ms, src, dict, ip, iend),
-            _ => row_find_best_match::<MLS, 4, EXT>(ms, src, dict, ip, iend),
+            5 => row_find_best_match::<MLS, 5, DICT_MODE>(ms, src, dict, dms, ip, iend),
+            6 => row_find_best_match::<MLS, 6, DICT_MODE>(ms, src, dict, dms, ip, iend),
+            _ => row_find_best_match::<MLS, 4, DICT_MODE>(ms, src, dict, dms, ip, iend),
         },
         _ => unreachable!("a search method the port does not have"),
     }
@@ -906,20 +1577,32 @@ fn gain(length: usize, scale: usize, off_base: u32, bonus: usize) -> i64 {
     (length * scale + bonus) as i64 - i64::from(highbit32(off_base))
 }
 
-/// `ZSTD_compressBlock_lazy_generic`, without a dictionary: the sequences
-/// of the block `src[istart..iend]` into `seq_store`, searching `DEPTH`
-/// positions past each match found (0 for `greedy`, 1 for `lazy`, 2 for
-/// `lazy2`). Returns the size of the literals left after the last
-/// sequence.
+/// `ZSTD_compressBlock_lazy_generic`: the sequences of the block
+/// `src[istart..iend]` into `seq_store`, searching `DEPTH` positions past
+/// each match found (0 for `greedy`, 1 for `lazy`, 2 for `lazy2`), without
+/// a dictionary (`NO_DICT`) or with the attached `CDict` `dms`
+/// (`DICT_MATCH_STATE`, `DEDICATED_DICT_SEARCH`), whose content is a
+/// segment before the prefix: its matches and repcodes may be there, and a
+/// match there may run on into the prefix. Returns the size of the
+/// literals left after the last sequence.
 #[allow(clippy::too_many_lines)]
-fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const MLS: u32>(
+fn zstd_compress_block_lazy_generic<
+    const SEARCH: u8,
+    const DEPTH: u32,
+    const MLS: u32,
+    const DICT_MODE: u8,
+>(
     ms: &mut MatchState,
     seq_store: &mut SeqStore,
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
+    dms: Option<DictMatchState<'_>>,
     istart: usize,
     iend: usize,
 ) -> usize {
+    let is_dxs = DICT_MODE == DICT_MATCH_STATE || DICT_MODE == DEDICATED_DICT_SEARCH;
+    debug_assert!(DICT_MODE != EXT_DICT);
+    debug_assert!(is_dxs == dms.is_some());
     let mut ip = istart;
     let mut anchor = istart;
     // Before the block for small blocks, where libzstd's pointer goes
@@ -930,13 +1613,32 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
     let prefix_lowest_index = ms.window.dict_limit;
     let prefix_lowest = (i64::from(prefix_lowest_index) - base) as usize;
 
+    // The attached CDict's content, where index i of its window is byte
+    // i - dict_base: where it starts and ends there, and dictIndexDelta,
+    // what its indices take to be the frame's. Its end is right before the
+    // frame's prefix, in the frame's indices.
+    let (dict, dict_base, dict_lowest, dict_end, dict_index_delta) = match dms {
+        Some(dms) if is_dxs => {
+            let window = &dms.ms.window;
+            (
+                dms.content,
+                window.base,
+                (i64::from(window.dict_limit) - window.base) as usize,
+                (window.next_src - window.base) as usize,
+                prefix_lowest_index.wrapping_sub(window.next_src as u32),
+            )
+        }
+        _ => (&[][..], 0, 0, 0, 0),
+    };
+    let dict_and_prefix_length = (ip - prefix_lowest) + (dict_end - dict_lowest);
+
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     let mut offset_saved1 = 0;
     let mut offset_saved2 = 0;
 
-    ip += usize::from(ip == prefix_lowest);
-    {
+    ip += usize::from(dict_and_prefix_length == 0);
+    if DICT_MODE == NO_DICT {
         let curr = ms.window.index(ip);
         let window_low = ms.lowest_prefix_index(curr, ms.c_params.window_log);
         let max_rep = curr - window_low;
@@ -949,6 +1651,13 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
             offset_1 = 0;
         }
     }
+    if is_dxs {
+        // The repcodes reach into the CDict at most, and none is 0: those
+        // of the CDict are within its content, and every match found since
+        // within it or the prefix. The checks below count on it.
+        debug_assert!(offset_1 as usize <= dict_and_prefix_length);
+        debug_assert!(offset_2 as usize <= dict_and_prefix_length);
+    }
 
     // Reset the lazy skipping state.
     ms.lazy_skipping = false;
@@ -957,9 +1666,42 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
         row_fill_hash_cache::<MLS>(ms, src, ms.next_to_update, ilimit);
     }
 
-    // The repcode `offset` at `at`: its length, or 0.
+    // Where index `i` of the frame is, with a CDict attached: before the
+    // prefix, in the CDict's content; its position there, and where its
+    // segment ends.
+    let locate = |i: u32| {
+        if i < prefix_lowest_index {
+            (
+                dict,
+                (i64::from(i.wrapping_sub(dict_index_delta)) - dict_base) as usize,
+                dict_end,
+            )
+        } else {
+            (src, (i64::from(i) - base) as usize, iend)
+        }
+    };
+    // The repcode `offset` at `at`: its length, or 0. With a CDict
+    // attached, it may be in its content, with its 4 bytes in one segment,
+    // and run on into the prefix.
     let rep_at = |at: usize, offset: u32| {
-        if offset > 0 && mem_read32(src, at - offset as usize) == mem_read32(src, at) {
+        if is_dxs {
+            let rep_index = ((at as i64 + base) as u32).wrapping_sub(offset);
+            if zstd_index_overlap_check(prefix_lowest_index, rep_index) {
+                let (rbuf, rpos, rep_end) = locate(rep_index);
+                if mem_read32(rbuf, rpos) == mem_read32(src, at) {
+                    return zstd_count_2segments(
+                        src,
+                        at + 4,
+                        rbuf,
+                        rpos + 4,
+                        iend,
+                        rep_end,
+                        prefix_lowest,
+                    ) + 4;
+                }
+            }
+            0
+        } else if offset > 0 && mem_read32(src, at - offset as usize) == mem_read32(src, at) {
             zstd_count(src, at + 4, at + 4 - offset as usize, iend) + 4
         } else {
             0
@@ -983,7 +1725,8 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
 
             // The first search (depth 0).
             {
-                let (ml2, off_found) = search_max::<SEARCH, MLS, false>(ms, src, &[], ip, iend);
+                let (ml2, off_found) =
+                    search_max::<SEARCH, MLS, DICT_MODE>(ms, src, &[], dms, ip, iend);
                 if ml2 > match_length {
                     match_length = ml2;
                     start = ip;
@@ -1013,7 +1756,7 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
                     }
                     {
                         let (ml2, off_candidate) =
-                            search_max::<SEARCH, MLS, false>(ms, src, &[], ip, iend);
+                            search_max::<SEARCH, MLS, DICT_MODE>(ms, src, &[], dms, ip, iend);
                         if ml2 >= 4
                             && gain(ml2, 4, off_candidate, 0) > gain(match_length, 4, off_base, 4)
                         {
@@ -1036,7 +1779,7 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
                             start = ip;
                         }
                         let (ml2, off_candidate) =
-                            search_max::<SEARCH, MLS, false>(ms, src, &[], ip, iend);
+                            search_max::<SEARCH, MLS, DICT_MODE>(ms, src, &[], dms, ip, iend);
                         if ml2 >= 4
                             && gain(ml2, 4, off_candidate, 0) > gain(match_length, 4, off_base, 7)
                         {
@@ -1051,18 +1794,35 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
                 }
             }
 
-            // Catch up, within the prefix.
+            // Catch up: within the prefix, or with a CDict attached within
+            // the match's segment.
             if offbase_is_offset(off_base) {
-                let offset = offbase_to_offset(off_base) as usize;
-                while start > anchor
-                    && start - offset > prefix_lowest
-                    && src[start - 1] == src[start - offset - 1]
-                {
-                    start -= 1;
-                    match_length += 1;
+                let offset = offbase_to_offset(off_base);
+                if is_dxs {
+                    let match_index = ((start as i64 + base) as u32).wrapping_sub(offset);
+                    let (mbuf, mut m, _) = locate(match_index);
+                    let m_start = if match_index < prefix_lowest_index {
+                        dict_lowest
+                    } else {
+                        prefix_lowest
+                    };
+                    while start > anchor && m > m_start && src[start - 1] == mbuf[m - 1] {
+                        start -= 1;
+                        m -= 1;
+                        match_length += 1;
+                    }
+                } else {
+                    let offset = offset as usize;
+                    while start > anchor
+                        && start - offset > prefix_lowest
+                        && src[start - 1] == src[start - offset - 1]
+                    {
+                        start -= 1;
+                        match_length += 1;
+                    }
                 }
                 offset_2 = offset_1;
-                offset_1 = offset as u32;
+                offset_1 = offset;
             }
         }
 
@@ -1080,21 +1840,37 @@ fn zstd_compress_block_lazy_generic<const SEARCH: u8, const DEPTH: u32, const ML
         }
 
         // Immediate repcodes.
-        while (ip as i64) <= ilimit && offset_2 > 0 {
-            if mem_read32(src, ip) != mem_read32(src, ip - offset_2 as usize) {
-                break;
+        if is_dxs {
+            // In the CDict's content too.
+            while (ip as i64) <= ilimit {
+                let rep_length = rep_at(ip, offset_2);
+                if rep_length == 0 {
+                    break;
+                }
+                // Swap offset_2 and offset_1.
+                std::mem::swap(&mut offset_1, &mut offset_2);
+                seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, rep_length);
+                ip += rep_length;
+                anchor = ip;
             }
-            match_length = zstd_count(src, ip + 4, ip + 4 - offset_2 as usize, iend) + 4;
-            // Swap offset_2 and offset_1.
-            std::mem::swap(&mut offset_1, &mut offset_2);
-            seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, match_length);
-            ip += match_length;
-            anchor = ip;
+        } else {
+            while (ip as i64) <= ilimit && offset_2 > 0 {
+                if mem_read32(src, ip) != mem_read32(src, ip - offset_2 as usize) {
+                    break;
+                }
+                match_length = zstd_count(src, ip + 4, ip + 4 - offset_2 as usize, iend) + 4;
+                // Swap offset_2 and offset_1.
+                std::mem::swap(&mut offset_1, &mut offset_2);
+                seq_store.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, match_length);
+                ip += match_length;
+                anchor = ip;
+            }
         }
     }
 
-    // The repcodes outside the prefix were set to zero before the loop;
-    // those still zero are restored, as in the fast strategy.
+    // Without a dictionary, the repcodes outside the prefix were set to
+    // zero before the loop; those still zero are restored, as in the fast
+    // strategy. With a CDict attached, none was.
     offset_saved2 = if offset_saved1 != 0 && offset_1 != 0 {
         offset_saved1
     } else {
@@ -1203,7 +1979,8 @@ fn zstd_compress_block_lazy_ext_dict_generic<const SEARCH: u8, const DEPTH: u32,
 
             // The first search (depth 0).
             {
-                let (ml2, off_candidate) = search_max::<SEARCH, MLS, true>(ms, src, dict, ip, iend);
+                let (ml2, off_candidate) =
+                    search_max::<SEARCH, MLS, EXT_DICT>(ms, src, dict, None, ip, iend);
                 if ml2 > match_length {
                     match_length = ml2;
                     start = ip;
@@ -1237,7 +2014,7 @@ fn zstd_compress_block_lazy_ext_dict_generic<const SEARCH: u8, const DEPTH: u32,
                     // The search, depth 1.
                     {
                         let (ml2, off_candidate) =
-                            search_max::<SEARCH, MLS, true>(ms, src, dict, ip, iend);
+                            search_max::<SEARCH, MLS, EXT_DICT>(ms, src, dict, None, ip, iend);
                         if ml2 >= 4
                             && gain(ml2, 4, off_candidate, 0) > gain(match_length, 4, off_base, 4)
                         {
@@ -1264,7 +2041,7 @@ fn zstd_compress_block_lazy_ext_dict_generic<const SEARCH: u8, const DEPTH: u32,
 
                         // The search, depth 2.
                         let (ml2, off_candidate) =
-                            search_max::<SEARCH, MLS, true>(ms, src, dict, ip, iend);
+                            search_max::<SEARCH, MLS, EXT_DICT>(ms, src, dict, None, ip, iend);
                         if ml2 >= 4
                             && gain(ml2, 4, off_candidate, 0) > gain(match_length, 4, off_base, 7)
                         {
@@ -1352,8 +2129,8 @@ fn lazy<const SEARCH: u8, const DEPTH: u32>(
     macro_rules! with_mls {
         ($mls:literal) => {
             match dict {
-                None => zstd_compress_block_lazy_generic::<SEARCH, DEPTH, $mls>(
-                    ms, seq_store, rep, src, istart, iend,
+                None => zstd_compress_block_lazy_generic::<SEARCH, DEPTH, $mls, NO_DICT>(
+                    ms, seq_store, rep, src, None, istart, iend,
                 ),
                 Some(dict) => zstd_compress_block_lazy_ext_dict_generic::<SEARCH, DEPTH, $mls>(
                     ms, seq_store, rep, src, dict, istart, iend,
@@ -1365,6 +2142,105 @@ fn lazy<const SEARCH: u8, const DEPTH: u32>(
         5 => with_mls!(5),
         6 => with_mls!(6),
         _ => with_mls!(4),
+    }
+}
+
+/// The parser for `DEPTH` and the shortest match, with the attached
+/// `CDict` `dms`: its `dedicatedDictSearch` variant when the `CDict`'s
+/// tables are laid out for it, its `dictMatchState` one otherwise
+/// (`ZSTD_matchState_dictMode`).
+#[allow(clippy::too_many_arguments)]
+fn lazy_dict_match_state<const SEARCH: u8, const DEPTH: u32>(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    macro_rules! with_mls {
+        ($mls:literal) => {
+            if dms.ms.dedicated_dict_search {
+                zstd_compress_block_lazy_generic::<SEARCH, DEPTH, $mls, DEDICATED_DICT_SEARCH>(
+                    ms,
+                    seq_store,
+                    rep,
+                    src,
+                    Some(dms),
+                    istart,
+                    iend,
+                )
+            } else {
+                zstd_compress_block_lazy_generic::<SEARCH, DEPTH, $mls, DICT_MATCH_STATE>(
+                    ms,
+                    seq_store,
+                    rep,
+                    src,
+                    Some(dms),
+                    istart,
+                    iend,
+                )
+            }
+        };
+    }
+    match ms.c_params.min_match.clamp(4, 6) {
+        5 => with_mls!(5),
+        6 => with_mls!(6),
+        _ => with_mls!(4),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For the tests: the blocks this thread compressed with greedy, lazy
+    /// or lazy2 and a `CDict` attached, with the hash chain, with the row
+    /// match finder, and with the dedicated dictionary search.
+    pub(crate) static DICT_MATCH_STATE_BLOCKS: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
+}
+
+/// `ZSTD_compressBlock_greedy_dictMatchState`, `_lazy_dictMatchState` and
+/// `_lazy2_dictMatchState`, with the hash chain, or with the row match
+/// finder (`row`, their `_row` variants); and their `_dedicatedDictSearch`
+/// variants for a `CDict` made for it: the sequences of the block
+/// `src[istart..iend]` into `seq_store`, with matches in the attached
+/// `CDict` `dms` too. Returns the size of the literals left after the last
+/// sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zstd_compress_block_lazy_dict_match_state(
+    depth: u32,
+    row: bool,
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    #[cfg(test)]
+    DICT_MATCH_STATE_BLOCKS.with(|blocks| {
+        let mut counts = blocks.get();
+        counts[if dms.ms.dedicated_dict_search {
+            2
+        } else {
+            usize::from(row)
+        }] += 1;
+        blocks.set(counts);
+    });
+    macro_rules! with {
+        ($search:expr, $depth:literal) => {
+            lazy_dict_match_state::<{ $search }, $depth>(ms, seq_store, rep, src, dms, istart, iend)
+        };
+    }
+    match (row, depth) {
+        (true, 0) => with!(SEARCH_ROW_HASH, 0),
+        (true, 1) => with!(SEARCH_ROW_HASH, 1),
+        (true, _) => with!(SEARCH_ROW_HASH, 2),
+        (false, 0) => with!(SEARCH_HASH_CHAIN, 0),
+        (false, 1) => with!(SEARCH_HASH_CHAIN, 1),
+        (false, _) => with!(SEARCH_HASH_CHAIN, 2),
     }
 }
 
@@ -1426,4 +2302,21 @@ pub(crate) fn zstd_compress_block_btlazy2(
     iend: usize,
 ) -> usize {
     lazy::<SEARCH_BINARY_TREE, 2>(ms, seq_store, rep, src, dict, istart, iend)
+}
+
+/// `ZSTD_compressBlock_btlazy2_dictMatchState`: the parser of `lazy2` with
+/// the binary tree, the frame attached to a `CDict`, `dms`. The sequences
+/// of the block `src[istart..iend]` into `seq_store`. Returns the size of
+/// the literals left after the last sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zstd_compress_block_btlazy2_dict_match_state(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    lazy_dict_match_state::<SEARCH_BINARY_TREE, 2>(ms, seq_store, rep, src, dms, istart, iend)
 }

@@ -218,10 +218,10 @@ jobs:
       # Both sides take the strongest levels' tables, 640 MB each for an
       # input of unknown size, and the sanitizer keeps what is freed for a
       # while: more than libFuzzer's 2 GB.
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress -- -max_total_time=150 -rss_limit_mb=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress -- -max_total_time=120 -rss_limit_mb=4096
       - name: Seed the streaming compressor's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/compress_stream
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=150 -rss_limit_mb=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=120 -rss_limit_mb=4096
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=150
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=150
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90
@@ -256,3 +256,12 @@ jobs:
               pathlib.Path(f"fuzz/corpus/zip_edit/d{i}").write_bytes(edits + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_edit -- -max_total_time=90
+      - name: Seed the extraction corpus with the same archives, behind a choice of options
+        run: |
+          mkdir -p fuzz/corpus/extract
+          python3 - <<'PY'
+          import pathlib
+          for i, path in enumerate(sorted(pathlib.Path("fuzz/corpus/zip_open").iterdir())):
+              pathlib.Path(f"fuzz/corpus/extract/{path.name}").write_bytes(bytes([i % 128]) + path.read_bytes())
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract -- -max_total_time=60

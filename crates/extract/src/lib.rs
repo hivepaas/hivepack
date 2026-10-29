@@ -13,7 +13,9 @@
 //!   `..`, carry a backslash, a colon, a control character or a Windows
 //!   device name, or end a component with a space or a dot, on every
 //!   system alike. Two entries may not name the same path, ignoring case.
-//! - **Links and special files** are not created.
+//! - **Links** are not created, unless [`Options::links`] says to create
+//!   those that stay inside the destination; a device or FIFO in a ZIP
+//!   archive, only a mode with data, is written as a file.
 //! - **Writing** goes through handles: each directory is opened from its
 //!   parent without following a link, and each file is created new, so a
 //!   link already in the destination, or put there while extracting, is
@@ -51,5 +53,5 @@ mod zip;
 
 pub use error::{Error, ErrorKind};
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};
-pub use plan::{Limits, Options};
+pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};
 pub use zip::{Summary, extract_zip};

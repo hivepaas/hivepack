@@ -10,7 +10,9 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hivepack_extract::{ErrorKind, Limits, NameError, Options, Summary, extract_zip};
+use hivepack_extract::{
+    ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Summary, extract_zip,
+};
 use hivepack_zip::{Archive, BufferSource, Flags, OpenFlags, cm, em, opsys};
 
 /// The time the test entries have, an even number of seconds as MS-DOS
@@ -23,6 +25,8 @@ enum Entry<'a> {
     /// A file with Unix mode bits, type included.
     Mode(&'a [u8], &'a [u8], u32),
     Dir(&'a [u8]),
+    /// A directory with the test time.
+    DirAt(&'a [u8]),
     Stored(&'a [u8], &'a [u8]),
 }
 
@@ -44,6 +48,10 @@ fn zip(entries: &[Entry<'_>]) -> Vec<u8> {
             }
             Entry::Dir(name) => {
                 za.dir_add(name, Flags::NONE).unwrap();
+            }
+            Entry::DirAt(name) => {
+                let i = za.dir_add(name, Flags::NONE).unwrap();
+                za.file_set_mtime(i, MTIME, Flags::NONE).unwrap();
             }
             Entry::Stored(name, data) => {
                 let i = za
@@ -254,20 +262,28 @@ fn the_same_path_twice_is_refused() {
 }
 
 #[test]
-fn links_and_special_files_are_not_created() {
-    for (mode, kind) in [
-        (0o120_777, "link"),
-        (0o010_644, "fifo"),
-        (0o020_644, "device"),
-    ] {
+fn links_are_not_created() {
+    let scratch = Scratch::new();
+    let data = zip(&[Entry::Mode(b"x", b"/etc/passwd", 0o120_777)]);
+    let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Link), "{error}");
+    assert!(listing(&scratch.out()).is_empty());
+}
+
+/// A FIFO or a device in a ZIP archive is a mode with data, as Info-ZIP's
+/// zip writes what it reads from a pipe: written as a file.
+#[test]
+fn special_files_are_written_as_files() {
+    for mode in [0o010_644, 0o020_644, 0o060_644, 0o140_644] {
         let scratch = Scratch::new();
-        let data = zip(&[Entry::Mode(b"x", b"/etc/passwd", mode)]);
-        let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
-        match kind {
-            "link" => assert!(matches!(error.kind, ErrorKind::Link), "{error}"),
-            _ => assert!(matches!(error.kind, ErrorKind::SpecialFile), "{error}"),
-        }
-        assert!(listing(&scratch.out()).is_empty());
+        let data = zip(&[Entry::Mode(b"-", b"from a pipe", mode)]);
+        extract(&data, &scratch.out(), &Options::default()).unwrap();
+        let path = scratch.out().join("-");
+        assert!(
+            std::fs::symlink_metadata(&path).unwrap().is_file(),
+            "{mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"from a pipe");
     }
 }
 
@@ -312,6 +328,11 @@ fn nothing_is_overwritten() {
     let data = zip(&[Entry::File(b"dir/a.txt/b", b"theirs")]);
     let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
     assert!(matches!(error.kind, ErrorKind::NotADirectory), "{error}");
+    // A directory where a file is to be, which Windows reports as access
+    // denied.
+    let data = zip(&[Entry::File(b"dir", b"theirs")]);
+    let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Exists), "{error}");
 }
 
 fn limits(change: impl FnOnce(&mut Limits)) -> Options {
@@ -487,4 +508,323 @@ fn encrypted_entries_need_their_password() {
         std::fs::read(scratch.out().join("zipcrypto")).unwrap(),
         b"secret"
     );
+}
+
+fn options(change: impl FnOnce(&mut Options)) -> Options {
+    let mut options = Options::default();
+    change(&mut options);
+    options
+}
+
+/// Links whose target stays inside are created, last; the others are
+/// refused, here skipped.
+#[cfg(unix)]
+#[test]
+fn links_inside_the_destination_are_created() {
+    let scratch = Scratch::new();
+    let data = zip(&[
+        Entry::Dir(b"lib/"),
+        Entry::Mode(b"lib/libfoo.so", b"libfoo.so.1", 0o120_777),
+        Entry::File(b"lib/libfoo.so.1", b"elf"),
+        Entry::Mode(b"up", b"lib/../lib/libfoo.so.1", 0o120_777),
+        Entry::Mode(b"to-dir", b"lib", 0o120_777),
+        Entry::Mode(b"escape", b"../outside", 0o120_777),
+        Entry::Mode(b"absolute", b"/etc/passwd", 0o120_777),
+        Entry::Mode(b"through", b"to-dir/libfoo.so.1", 0o120_777),
+    ]);
+    let options = options(|o| {
+        o.links = Links::Inside;
+        o.on_refused = OnRefused::Skip;
+    });
+    let summary = extract(&data, &scratch.out(), &options).unwrap();
+    assert_eq!((summary.files, summary.links), (1, 3));
+    let reasons: Vec<_> = summary
+        .skipped
+        .iter()
+        .map(|e| (e.index, format!("{:?}", e.kind)))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (Some(5), "LinkTarget(Dot)".to_string()),
+            (Some(6), "LinkTarget(Absolute)".to_string()),
+            (Some(7), "LinkChain { other: 4 }".to_string()),
+        ]
+    );
+    let out = scratch.out();
+    assert_eq!(
+        std::fs::read_link(out.join("lib/libfoo.so")).unwrap(),
+        Path::new("libfoo.so.1")
+    );
+    assert_eq!(std::fs::read(out.join("up")).unwrap(), b"elf");
+    assert_eq!(
+        std::fs::read(out.join("to-dir/libfoo.so.1")).unwrap(),
+        b"elf"
+    );
+    assert_eq!(listing(scratch.path()).len(), listing(&out).len() + 1);
+
+    // Stopping, the default: before anything is written.
+    let scratch = Scratch::new();
+    let options = self::options(|o| o.links = Links::Inside);
+    let error = extract(&data, &scratch.out(), &options).unwrap_err();
+    assert!(
+        matches!(error.kind, ErrorKind::LinkTarget(NameError::Dot)),
+        "{error}"
+    );
+    assert!(listing(scratch.path()).is_empty());
+}
+
+#[test]
+fn links_can_be_written_as_files() {
+    let scratch = Scratch::new();
+    let data = zip(&[Entry::Mode(b"link", b"../../etc/passwd", 0o120_777)]);
+    let options = options(|o| o.links = Links::AsFile);
+    extract(&data, &scratch.out(), &options).unwrap();
+    assert_eq!(
+        std::fs::read(scratch.out().join("link")).unwrap(),
+        b"../../etc/passwd"
+    );
+    assert!(
+        !std::fs::symlink_metadata(scratch.out().join("link"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn names_can_be_cleaned_up() {
+    let scratch = Scratch::new();
+    let data = zip(&[
+        Entry::File(b"/etc/passwd", b"1"),
+        Entry::File(b"../../up", b"2"),
+        Entry::File(b"C:\\win\\..\\x.txt", b"3"),
+        Entry::File(b"a/./b//c", b"4"),
+    ]);
+    let options = options(|o| {
+        o.names = Names::Sanitize;
+        o.backslash_separator = true;
+    });
+    extract(&data, &scratch.out(), &options).unwrap();
+    assert_eq!(
+        listing(&scratch.out()),
+        [
+            "a/",
+            "a/b/",
+            "a/b/c",
+            "etc/",
+            "etc/passwd",
+            "up",
+            "win/",
+            "win/x.txt"
+        ]
+    );
+
+    // A backslash for a separator, nothing cleaned up.
+    let scratch = Scratch::new();
+    let data = zip(&[Entry::File(b"dir\\file.txt", b"x")]);
+    let options = self::options(|o| o.backslash_separator = true);
+    extract(&data, &scratch.out(), &options).unwrap();
+    assert_eq!(listing(&scratch.out()), ["dir/", "dir/file.txt"]);
+}
+
+#[test]
+fn refused_entries_can_be_skipped() {
+    let scratch = Scratch::new();
+    let data = zip(&[
+        Entry::File(b"good.txt", b"ok"),
+        Entry::File(b"../evil", b"x"),
+        Entry::File(b"CON", b"x"),
+        Entry::File(b"GOOD.txt", b"x"),
+        Entry::Mode(b"link", b"good.txt", 0o120_777),
+        Entry::File(b"also-good", b"ok"),
+    ]);
+    let options = options(|o| o.on_refused = OnRefused::Skip);
+    let summary = extract(&data, &scratch.out(), &options).unwrap();
+    assert_eq!(listing(&scratch.out()), ["also-good", "good.txt"]);
+    let skipped: Vec<_> = summary.skipped.iter().map(|e| e.index.unwrap()).collect();
+    assert_eq!(skipped, [1, 2, 3, 4]);
+    assert!(matches!(
+        summary.skipped[2].kind,
+        ErrorKind::Duplicate { first: 0 }
+    ));
+
+    // The limits still stop it.
+    let scratch = Scratch::new();
+    let options = self::options(|o| {
+        o.on_refused = OnRefused::Skip;
+        o.limits.max_entries = 3;
+    });
+    let error = extract(&data, &scratch.out(), &options).unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::TooManyEntries), "{error}");
+}
+
+#[test]
+fn files_can_be_overwritten() {
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(scratch.out().join("dir/sub")).unwrap();
+    std::fs::write(scratch.out().join("a.txt"), b"mine, and longer").unwrap();
+    let options = options(|o| o.overwrite = true);
+    extract(
+        &zip(&[Entry::File(b"a.txt", b"theirs")]),
+        &scratch.out(),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(scratch.out().join("a.txt")).unwrap(),
+        b"theirs"
+    );
+    // Not a directory.
+    let error = extract(
+        &zip(&[Entry::File(b"dir/sub", b"x")]),
+        &scratch.out(),
+        &options,
+    )
+    .unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Exists), "{error}");
+}
+
+/// Not a link, even with `overwrite`: the file it points to is untouched.
+#[cfg(unix)]
+#[test]
+fn links_are_not_overwritten() {
+    let scratch = Scratch::new();
+    std::fs::create_dir(scratch.out()).unwrap();
+    let victim = scratch.path().join("victim");
+    std::fs::write(&victim, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, scratch.out().join("a.txt")).unwrap();
+    let options = options(|o| o.overwrite = true);
+    let error = extract(
+        &zip(&[Entry::File(b"a.txt", b"theirs")]),
+        &scratch.out(),
+        &options,
+    )
+    .unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Exists), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn permissions_can_be_kept_or_left_to_the_system() {
+    use hivepack_extract::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    let data = zip(&[Entry::Mode(b"x", b"x", 0o106_775)]);
+    let mode = |permissions| {
+        let scratch = Scratch::new();
+        let options = options(|o| o.permissions = permissions);
+        extract(&data, &scratch.out(), &options).unwrap();
+        std::fs::metadata(scratch.out().join("x"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode(Permissions::Masked), 0o755);
+    assert_eq!(mode(Permissions::Preserve), 0o775);
+    // The system's: no setuid or setgid bit either way.
+    assert_eq!(mode(Permissions::Ignore) & 0o7000, 0);
+}
+
+#[test]
+fn directories_get_their_time() {
+    let scratch = Scratch::new();
+    let data = zip(&[
+        Entry::DirAt(b"dir/"),
+        Entry::File(b"dir/inner/file", b"x"),
+        Entry::DirAt(b"dir/inner/"),
+    ]);
+    extract(&data, &scratch.out(), &Options::default()).unwrap();
+    for dir in ["dir", "dir/inner"] {
+        let modified = std::fs::metadata(scratch.out().join(dir))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            MTIME as u64,
+            "{dir}"
+        );
+    }
+}
+
+/// The archives of libzip's tests, where the libzip sources are fetched.
+fn regress_archives() -> Vec<(String, Vec<u8>)> {
+    let cache = std::env::var_os("HIVEPACK_TESTDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/testdata"));
+    let regress = cache.join("libzip-1.12.1-source/libzip-1.12.1/regress");
+    let mut files = Vec::new();
+    for folder in [regress.clone(), regress.join("data")] {
+        let Ok(dir) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in dir {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_file() && !name.ends_with(".test") {
+                files.push((name, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Every archive of libzip's tests that opens extracts, or stops with its
+/// reason, and writes nothing outside the destination: a test of the rules
+/// on archives made by others, and a measure of what they refuse.
+#[test]
+fn libzip_archives_extract_or_stop_cleanly() {
+    let archives = regress_archives();
+    if archives.is_empty() {
+        let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
+        assert!(
+            !required.split(',').any(|g| g == "all" || g == "generated"),
+            "libzip's archives are missing: run `python3 scripts/testdata.py fetch --group generated`"
+        );
+        eprintln!("skipping: libzip's archives are not fetched");
+        return;
+    }
+    let mut outcomes = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut opened = 0;
+    for (name, data) in &archives {
+        let Ok(archive) = Archive::open(data.as_slice(), OpenFlags::CHECKCONS) else {
+            continue;
+        };
+        opened += 1;
+        let scratch = Scratch::new();
+        std::fs::write(scratch.path().join("sentinel"), b"untouched").unwrap();
+        let mut options = Options::default();
+        options.password = Some(b"foofoofoo".to_vec());
+        let outcome = match extract_zip(&archive, &scratch.out(), &options) {
+            Ok(summary) => {
+                let files = listing(&scratch.out())
+                    .iter()
+                    .filter(|path| !path.ends_with('/'))
+                    .count();
+                assert_eq!(files as u64, summary.files, "{name}");
+                "extracted".to_string()
+            }
+            Err(error) => {
+                let kind = format!("{:?}", error.kind);
+                kind.split(['(', ' ', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        let mut around = listing(scratch.path());
+        around.retain(|path| !path.starts_with("out/") && path != "out/");
+        assert_eq!(around, ["sentinel"], "{name}");
+        outcomes.entry(outcome).or_default().push(name.clone());
+    }
+    eprintln!("{opened} of {} archives open", archives.len());
+    for (outcome, names) in &outcomes {
+        eprintln!("{outcome}: {} ({})", names.len(), names.join(" "));
+    }
+    assert!(opened > 100, "only {opened} archives open");
 }

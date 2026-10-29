@@ -24,10 +24,15 @@ pub enum ErrorKind {
     /// Another entry, `first`, names the same path, ignoring case, or
     /// names a file where this one has a directory, or the other way.
     Duplicate { first: u64 },
-    /// A symbolic or hard link, which is not created.
+    /// A symbolic or hard link, which is not created (see
+    /// [`Links`](crate::Links)).
     Link,
-    /// A device, FIFO or socket, which is not created.
-    SpecialFile,
+    /// A link whose target is refused, as a name is
+    /// ([`NameError::Dot`] for one that climbs out of the destination).
+    LinkTarget(NameError),
+    /// A link whose target passes through link `other`, which the system
+    /// would follow where the target's text does not.
+    LinkChain { other: u64 },
     /// The entry's data overlaps that of entry `other`: an archive bomb
     /// that reuses the same compressed data, or a broken archive.
     Overlap { other: u64 },
@@ -76,7 +81,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Name(e) => write!(f, "name refused: {e}"),
             ErrorKind::Duplicate { first } => write!(f, "same path as entry {first}"),
             ErrorKind::Link => f.write_str("link"),
-            ErrorKind::SpecialFile => f.write_str("device, FIFO or socket"),
+            ErrorKind::LinkTarget(e) => write!(f, "link target refused: {e}"),
+            ErrorKind::LinkChain { other } => write!(f, "link through link {other}"),
             ErrorKind::Overlap { other } => write!(f, "data overlaps entry {other}"),
             ErrorKind::TooManyEntries => f.write_str("too many entries"),
             ErrorKind::EntryTooLarge => f.write_str("entry too large"),

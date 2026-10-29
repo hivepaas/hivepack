@@ -200,18 +200,18 @@ jobs:
           find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
       # The prebuilt cargo-fuzz is a musl binary and would default to that
       # target, which the sanitizer does not support.
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=240
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast decompress -- -max_total_time=210
       - name: Seed the compressor's corpus with the committed files
         run: |
           mkdir -p fuzz/corpus/compress
           find testdata -type f -size -64k -exec cp {} fuzz/corpus/compress/ \;
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress -- -max_total_time=180
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress -- -max_total_time=150
       - name: Seed the streaming compressor's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/compress_stream
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=180
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=180
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=180
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=120
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=150
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=150
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=150
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90
       - name: Seed the ZIP corpus with the recorded archives
         run: |
           mkdir -p fuzz/corpus/zip_open

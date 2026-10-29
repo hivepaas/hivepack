@@ -2,7 +2,7 @@
 
 ZIP archives in safe Rust, the container logic ported from [libzip](https://libzip.org) 1.12.1.
 
-> **Status:** opens archives and reads their central directory and local headers with libzip's rules and errors, compared with libzip itself. Reading the entries' data comes next. This crate is not on crates.io.
+> **Status:** opens archives, reads their central directory and local headers, and reads stored and deflated entries, with libzip's rules and errors, compared with libzip itself. Deflate64 entries and `ziptool` come next, then writing. This crate is not on crates.io.
 
 ```rust
 use hivepack_zip::{Archive, Flags, OpenFlags};
@@ -13,6 +13,11 @@ for i in 0..archive.get_num_entries(Flags::NONE) {
     let st = archive.stat_index(i, Flags::NONE)?;
     println!("{} {}", String::from_utf8_lossy(st.name.unwrap_or_default()), st.size);
 }
+// Decompressed, its CRC-32 and length checked at the end.
+let mut data = Vec::new();
+let mut file = archive.fopen(b"README.md", Flags::NONE)?;
+std::io::Read::read_to_end(&mut file, &mut data)?;
+file.fclose()?;
 ```
 
 `OpenFlags::CHECKCONS` compares every local header with the central directory and checks more strictly, as libzip's `ZIP_CHECKCONS` does. Without it, the archive opens as libzip opens it by default.

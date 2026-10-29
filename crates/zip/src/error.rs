@@ -283,8 +283,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     /// `zip_error_set(error, ze, se)`.
-    pub(crate) fn new(zip_err: ErrorCode, sys_err: i32) -> Error {
+    pub(crate) const fn new(zip_err: ErrorCode, sys_err: i32) -> Error {
         Error { zip_err, sys_err }
+    }
+
+    /// No error: what `zip_error_init` leaves.
+    pub(crate) const OK: Error = Error::new(ErrorCode::Ok, 0);
+
+    /// Whether this is an error: `zip_err != ZIP_ER_OK`.
+    pub(crate) fn is_set(&self) -> bool {
+        self.zip_err != ErrorCode::Ok
     }
 
     /// An inconsistency, with its detail: `ZIP_ER_INCONS`.

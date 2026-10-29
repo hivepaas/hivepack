@@ -235,3 +235,33 @@ impl Default for Stat<'_> {
         }
     }
 }
+
+/// Takes what `src` knows into `dst`, all but the name: port of
+/// `_zip_stat_merge`.
+pub(crate) fn stat_merge(dst: &mut Stat<'_>, src: &Stat<'_>) {
+    if src.valid & stat::INDEX != 0 {
+        dst.index = src.index;
+    }
+    if src.valid & stat::SIZE != 0 {
+        dst.size = src.size;
+    }
+    if src.valid & stat::COMP_SIZE != 0 {
+        dst.comp_size = src.comp_size;
+    }
+    if src.valid & stat::MTIME != 0 {
+        dst.mtime = src.mtime;
+    }
+    if src.valid & stat::CRC != 0 {
+        dst.crc = src.crc;
+    }
+    if src.valid & stat::COMP_METHOD != 0 {
+        dst.comp_method = src.comp_method;
+    }
+    if src.valid & stat::ENCRYPTION_METHOD != 0 {
+        dst.encryption_method = src.encryption_method;
+    }
+    if src.valid & stat::FLAGS != 0 {
+        dst.flags = src.flags;
+    }
+    dst.valid |= src.valid;
+}

@@ -1788,6 +1788,22 @@ fn record_edit_answers() {
     );
 }
 
+/// The port's answer as it is on Linux, where the answers are recorded:
+/// `zip_file_set_mtime` fails with the platform's `EOVERFLOW`, which is
+/// 75 there.
+fn as_on_linux(answer: String) -> String {
+    let empty: &[u8] = &[];
+    let mut za = Archive::open(empty, OpenFlags(0)).unwrap();
+    let eoverflow = za
+        .file_set_mtime(0, i64::MAX, Flags::NONE)
+        .unwrap_err()
+        .system();
+    if eoverflow == 75 {
+        return answer;
+    }
+    answer.replace(&format!("e18/{eoverflow}"), "e18/75")
+}
+
 /// Replays the answers recorded in `path`.
 fn replay(path: &PathBuf, at_least: usize) {
     let text = std::fs::read_to_string(path).expect("the recorded answers");
@@ -1797,7 +1813,11 @@ fn replay(path: &PathBuf, at_least: usize) {
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
         let (request, want) = line.split_once('\t').expect("request, tab, answer");
-        assert_eq!(recorded_form(&answer(request)), want, "{request:.300}");
+        assert_eq!(
+            recorded_form(&as_on_linux(answer(request))),
+            want,
+            "{request:.300}"
+        );
         checked += 1;
     }
     assert!(checked > at_least, "only {checked} recorded answers");

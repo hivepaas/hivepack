@@ -1016,15 +1016,30 @@ pub(crate) fn cm_actual(method: i32) -> u16 {
     }
 }
 
-/// `EOVERFLOW` on Linux, which `localtime_r` sets for a year past what an
-/// `int` holds.
-const EOVERFLOW: i32 = 75;
+/// `EOVERFLOW`, which `localtime_r` sets for a year past what an `int`
+/// holds: the platform's value (in the Windows C runtime's `errno.h`
+/// there).
+const EOVERFLOW: i32 = if cfg!(windows) {
+    132
+} else if cfg!(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)) {
+    84
+} else if cfg!(any(target_os = "solaris", target_os = "illumos")) {
+    79
+} else {
+    75
+};
 
 /// A time in seconds since 1970 as MS-DOS keeps it, taken as UTC: port of
 /// `_zip_u2d_time`. Years before 1980 are taken as 1980, with the same
 /// day, and years past 2107 wrap around in the 7 bits of the year, as in
 /// libzip. A year that does not fit in an `int` fails with `ZIP_ER_INVAL`
-/// and `EOVERFLOW`, as `localtime_r` refuses it.
+/// and the platform's `EOVERFLOW`, as `localtime_r` refuses it.
 ///
 /// Differs from libzip, which calls `localtime_r` and so takes the time in
 /// the machine's time zone: the two agree where it is UTC.

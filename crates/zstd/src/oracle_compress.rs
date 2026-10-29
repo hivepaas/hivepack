@@ -1422,8 +1422,8 @@ fn cstream_dict(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
 }
 
 /// Steps that set a dictionary from `dict_len` bytes for the next frames:
-/// first the preference to copy a CDict in or load it again, then one of
-/// the dictionary steps, mostly with all the bytes.
+/// first the attach preference (as libzstd decides, attach, copy, or load
+/// again), then one of the dictionary steps, mostly with all the bytes.
 ///
 /// With a stable input buffer, none that can fail as the frame starts (a
 /// dictionary read as a zstd one): the oracle then resets the context,
@@ -1439,7 +1439,8 @@ fn cstream_dict_steps(rng: &mut Rng, dict_len: usize, stable_in: bool) -> Vec<i6
     } else {
         (0, len)
     };
-    let mut steps = vec![7, 1001, rng.range(2, 3) as i64];
+    // Every attach preference: default, attach, copy, load.
+    let mut steps = vec![7, 1001, rng.range(0, 3) as i64];
     match rng.range(0, 9) {
         0 | 2 | 4 if stable_in => steps.extend([12, at, size]),
         0 => steps.extend([11, at, size]),

@@ -1,11 +1,9 @@
 //! The `greedy`, `lazy`, `lazy2` and `btlazy2` strategies: port of
 //! `compress/zstd_lazy.c`: the parser they share, the hash chain match
 //! finder, the row match finder, and `btlazy2`'s binary tree; without a
-//! dictionary, with the window's older segment (`extDict`), and for
-//! `greedy`, `lazy` and `lazy2` with an attached `CDict` (`dictMatchState`,
-//! and `dedicatedDictSearch` for a `CDict` made with
-//! `ZSTD_c_enableDedicatedDictSearch`). `btlazy2` with an attached `CDict`
-//! is not ported yet.
+//! dictionary, with the window's older segment (`extDict`), and with an
+//! attached `CDict` (`dictMatchState`, and `dedicatedDictSearch` for a
+//! `CDict` made with `ZSTD_c_enableDedicatedDictSearch`).
 //!
 //! Positions are indices into `src`, the buffer the window's prefix is in,
 //! and `dict`, the one its older segment is in; the tables hold window
@@ -17,7 +15,8 @@ use crate::common::bits::highbit32;
 use crate::common::zstd_internal::ZSTD_REP_NUM;
 use crate::compress::zstd_compress_internal::{
     DictMatchState, K_SEARCH_STRENGTH, MatchState, REPCODE1_TO_OFFBASE, SeqStore,
-    ZSTD_DUBT_UNSORTED_MARK, ZSTD_ROW_HASH_CACHE_SIZE, mem_read32, offset_to_offbase, zstd_count,
+    ZSTD_DEDICATED_DICT_SEARCH, ZSTD_DICT_MATCH_STATE, ZSTD_DUBT_UNSORTED_MARK, ZSTD_EXT_DICT,
+    ZSTD_NO_DICT, ZSTD_ROW_HASH_CACHE_SIZE, mem_read32, offset_to_offbase, zstd_count,
     zstd_count_2segments, zstd_hash_ptr, zstd_hash_ptr_salted, zstd_index_overlap_check,
 };
 
@@ -33,10 +32,10 @@ pub(crate) const SEARCH_ROW_HASH: u8 = 2;
 /// functions: no dictionary, the window's older segment, an attached
 /// `CDict`'s tables, or an attached `CDict`'s tables laid out for the
 /// dedicated dictionary search.
-pub(crate) const NO_DICT: u8 = 0;
-pub(crate) const EXT_DICT: u8 = 1;
-pub(crate) const DICT_MATCH_STATE: u8 = 2;
-pub(crate) const DEDICATED_DICT_SEARCH: u8 = 3;
+pub(crate) const NO_DICT: u8 = ZSTD_NO_DICT;
+pub(crate) const EXT_DICT: u8 = ZSTD_EXT_DICT;
+pub(crate) const DICT_MATCH_STATE: u8 = ZSTD_DICT_MATCH_STATE;
+pub(crate) const DEDICATED_DICT_SEARCH: u8 = ZSTD_DEDICATED_DICT_SEARCH;
 
 /// `ZSTD_LAZY_DDSS_BUCKET_LOG`: a `CDict` with the dedicated dictionary
 /// search has buckets of `1 << ZSTD_LAZY_DDSS_BUCKET_LOG` entries in its
@@ -111,12 +110,13 @@ fn update_dubt<const MLS: u32>(ms: &mut MatchState, src: &[u8], ip: usize) {
 
 /// `ZSTD_insertDUBT1`: sorts `curr`, inserted but unsorted, into the tree,
 /// comparing at most `nb_compares` positions, down to `bt_low`. Its bytes
-/// end at `input_end` of `src` in the prefix. With `EXT`, `curr` and the
-/// positions it is compared with may be in the older segment, `dict`,
-/// where its bytes end at the segment's end.
+/// end at `input_end` of `src` in the prefix. With `DICT_MODE`
+/// [`ZSTD_EXT_DICT`], `curr` and the positions it is compared with may be
+/// in the older segment, `dict`, where its bytes end at the segment's end;
+/// the tree holds no position of an attached `CDict`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn insert_dubt1<const EXT: bool>(
+fn insert_dubt1<const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
@@ -134,7 +134,8 @@ fn insert_dubt1<const EXT: bool>(
     let dict_end = (i64::from(dict_limit) - dict_base) as usize;
     // Where `curr` is: its segment, the index of the segment's first byte,
     // and where the bytes after `curr` end.
-    let (ibuf, ibase, iend) = if !EXT || curr >= dict_limit {
+    let ext = DICT_MODE == ZSTD_EXT_DICT;
+    let (ibuf, ibase, iend) = if !ext || curr >= dict_limit {
         (src, base, input_end)
     } else {
         (dict, dict_base, dict_end)
@@ -167,7 +168,7 @@ fn insert_dubt1<const EXT: bool>(
 
         // The candidate's segment, and the index of its first byte, for
         // the byte after the common run.
-        let (mbuf, mbase) = if !EXT
+        let (mbuf, mbase) = if !ext
             || match_index as usize + match_length >= dict_limit as usize
             || curr < dict_limit
         {
@@ -181,7 +182,7 @@ fn insert_dubt1<const EXT: bool>(
             // run ends before the segment's end, as `curr`'s bytes do, and
             // the candidate is before `curr`.
             debug_assert!(
-                !EXT || curr >= dict_limit
+                !ext || curr >= dict_limit
                     || match_index as usize + match_length < dict_limit as usize
             );
             let m = (i64::from(match_index) + match_length as i64 - ibase) as usize;
@@ -252,20 +253,141 @@ fn insert_dubt1<const EXT: bool>(
     }
 }
 
+/// `ZSTD_DUBT_findBetterDictMatch`: the search of the binary tree goes on
+/// in the attached `CDict`'s, `dms`, for a match at `ip` longer than
+/// `best_length`, the longest found in the frame's, with at most
+/// `nb_compares` comparisons, the rest of the search's. A match there is
+/// weighed as in the frame's tree against `off_base`, the best so far,
+/// which it then replaces. Returns the best length.
+///
+/// The `CDict`'s tree is sorted: its content was inserted with
+/// `ZSTD_updateTree`, as the optimal parser's are. It is read only. Its
+/// indices, from its `low_limit` to its `next_src`, are the frame's less
+/// `dict_index_delta`: the frame's window starts where the `CDict`'s ends.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn dubt_find_better_dict_match<const MLS: u32>(
+    ms: &MatchState,
+    dms: DictMatchState<'_>,
+    src: &[u8],
+    ip: usize,
+    iend: usize,
+    off_base: &mut u32,
+    mut best_length: usize,
+    mut nb_compares: u32,
+) -> usize {
+    let dms_c_params = dms.ms.c_params;
+    let h = zstd_hash_ptr(src, ip, dms_c_params.hash_log, MLS);
+    let mut dict_match_index = dms.ms.hash_table[h];
+
+    let base = ms.window.base;
+    let prefix_start = (i64::from(ms.window.dict_limit) - base) as usize;
+    let curr = ms.window.index(ip);
+    let dict_base = dms.ms.window.base;
+    let content = dms.content;
+    // The content's end, in it and as an index.
+    let dict_end = (dms.ms.window.next_src - dict_base) as usize;
+    let dict_high_limit = dms.ms.window.next_src as u32;
+    let dict_low_limit = dms.ms.window.low_limit;
+    let dict_index_delta = ms.window.low_limit.wrapping_sub(dict_high_limit);
+
+    let dict_bt = &dms.ms.chain_table;
+    let bt_mask = (1u32 << (dms_c_params.chain_log - 1)) - 1;
+    let bt_low = if bt_mask >= dict_high_limit - dict_low_limit {
+        dict_low_limit
+    } else {
+        dict_high_limit - bt_mask
+    };
+
+    let mut common_length_smaller = 0;
+    let mut common_length_larger = 0;
+
+    while nb_compares > 0 && dict_match_index > dict_low_limit {
+        let next_ptr = 2 * (dict_match_index & bt_mask) as usize;
+        // The bytes it has in common with `ip` at least.
+        let mut match_length = common_length_smaller.min(common_length_larger);
+        let m = (i64::from(dict_match_index) - dict_base) as usize;
+        // Past the content's end, on into the frame's prefix.
+        match_length += zstd_count_2segments(
+            src,
+            ip + match_length,
+            content,
+            m + match_length,
+            iend,
+            dict_end,
+            prefix_start,
+        );
+
+        if match_length > best_length {
+            let match_index = dict_match_index.wrapping_add(dict_index_delta);
+            // Longer, unless its offset costs more than the bytes gained;
+            // the best so far weighs as `off_base + 1` here.
+            if 4 * (match_length - best_length) as i32
+                > highbit32(curr - match_index + 1) as i32 - highbit32(*off_base + 1) as i32
+            {
+                best_length = match_length;
+                *off_base = offset_to_offbase(curr - match_index);
+            }
+            if ip + match_length == iend {
+                // Equal up to the end: no way to know if smaller or
+                // larger. Dropped.
+                break;
+            }
+        }
+
+        // The byte after the common run: in the prefix, when the run went
+        // past the content.
+        let match_byte = if dict_match_index as usize + match_length >= dict_high_limit as usize {
+            let at =
+                i64::from(dict_match_index.wrapping_add(dict_index_delta)) + match_length as i64;
+            src[(at - base) as usize]
+        } else {
+            content[m + match_length]
+        };
+        if match_byte < src[ip + match_length] {
+            // The candidate is smaller than `ip`.
+            if dict_match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                break;
+            }
+            // Every smaller one has at least this in common.
+            common_length_smaller = match_length;
+            // The next one is larger than the candidate.
+            dict_match_index = dict_bt[next_ptr + 1];
+        } else {
+            // The candidate is larger than `ip`.
+            if dict_match_index <= bt_low {
+                // Beyond the tree's size: stop.
+                break;
+            }
+            common_length_larger = match_length;
+            dict_match_index = dict_bt[next_ptr];
+        }
+        nb_compares -= 1;
+    }
+
+    best_length
+}
+
 /// `ZSTD_DUBT_findBestMatch`: sorts the unsorted positions of `ip`'s hash
 /// (up to `1 << search_log` of them, the oldest first), then inserts `ip`
 /// into the tree, sorted, and returns the best match the way down gave, up
-/// to `iend`, and its offset base. With `EXT`, candidates below the prefix
-/// are in `dict`.
+/// to `iend`, and its offset base. With `DICT_MODE` [`ZSTD_EXT_DICT`],
+/// candidates below the prefix are in `dict`; with
+/// [`ZSTD_DICT_MATCH_STATE`], the comparisons left go on in the tree of the
+/// attached `CDict`, `dms` ([`dubt_find_better_dict_match`]).
 #[allow(clippy::too_many_lines)]
 #[inline(always)]
-fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
+fn dubt_find_best_match<const MLS: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     iend: usize,
 ) -> (usize, u32) {
+    debug_assert!(DICT_MODE != ZSTD_DEDICATED_DICT_SEARCH);
+    let ext = DICT_MODE == ZSTD_EXT_DICT;
     let c_params = ms.c_params;
     let h = zstd_hash_ptr(src, ip, c_params.hash_log, MLS);
     let mut match_index = ms.hash_table[h];
@@ -315,7 +437,7 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
     match_index = previous_candidate;
     while match_index != 0 {
         let next_candidate_idx = ms.chain_table[2 * (match_index & bt_mask) as usize + 1];
-        insert_dubt1::<EXT>(
+        insert_dubt1::<DICT_MODE>(
             ms,
             src,
             dict,
@@ -354,7 +476,7 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
 
         // The candidate's segment, and the index of its first byte, for
         // the byte after the common run.
-        let (mbuf, mbase) = if !EXT || match_index as usize + match_length >= dict_limit as usize {
+        let (mbuf, mbase) = if !ext || match_index as usize + match_length >= dict_limit as usize {
             let m = (i64::from(match_index) + match_length as i64 - base) as usize;
             match_length += zstd_count(src, ip + match_length, m, iend);
             (src, base)
@@ -391,7 +513,11 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
             }
             if ip + match_length == iend {
                 // Equal up to the end: no way to know if smaller or
-                // larger. Dropped, to keep the tree consistent.
+                // larger. Dropped, to keep the tree consistent; nor is an
+                // attached dictionary searched.
+                if DICT_MODE == ZSTD_DICT_MATCH_STATE {
+                    nb_compares = 0;
+                }
                 break;
             }
         }
@@ -432,6 +558,23 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
         }
     }
 
+    // The comparisons left, in the attached CDict's tree.
+    if DICT_MODE == ZSTD_DICT_MATCH_STATE
+        && nb_compares > 0
+        && let Some(dms) = dms
+    {
+        best_length = dubt_find_better_dict_match::<MLS>(
+            ms,
+            dms,
+            src,
+            ip,
+            iend,
+            &mut off_base,
+            best_length,
+            nb_compares,
+        );
+    }
+
     // Past the longest match: repetitive data is not inserted again.
     debug_assert!(match_end_idx > curr + 8);
     ms.next_to_update = match_end_idx - 8;
@@ -443,10 +586,11 @@ fn dubt_find_best_match<const MLS: u32, const EXT: bool>(
 /// libzstd's search functions: one copy serves the parser's three
 /// searches.
 #[inline(never)]
-fn bt_find_best_match<const MLS: u32, const EXT: bool>(
+fn bt_find_best_match<const MLS: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     i_limit: usize,
 ) -> (usize, u32) {
@@ -455,7 +599,7 @@ fn bt_find_best_match<const MLS: u32, const EXT: bool>(
         return (0, NO_OFFBASE);
     }
     update_dubt::<MLS>(ms, src, ip);
-    dubt_find_best_match::<MLS, EXT>(ms, src, dict, ip, i_limit)
+    dubt_find_best_match::<MLS, DICT_MODE>(ms, src, dict, dms, ip, i_limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,16 +1547,7 @@ fn search_max<const SEARCH: u8, const MLS: u32, const DICT_MODE: u8>(
 ) -> (usize, u32) {
     match SEARCH {
         SEARCH_HASH_CHAIN => hc_find_best_match::<MLS, DICT_MODE>(ms, src, dict, dms, ip, iend),
-        SEARCH_BINARY_TREE => {
-            // The binary tree's dictMatchState search is not ported yet:
-            // btlazy2 never comes here with a CDict attached.
-            debug_assert!(DICT_MODE == NO_DICT || DICT_MODE == EXT_DICT);
-            if DICT_MODE == EXT_DICT {
-                bt_find_best_match::<MLS, true>(ms, src, dict, ip, iend)
-            } else {
-                bt_find_best_match::<MLS, false>(ms, src, dict, ip, iend)
-            }
-        }
+        SEARCH_BINARY_TREE => bt_find_best_match::<MLS, DICT_MODE>(ms, src, dict, dms, ip, iend),
         // Rows of 16 entries up to a search log of 4, then 32, then 64.
         SEARCH_ROW_HASH => match ms.c_params.search_log.clamp(4, 6) {
             5 => row_find_best_match::<MLS, 5, DICT_MODE>(ms, src, dict, dms, ip, iend),
@@ -2167,4 +2302,21 @@ pub(crate) fn zstd_compress_block_btlazy2(
     iend: usize,
 ) -> usize {
     lazy::<SEARCH_BINARY_TREE, 2>(ms, seq_store, rep, src, dict, istart, iend)
+}
+
+/// `ZSTD_compressBlock_btlazy2_dictMatchState`: the parser of `lazy2` with
+/// the binary tree, the frame attached to a `CDict`, `dms`. The sequences
+/// of the block `src[istart..iend]` into `seq_store`. Returns the size of
+/// the literals left after the last sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zstd_compress_block_btlazy2_dict_match_state(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+) -> usize {
+    lazy_dict_match_state::<SEARCH_BINARY_TREE, 2>(ms, seq_store, rep, src, dms, istart, iend)
 }

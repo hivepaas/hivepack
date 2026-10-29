@@ -1,12 +1,15 @@
 //! The `btopt`, `btultra` and `btultra2` strategies: port of
-//! `compress/zstd_opt.c`, without a dictionary or long distance matching so
-//! far: the prices of literals and sequences from the statistics of the
-//! blocks before, the binary tree that finds every match at a position, and
-//! the optimal parser.
+//! `compress/zstd_opt.c`: the prices of literals and sequences from the
+//! statistics of the blocks before (or a dictionary's tables), the binary
+//! tree that finds every match at a position, and the optimal parser, with
+//! the matches of long distance matching among its candidates. With the
+//! window's older segment (`extDict`), or an attached `CDict`
+//! (`dictMatchState`).
 //!
 //! Positions are indices into `src`, the buffer the window's prefix is in,
 //! and `dict`, the one its older segment is in; the tables hold window
-//! indices, `position + window.base` (or `window.dict_base`).
+//! indices, `position + window.base` (or `window.dict_base`). An attached
+//! `CDict`'s tables hold its own window's indices, into its content.
 
 use crate::common::bits::highbit32;
 use crate::common::fse::{FseCState, fse_get_max_nb_bits};
@@ -17,10 +20,10 @@ use crate::common::zstd_internal::{
 use crate::compress::hist::hist_count_simple;
 use crate::compress::huf_compress::{HufRepeat, huf_get_nb_bits_from_ctable};
 use crate::compress::zstd_compress_internal::{
-    EntropyCTables, MatchState, OptMatch, OptPrice, OptState, Optimal, ParamSwitch, RawSeq,
-    RawSeqStore, SeqStore, Strategy, ZSTD_OPT_SIZE, mem_read32, offset_to_offbase, zstd_count,
-    zstd_count_2segments, zstd_hash_ptr, zstd_hash3_ptr, zstd_index_overlap_check, zstd_ll_code,
-    zstd_ml_code, zstd_new_rep,
+    DictMatchState, EntropyCTables, MatchState, OptMatch, OptPrice, OptState, Optimal, ParamSwitch,
+    RawSeq, RawSeqStore, SeqStore, Strategy, ZSTD_DICT_MATCH_STATE, ZSTD_EXT_DICT, ZSTD_NO_DICT,
+    ZSTD_OPT_SIZE, mem_read32, offset_to_offbase, zstd_count, zstd_count_2segments, zstd_hash_ptr,
+    zstd_hash3_ptr, zstd_index_overlap_check, zstd_ll_code, zstd_ml_code, zstd_new_rep,
 };
 
 /// `ZSTD_LITFREQ_ADD`: what a literal adds to its frequency, for the
@@ -655,14 +658,22 @@ pub(crate) fn zstd_update_tree(ms: &mut MatchState, src: &[u8], ip: usize, iend:
 /// tried), then with a shortest match of 3 bytes the last position with
 /// the same 3 bytes, then the tree's. Returns how many. A match of more
 /// than the target length, or up to `i_limit`, ends the search early.
+///
+/// With `DICT_MODE` [`ZSTD_EXT_DICT`], candidates and repcodes below the
+/// prefix are in `dict`. With [`ZSTD_DICT_MATCH_STATE`], the repcodes
+/// below the prefix are in the attached `CDict`'s content, `dms`, and the
+/// comparisons left after the frame's tree go on in the `CDict`'s, whose
+/// index `i` is the frame's `i + dms_index_delta`; its 3-byte hash table
+/// is empty.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[inline(always)]
-fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
+fn insert_bt_and_get_all_matches<const MLS: u32, const DICT_MODE: u8>(
     matches: &mut [OptMatch],
     ms: &mut MatchState,
     next_to_update3: &mut u32,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     i_limit: usize,
     rep: &[u32; ZSTD_REP_NUM],
@@ -694,6 +705,30 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
     let mut mnum = 0u32;
     let mut nb_compares = 1u32 << c_params.search_log;
 
+    // The attached CDict's window and tables: its indices are the frame's
+    // less dms_index_delta, from dms_low_limit to dms_high_limit; dms_end is
+    // where its content ends.
+    let dms = if DICT_MODE == ZSTD_DICT_MATCH_STATE {
+        dms
+    } else {
+        None
+    };
+    let (dms_content, dms_base, dms_end, dms_high_limit, dms_low_limit) = match dms {
+        Some(dms) => {
+            let window = &dms.ms.window;
+            (
+                dms.content,
+                window.base,
+                (window.next_src - window.base) as usize,
+                window.next_src as u32,
+                window.low_limit,
+            )
+        }
+        None => (&[][..], 0, 0, 0, 0),
+    };
+    let dms_index_delta = window_low.wrapping_sub(dms_high_limit);
+    debug_assert!(dms.is_none() || window_low == dict_limit);
+
     let mut best_length = (length_to_beat - 1) as usize;
 
     // The repcodes.
@@ -721,7 +756,7 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
                     rep_len =
                         zstd_count(src, at, at - rep_offset as usize, i_limit) as u32 + min_match;
                 }
-            } else if EXT {
+            } else if DICT_MODE == ZSTD_EXT_DICT {
                 // repIndex < dictLimit, or repIndex >= curr. curr >
                 // repIndex >= windowLow, and the 4 bytes in one segment:
                 // in the older one.
@@ -740,6 +775,31 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
                             rep_match + min_match as usize,
                             i_limit,
                             dict_end,
+                            prefix_start,
+                        ) as u32
+                            + min_match;
+                    }
+                }
+            } else if DICT_MODE == ZSTD_DICT_MATCH_STATE {
+                // In the CDict's content: curr > repIndex >= its lowest,
+                // and the 4 bytes in it. A match there goes on into the
+                // prefix.
+                if rep_offset.wrapping_sub(1)
+                    < curr.wrapping_sub(dms_low_limit.wrapping_add(dms_index_delta))
+                    && zstd_index_overlap_check(dict_limit, rep_index)
+                {
+                    let dms_index = rep_index.wrapping_sub(dms_index_delta);
+                    let rep_match = (i64::from(dms_index) - dms_base) as usize;
+                    if read_minmatch(src, ip, min_match)
+                        == read_minmatch(dms_content, rep_match, min_match)
+                    {
+                        rep_len = zstd_count_2segments(
+                            src,
+                            ip + min_match as usize,
+                            dms_content,
+                            rep_match + min_match as usize,
+                            i_limit,
+                            dms_end,
                             prefix_start,
                         ) as u32
                             + min_match;
@@ -768,7 +828,7 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
         let match_index3 = insert_and_find_first_index_hash3(ms, next_to_update3, src, ip);
         // Longer distances are likely too dear.
         if match_index3 >= match_low && curr.wrapping_sub(match_index3) < (1 << 18) {
-            let mlen = if !EXT || match_index3 >= dict_limit {
+            let mlen = if DICT_MODE != ZSTD_EXT_DICT || match_index3 >= dict_limit {
                 let m = (i64::from(match_index3) - base) as usize;
                 zstd_count(src, ip, m, i_limit)
             } else {
@@ -794,6 +854,7 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
                 }
             }
         }
+        // No search of an attached CDict: its 3-byte hash table is empty.
     }
 
     ms.hash_table[h] = curr;
@@ -807,7 +868,9 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
 
         // The candidate's segment, and the index of its first byte, for
         // the byte after the common run.
-        let (mbuf, mbase) = if !EXT || match_index as usize + match_length >= dict_limit as usize {
+        let (mbuf, mbase) = if DICT_MODE != ZSTD_EXT_DICT
+            || match_index as usize + match_length >= dict_limit as usize
+        {
             let m = (i64::from(match_index) + match_length as i64 - base) as usize;
             match_length += zstd_count(src, ip + match_length, m, i_limit);
             (src, base)
@@ -845,7 +908,10 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
             if match_length > ZSTD_OPT_NUM || ip + match_length == i_limit {
                 // Equal up to the end: no way to know if smaller or larger.
                 // Dropped, to keep the tree consistent (a bit less
-                // compression).
+                // compression); nor is an attached CDict searched.
+                if DICT_MODE == ZSTD_DICT_MATCH_STATE {
+                    nb_compares = 0;
+                }
                 break;
             }
         }
@@ -885,6 +951,85 @@ fn insert_bt_and_get_all_matches<const MLS: u32, const EXT: bool>(
         }
     }
 
+    // The comparisons left, in the attached CDict's tree: sorted, read
+    // only.
+    if let Some(dms) = dms
+        && nb_compares > 0
+    {
+        let dms_c_params = dms.ms.c_params;
+        let dms_bt_mask = (1u32 << (dms_c_params.chain_log - 1)) - 1;
+        let dms_bt_low = if dms_bt_mask < dms_high_limit - dms_low_limit {
+            dms_high_limit - dms_bt_mask
+        } else {
+            dms_low_limit
+        };
+        let dms_h = zstd_hash_ptr(src, ip, dms_c_params.hash_log, MLS);
+        let mut dict_match_index = dms.ms.hash_table[dms_h];
+        let dms_bt = &dms.ms.chain_table;
+        common_length_smaller = 0;
+        common_length_larger = 0;
+        while nb_compares > 0 && dict_match_index > dms_low_limit {
+            let next_ptr = 2 * (dict_match_index & dms_bt_mask) as usize;
+            // The bytes it has in common with `ip` at least.
+            let mut match_length = common_length_smaller.min(common_length_larger);
+            let m = (i64::from(dict_match_index) - dms_base) as usize;
+            // Past the content's end, on into the prefix.
+            match_length += zstd_count_2segments(
+                src,
+                ip + match_length,
+                dms_content,
+                m + match_length,
+                i_limit,
+                dms_end,
+                prefix_start,
+            );
+
+            if match_length > best_length {
+                let match_index = dict_match_index.wrapping_add(dms_index_delta);
+                if match_length > (match_end_idx - match_index) as usize {
+                    match_end_idx = match_index + match_length as u32;
+                }
+                best_length = match_length;
+                matches[mnum as usize] = OptMatch {
+                    off: offset_to_offbase(curr - match_index),
+                    len: match_length as u32,
+                };
+                mnum += 1;
+                if match_length > ZSTD_OPT_NUM || ip + match_length == i_limit {
+                    // Equal up to the end: no way to know if smaller or
+                    // larger. Dropped.
+                    break;
+                }
+            }
+
+            if dict_match_index <= dms_bt_low {
+                // Beyond the tree's size: stop.
+                break;
+            }
+            // The byte after the common run: in the prefix, when the run
+            // went past the content.
+            let match_byte = if dict_match_index as usize + match_length >= dms_high_limit as usize
+            {
+                let at =
+                    i64::from(dict_match_index.wrapping_add(dms_index_delta)) + match_length as i64;
+                src[(at - base) as usize]
+            } else {
+                dms_content[m + match_length]
+            };
+            if match_byte < src[ip + match_length] {
+                // Every smaller one has at least this in common.
+                common_length_smaller = match_length;
+                // The next one is larger than the candidate.
+                dict_match_index = dms_bt[next_ptr + 1];
+            } else {
+                // The candidate is larger than `ip`.
+                common_length_larger = match_length;
+                dict_match_index = dms_bt[next_ptr];
+            }
+            nb_compares -= 1;
+        }
+    }
+
     // Past the longest match: repetitions are not inserted again.
     debug_assert!(match_end_idx > curr + 8);
     ms.next_to_update = match_end_idx - 8;
@@ -898,6 +1043,7 @@ type GetAllMatchesFn = fn(
     &mut u32,
     &[u8],
     &[u8],
+    Option<DictMatchState<'_>>,
     usize,
     usize,
     &[u32; ZSTD_REP_NUM],
@@ -909,12 +1055,13 @@ type GetAllMatchesFn = fn(
 /// [`insert_bt_and_get_all_matches`] at `ip`. Nothing for a position a
 /// long match skipped.
 #[allow(clippy::too_many_arguments)]
-fn bt_get_all_matches<const MLS: u32, const EXT: bool>(
+fn bt_get_all_matches<const MLS: u32, const DICT_MODE: u8>(
     matches: &mut [OptMatch],
     ms: &mut MatchState,
     next_to_update3: &mut u32,
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; ZSTD_REP_NUM],
@@ -926,13 +1073,19 @@ fn bt_get_all_matches<const MLS: u32, const EXT: bool>(
         // A skipped area.
         return 0;
     }
-    update_tree_internal::<MLS, EXT>(ms, src, dict, ip, i_high_limit);
-    insert_bt_and_get_all_matches::<MLS, EXT>(
+    // The tree holds no position of an attached CDict: as without one.
+    if DICT_MODE == ZSTD_EXT_DICT {
+        update_tree_internal::<MLS, true>(ms, src, dict, ip, i_high_limit);
+    } else {
+        update_tree_internal::<MLS, false>(ms, src, dict, ip, i_high_limit);
+    }
+    insert_bt_and_get_all_matches::<MLS, DICT_MODE>(
         matches,
         ms,
         next_to_update3,
         src,
         dict,
+        dms,
         ip,
         i_high_limit,
         rep,
@@ -943,12 +1096,12 @@ fn bt_get_all_matches<const MLS: u32, const EXT: bool>(
 
 /// `ZSTD_selectBtGetAllMatches`: the search for the shortest match, 3 to
 /// 6 bytes (libzstd takes 7 as 6 here).
-fn select_bt_get_all_matches<const EXT: bool>(min_match: u32) -> GetAllMatchesFn {
+fn select_bt_get_all_matches<const DICT_MODE: u8>(min_match: u32) -> GetAllMatchesFn {
     match min_match.clamp(3, 6) {
-        3 => bt_get_all_matches::<3, EXT>,
-        4 => bt_get_all_matches::<4, EXT>,
-        5 => bt_get_all_matches::<5, EXT>,
-        _ => bt_get_all_matches::<6, EXT>,
+        3 => bt_get_all_matches::<3, DICT_MODE>,
+        4 => bt_get_all_matches::<4, DICT_MODE>,
+        5 => bt_get_all_matches::<5, DICT_MODE>,
+        _ => bt_get_all_matches::<6, DICT_MODE>,
     }
 }
 
@@ -1136,9 +1289,10 @@ impl<'a> OptLdm<'a> {
 
 /// `ZSTD_compressBlock_opt_generic`: the sequences of the block
 /// `src[istart..iend]` into `seq_store`, at `OPT_LEVEL` 0 (`btopt`) or 2
-/// (`btultra`, `btultra2`). With `EXT`, matches may be in the window's
-/// older segment, `dict`. Returns the size of the literals left after the
-/// last sequence.
+/// (`btultra`, `btultra2`). With `DICT_MODE` [`ZSTD_EXT_DICT`], matches may
+/// be in the window's older segment, `dict`; with
+/// [`ZSTD_DICT_MATCH_STATE`], in the attached `CDict`, `dms`. Returns the
+/// size of the literals left after the last sequence.
 ///
 /// From a match found, the parser looks ahead for the cheapest way to each
 /// position up to the end of the longest matches found on the way: as a
@@ -1149,13 +1303,14 @@ impl<'a> OptLdm<'a> {
 /// The matches of long distance matching, `ldm` (`ms->ldmSeqStore`), are
 /// among the candidates of each position.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn compress_block_opt_generic<const OPT_LEVEL: u32, const EXT: bool>(
+fn compress_block_opt_generic<const OPT_LEVEL: u32, const DICT_MODE: u8>(
     ms: &mut MatchState,
     opt_state: &mut OptState,
     seq_store: &mut SeqStore,
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
     dict: &[u8],
+    dms: Option<DictMatchState<'_>>,
     istart: usize,
     iend: usize,
     symbol_costs: &EntropyCTables,
@@ -1170,7 +1325,7 @@ fn compress_block_opt_generic<const OPT_LEVEL: u32, const EXT: bool>(
     let prefix_start = (i64::from(ms.window.dict_limit) - base) as usize;
     let c_params = ms.c_params;
 
-    let get_all_matches = select_bt_get_all_matches::<EXT>(c_params.min_match);
+    let get_all_matches = select_bt_get_all_matches::<DICT_MODE>(c_params.min_match);
 
     let sufficient_len = c_params.target_length.min(ZSTD_OPT_NUM as u32 - 1);
     let min_match = if c_params.min_match == 3 { 3 } else { 4 };
@@ -1189,6 +1344,7 @@ fn compress_block_opt_generic<const OPT_LEVEL: u32, const EXT: bool>(
     // Init.
     debug_assert!(OPT_LEVEL <= 2);
     rescale_freqs::<OPT_LEVEL>(opt_state, &src[istart..iend], symbol_costs);
+    // The frame's first position, even with a CDict attached.
     ip += usize::from(ip == prefix_start);
 
     // The match loop.
@@ -1207,6 +1363,7 @@ fn compress_block_opt_generic<const OPT_LEVEL: u32, const EXT: bool>(
                     &mut next_to_update3,
                     src,
                     dict,
+                    dms,
                     ip,
                     iend,
                     rep,
@@ -1384,6 +1541,7 @@ fn compress_block_opt_generic<const OPT_LEVEL: u32, const EXT: bool>(
                             &mut next_to_update3,
                             src,
                             dict,
+                            dms,
                             inr,
                             iend,
                             &cur_rep,
@@ -1593,13 +1751,14 @@ fn init_stats_ultra(
     debug_assert!(ms.window.dict_limit.wrapping_sub(ms.next_to_update) <= 1);
 
     // The statistics into the state.
-    compress_block_opt_generic::<2, false>(
+    compress_block_opt_generic::<2, ZSTD_NO_DICT>(
         ms,
         opt_state,
         seq_store,
         &mut tmp_rep,
         src,
         &[],
+        None,
         istart,
         iend,
         symbol_costs,
@@ -1643,103 +1802,173 @@ pub(crate) fn zstd_compress_block_opt(
     literal_compression_mode: ParamSwitch,
     ldm: Option<&RawSeqStore>,
 ) -> usize {
-    // The context reserves the state for these strategies.
-    let mut opt_state = ms.opt.take().unwrap_or_else(|| Box::new(OptState::new()));
-    opt_state.literal_compression_mode = literal_compression_mode;
-    let opt = &mut *opt_state;
-    let last_ll_size = match (strategy, dict) {
-        (Strategy::Btopt, None) => compress_block_opt_generic::<0, false>(
-            ms,
-            opt,
-            seq_store,
-            rep,
-            src,
-            &[],
-            istart,
-            iend,
-            symbol_costs,
-            ldm,
-        ),
-        (Strategy::Btopt, Some(dict)) => compress_block_opt_generic::<0, true>(
-            ms,
-            opt,
-            seq_store,
-            rep,
-            src,
-            dict,
-            istart,
-            iend,
-            symbol_costs,
-            ldm,
-        ),
-        (Strategy::Btultra2, None) => {
-            // ZSTD_compressBlock_btultra2: two passes over the first block,
-            // the first to gather statistics for the second. Only with
-            // nothing in the tables before (no dictionary, no prefix, no
-            // long distance matching). About 0.5% smaller for the first
-            // block, at twice the time.
-            let curr = ms.window.index(istart);
-            debug_assert!(iend - istart <= ZSTD_BLOCKSIZE_MAX);
-            if opt.lit_length_sum == 0
-                // No long distance matching.
-                && seq_store.sequences.is_empty()
-                // No dictionary.
-                && ms.window.dict_limit == ms.window.low_limit
-                // The frame's start, nothing loaded or skipped.
-                && curr == ms.window.dict_limit
-                // Large enough for statistics.
-                && iend - istart > ZSTD_PREDEF_THRESHOLD
-            {
-                init_stats_ultra(
-                    ms,
-                    opt,
-                    seq_store,
-                    rep,
-                    src,
-                    istart,
-                    iend,
-                    symbol_costs,
-                    ldm,
-                );
-            }
-            compress_block_opt_generic::<2, false>(
+    with_opt_state(ms, literal_compression_mode, |ms, opt| {
+        match (strategy, dict) {
+            (Strategy::Btopt, None) => compress_block_opt_generic::<0, ZSTD_NO_DICT>(
                 ms,
                 opt,
                 seq_store,
                 rep,
                 src,
                 &[],
+                None,
+                istart,
+                iend,
+                symbol_costs,
+                ldm,
+            ),
+            (Strategy::Btopt, Some(dict)) => compress_block_opt_generic::<0, ZSTD_EXT_DICT>(
+                ms,
+                opt,
+                seq_store,
+                rep,
+                src,
+                dict,
+                None,
+                istart,
+                iend,
+                symbol_costs,
+                ldm,
+            ),
+            (Strategy::Btultra2, None) => {
+                // ZSTD_compressBlock_btultra2: two passes over the first
+                // block, the first to gather statistics for the second.
+                // Only with nothing in the tables before (no dictionary, no
+                // prefix, no long distance matching). About 0.5% smaller
+                // for the first block, at twice the time.
+                let curr = ms.window.index(istart);
+                debug_assert!(iend - istart <= ZSTD_BLOCKSIZE_MAX);
+                if opt.lit_length_sum == 0
+                    // No long distance matching.
+                    && seq_store.sequences.is_empty()
+                    // No dictionary.
+                    && ms.window.dict_limit == ms.window.low_limit
+                    // The frame's start, nothing loaded or skipped.
+                    && curr == ms.window.dict_limit
+                    // Large enough for statistics.
+                    && iend - istart > ZSTD_PREDEF_THRESHOLD
+                {
+                    init_stats_ultra(
+                        ms,
+                        opt,
+                        seq_store,
+                        rep,
+                        src,
+                        istart,
+                        iend,
+                        symbol_costs,
+                        ldm,
+                    );
+                }
+                compress_block_opt_generic::<2, ZSTD_NO_DICT>(
+                    ms,
+                    opt,
+                    seq_store,
+                    rep,
+                    src,
+                    &[],
+                    None,
+                    istart,
+                    iend,
+                    symbol_costs,
+                    ldm,
+                )
+            }
+            (_, None) => compress_block_opt_generic::<2, ZSTD_NO_DICT>(
+                ms,
+                opt,
+                seq_store,
+                rep,
+                src,
+                &[],
+                None,
+                istart,
+                iend,
+                symbol_costs,
+                ldm,
+            ),
+            (_, Some(dict)) => compress_block_opt_generic::<2, ZSTD_EXT_DICT>(
+                ms,
+                opt,
+                seq_store,
+                rep,
+                src,
+                dict,
+                None,
+                istart,
+                iend,
+                symbol_costs,
+                ldm,
+            ),
+        }
+    })
+}
+
+/// `ZSTD_compressBlock_btopt_dictMatchState` and
+/// `ZSTD_compressBlock_btultra_dictMatchState`, which `btultra2` takes too
+/// (libzstd has no `btultra2` of its own for a dictionary: its first pass
+/// is for frames with nothing before them). The frame is attached to a
+/// `CDict`, `dms`. Otherwise as [`zstd_compress_block_opt`], `ldm` among
+/// the candidates as without a dictionary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zstd_compress_block_opt_dict_match_state(
+    strategy: Strategy,
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    dms: DictMatchState<'_>,
+    istart: usize,
+    iend: usize,
+    symbol_costs: &EntropyCTables,
+    literal_compression_mode: ParamSwitch,
+    ldm: Option<&RawSeqStore>,
+) -> usize {
+    with_opt_state(ms, literal_compression_mode, |ms, opt| {
+        if strategy == Strategy::Btopt {
+            compress_block_opt_generic::<0, ZSTD_DICT_MATCH_STATE>(
+                ms,
+                opt,
+                seq_store,
+                rep,
+                src,
+                &[],
+                Some(dms),
+                istart,
+                iend,
+                symbol_costs,
+                ldm,
+            )
+        } else {
+            compress_block_opt_generic::<2, ZSTD_DICT_MATCH_STATE>(
+                ms,
+                opt,
+                seq_store,
+                rep,
+                src,
+                &[],
+                Some(dms),
                 istart,
                 iend,
                 symbol_costs,
                 ldm,
             )
         }
-        (_, None) => compress_block_opt_generic::<2, false>(
-            ms,
-            opt,
-            seq_store,
-            rep,
-            src,
-            &[],
-            istart,
-            iend,
-            symbol_costs,
-            ldm,
-        ),
-        (_, Some(dict)) => compress_block_opt_generic::<2, true>(
-            ms,
-            opt,
-            seq_store,
-            rep,
-            src,
-            dict,
-            istart,
-            iend,
-            symbol_costs,
-            ldm,
-        ),
-    };
+    })
+}
+
+/// `f` with the optimal parser's state, taken out of `ms` while it runs
+/// (see [`MatchState::opt`]), for a block whose literals are compressed as
+/// `literal_compression_mode` says.
+fn with_opt_state(
+    ms: &mut MatchState,
+    literal_compression_mode: ParamSwitch,
+    f: impl FnOnce(&mut MatchState, &mut OptState) -> usize,
+) -> usize {
+    // The context reserves the state for these strategies.
+    let mut opt_state = ms.opt.take().unwrap_or_else(|| Box::new(OptState::new()));
+    opt_state.literal_compression_mode = literal_compression_mode;
+    let last_ll_size = f(ms, &mut opt_state);
     ms.opt = Some(opt_state);
     last_ll_size
 }

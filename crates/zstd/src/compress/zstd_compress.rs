@@ -50,14 +50,17 @@ use crate::compress::zstd_fast::{
     zstd_compress_block_fast_ext_dict,
 };
 use crate::compress::zstd_lazy::{
-    ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_dict_match_state,
+    ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2,
+    zstd_compress_block_btlazy2_dict_match_state, zstd_compress_block_lazy_dict_match_state,
     zstd_compress_block_lazy_hc, zstd_compress_block_lazy_row,
 };
 use crate::compress::zstd_ldm::{
     ZSTD_LDM_BUCKETSIZELOG_MAX, ZSTD_LDM_DEFAULT_WINDOW_LOG, zstd_ldm_adjust_parameters,
     zstd_ldm_block_compress, zstd_ldm_generate_sequences, zstd_ldm_get_max_nb_seq,
 };
-use crate::compress::zstd_opt::zstd_compress_block_opt;
+use crate::compress::zstd_opt::{
+    zstd_compress_block_opt, zstd_compress_block_opt_dict_match_state,
+};
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
@@ -1198,8 +1201,8 @@ pub(crate) fn zstd_dict_match_state_ported(params: &CCtxParams, dedicated: bool)
         // Greedy, lazy and lazy2: the hash chain, the row match finder,
         // and the dedicated dictionary search.
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => true,
-        // Phase 1: btlazy2 and the optimal parser.
-        Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => false,
+        // btlazy2 and the optimal parser.
+        Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => true,
     }
 }
 
@@ -2004,9 +2007,6 @@ impl BlockCompressor<'_> {
         dms: DictMatchState<'_>,
         ldm: Option<&RawSeqStore>,
     ) -> Result<usize> {
-        // Only the optimal parser takes the matches of long distance
-        // matching as candidates.
-        let _ = ldm;
         let src = self.src;
         match self.strategy {
             Strategy::Fast => Ok(zstd_compress_block_fast_dict_match_state(
@@ -2025,11 +2025,30 @@ impl BlockCompressor<'_> {
                     depth, row, ms, seq_store, rep, src, dms, istart, iend,
                 ))
             }
-            // Phase 1: ZSTD_compressBlock_btlazy2_dictMatchState and
+            // ZSTD_compressBlock_btlazy2_dictMatchState; long distance
+            // matching calls it between its matches.
+            Strategy::Btlazy2 => {
+                debug_assert!(ldm.is_none());
+                Ok(zstd_compress_block_btlazy2_dict_match_state(
+                    ms, seq_store, rep, src, dms, istart, iend,
+                ))
+            }
             // ZSTD_compressBlock_{btopt,btultra}_dictMatchState (btultra2
             // takes btultra's), with `ldm`.
-            Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
-                error!(ParameterUnsupported)
+            Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+                Ok(zstd_compress_block_opt_dict_match_state(
+                    self.strategy,
+                    ms,
+                    seq_store,
+                    rep,
+                    self.src,
+                    dms,
+                    istart,
+                    iend,
+                    self.symbol_costs,
+                    self.literal_compression_mode,
+                    ldm,
+                ))
             }
         }
     }

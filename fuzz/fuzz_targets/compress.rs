@@ -11,7 +11,7 @@
 
 #![no_main]
 
-use hivepack_zstd::{CCtx, CDict, CParameter as P, DCtx, ErrorCode, ParamSwitch};
+use hivepack_zstd::{CCtx, CDict, CParameter as P, DCtx, ParamSwitch};
 use libfuzzer_sys::fuzz_target;
 use zstd::zstd_safe::{self, CParameter as C};
 
@@ -56,13 +56,6 @@ fn with_dictionary(pick: u8, level: i32, src: &[u8]) {
             return;
         };
         let got = p.compress_using_cdict(&mut p_out, src, p_cdict);
-        if got
-            .as_ref()
-            .is_err_and(|error| error.code() == ErrorCode::ParameterUnsupported)
-        {
-            // libzstd attaches the CDict, which the port does not do yet.
-            return;
-        }
         (
             c.compress_using_cdict(&mut c_out[..], src, c_cdict)
                 .map(|n| &c_out[..n]),

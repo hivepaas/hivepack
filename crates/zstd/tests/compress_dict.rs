@@ -393,7 +393,8 @@ fn one_call_with_dictionaries_compresses_as_libzstd() {
     assert!(counts.direct > 150, "{counts:?}");
     assert!(counts.copied > 50, "{counts:?}");
     assert!(counts.reloaded > 15, "{counts:?}");
-    assert!(counts.refused > 10, "{counts:?}");
+    // The port attaches every CDict libzstd attaches.
+    assert_eq!(counts.refused, 0, "{counts:?}");
     problems.check();
 }
 
@@ -647,7 +648,8 @@ fn compress2_with_dictionaries_compresses_as_libzstd() {
     assert!(counts.prefix > 50, "{counts:?}");
     assert!(counts.copied > 100, "{counts:?}");
     assert!(counts.reloaded > 50, "{counts:?}");
-    assert!(counts.refused > 10, "{counts:?}");
+    // The port attaches every CDict libzstd attaches.
+    assert_eq!(counts.refused, 0, "{counts:?}");
     problems.check();
 }
 

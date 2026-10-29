@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use hivepack_zstd::{
-    CCtx, CDict, CParameter as P, DCtx, DictAttachPref, EndDirective, ErrorCode, ParamSwitch,
+    CCtx, CDict, CParameter as P, DCtx, DictAttachPref, EndDirective, ParamSwitch,
     Strategy,
 };
 use libfuzzer_sys::fuzz_target;
@@ -269,14 +269,6 @@ fuzz_target!(|input: &[u8]| {
             let result = p.compress_stream2(&mut output, &mut input, directive);
             (result, input.pos, output.pos)
         };
-        if call == 0
-            && got
-                .as_ref()
-                .is_err_and(|error| error.code() == ErrorCode::ParameterUnsupported)
-        {
-            // libzstd attaches the CDict, which the port does not do yet.
-            return;
-        }
         let got = got.map_err(|error| error.code().message().to_string());
         assert!(
             (&want, ci, co) == (&got, pi, po),

@@ -263,8 +263,7 @@ enum Ended {
     Frame(Vec<u8>),
     /// Both failed the same way.
     Failed,
-    /// The port refused the frame as it started, where libzstd attaches a
-    /// `CDict` (the `dictMatchState` block compressors, not ported yet).
+    /// The port refused the frame as it started: none should be.
     Refused,
 }
 
@@ -714,7 +713,8 @@ fn streaming_with_dictionaries_compresses_as_libzstd_does() {
     }
     println!("{frames} frames compared, {refused} refused");
     assert!(frames > 150, "too few frames compared: {frames}");
-    assert!(refused > 5, "only {refused} frames refused");
+    // The port attaches every CDict libzstd attaches.
+    assert_eq!(refused, 0, "{refused} frames refused");
     problems.check();
 }
 

@@ -53,6 +53,7 @@ Each set has a `kind`:
 | `nettle-oracle` | `tools/nettle-oracle`, built with nettle 3.10.2's AES, SHA-1, HMAC and PBKDF2 sources: for comparing hivepack-crypto with them | MIT, and nettle's licenses | generated |
 | `libzip-1.12.1-source` | the libzip 1.12.1 release, to build the next set from, and its `regress/` archives | BSD-3-Clause | fetched, `generated` |
 | `fifield-zipbombs` | David Fifield's zip bombs from "A better zip bomb" (WOOT 2019): `zbsm.zip` (42 kB to 5.5 GB), `zblg.zip` (10 MB to 281 TB) and `zbxl.zip` (46 MB to 4.5 PB, Zip64), whose entries share one stream | public domain | fetched, `core` |
+| `unicode-18.0.0` | the Unicode Character Database 18.0.0: `UnicodeData.txt` and `CaseFolding.txt`, which `scripts/unicode.py` makes hivepack-extract's tables from, and `NormalizationTest.txt`, which its tests check them with | Unicode-3.0 | fetched, `core` |
 | `zip-oracle` | `tools/zip-oracle`, built with the libzip 1.12.1, zlib 1.3.2 and nettle 3.10.2 sources, and its crypto backend for GnuTLS on nettle: libzip's API, for comparing hivepack-zip with it | MIT, BSD-3-Clause, Zlib, and nettle's licenses | generated |
 
 zstd's `tests/gzip` is GPLv3, and nothing is taken from it.

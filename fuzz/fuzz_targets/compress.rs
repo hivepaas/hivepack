@@ -5,9 +5,8 @@
 //! (`ZSTD_c_splitAfterSequences`), through `compress2`. With another, a
 //! dictionary from the start of the input, raw content or behind the
 //! dictionary magic number (a zstd dictionary to read, if it can be), in
-//! `ZSTD_compress_usingDict`, or as a `CDict` in `ZSTD_compress_usingCDict`
-//! (but where libzstd attaches it, which the port does not do yet). A
-//! panic or a difference is a bug.
+//! `ZSTD_compress_usingDict`, or as a `CDict` in `ZSTD_compress_usingCDict`.
+//! A panic or a difference is a bug.
 
 #![no_main]
 

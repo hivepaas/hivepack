@@ -3,9 +3,8 @@
 //! room for output, all picked by its first 8 bytes, and checks that every
 //! call returns the same, moves as far and writes the same, and that the
 //! port decodes the frame back. A third of the time with a dictionary
-//! from the start of the input, loaded, a prefix or a `CDict` (but frames
-//! that attach a `CDict`, which the port does not do yet). A panic or a
-//! difference is a bug.
+//! from the start of the input, loaded, a prefix or a `CDict`, attached,
+//! copied in or loaded again. A panic or a difference is a bug.
 
 #![no_main]
 
@@ -138,8 +137,8 @@ fuzz_target!(|input: &[u8]| {
     // A dictionary, a third of the time: the start of the input, copied
     // apart (libzstd takes a dictionary that ends where the input starts
     // in memory as part of the input's segment), behind the dictionary
-    // magic number sometimes; loaded, a prefix, or a CDict. Mostly copied in
-    // or loaded again: the port does not attach CDicts yet.
+    // magic number sometimes; loaded, a prefix, or a CDict, attached as
+    // libzstd decides or forced to attach, copy or load.
     let dict_pick = rng.next();
     let mut dict = Vec::new();
     let mut src = src;
@@ -152,11 +151,15 @@ fuzz_target!(|input: &[u8]| {
         dict.extend_from_slice(&src[..dict_len]);
         src = &src[dict_len..];
         let (pp, cp) = match dict_pick >> 40 & 7 {
-            0 => (
+            0..=2 => (
                 DictAttachPref::DefaultAttach,
                 zstd_safe::DictAttachPref::DefaultAttach,
             ),
-            1..=4 => (
+            3 => (
+                DictAttachPref::ForceAttach,
+                zstd_safe::DictAttachPref::ForceAttach,
+            ),
+            4..=5 => (
                 DictAttachPref::ForceCopy,
                 zstd_safe::DictAttachPref::ForceCopy,
             ),

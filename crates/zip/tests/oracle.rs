@@ -914,6 +914,12 @@ fn check_written(expected: &ArchiveState, written: &[u8]) {
         // which the header may have wrong.
         if reencrypted {
             both &= stat::ENCRYPTION_METHOD;
+            // An entry whose flags have the strong encryption bit keeps it
+            // when encrypted, as in libzip, and reads back as encrypted
+            // with an unknown method.
+            if a.encryption_method == hivepack_zip::em::UNKNOWN {
+                both = 0;
+            }
         }
         for (field, x, y) in [
             (stat::SIZE, a.size, b.size),

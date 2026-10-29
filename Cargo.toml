@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/crypto", "crates/deflate", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/crypto", "crates/deflate", "crates/extract", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -13,6 +13,7 @@ homepage = "https://github.com/hivepaas/hivepack-rs"
 [workspace.dependencies]
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
+hivepack-extract = { path = "crates/extract" }
 hivepack-zip = { path = "crates/zip" }
 hivepack-zstd = { path = "crates/zstd" }
 # The official libraries, used only as the reference in tests and
@@ -27,6 +28,12 @@ zstd = { version = "0.14.3", default-features = false, features = ["zdict_builde
 # interface to it.
 libz-sys = { version = "=1.1.31", features = ["static"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
+# Directories opened by handle, where nothing resolves outside them or
+# through a symbolic link: hivepack-extract's way to write, until the
+# standard library's directory handles (`std::fs::Dir`) are stable. The one
+# dependency with `unsafe` code in a library; see docs/safety.md.
+cap-std = { version = "4.0.3", default-features = false }
+cap-fs-ext = { version = "4.0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

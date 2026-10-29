@@ -5,6 +5,9 @@
 allow = [
   "MIT",
   "Apache-2.0",
+  # Apache-2.0 with an exception that only grants more: winx, which cap-std
+  # takes on Windows, has no other license.
+  "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",

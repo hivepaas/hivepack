@@ -1,5 +1,4 @@
-//! Traditional PKWARE encryption, ZipCrypto: port of `zip_pkware.c`,
-//! decrypting for now.
+//! Traditional PKWARE encryption, ZipCrypto: port of `zip_pkware.c`.
 
 use hivepack_deflate::crc32;
 
@@ -32,6 +31,24 @@ impl PkwareKeys {
     /// `_zip_pkware_keys_reset`.
     pub(crate) fn reset(&mut self) {
         self.key = [PKWARE_KEY0, PKWARE_KEY1, PKWARE_KEY2];
+    }
+
+    /// `_zip_pkware_encrypt`, in place.
+    pub(crate) fn encrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            let b = *byte;
+            let tmp = self.crypt_byte();
+            self.update_keys(b);
+            *byte = b ^ tmp;
+        }
+    }
+
+    /// `_zip_pkware_encrypt` with no output: the keys take in `data`.
+    pub(crate) fn encrypt_keys(&mut self, data: &[u8]) {
+        // during initialization, we're only interested in key updates
+        for &b in data {
+            self.update_keys(b);
+        }
     }
 
     /// `_zip_pkware_decrypt`, in place.

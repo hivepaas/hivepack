@@ -14,7 +14,7 @@ hivepack-deflate with zlib. They need nightly, where
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
 | `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |
 | `zip_open` | Opening the input as a ZIP archive, leniently and with `ZIP_CHECKCONS`, asking the reading API about every entry, and reading every entry's data, decompressed, raw, and decrypted with the password "foo": no panic (`crates/zip/tests/oracle.rs` compares the answers with libzip) |
-| `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
+| `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick (encrypting among them) and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data, read with the passwords the edits set (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
 
 Seed the corpus with the frames in `testdata`, then run, with the
@@ -37,7 +37,8 @@ cargo fuzz run inflate9 -- -max_total_time=3600
 
 CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and
 those libzip encrypted in `testdata/oracle/zip-decrypt.txt` (some with
-"foo"), and `zip_edit` with the first behind two edits.
+"foo"), and `zip_edit` with the same archives behind two edits (encrypting, for
+the encrypted ones).
 
 `cargo fuzz` builds with AddressSanitizer, so with the feature an access out
 of bounds in its unchecked copies stops the run as a crash, as a difference

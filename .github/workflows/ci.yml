@@ -249,5 +249,9 @@ jobs:
               # Two edits: delete entry i, rename entry 7i.
               edits = bytes([2, 0, i % 256, 1, 7 * i % 256])
               pathlib.Path(f"fuzz/corpus/zip_edit/r{i}").write_bytes(edits + path.read_bytes())
+          for i, path in enumerate(sorted(pathlib.Path("fuzz/corpus/zip_open").glob("d*"))):
+              # Two edits: encrypt entry i, set the default password.
+              edits = bytes([2, 14 + 17 * (i % 4), i % 256, 15, 0])
+              pathlib.Path(f"fuzz/corpus/zip_edit/d{i}").write_bytes(edits + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_edit -- -max_total_time=90

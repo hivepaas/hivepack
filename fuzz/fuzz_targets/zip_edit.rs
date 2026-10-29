@@ -1,20 +1,23 @@
 //! Opens the input as a ZIP archive with hivepack-zip, makes the edits its
 //! first bytes choose (the count, then a kind and an index for each),
-//! adding and replacing data and changing methods among them, and writes
+//! adding and replacing data, changing methods and encrypting among them,
+//! and writes
 //! it with `close_to`, or `close_to_cloning` if the first byte's top bit is
 //! set. The archive `close_to` writes must open, with the entries that are
 //! not deleted, in order, as edited: their names, comments, attributes,
-//! times, sizes and data. A panic is a bug.
+//! times, sizes and data, read with the passwords the edits set. A panic
+//! is a bug.
 //! `crates/zip/tests/oracle.rs` compares the edits and what is written
 //! with libzip through the oracle.
 
 #![no_main]
 
 use std::io::{Cursor, Read};
+use std::sync::{Arc, Mutex};
 
 use hivepack_zip::{
     Archive, ArchiveFlags, BufferSource, Closed, EXTRA_FIELD_ALL, EXTRA_FIELD_NEW, ErrorCode,
-    Flags, OpenFlags, ReadAt, Stat, cm, stat,
+    Flags, OpenFlags, ReadAt, Stat, cm, em, stat,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -34,8 +37,26 @@ fn entry_data<R: ReadAt>(za: &Archive<R>, i: u64) -> Option<Vec<u8>> {
     Some(data)
 }
 
+/// The passwords the edits encrypt with.
+const PASSWORDS: [&[u8]; 3] = [b"foo", b"bar", b""];
+
+/// Whether entry `i` reads as `data`, without a password or with one of
+/// the edits'.
+fn reads_as<R: ReadAt>(za: &Archive<R>, i: u64, data: &[u8]) -> bool {
+    std::iter::once(None)
+        .chain(PASSWORDS.iter().map(|p| Some(*p)))
+        .any(|password| {
+            let Ok(mut zf) = za.fopen_index_encrypted(i, Flags::NONE, password) else {
+                return false;
+            };
+            let mut read = Vec::new();
+            zf.read_to_end(&mut read).is_ok() && read == data
+        })
+}
+
 /// What the API says of an entry before the archive is written.
 struct EntryState {
+    index: u64,
     name: Vec<u8>,
     comment: Vec<u8>,
     attributes: (u8, u32),
@@ -52,6 +73,7 @@ fn archive_state<R: ReadAt>(za: &Archive<R>) -> (Vec<EntryState>, Vec<u8>) {
     let entries = (0..za.get_num_entries(Flags::NONE))
         .filter_map(|i| {
             Some(EntryState {
+                index: i,
                 name: za.get_name(i, Flags::ENC_RAW).ok()?.to_vec(),
                 comment: za.file_get_comment(i, Flags::ENC_RAW).ok()?.to_vec(),
                 attributes: za.file_get_external_attributes(i, Flags::NONE).ok()?,
@@ -76,7 +98,12 @@ fn archive_state<R: ReadAt>(za: &Archive<R>) -> (Vec<EntryState>, Vec<u8>) {
 /// edited. What libzip writes from an edited archive is not always what
 /// its API said before (see `check_written` in `crates/zip/tests/oracle.rs`,
 /// which this follows).
-fn check_written(expected: &(Vec<EntryState>, Vec<u8>), written: &[u8]) {
+fn check_written(
+    expected: &(Vec<EntryState>, Vec<u8>),
+    encrypted: &[u64],
+    unreadable: &[u64],
+    written: &[u8],
+) {
     let (entries, archive_comment) = expected;
     // Something that looks like an end of central directory record, or a
     // Zip64 one or its locator, in a name, a comment, an extra field or the
@@ -98,6 +125,12 @@ fn check_written(expected: &(Vec<EntryState>, Vec<u8>), written: &[u8]) {
     }
     for (j, e) in entries.iter().enumerate() {
         let j = j as u64;
+        // An entry encrypted anew is read through the layers that decrypt
+        // and decompress it, so it has the time of its stat, and the layer
+        // that encrypts stops at the first short read, so its CRC is never
+        // checked: it takes the CRC and length of its data.
+        let reencrypted = encrypted.contains(&e.index)
+            || (e.stat.valid & stat::COMP_SIZE == 0 && e.stat.encryption_method != em::NONE);
         assert_eq!(new.get_name(j, Flags::ENC_RAW).ok(), Some(&e.name[..]));
         assert_eq!(
             new.file_get_comment(j, Flags::ENC_RAW).ok(),
@@ -117,6 +150,7 @@ fn check_written(expected: &(Vec<EntryState>, Vec<u8>), written: &[u8]) {
         let recompressed = b.valid & stat::COMP_SIZE == 0;
         if let Some(dos_time) = e.dos_time
             && !recompressed
+            && !reencrypted
         {
             assert_eq!(new.file_get_dos_time(j, Flags::NONE).ok(), Some(dos_time));
         }
@@ -126,6 +160,9 @@ fn check_written(expected: &(Vec<EntryState>, Vec<u8>), written: &[u8]) {
         }
         if recompressed {
             both &= stat::CRC;
+        }
+        if reencrypted {
+            both &= stat::ENCRYPTION_METHOD;
         }
         for (field, x, y) in [
             (stat::SIZE, a.size, b.size),
@@ -148,14 +185,14 @@ fn check_written(expected: &(Vec<EntryState>, Vec<u8>), written: &[u8]) {
         }
         // Before it is written, new data is read with the method the entry
         // had, as libzip reads it.
+        // ZipCrypto encrypts with an empty password, but reading takes an
+        // empty password for none, as libzip does: such an entry cannot be
+        // read.
         if let Some(data) = &e.data
             && e.dos_time.is_some()
+            && !unreadable.contains(&e.index)
         {
-            assert_eq!(
-                entry_data(&new, j).as_ref(),
-                Some(data),
-                "data of entry {j}"
-            );
+            assert!(reads_as(&new, j, data), "data of entry {j}");
         }
         // A WinZip AES entry of AE-2, without a CRC, is written as AE-1 if
         // it has 20 bytes or more, and its CRC is then checked on reading,
@@ -163,6 +200,7 @@ fn check_written(expected: &(Vec<EntryState>, Vec<u8>), written: &[u8]) {
         if let Some(raw) = &e.raw
             && a.valid & stat::CRC == b.valid & stat::CRC
             && !recompressed
+            && !reencrypted
         {
             assert_eq!(
                 raw_data(&new, j).as_ref(),
@@ -204,12 +242,13 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let n = za.get_num_entries(Flags::NONE);
+    let (mut encrypted, mut unreadable) = (Vec::new(), Vec::new());
     for op in ops.chunks(2) {
         let (kind, arg) = (op[0], op[1]);
         let i = u64::from(arg) % (n + 1);
         // ZIP_FL_LOCAL, ZIP_FL_CENTRAL or both, or neither.
         let ef_flags = Flags(u32::from(kind & 0x30) << 4);
-        let _ = match kind % 15 {
+        let _ = match kind % 17 {
             0 => za.delete(i),
             1 => za.file_rename(
                 i,
@@ -259,6 +298,21 @@ fuzz_target!(|data: &[u8]| {
                 )
                 .map(|_| ()),
             13 => za.file_replace(i, new_data(kind, arg), Flags::NONE),
+            14 => {
+                encrypted.push(i);
+                let method = [em::NONE, em::TRAD_PKWARE, em::AES_128, em::AES_192, em::AES_256]
+                    [usize::from(arg % 5)];
+                let password = [None, Some(PASSWORDS[0]), Some(PASSWORDS[1]), Some(PASSWORDS[2])]
+                    [usize::from(kind >> 6)];
+                if password == Some(b"") {
+                    unreadable.push(i);
+                }
+                za.file_set_encryption(i, method, password)
+            }
+            15 => {
+                za.set_default_password([None, Some(PASSWORDS[0])][usize::from(kind >> 7)]);
+                Ok(())
+            }
             _ => za.set_file_compression(
                 i,
                 [i32::from(cm::STORE), i32::from(cm::DEFLATE), cm::DEFAULT][usize::from(arg % 3)],
@@ -268,6 +322,16 @@ fuzz_target!(|data: &[u8]| {
     }
     let mut out = Cursor::new(Vec::new());
     let expected = archive_state(&za);
+    // Random bytes the same on every run.
+    let state = Mutex::new(0u8);
+    za.set_random_source(Some(Arc::new(move |buffer: &mut [u8]| {
+        let mut x = state.lock().map_err(|_| std::io::ErrorKind::Other)?;
+        for byte in buffer {
+            *x = x.wrapping_mul(5).wrapping_add(1);
+            *byte = *x;
+        }
+        Ok(())
+    })));
     if count_byte & 0x80 != 0 {
         // Cloning what is kept: an entry before the first one that changed
         // is cut there if its data reaches past it, as in libzip, so only
@@ -276,6 +340,6 @@ fuzz_target!(|data: &[u8]| {
     } else if matches!(za.close_to(&mut out), Ok(Closed::Written))
         && !za.get_archive_flag(ArchiveFlags::WANT_TORRENTZIP, Flags::NONE)
     {
-        check_written(&expected, out.get_ref());
+        check_written(&expected, &encrypted, &unreadable, out.get_ref());
     }
 });

@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hivepack_extract::{
-    Cancel, ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Progress, Summary,
-    extract_zip,
+    Cancel, ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Origin, Progress,
+    Summary, extract_zip,
 };
 use hivepack_zip::{Archive, BufferSource, Flags, OpenFlags, cm, em, opsys};
 
@@ -920,6 +920,123 @@ fn testdata() -> PathBuf {
 fn required(group: &str) -> bool {
     let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
     required.split(',').any(|g| g == "all" || g == group)
+}
+
+/// A mark this system cannot carry stops the extraction before anything is
+/// written: an extraction that drops it would hide where files came from.
+#[test]
+fn a_mark_this_system_cannot_carry_is_refused() {
+    let scratch = Scratch::new();
+    let data = zip(&[Entry::File(b"a.txt", b"a")]);
+    let foreign = if cfg!(windows) {
+        Origin::Quarantine(b"0083;6720f5a0;Safari;".to_vec())
+    } else {
+        Origin::ZoneIdentifier(b"[ZoneTransfer]\r\nZoneId=3\r\n".to_vec())
+    };
+    let error = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| o.origin = Some(foreign)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error.kind, ErrorKind::Origin(e) if e.kind() == std::io::ErrorKind::Unsupported),
+        "{error}"
+    );
+    assert!(!scratch.out().exists());
+}
+
+/// Linux and the other systems have no mark.
+#[cfg(not(any(windows, target_os = "macos")))]
+#[test]
+fn other_systems_have_no_mark() {
+    let scratch = Scratch::new();
+    let path = scratch.path().join("a.zip");
+    std::fs::write(&path, zip(&[Entry::File(b"a", b"1")])).unwrap();
+    assert_eq!(Origin::of(&path).unwrap(), None);
+}
+
+/// The archive's Mark of the Web is carried to every file, as it is,
+/// written from each file's handle. One file is named `a`, which beside a
+/// colon would name drive A; the files keep their time.
+#[cfg(windows)]
+#[test]
+fn the_mark_of_the_web_is_carried() {
+    let scratch = Scratch::new();
+    let path = scratch.path().join("download.zip");
+    std::fs::write(
+        &path,
+        zip(&[Entry::File(b"a", b"1"), Entry::File(b"d/b.txt", b"2")]),
+    )
+    .unwrap();
+    assert_eq!(Origin::of(&path).unwrap(), None);
+    let mark = b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/download.zip\r\n";
+    std::fs::write(format!("{}:Zone.Identifier", path.display()), mark).unwrap();
+    let origin = Origin::of(&path).unwrap().unwrap();
+    assert_eq!(origin, Origin::ZoneIdentifier(mark.to_vec()));
+
+    let data = std::fs::read(&path).unwrap();
+    let summary = extract(&data, &scratch.out(), &options(|o| o.origin = Some(origin))).unwrap();
+    assert_eq!(summary.files, 2);
+    for file in ["a", "d/b.txt"] {
+        let file = scratch.out().join(file);
+        let stream = format!("{}:Zone.Identifier", file.display());
+        assert_eq!(std::fs::read(&stream).unwrap(), mark, "{stream}");
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            MTIME as u64
+        );
+    }
+}
+
+/// The archive's quarantine is carried to every file, and to every
+/// directory created, as an app is one, as it is.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_quarantine_is_carried() {
+    const QUARANTINE: &str = "com.apple.quarantine";
+    fn quarantine(path: &Path) -> Option<Vec<u8>> {
+        let mut value = Vec::with_capacity(1024);
+        rustix::fs::getxattr(path, QUARANTINE, rustix::buffer::spare_capacity(&mut value))
+            .ok()
+            .map(|_| value)
+    }
+    let scratch = Scratch::new();
+    let path = scratch.path().join("download.zip");
+    std::fs::write(
+        &path,
+        zip(&[
+            Entry::File(b"a", b"1"),
+            Entry::Dir(b"Some.app/"),
+            Entry::File(b"Some.app/Contents/MacOS/some", b"2"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(Origin::of(&path).unwrap(), None);
+    let mark = b"0083;6720f5a0;Safari;3A2B1C0D-0000-4000-8000-000000000000";
+    rustix::fs::setxattr(&path, QUARANTINE, mark, rustix::fs::XattrFlags::empty()).unwrap();
+    let origin = Origin::of(&path).unwrap().unwrap();
+    assert_eq!(origin, Origin::Quarantine(mark.to_vec()));
+
+    let data = std::fs::read(&path).unwrap();
+    extract(&data, &scratch.out(), &options(|o| o.origin = Some(origin))).unwrap();
+    for item in [
+        "a",
+        "Some.app",
+        "Some.app/Contents",
+        "Some.app/Contents/MacOS",
+        "Some.app/Contents/MacOS/some",
+    ] {
+        assert_eq!(
+            quarantine(&scratch.out().join(item)).as_deref(),
+            Some(&mark[..]),
+            "{item}"
+        );
+    }
 }
 
 /// The archives of libzip's tests, where the libzip sources are fetched.

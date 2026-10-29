@@ -118,6 +118,7 @@ pub(crate) enum Whence {
 
 /// An archive's source while it is read: its length when opened, the
 /// position, and whether a read has failed.
+#[derive(Clone)]
 pub(crate) struct Source<R: ?Sized> {
     /// The length the source had when opened (`ctx->len`); reads stop
     /// there.
@@ -130,16 +131,21 @@ pub(crate) struct Source<R: ?Sized> {
 }
 
 impl<R: ReadAt> Source<R> {
-    /// The source, its length read: `zip_source_stat`.
-    pub(crate) fn new(inner: R) -> Result<Source<R>> {
-        let size = inner.size().map_err(read_error)?;
-        Ok(Source {
+    /// The source, of `size` bytes, as `stat` gives it.
+    pub(crate) fn with_size(inner: R, size: u64) -> Source<R> {
+        Source {
             size,
             offset: 0,
             read_error: None,
             inner,
-        })
+        }
     }
+}
+
+/// The length of `inner`: `zip_source_stat`, with the error of libzip's
+/// file sources.
+pub(crate) fn stat<R: ReadAt + ?Sized>(inner: &R) -> Result<u64> {
+    inner.size().map_err(read_error)
 }
 
 impl<R: ReadAt + ?Sized> Source<R> {
@@ -246,7 +252,7 @@ mod tests {
     #[test]
     fn seeks_as_libzip() {
         let data = [0u8; 10];
-        let mut src = Source::new(&data[..]).unwrap();
+        let mut src = Source::with_size(&data[..], data.len() as u64);
         assert!(src.seek(-4, Whence::End).is_ok());
         assert_eq!(src.tell(), 6);
         let mut buf = [0; 8];

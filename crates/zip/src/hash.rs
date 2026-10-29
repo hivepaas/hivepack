@@ -25,7 +25,7 @@ struct Indices {
 }
 
 /// `zip_hash_t`: each name, and the entries that have it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Names {
     table: HashMap<Vec<u8>, Indices>,
 }

@@ -1,21 +1,26 @@
 //! ziptool, with the commands libzip's tests add to it (ziptool_regress):
 //! port of libzip's `src/ziptool.c` and `regress/programs/ziptool_regress.c`,
-//! for the commands that read an archive. Those that change it come with
-//! writing; until then they are unknown commands. The output is libzip's,
-//! word for word, so that libzip's tests can run on the port.
+//! for the commands that read an archive and those that change it without
+//! new data. Adding data, compression and encryption come later; until
+//! then their commands are unknown. The output is libzip's, word for word,
+//! so that libzip's tests can run on the port.
 
 use std::io::Write;
 use std::process::ExitCode;
 
 use hivepack_zip::{Archive, ArchiveFlags, Error, ErrorCode, Flags, OpenFlags, ZipFile, stat};
-use ziptool::{Create, Getopt, Src, strtoull, zip_open, zip_open_in_memory};
+use ziptool::{
+    Getopt, Src, strtoull, zip_close, zip_close_in_memory, zip_open, zip_open_in_memory,
+};
 
 /// The state of the C program's globals.
 struct Tool {
-    za: &'static Archive<Src>,
+    za: Archive<Src>,
     stat_flags: Flags,
     hex_encoded_filenames: bool,
-    /// the entries opened by `fopen`
+    /// the entries opened by `fopen`, each from a copy of the archive as it
+    /// was then: libzip's open entries read what they were opened on,
+    /// whatever is changed afterwards
     z_files: Vec<ZipFile<'static, Src>>,
     out: std::io::Stdout,
 }
@@ -27,15 +32,16 @@ type Command = (
     fn(&mut Tool, &[String]) -> Result<(), ()>,
 );
 
-/// `dispatch_table`, with `DISPATCH_REGRESS`: the reading commands.
+/// `dispatch_table`, with `DISPATCH_REGRESS`: the commands that read, and
+/// those that change the archive without new data.
 const DISPATCH_TABLE: &[Command] = &[
     ("cat", 1, cat),
     ("cat_partial", 3, cat_partial),
     ("count_extra", 2, count_extra),
     ("count_extra_by_id", 3, count_extra_by_id),
-    ("extract_as", 2, extract_as),
-    ("fopen", 1, regress_fopen),
-    ("fread", 2, regress_fread),
+    ("delete", 1, delete),
+    ("delete_extra", 3, delete_extra),
+    ("delete_extra_by_id", 4, delete_extra_by_id),
     ("get_archive_comment", 0, get_archive_comment),
     ("get_archive_flag", 1, get_archive_flag),
     ("get_extra", 3, get_extra),
@@ -43,7 +49,20 @@ const DISPATCH_TABLE: &[Command] = &[
     ("get_file_comment", 1, get_file_comment),
     ("get_num_entries", 1, get_num_entries),
     ("name_locate", 2, name_locate),
+    ("rename", 2, zrename),
+    ("set_archive_comment", 1, set_archive_comment),
+    ("set_archive_flag", 2, set_archive_flag),
+    ("set_extra", 5, set_extra),
+    ("set_file_comment", 2, set_file_comment),
+    ("set_file_dostime", 3, set_file_dostime),
+    ("set_file_mtime", 2, set_file_mtime),
+    ("set_file_mtime_all", 1, set_file_mtime_all),
     ("stat", 1, zstat),
+    ("extract_as", 2, extract_as),
+    ("fopen", 1, regress_fopen),
+    ("fread", 2, regress_fread),
+    ("unchange", 1, unchange_one),
+    ("unchange_all", 0, unchange_all),
 ];
 
 /// A name as C sees it: up to its first NUL byte.
@@ -224,7 +243,8 @@ fn regress_fopen(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
         return Err(());
     }
     let name = t.decode_filename(&argv[0]);
-    match t.za.fopen(&name, Flags::NONE) {
+    let za: &'static Archive<Src> = Box::leak(Box::new(t.za.clone()));
+    match za.fopen(&name, Flags::NONE) {
         Ok(zf) => {
             t.print(format!("opened '{}' as file {}\n", argv[0], t.z_files.len()).as_bytes());
             t.z_files.push(zf);
@@ -261,6 +281,138 @@ fn regress_fread(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
         length -= n as u64;
     }
     Ok(())
+}
+
+fn delete(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    t.za.delete(idx).map_err(|e| {
+        eprintln!("can't delete file at index '{idx}': {e}");
+    })
+}
+
+fn delete_extra(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let eid = strtoull(&argv[1]) as u16;
+    let geflags = get_flags(&argv[2]);
+    t.za.file_extra_field_delete(idx, eid, geflags).map_err(|e| {
+        eprintln!(
+            "can't delete extra field data for file at index '{idx}', extra field id '{eid}': {e}"
+        );
+    })
+}
+
+fn delete_extra_by_id(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let eid = strtoull(&argv[1]) as u16;
+    let eidx = strtoull(&argv[2]) as u16;
+    let geflags = get_flags(&argv[3]);
+    t.za.file_extra_field_delete_by_id(idx, eid, eidx, geflags).map_err(|e| {
+        eprintln!(
+            "can't delete extra field data for file at index '{idx}', extra field id '{eid}', extra field idx '{eidx}': {e}"
+        );
+    })
+}
+
+fn zrename(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let name = t.decode_filename(&argv[1]);
+    t.za.file_rename(idx, &name, Flags::NONE).map_err(|e| {
+        eprintln!("can't rename file at index '{idx}' to '{}': {e}", argv[1]);
+    })
+}
+
+fn set_extra(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    let eid = strtoull(&argv[1]) as u16;
+    let eidx = strtoull(&argv[2]) as u16;
+    let geflags = get_flags(&argv[3]);
+    let efdata = argv[4].as_bytes();
+    t.za.file_extra_field_set(idx, eid, eidx, efdata, geflags)
+        .map_err(|e| {
+            eprintln!(
+                "can't set extra field data for file at index '{idx}', extra field id '{eid}', index '{eidx}': {e}"
+            );
+        })
+}
+
+fn set_archive_comment(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    t.za.set_archive_comment(argv[0].as_bytes()).map_err(|e| {
+        eprintln!("can't set archive comment to '{}': {e}", argv[0]);
+    })
+}
+
+fn set_archive_flag(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let Some(flag) = parse_archive_flag(&argv[0]) else {
+        eprintln!("invalid archive flag '{}'", argv[0]);
+        return Err(());
+    };
+    let value = ["1", "true", "yes"]
+        .iter()
+        .any(|v| argv[1].eq_ignore_ascii_case(v));
+    t.za.set_archive_flag(flag, value).map_err(|e| {
+        eprintln!(
+            "can't set archive flag '{}' to {}: {e}",
+            argv[0],
+            u8::from(value)
+        );
+    })
+}
+
+fn set_file_comment(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    t.za.file_set_comment(idx, argv[1].as_bytes(), Flags::NONE)
+        .map_err(|e| {
+            eprintln!(
+                "can't set file comment at index '{idx}' to '{}': {e}",
+                argv[1]
+            );
+        })
+}
+
+fn set_file_dostime(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // set file last modification time (mtime) directly
+    let idx = strtoull(&argv[0]);
+    let dostime = strtoull(&argv[1]) as u16;
+    let dosdate = strtoull(&argv[2]) as u16;
+    t.za.file_set_dostime(idx, dostime, dosdate, Flags::NONE)
+        .map_err(|e| {
+            eprintln!("can't set file dostime at index '{idx}' to '{dostime}'/'{dosdate}': {e}");
+        })
+}
+
+fn set_file_mtime(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // set file last modification time (mtime)
+    let idx = strtoull(&argv[0]);
+    let mtime = strtoull(&argv[1]) as i64;
+    t.za.file_set_mtime(idx, mtime, Flags::NONE).map_err(|e| {
+        eprintln!("can't set file mtime at index '{idx}' to '{mtime}': {e}");
+    })
+}
+
+fn set_file_mtime_all(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    // set last modification time (mtime) for all files
+    let mtime = strtoull(&argv[0]) as i64;
+    for idx in 0..t.za.get_num_entries(Flags::NONE) {
+        if let Err(e) = t.za.file_set_mtime(idx, mtime, Flags::NONE) {
+            eprintln!("can't set file mtime at index '{idx}' to '{mtime}': {e}");
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn unchange_all(t: &mut Tool, _argv: &[String]) -> Result<(), ()> {
+    // zip_unchange_all cannot fail here: "can't revert changes to archive"
+    t.za.unchange_all();
+    Ok(())
+}
+
+fn unchange_one(t: &mut Tool, argv: &[String]) -> Result<(), ()> {
+    let idx = strtoull(&argv[0]);
+    t.za.unchange(idx).map_err(|e| {
+        // libzip prints no newline here.
+        eprint!("can't revert changes for entry {idx}: {e}");
+    })
 }
 
 fn get_archive_comment(t: &mut Tool, _argv: &[String]) -> Result<(), ()> {
@@ -561,31 +713,30 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let prg = argv.first().cloned().unwrap_or_else(|| "ziptool".into());
     let mut flags = OpenFlags(0);
-    let mut create = Create::default();
     let mut stat_flags = Flags::NONE;
     let mut hex_encoded_filenames = false;
     let mut in_memory = false;
     let mut commands_from_stdin = false;
-    let (mut len, mut offset) = (0, 0);
+    let (mut len, mut offset, mut fragment_size) = (0, 0, 0);
 
     let mut getopt = Getopt::new(&argv);
     while let Some(option) = getopt.next("ceghl:no:rstF:Himx") {
         match option {
             Ok(('c', _)) => flags = flags | OpenFlags::CHECKCONS,
-            Ok(('e', _)) => create.excl = true,
+            Ok(('e', _)) => flags = flags | OpenFlags::EXCL,
             Ok(('g', _)) => stat_flags = Flags::ENC_GUESS,
             Ok(('l', value)) => len = strtoull(&value.unwrap_or_default()),
-            Ok(('n', _)) => create.create = true,
+            Ok(('n', _)) => flags = flags | OpenFlags::CREATE,
             Ok(('o', value)) => offset = strtoull(&value.unwrap_or_default()),
             Ok(('r', _)) => stat_flags = Flags::ENC_RAW,
             Ok(('s', _)) => stat_flags = Flags::ENC_STRICT,
-            Ok(('t', _)) => create.truncate = true,
+            Ok(('t', _)) => flags = flags | OpenFlags::TRUNCATE,
             Ok(('i', _)) => commands_from_stdin = true,
             Ok(('m', _)) => in_memory = true,
             Ok(('x', _)) => hex_encoded_filenames = true,
-            // The fragment size of in-memory archives makes no difference
-            // to reading.
-            Ok(('F', _)) => {}
+            // The fragment size of in-memory archives, which decides what
+            // closing can clone.
+            Ok(('F', value)) => fragment_size = strtoull(&value.unwrap_or_default()),
             Ok((c, _)) | Err(c) => return usage(&prg, &format!("invalid option -{c}")),
         }
     }
@@ -600,23 +751,22 @@ fn main() -> ExitCode {
     arg += 1;
 
     // if no flags were given, ZIP_CREATE
-    if flags.0 == 0 && !create.excl && !create.truncate && !create.create {
-        create.create = true;
+    if flags.0 == 0 {
+        flags = OpenFlags::CREATE;
     }
 
     let opened = if in_memory {
-        zip_open_in_memory(&archive, flags, create)
+        zip_open_in_memory(&archive, flags).map(|(za, data)| (za, Some(data)))
     } else {
-        zip_open(&archive, flags, create, offset, len)
+        zip_open(&archive, flags, offset, len).map(|za| (za, None))
     };
-    let za = match opened {
-        Ok(za) => za,
+    let (za, memory) = match opened {
+        Ok(opened) => opened,
         Err(e) => {
             eprintln!("can't open zip archive '{archive}': {e}");
             return ExitCode::from(1);
         }
     };
-    let za: &'static Archive<Src> = Box::leak(Box::new(za));
     let mut tool = Tool {
         za,
         stat_flags,
@@ -649,6 +799,22 @@ fn main() -> ExitCode {
         }
     }
     let _ = tool.out.flush();
-    // zip_close of an archive that is not changed writes nothing.
+
+    let closed = match &memory {
+        Some(data) => zip_close_in_memory(&mut tool.za, &archive, data, fragment_size),
+        None => zip_close(&mut tool.za, &archive).map(Ok),
+    };
+    match closed {
+        Err(e) => {
+            eprintln!("can't close zip archive '{archive}': {e}");
+            return ExitCode::from(1);
+        }
+        // ziptool_post_close
+        Ok(Err(text)) => {
+            eprintln!("{text}");
+            err = true;
+        }
+        Ok(Ok(())) => {}
+    }
     ExitCode::from(u8::from(err))
 }

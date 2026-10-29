@@ -107,6 +107,7 @@ pub use fopen_index_encrypted::ZipFile;
 pub use open::Archive;
 pub use source::ReadAt;
 pub use zip::{ArchiveFlags, Flags, OpenFlags, Stat, cm, em, opsys, stat};
+pub use zipint::{EXTRA_FIELD_ALL, EXTRA_FIELD_NEW};
 
 /// The libzip release this crate follows.
 pub const UPSTREAM_VERSION: &str = "1.12.1";

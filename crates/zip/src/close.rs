@@ -1,5 +1,6 @@
 //! Writing an archive with its changes: port of `zip_close.c`, for entries
-//! whose data is kept as it is.
+//! whose data is kept as it is, to an output that can clone what is kept
+//! or one that cannot.
 //!
 //! In torrentzip format ([`ArchiveFlags::WANT_TORRENTZIP`]), the entries
 //! are sorted by name, ignoring ASCII case, and written without times,
@@ -18,7 +19,7 @@ use crate::io_util::read;
 use crate::open::Archive;
 use crate::source::{ReadAt, Source, Whence};
 use crate::source_write::Output;
-use crate::zip::{ArchiveFlags, Flags, em};
+use crate::zip::{ArchiveFlags, Flags, OpenFlags, em};
 use crate::zipint::{
     BUFSIZE, DATADES_MAGIC, Entry, GPBF_DATA_DESCRIPTOR, MAX_DATA_DESCRIPTOR_LENGTH, changed,
 };
@@ -49,8 +50,9 @@ impl<R: ReadAt> Archive<R> {
     /// Differs from libzip:
     /// - The archive is written to `out` in whole, as libzip writes to a
     ///   source that cannot clone the data it keeps
-    ///   (`ZIP_SOURCE_BEGIN_WRITE_CLONING`), and offsets in `out` count
-    ///   from where it was when given.
+    ///   (`ZIP_SOURCE_BEGIN_WRITE_CLONING`; see
+    ///   [`Archive::close_to_cloning`]), and offsets in `out` count from
+    ///   where it was when given.
     /// - The archive stays open. libzip discards it once written; on
     ///   failure, both leave it as it was then, and `out` has what was
     ///   written up to the error.
@@ -58,6 +60,33 @@ impl<R: ReadAt> Archive<R> {
     ///   ([`ArchiveFlags::WANT_TORRENTZIP`]), fails with
     ///   `ZIP_ER_OPNOTSUPP`, for now.
     pub fn close_to<W: Write + Seek>(&mut self, out: W) -> Result<Closed> {
+        self.close_impl(out, None::<fn(u64) -> bool>)
+    }
+
+    /// Writes the archive with its changes to `out`, which must be at its
+    /// start, as libzip writes to a source that can clone (a buffer, or a
+    /// file on a file system with reflinks): the start of the archive up
+    /// to the first entry that changed, or to the end of the data if none
+    /// did, is kept as it is, copied here from the source, and only what
+    /// follows is written. `can_clone` is asked whether that length can be
+    /// kept, as libzip asks the source with
+    /// `zip_source_begin_write_cloning`; if not, or in torrentzip format,
+    /// the archive is written in whole, as [`Archive::close_to`] writes
+    /// it. Otherwise the same as `close_to`.
+    pub fn close_to_cloning<W: Write + Seek>(
+        &mut self,
+        out: W,
+        can_clone: impl FnOnce(u64) -> bool,
+    ) -> Result<Closed> {
+        self.close_impl(out, Some(can_clone))
+    }
+
+    /// Port of `zip_close`, cloning what is kept if `can_clone` is given.
+    fn close_impl<W: Write + Seek, F: FnOnce(u64) -> bool>(
+        &mut self,
+        out: W,
+        can_clone: Option<F>,
+    ) -> Result<Closed> {
         let (changed, survivors) = self.changed();
 
         if survivors == 0
@@ -65,13 +94,14 @@ impl<R: ReadAt> Archive<R> {
                 .ch_flags
                 .intersects(ArchiveFlags::CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE)
         {
-            // don't create zip files with no entries (ZIP_TRUNCATE, which
-            // also removes the file, is not one of the port's flags yet)
-            return Ok(if changed {
-                Closed::Removed
-            } else {
-                Closed::Unchanged
-            });
+            // don't create zip files with no entries
+            return Ok(
+                if self.open_flags.intersects(OpenFlags::TRUNCATE) || changed {
+                    Closed::Removed
+                } else {
+                    Closed::Unchanged
+                },
+            );
         }
 
         // Always write empty archive if we are told to keep it, otherwise it
@@ -84,9 +114,15 @@ impl<R: ReadAt> Archive<R> {
             return Err(Error::new(ErrorCode::Internal, 0));
         }
 
+        let mut unchanged_offset = u64::MAX;
         // create list of files with index into original archive
         let mut filelist = Vec::new();
         for (i, entry) in self.entry.iter().enumerate() {
+            if let Some(orig) = &entry.orig
+                && entry.has_changes()
+            {
+                unchanged_offset = unchanged_offset.min(orig.offset);
+            }
             if entry.deleted {
                 continue;
             }
@@ -114,8 +150,52 @@ impl<R: ReadAt> Archive<R> {
             filelist = order.into_iter().map(|j| filelist[j]).collect();
         }
 
+        let unchanged_offset = match can_clone {
+            Some(can_clone) if !self.want_torrentzip() => {
+                let mut unchanged_offset = unchanged_offset;
+                if unchanged_offset == u64::MAX {
+                    // we're keeping all file data, find the end of the last
+                    // one
+                    let mut last_index = None;
+                    unchanged_offset = 0;
+                    for (i, entry) in self.entry.iter().enumerate() {
+                        if let Some(orig) = &entry.orig
+                            && orig.offset >= unchanged_offset
+                        {
+                            unchanged_offset = orig.offset;
+                            last_index = Some(i);
+                        }
+                    }
+                    if let Some(last_index) = last_index {
+                        unchanged_offset = self.file_get_end(last_index as u64)?;
+                    }
+                }
+                // cloning not supported, need to copy everything
+                if unchanged_offset > 0 && !can_clone(unchanged_offset) {
+                    0
+                } else {
+                    unchanged_offset
+                }
+            }
+            _ => 0,
+        };
+
         let mut out = Output::new(out);
+        if unchanged_offset > 0 {
+            // The clone: the start of the archive as it is.
+            let mut src = self.src.view();
+            src.seek(0, Whence::Set)?;
+            copy_data(&mut src, &mut out, unchanged_offset)?;
+        }
         for &i in &filelist {
+            if self.entry[i]
+                .orig
+                .as_ref()
+                .is_some_and(|orig| orig.offset < unchanged_offset)
+            {
+                // already implicitly copied by cloning
+                continue;
+            }
             self.write_entry(i, &mut out)?;
         }
 

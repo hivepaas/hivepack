@@ -76,8 +76,9 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 
   Reading entries is compared the same way, through the oracle's `read` requests: every entry opened with `zip_fopen_index` (decompressed, or raw with `ZIP_FL_COMPRESSED` or `ZIP_FL_ENCRYPTED`), read with `zip_fread` in pieces of one byte to 64 KiB, to its end or to a limit, then closed. The port must return the same from every read, the same data, the same error at the end and the same from `zip_fclose`. The generated entries hold deflate streams from `hivepack-deflate`'s compressor, some cut short, followed by garbage or with a byte changed, and CRCs and sizes right or wrong; what came up includes CRC errors when the end is read and when an entry read to its last byte is closed, wrong lengths, zlib data errors, garbage after a stream with `ZIP_CHECKCONS`, compressed sizes past the end of the file, and local headers that cannot be read. 10,000 requests agreed before the first commit, every regress archive is read four ways on each run, and `testdata/oracle/zip-read.txt` replays 560 answers. libzip's build writes `config.h`, `zipconf.h` and its error strings with CMake; `scripts/testdata.py` builds the oracle with the C compiler alone, from `tools/zip-oracle/config.h` and `zipconf.h` and the strings generated as CMake would.
 - **libzip's own tests.** The 199 `.test` files in `regress/` are scripts for libzip's test programs (`ziptool`, `tryopen` and a few others), run by nihtest. `tools/ziptool` has the port's `ziptool`, with the commands libzip's tests add to it (`ziptool_regress`), and `tryopen`, with libzip's output word for word, and `tools/ziptool/tests/regress.rs` runs the scripts as nihtest does: the test's files copied into a fresh folder, the program run there, its exit status, output and errors compared, and the files checked afterwards. 64 of them run and pass now. The others wait for what they need: 88 change an archive or use a command that writes, 31 need encryption, bzip2, LZMA or Zstandard, 9 run other test programs, and 7 need a setup the runner does not do yet.
+- **Editing.** The oracle's `edit` requests open an archive from a file, make a list of edits (delete, rename, set an entry's or the archive's comment, its time in MS-DOS or Unix form, its external attributes, undo one entry's changes or all of them, set an archive flag), answer each edit's result and what the API then says of every entry, and write the archive with `zip_close`. The port must answer the same and write the same bytes, or nothing where libzip leaves the file as it was or removes it. The generated archives are mostly ones that open, so that the edits are made; the edits take names and comments from the archive or make them up, in each encoding flag, with indices in range and not, and times before 1980, after 2107 and past what `localtime_r` takes. 3,000 requests are compared on each run, every regress archive is edited four ways, an archive of 65,539 entries is written with and without the Zip64 end of central directory records, and `testdata/oracle/zip-edit.txt` replays 669 answers. Each archive the port writes is opened again and must have the entries that are left, in order, with their names, comments, attributes, times, sizes and data, unless libzip would not read it back either (see below).
 - **Writing.** For the same input, the port writes the same archive as libzip, byte for byte. libzip compresses with zlib's raw deflate (`windowBits` −15) at level 9 and `memLevel` 9 unless told otherwise (`zip_algorithm_deflate.c`), so this needs `hivepack-deflate` to give zlib's output at those settings. Torrentzip output is compared too.
-- **Fuzzing.** A fuzzer compares the port with the libzip oracle under AddressSanitizer, seeded with libzip's OSS-Fuzz corpus. For now `fuzz/fuzz_targets/zip_open.rs` opens its input and asks the reading API everything, which must not panic, seeded with the archives of `zip-open.txt`.
+- **Fuzzing.** A fuzzer compares the port with the libzip oracle under AddressSanitizer, seeded with libzip's OSS-Fuzz corpus. For now `fuzz/fuzz_targets/zip_open.rs` opens its input and asks the reading API everything, which must not panic, seeded with the archives of `zip-open.txt`, and `fuzz/fuzz_targets/zip_edit.rs` makes the edits its first bytes pick and writes the archive, which must open again with the entries as edited.
 - **Beyond libzip.** Info-ZIP `unzip`, 7-Zip, bsdtar, Python and Go read everything the port writes; ZipDiff's ambiguous archives are read, and where the oracles disagree, the manifest records which one hivepack follows.
 
 ## Progress
@@ -85,10 +86,10 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 | libzip | Port | Status |
 |---|---|---|
 | `zip_error.c`, `zip_error_strerror.c`, `zip_err_str.c` (generated) | `error.rs` | done |
-| `zip_buffer.c`, `zip_io_util.c`, `zip_string.c` | `buffer.rs`, `io_util.rs`, `string.rs` | reading done; writing with step 3 |
+| `zip_buffer.c`, `zip_io_util.c`, `zip_string.c` | `buffer.rs`, `io_util.rs`, `string.rs`, `source_write.rs` (`_zip_write`) | done |
 | `zip_utf-8.c` | `utf_8.rs` | done |
-| `zip_extra_field.c`, `zip_extra_field_api.c` | `extra_field.rs`, `extra_field_api.rs` | reading done |
-| `zip_dirent.c` | `dirent.rs` | reading done |
+| `zip_extra_field.c`, `zip_extra_field_api.c` | `extra_field.rs`, `extra_field_api.rs` | done but setting and deleting fields |
+| `zip_dirent.c` | `dirent.rs` | done but `_zip_dirent_apply_attributes`, which comes with new data |
 | `zip_open.c`, `zip_new.c` | `open.rs` | done for reading; `ZIP_CREATE`, `ZIP_EXCL` and `ZIP_TRUNCATE` with step 3 |
 | `zip_hash.c` | `hash.rs` | its rules, on `HashMap` |
 | `zip_name_locate.c`, `zip_get_name.c`, `zip_stat_index.c`, `zip_stat_init.c`, `zip_file_get_comment.c`, `zip_file_get_external_attributes.c`, `zip_get_archive_comment.c`, `zip_get_archive_flag.c`, `zip_get_num_entries.c` | modules of the same names, `zip.rs` | done |
@@ -101,7 +102,10 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 | Deflate64 (libzip has none) | `algorithm_deflate.rs`, with `Inflate9` | done: `tests/deflate64.rs` reads streams with long and far matches back to their data, checks the CRC and length, and refuses garbage after the stream with `ZIP_CHECKCONS` |
 | `zip_source_zip_file_create` with a start and a length | `source_zip_new.rs`, `source_window.rs` (`UpperWindow`) | done: `Archive::fopen_index_range`, compared through the oracle's `range` requests |
 | `src/ziptool.c`, `regress/programs/ziptool_regress.c` and `tryopen.c`, the reading commands | `tools/ziptool` | done: 64 of libzip's tests pass |
-| Writing, and the tests that write | | step 3 |
+| `zip_delete.c`, `zip_file_rename.c`, `zip_set_name.c`, `zip_file_set_comment.c`, `zip_set_archive_comment.c`, `zip_file_set_mtime.c`, `zip_file_set_external_attributes.c`, `zip_set_archive_flag.c`, `zip_unchange.c`, `zip_unchange_all.c`, `zip_unchange_archive.c`, `zip_unchange_data.c` | modules of the same names, `zipint.rs` | done |
+| `zip_close.c` | `close.rs` | done for entries whose data is kept (`Archive::close_to`), and torrentzip's order; new data (`add_data`), recompression and the cloning of kept data later |
+| The writing commands of `zip_source_write.c`, `zip_source_tell_write.c`, `zip_source_commit_write.c` | `source_write.rs` | on a `Write` and `Seek` |
+| Adding data, compression levels, the tests that write | | step 3, next |
 
 Where the port differs from libzip, a `Differs from libzip:` comment says so. The differences so far:
 
@@ -111,13 +115,24 @@ Where the port differs from libzip, a `Differs from libzip:` comment says so. Th
 - The system error of an error is described by the standard library, whose text is `strerror`'s on Unix.
 - `zip_source_zip_file_create` sets `ZIP_ER_COMPNOTSUPP` on the archive's error, not on the error it is given, which stays `ZIP_ER_OK`; `Archive::fopen_index_range` returns `ZIP_ER_COMPNOTSUPP`. The port's `ziptool` prints libzip's "No error" there.
 - An entry is read through a struct of layers (a window on the archive, then decompression, then the CRC check), each with the state libzip keeps in its `zip_source_t`, in place of a chain of callbacks. Each open entry reads through a view of the archive's source with its own position, so several can be read at once from `&Archive`; a failed read fails only that entry's later reads.
+- An archive is written by `Archive::close_to` to a `Write` and `Seek` of the caller's, from scratch, as libzip writes to a source that cannot clone the data it keeps; `Closed` says whether it wrote, or whether libzip would have left the file as it was or removed it. The archive stays open afterwards, where libzip discards it once written. On failure, both leave the archive as it was then.
+- `zip_file_set_mtime` takes the time as UTC, as `_zip_u2d_time` does with `localtime_r` where the time zone is UTC, and fails as `localtime_r` does for a year past what an `int` holds, with Linux's `EOVERFLOW`.
+- A comment longer than 65,535 bytes is refused with `ZIP_ER_INVAL`, where libzip's `zip_uint16_t` length cuts it. `zip_unchange_all` and `zip_unchange_archive`, which cannot fail, return nothing.
+- The oracle clears `errno` before each request and before `zip_close`: libzip gives it, stale, with `ZIP_ER_SEEK` when a local header's extra fields cannot be reached, where the port gives 0.
 - Decryption comes with step 4: an encrypted entry fails with `ZIP_ER_NOPASSWD`, as in libzip without a password. Of the compression methods, deflate is read, as the oracle's libzip is built without bzip2, LZMA and Zstandard, and Deflate64, which libzip does not read: where libzip refuses such an entry with `ZIP_ER_COMPNOTSUPP` (once the password and sizes are checked, before the local header is read), the port reads it. The comparison with the oracle expects libzip's refusal there, and `tests/deflate64.rs` checks the data.
+
+libzip's ways that the port keeps, though they surprise:
+
+- A size of exactly 0xffffffff, or a disk number of 0xffff, is written as 0xffffffff (or 0xffff) in the header, with a Zip64 extra field that lacks the value: `_zip_dirent_write` adds it only when it is larger. libzip then refuses the archive it wrote, with `ZIP_ER_INCONS` and `ZIP_ER_DETAIL_INVALID_ZIP64_EF`.
+- Comments, names and data are written as they are, so bytes in them that look like an end of central directory record, or a Zip64 one and its locator, can be taken for the real one when the archive is read again.
+- An archive comment removed with `zip_set_archive_comment` is still given by `zip_get_archive_comment` until the archive is written without it.
+- An AES entry of AE-2 is written as AE-1, with its CRC, when it has 20 bytes or more.
 
 ## The order of work
 
 1. **CRC-32 and inflate.** The decompressor and checksums of `hivepack-deflate`, ported from zlib 1.3.2 (`crc32.c`; `inflate.c`, `inftrees.c`, `inffast.c`). Nothing compressed can be read before them. Done: see [deflate.md](deflate.md).
 2. **Reading.** Errors, buffers, extra fields, headers, file names, `open.rs`; stored and deflated entries; `tools/zip-oracle`, and `tools/ziptool`'s reading commands. Deflate64 entries, with `Inflate9` (see [deflate.md](deflate.md)): done.
-3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md).
+3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md). Editing and writing archives whose data is kept: done. Adding data next, then `ziptool`'s writing commands and the tests that write.
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto`.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.
 6. **More methods.** bzip2, LZMA, XZ and PPMd, as their crates arrive; zstd once `hivepack-zstd` compresses.

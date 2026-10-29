@@ -891,8 +891,10 @@ pub(crate) struct MatchState {
     /// with `loaded_dict_end`, once the input is a window past it.
     pub(crate) dict_match_state: bool,
     /// `dedicatedDictSearch`: for a `CDict`'s match state, whether its
-    /// tables are laid out for `ZSTD_dedicatedDictSearch`. Never set yet:
-    /// phase 1 ports `ZSTD_c_enableDedicatedDictSearch`.
+    /// tables are laid out for `ZSTD_dedicatedDictSearch`
+    /// (`ZSTD_c_enableDedicatedDictSearch`; see
+    /// `zstd_dedicated_dict_search_lazy_load_dictionary`). Never set for a
+    /// context's.
     pub(crate) dedicated_dict_search: bool,
 }
 

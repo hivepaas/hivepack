@@ -22,7 +22,8 @@ use crate::compress::huf_compress::{
 };
 use crate::compress::zstd_cdict::{
     CDict, DictTableLoadMethod, TableFillPurpose, zstd_cdict_indices_are_tagged,
-    zstd_compress_insert_dictionary, zstd_get_cparam_mode, zstd_should_attach_dict,
+    zstd_compress_insert_dictionary, zstd_dedicated_dict_search_revert_cparams,
+    zstd_get_cparam_mode, zstd_should_attach_dict,
 };
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, DictAttachPref, DictMatchState,
@@ -45,8 +46,8 @@ use crate::compress::zstd_double_fast::{
 };
 use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_fast_ext_dict};
 use crate::compress::zstd_lazy::{
-    ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc,
-    zstd_compress_block_lazy_row,
+    ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_dict_match_state,
+    zstd_compress_block_lazy_hc, zstd_compress_block_lazy_row,
 };
 use crate::compress::zstd_ldm::{
     ZSTD_LDM_BUCKETSIZELOG_MAX, ZSTD_LDM_DEFAULT_WINDOW_LOG, zstd_ldm_adjust_parameters,
@@ -1189,9 +1190,9 @@ pub(crate) fn zstd_dict_match_state_ported(params: &CCtxParams, dedicated: bool)
     match params.c_params.strategy {
         // Phase 1: fast and dfast.
         Strategy::Fast | Strategy::Dfast => false,
-        // Phase 1: greedy, lazy and lazy2: the hash chain, the row match
-        // finder, and the dedicated dictionary search.
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => false,
+        // Greedy, lazy and lazy2: the hash chain, the row match finder,
+        // and the dedicated dictionary search.
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => true,
         // Phase 1: btlazy2 and the optimal parser.
         Strategy::Btlazy2 | Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => false,
     }
@@ -1646,7 +1647,10 @@ impl From<&CompressionParameters> for CParamOverrides {
 }
 
 /// `ZSTD_overrideCParams`: the parameters set, over the level's.
-fn zstd_override_cparams(c_params: &mut CompressionParameters, overrides: &CParamOverrides) {
+pub(crate) fn zstd_override_cparams(
+    c_params: &mut CompressionParameters,
+    overrides: &CParamOverrides,
+) {
     if overrides.window_log != 0 {
         c_params.window_log = overrides.window_log;
     }
@@ -1706,6 +1710,10 @@ pub(crate) struct CCtxParams {
     /// `attachDictPref`: whether a frame with a `CDict` attaches it, copies
     /// it or loads it again (`ZSTD_c_forceAttachDict`).
     pub(crate) attach_dict_pref: DictAttachPref,
+    /// `enableDedicatedDictSearch`: whether a `CDict` made with these
+    /// parameters lays out its tables for the dedicated dictionary search
+    /// (`ZSTD_c_enableDedicatedDictSearch`).
+    pub(crate) enable_dedicated_dict_search: bool,
 }
 
 impl CCtxParams {
@@ -1731,6 +1739,7 @@ impl CCtxParams {
             ldm_enable: zstd_resolve_enable_ldm(ParamSwitch::Auto, &c_params),
             ldm: LdmParams::default(),
             attach_dict_pref: DictAttachPref::DefaultAttach,
+            enable_dedicated_dict_search: false,
         }
     }
 
@@ -1990,15 +1999,21 @@ impl BlockCompressor<'_> {
         dms: DictMatchState<'_>,
         ldm: Option<&RawSeqStore>,
     ) -> Result<usize> {
-        let _ = (ms, seq_store, rep, istart, iend, dms, ldm);
+        let _ = ldm;
         match self.strategy {
             // Phase 1: ZSTD_compressBlock_fast_dictMatchState and
             // ZSTD_compressBlock_doubleFast_dictMatchState.
             Strategy::Fast | Strategy::Dfast => error!(ParameterUnsupported),
-            // Phase 1: ZSTD_compressBlock_{greedy,lazy,lazy2}_dictMatchState,
-            // their _row variants (self.use_row_match_finder), and
-            // _dedicatedDictSearch (dms.ms.dedicated_dict_search).
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => error!(ParameterUnsupported),
+            // ZSTD_compressBlock_{greedy,lazy,lazy2}_dictMatchState, their
+            // _row variants, and their _dedicatedDictSearch ones
+            // (dms.ms.dedicated_dict_search).
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+                let depth = self.strategy as u32 - Strategy::Greedy as u32;
+                let row = zstd_row_match_finder_used(self.strategy, self.use_row_match_finder);
+                Ok(zstd_compress_block_lazy_dict_match_state(
+                    depth, row, ms, seq_store, rep, self.src, dms, istart, iend,
+                ))
+            }
             // Phase 1: ZSTD_compressBlock_btlazy2_dictMatchState and
             // ZSTD_compressBlock_{btopt,btultra}_dictMatchState (btultra2
             // takes btultra's), with `ldm`.
@@ -2163,6 +2178,20 @@ pub enum CParameter {
     /// its content again (`ZSTD_c_forceAttachDict`). The default leaves it
     /// to the input's size.
     ForceAttachDict(DictAttachPref),
+    /// Whether a [`CDict`] made with this parameter (by
+    /// [`CDict::with_parameters`], or from the dictionary loaded into a
+    /// context that has it) lays out its tables for `greedy`, `lazy` and
+    /// `lazy2` to search them faster, in exchange for a `CDict` a bit
+    /// slower to make (`ZSTD_c_enableDedicatedDictSearch`). Off by default.
+    ///
+    /// The `CDict` then takes the level's parameters for its dictionary
+    /// (a hash table 4 times as large), under those set; without one of
+    /// those strategies, or with a chain log over 24 or not under the hash
+    /// log, it is made as without the parameter. Its frames always search
+    /// its tables where they are (unless told to load it again,
+    /// [`DictAttachPref::ForceLoad`]), never copy them. A context's own
+    /// frames do not use the parameter otherwise.
+    EnableDedicatedDictSearch(bool),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -2194,6 +2223,7 @@ pub enum CParameterKind {
     LdmBucketSizeLog,
     LdmHashRateLog,
     ForceAttachDict,
+    EnableDedicatedDictSearch,
 }
 
 impl CParameter {
@@ -2226,6 +2256,7 @@ impl CParameter {
             CParameter::LdmBucketSizeLog(_) => CParameterKind::LdmBucketSizeLog,
             CParameter::LdmHashRateLog(_) => CParameterKind::LdmHashRateLog,
             CParameter::ForceAttachDict(_) => CParameterKind::ForceAttachDict,
+            CParameter::EnableDedicatedDictSearch(_) => CParameterKind::EnableDedicatedDictSearch,
         }
     }
 }
@@ -2373,6 +2404,9 @@ pub(crate) fn set_cctx_parameter(
             params.ldm.hash_rate_log = value;
         }
         CParameter::ForceAttachDict(pref) => params.attach_dict_pref = pref,
+        CParameter::EnableDedicatedDictSearch(enable) => {
+            params.enable_dedicated_dict_search = enable;
+        }
     }
     Ok(())
 }
@@ -2677,13 +2711,16 @@ impl CCtx {
         buffered: bool,
     ) -> Result<()> {
         {
-            let adjusted_cdict_c_params = *cdict.c_params();
+            let mut adjusted_cdict_c_params = *cdict.c_params();
             let window_log = params.c_params.window_log;
             debug_assert!(window_log != 0);
             // The tables for the input only, the dictionary has its own. A
-            // pledged size of 0 means 0. Phase 1: a CDict with the dedicated
-            // dictionary search first takes its parameters back
-            // (ZSTD_dedicatedDictSearch_revertCParams).
+            // pledged size of 0 means 0. A CDict with the dedicated
+            // dictionary search first takes its larger hash table back, not
+            // to make the context's larger too.
+            if cdict.match_state.dedicated_dict_search {
+                zstd_dedicated_dict_search_revert_cparams(&mut adjusted_cdict_c_params);
+            }
             params.c_params = zstd_adjust_cparams_internal(
                 adjusted_cdict_c_params,
                 pledged_src_size,
@@ -3883,6 +3920,9 @@ impl CCtx {
             CParameterKind::LdmBucketSizeLog => params.ldm.bucket_size_log as i32,
             CParameterKind::LdmHashRateLog => params.ldm.hash_rate_log as i32,
             CParameterKind::ForceAttachDict => params.attach_dict_pref as i32,
+            CParameterKind::EnableDedicatedDictSearch => {
+                i32::from(params.enable_dedicated_dict_search)
+            }
         }
     }
 

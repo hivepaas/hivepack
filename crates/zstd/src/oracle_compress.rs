@@ -535,6 +535,8 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         164 => CParameter::LdmHashRateLog(unsigned()),
         // ZSTD_c_useRowMatchFinder
         1011 => CParameter::UseRowMatchFinder(switch()),
+        // ZSTD_c_enableDedicatedDictSearch
+        1005 => CParameter::EnableDedicatedDictSearch(flag),
         // ZSTD_c_forceAttachDict
         1001 => CParameter::ForceAttachDict(match value {
             0 => DictAttachPref::DefaultAttach,

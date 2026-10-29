@@ -1,8 +1,9 @@
 //! Opens the input as a ZIP archive with hivepack-zip, makes the edits its
 //! first bytes choose (the count, then a kind and an index for each), and
-//! writes it with `close_to`. The archive written must open, with the
-//! entries that are not deleted, in order, as edited: their names,
-//! comments, attributes, times, sizes and data. A panic is a bug.
+//! writes it with `close_to`, or `close_to_cloning` if the first byte's top
+//! bit is set. The archive `close_to` writes must open, with the entries
+//! that are not deleted, in order, as edited: their names, comments,
+//! attributes, times, sizes and data. A panic is a bug.
 //! `crates/zip/tests/oracle.rs` compares the edits and what is written
 //! with libzip through the oracle.
 
@@ -10,7 +11,9 @@
 
 use std::io::{Cursor, Read};
 
-use hivepack_zip::{Archive, ArchiveFlags, Closed, Flags, OpenFlags, ReadAt, stat};
+use hivepack_zip::{
+    Archive, ArchiveFlags, Closed, EXTRA_FIELD_ALL, EXTRA_FIELD_NEW, Flags, OpenFlags, ReadAt, stat,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// The raw data of entry `i`, as stored.
@@ -88,10 +91,10 @@ fn check_written<R: ReadAt>(za: &Archive<R>, written: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&count, rest)) = data.split_first() else {
+    let Some((&count_byte, rest)) = data.split_first() else {
         return;
     };
-    let count = usize::from(count % 8);
+    let count = usize::from(count_byte % 8);
     if rest.len() < 2 * count {
         return;
     }
@@ -103,7 +106,9 @@ fuzz_target!(|data: &[u8]| {
     for op in ops.chunks(2) {
         let (kind, arg) = (op[0], op[1]);
         let i = u64::from(arg) % (n + 1);
-        let _ = match kind % 10 {
+        // ZIP_FL_LOCAL, ZIP_FL_CENTRAL or both, or neither.
+        let ef_flags = Flags(u32::from(kind & 0x30) << 4);
+        let _ = match kind % 12 {
             0 => za.delete(i),
             1 => za.file_rename(
                 i,
@@ -125,14 +130,35 @@ fuzz_target!(|data: &[u8]| {
                 za.unchange_all();
                 Ok(())
             }
-            _ => za.set_archive_flag(
+            9 => za.set_archive_flag(
                 ArchiveFlags::CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE,
                 kind & 0x80 != 0,
+            ),
+            10 => za.file_extra_field_set(
+                i,
+                0xcafe,
+                if kind & 0x40 != 0 { EXTRA_FIELD_NEW } else { 0 },
+                &op[..usize::from(arg % 3)],
+                ef_flags,
+            ),
+            _ => za.file_extra_field_delete(
+                i,
+                if kind & 0x40 != 0 {
+                    EXTRA_FIELD_ALL
+                } else {
+                    u16::from(arg % 3)
+                },
+                ef_flags,
             ),
         };
     }
     let mut out = Cursor::new(Vec::new());
-    if matches!(za.close_to(&mut out), Ok(Closed::Written)) {
+    if count_byte & 0x80 != 0 {
+        // Cloning what is kept: an entry before the first one that changed
+        // is cut there if its data reaches past it, as in libzip, so only
+        // that it does not panic.
+        let _ = za.close_to_cloning(&mut out, |offset| offset % 2 == 0);
+    } else if matches!(za.close_to(&mut out), Ok(Closed::Written)) {
         check_written(&za, out.get_ref());
     }
 });

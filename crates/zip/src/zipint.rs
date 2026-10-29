@@ -50,6 +50,11 @@ pub(crate) const GPBF_DATA_DESCRIPTOR: u16 = 0x0008;
 pub(crate) const GPBF_STRONG_ENCRYPTION: u16 = 0x0040;
 pub(crate) const GPBF_ENCODING_UTF_8: u16 = 0x0800;
 
+/// `ZIP_EXTRA_FIELD_ALL`: every extra field, to delete.
+pub const EXTRA_FIELD_ALL: u16 = u16::MAX;
+/// `ZIP_EXTRA_FIELD_NEW`: a new extra field, to set.
+pub const EXTRA_FIELD_NEW: u16 = u16::MAX;
+
 /// `ZIP_EF_LOCAL`, `ZIP_EF_CENTRAL` and `ZIP_EF_BOTH`.
 pub(crate) const EF_LOCAL: Flags = Flags::LOCAL;
 pub(crate) const EF_CENTRAL: Flags = Flags::CENTRAL;
@@ -122,7 +127,7 @@ pub(crate) mod changed {
 /// whether it is deleted. Boxed as libzip keeps pointers, so that a
 /// directory sized from a large count of entries is small until the
 /// entries are read.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Entry {
     pub orig: Option<Box<Dirent>>,
     pub changes: Option<Box<Dirent>>,

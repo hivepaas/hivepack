@@ -38,9 +38,18 @@ flag_type!(
 );
 
 impl OpenFlags {
+    /// `ZIP_CREATE`: an empty archive if the source is not there (its
+    /// length fails with `ENOENT`).
+    pub const CREATE: OpenFlags = OpenFlags(1);
+    /// `ZIP_EXCL`: fail with `ZIP_ER_EXISTS` if the source is there.
+    pub const EXCL: OpenFlags = OpenFlags(2);
     /// `ZIP_CHECKCONS`: compare every local header with the central
     /// directory, and check more strictly.
     pub const CHECKCONS: OpenFlags = OpenFlags(4);
+    /// `ZIP_TRUNCATE`: an empty archive in place of what the source has,
+    /// which [`Archive::close_to`](crate::Archive::close_to) then says to
+    /// remove if no entries are added.
+    pub const TRUNCATE: OpenFlags = OpenFlags(8);
     /// `ZIP_RDONLY`: open for reading only.
     pub const RDONLY: OpenFlags = OpenFlags(16);
 }

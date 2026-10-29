@@ -12,7 +12,7 @@ use crate::dirent::{Dirent, check_consistency};
 use crate::error::{Detail, Error, ErrorCode, Result, add_index_to_detail, make_detail_with_index};
 use crate::extra_field::EFBIG;
 use crate::hash::Names;
-use crate::source::{ReadAt, Source, Whence};
+use crate::source::{ReadAt, Source, Whence, stat};
 use crate::string::{ZipString, string_equal, string_get, string_length};
 use crate::zip::{ArchiveFlags, Flags, OpenFlags};
 use crate::zipint::{
@@ -21,7 +21,9 @@ use crate::zipint::{
     MAGIC_LEN, TORRENTZIP_CRC_LENGTH, TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH,
 };
 
-/// An open archive: `struct zip`.
+/// An open archive: `struct zip`. It can be cloned, with its changes, when
+/// its source can.
+#[derive(Clone)]
 pub struct Archive<R> {
     /// data source for archive
     pub(crate) src: Source<R>,
@@ -63,20 +65,39 @@ impl<R: ReadAt> Archive<R> {
     /// `_zip_open`. With [`OpenFlags::CHECKCONS`], every local header is
     /// compared with the central directory, and more is checked. Unless
     /// [`OpenFlags::RDONLY`] is given, the archive can be changed, and
-    /// [`Archive::close_to`] writes it.
+    /// [`Archive::close_to`] writes it. A source that is not there, whose
+    /// length fails with `ENOENT`, is refused with `ZIP_ER_NOENT`, or with
+    /// [`OpenFlags::CREATE`] taken as an empty archive.
     ///
     /// Differs from libzip: the source is only read, as the archive is
-    /// written elsewhere, and `ZIP_CREATE`, `ZIP_EXCL` and `ZIP_TRUNCATE`
-    /// have no flags yet.
+    /// written elsewhere.
     pub fn open(src: R, flags: OpenFlags) -> Result<Archive<R>> {
-        let src = match Source::new(src) {
-            Ok(src) => src,
-            // _zip_file_exists: a file that is not there.
+        if flags.contains(OpenFlags::RDONLY | OpenFlags::TRUNCATE) {
+            return Err(Error::new(ErrorCode::RdOnly, 0));
+        }
+
+        // _zip_file_exists
+        let len = match stat(&src) {
+            Ok(len) => len,
             Err(e) if e.code() == ErrorCode::Read && e.system() == ENOENT => {
-                return Err(Error::new(ErrorCode::NoEntry, 0));
+                if !flags.intersects(OpenFlags::CREATE) {
+                    return Err(Error::new(ErrorCode::NoEntry, 0));
+                }
+                return Ok(Archive::allocate_new(Source::with_size(src, 0), flags));
             }
             Err(e) => return Err(e),
         };
+
+        if flags.intersects(OpenFlags::EXCL) {
+            return Err(Error::new(ErrorCode::Exists, 0));
+        }
+
+        let src = Source::with_size(src, len);
+        if flags.intersects(OpenFlags::TRUNCATE) {
+            return Ok(Archive::allocate_new(src, flags));
+        }
+        // ZIP_CREATE gets ignored if file exists and not ZIP_EXCL, just
+        // like open()
         Archive::open_source(src, flags)
     }
 

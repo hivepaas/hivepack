@@ -693,6 +693,12 @@ fn long_distance_matching_matches_libzstd() {
             _ => rng.range(400_000, 2_500_000),
         } as usize;
         let data = far_repeats(&mut rng, len);
+        // On big-endian machines libzstd's block splitter, which the
+        // strategies from `greedy` up use on full blocks, splits elsewhere
+        // (see `is_ported`).
+        if cfg!(target_endian = "big") && strategy >= Strategy::Greedy && len >= 128 << 10 {
+            continue;
+        }
         cctx.reset(crate::decompress::zstd_decompress::ResetDirective::Parameters)
             .expect("between frames");
         c_cctx

@@ -2,7 +2,7 @@
 
 Extracting archives to disk, safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs.
 
-> **Status:** extracts ZIP archives that `hivepack-zip` opened, refusing unportable names, the same path twice, links and overlapping data, writing by handle, and counting what is written against its limits, with named options to relax each rule, a time limit, cancelling and progress. tar and RAR come later. This crate is not on crates.io.
+> **Status:** extracts ZIP archives that `hivepack-zip` opened, refusing unportable names, the same path twice (ignoring case and how accents are written), links and overlapping data, writing by handle, and counting what is written against its limits, with named options to relax each rule, a time limit, cancelling and progress. tar and RAR come later. This crate is not on crates.io.
 
 ```rust
 use hivepack_extract::{Options, extract_zip};
@@ -18,3 +18,5 @@ The rules, and why each is there, are in [docs/extract.md](../../docs/extract.md
 ## License
 
 MIT. See [LICENSE](../../LICENSE). Copyright (c) 2026 HivePaaS.
+
+The tables names are compared with (`src/unicode/tables.rs`) are made by `scripts/unicode.py` from the Unicode Character Database, under the Unicode License v3: see [LICENSE-UNICODE](LICENSE-UNICODE).

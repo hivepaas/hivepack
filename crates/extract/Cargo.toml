@@ -2,7 +2,7 @@
 name = "hivepack-extract"
 version = "0.0.0"
 description = "Extracting archives to disk, safe by default: nothing outside the destination, through links, or past limits"
-license = "MIT"
+license = "MIT AND Unicode-3.0"
 readme = "README.md"
 keywords = ["extract", "unzip", "archive", "zip-slip", "zip-bomb"]
 categories = ["filesystem", "compression"]

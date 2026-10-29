@@ -265,6 +265,40 @@ fn the_same_path_twice_is_refused() {
     assert_eq!(listing(&scratch.out()), ["d/", "d/x"]);
 }
 
+/// One name written two ways, which macOS or a case-insensitive file
+/// system takes for one, is the same path.
+#[test]
+fn one_name_written_two_ways_is_the_same_path() {
+    for (a, b) in [
+        ("caf\u{e9}.txt", "cafe\u{301}.txt"),
+        ("\u{212a}.txt", "k.txt"),
+        ("\u{3c3}.txt", "\u{3c2}.txt"),
+        // A directory one way, then on the way of another entry.
+        ("caf\u{e9}/a", "cafe\u{301}/b"),
+    ] {
+        let scratch = Scratch::new();
+        let data = zip(&[
+            Entry::File(a.as_bytes(), b"1"),
+            Entry::File(b.as_bytes(), b"2"),
+        ]);
+        let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
+        assert!(
+            matches!(error.kind, ErrorKind::Duplicate { first: 0 }),
+            "{a:?} {b:?}: {error}"
+        );
+        assert!(!scratch.out().exists());
+    }
+    // Compatibility forms are other names, on every system.
+    let scratch = Scratch::new();
+    let data = zip(&[
+        Entry::File("\u{fb01}".as_bytes(), b"1"),
+        Entry::File(b"fi", b"2"),
+    ]);
+    extract(&data, &scratch.out(), &Options::default()).unwrap();
+    assert_eq!(listing(&scratch.out()), ["fi", "\u{fb01}"]);
+    assert_eq!(hivepack_extract::UNICODE_VERSION, (18, 0, 0));
+}
+
 #[test]
 fn links_are_not_created() {
     let scratch = Scratch::new();

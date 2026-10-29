@@ -12,7 +12,9 @@
 //! - **Names**: [`check_name`] refuses names that are absolute, climb with
 //!   `..`, carry a backslash, a colon, a control character or a Windows
 //!   device name, or end a component with a space or a dot, on every
-//!   system alike. Two entries may not name the same path, ignoring case.
+//!   system alike. Two entries may not name the same path, ignoring case
+//!   and how accents are written (`é` as one character or as `e` and an
+//!   accent), with the tables of one Unicode version ([`UNICODE_VERSION`]).
 //! - **Links** are not created, unless [`Options::links`] says to create
 //!   those that stay inside the destination; a device or FIFO in a ZIP
 //!   archive, only a mode with data, is written as a file.
@@ -44,19 +46,21 @@
 //! # }
 //! ```
 //!
-//! The design, and what comes next (marks of origin, Unicode
-//! normalization, tar and RAR), are in the repository's
-//! `docs/extract.md`.
+//! The design, and what comes next (marks of origin, tar and RAR), are in
+//! the repository's `docs/extract.md`.
 
 mod destination;
 mod error;
 mod name;
 mod plan;
 mod progress;
+mod unicode;
 mod zip;
 
 pub use error::{Error, ErrorKind};
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};
 pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};
 pub use progress::{Cancel, Progress, ProgressFn};
+/// The version of Unicode names are compared with: major, minor, update.
+pub use unicode::VERSION as UNICODE_VERSION;
 pub use zip::{Summary, extract_zip};

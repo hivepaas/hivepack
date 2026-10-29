@@ -184,10 +184,11 @@ impl Item {
     }
 }
 
-/// A path as the checks see it: case folded, as a case-insensitive file
-/// system would.
+/// A path as the checks see it: case folded and canonically decomposed, as
+/// a case-insensitive file system, and macOS, would (see
+/// [`unicode::key`](crate::unicode::key)).
 pub(crate) fn fold(components: &[String]) -> String {
-    components.join("/").to_lowercase()
+    crate::unicode::key(&components.join("/"))
 }
 
 /// What a path already is, among the entries checked.

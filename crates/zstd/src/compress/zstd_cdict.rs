@@ -98,18 +98,29 @@ impl CDict {
             dict.len(),
             CParamMode::CreateCDict,
         );
-        // ZSTD_createCDict_advanced: parameters at level 0, with these
-        // compression parameters over the level's.
-        let (mut params, _) = CCtxParams::requested_default();
-        params.compression_level = 0;
-        let overrides = CParamOverrides::from(&c_params);
-        let mut cdict = CDict::create_advanced2(dict, DictContentType::Auto, &params, &overrides)?;
+        let mut cdict = CDict::create_advanced(dict, DictContentType::Auto, &c_params)?;
         cdict.compression_level = if compression_level == 0 {
             ZSTD_CLEVEL_DEFAULT
         } else {
             compression_level
         };
         Ok(cdict)
+    }
+
+    /// `ZSTD_createCDict_advanced`, with the content copied in: `dict`,
+    /// read as `content_type` says, made ready with `c_params` (but a
+    /// target length of 0, which is the default level's), for no level.
+    pub(crate) fn create_advanced(
+        dict: &[u8],
+        content_type: DictContentType,
+        c_params: &CompressionParameters,
+    ) -> Result<CDict> {
+        // Parameters at level 0, with these compression parameters over
+        // the level's.
+        let (mut params, _) = CCtxParams::requested_default();
+        params.compression_level = 0;
+        let overrides = CParamOverrides::from(c_params);
+        CDict::create_advanced2(dict, content_type, &params, &overrides)
     }
 
     /// `ZSTD_createCDict_advanced2`, with the content copied in: `dict`
@@ -278,10 +289,8 @@ const ATTACH_DICT_SIZE_CUTOFFS: [u64; 10] = [
 /// `ZSTD_shouldAttachDict`: whether a frame of `pledged_src_size` bytes
 /// with `params` attaches `cdict` rather than copy it: always for a
 /// dedicated dictionary search; otherwise for inputs up to the strategy's
-/// cutoff or of unknown size, unless the preference says.
-///
-/// libzstd never attaches with `ZSTD_c_forceMaxWindow`, which the port does
-/// not have.
+/// cutoff or of unknown size, unless the preference says, and never with
+/// `forceWindow` (`dictMatchState` does not keep to it).
 pub(crate) fn zstd_should_attach_dict(
     cdict: &CDict,
     params: &CCtxParams,
@@ -293,7 +302,8 @@ pub(crate) fn zstd_should_attach_dict(
         || ((pledged_src_size <= cutoff
             || pledged_src_size == ZSTD_CONTENTSIZE_UNKNOWN
             || params.attach_dict_pref == DictAttachPref::ForceAttach)
-            && params.attach_dict_pref != DictAttachPref::ForceCopy)
+            && params.attach_dict_pref != DictAttachPref::ForceCopy
+            && !params.force_window)
 }
 
 /// `ZSTD_dedicatedDictSearch_getCParams`: the parameters of a `CDict` with
@@ -400,9 +410,11 @@ pub(crate) enum TableFillPurpose {
 }
 
 /// `ZSTD_loadDictionaryContent`: `dict[start..end]`, the content, into the
-/// match state's window, as the segment of [`WindowBuffer::Dict`] before
-/// the input, and its positions into the tables; with `ldm`, into those of
-/// long distance matching too, when the frame has it.
+/// match state's window, as the segment of `which` before the input
+/// ([`WindowBuffer::Dict`], but for the jobs of multithreaded compression
+/// after the first, whose input follows it in the same buffer), and its
+/// positions into the tables; with `ldm`, into those of long distance
+/// matching too, when the frame has it.
 ///
 /// The content can be too large for the indices: only its end is loaded,
 /// up to `ZSTD_CURRENT_MAX` bytes, or under 16 MB for a `CDict` with tagged
@@ -414,6 +426,7 @@ pub(crate) fn zstd_load_dictionary_content(
     ldm: Option<&mut LdmState>,
     params: &CCtxParams,
     dict: &[u8],
+    which: WindowBuffer,
     start: usize,
     end: usize,
     dtlm: DictTableLoadMethod,
@@ -451,12 +464,16 @@ pub(crate) fn zstd_load_dictionary_content(
         // always is.
         debug_assert!(ms.window.is_empty());
     }
-    ms.window.update(WindowBuffer::Dict, ip, src_size, false);
+    ms.window.update(which, ip, src_size, false);
 
     if let Some(ldm) = ldm.filter(|_| load_ldm_dict) {
         // All of it into long distance matching's tables.
-        ldm.window.update(WindowBuffer::Dict, ip, src_size, false);
-        ldm.loaded_dict_end = ldm.window.index(iend);
+        ldm.window.update(which, ip, src_size, false);
+        ldm.loaded_dict_end = if params.force_window {
+            0
+        } else {
+            ldm.window.index(iend)
+        };
         zstd_ldm_fill_hash_table(ldm, dict, ip, iend, &params.ldm);
     }
 
@@ -472,10 +489,14 @@ pub(crate) fn zstd_load_dictionary_content(
         }
     }
 
-    // libzstd's ZSTD_c_forceMaxWindow, which the port does not have, would
-    // keep loadedDictEnd at 0.
+    // With forceWindow, the content is part of the window, its matches
+    // no farther than the window's size: no dictionary end.
     ms.next_to_update = ms.window.index(ip);
-    ms.loaded_dict_end = ms.window.index(iend);
+    ms.loaded_dict_end = if params.force_window {
+        0
+    } else {
+        ms.window.index(iend)
+    };
     if src_size == 0 {
         // Differs from libzstd: there the window, left as it was, makes
         // these indices from an unrelated pointer. A dictionary without
@@ -723,7 +744,17 @@ fn zstd_load_zstd_dictionary(
     };
     let e_size = zstd_load_c_entropy(bs, dict)?;
     // Without long distance matching, which only takes raw content.
-    zstd_load_dictionary_content(ms, None, params, dict, e_size, dict.len(), dtlm, tfp)?;
+    zstd_load_dictionary_content(
+        ms,
+        None,
+        params,
+        dict,
+        WindowBuffer::Dict,
+        e_size,
+        dict.len(),
+        dtlm,
+        tfp,
+    )?;
     Ok(dict_id)
 }
 
@@ -758,14 +789,34 @@ pub(crate) fn zstd_compress_insert_dictionary(
 
     // Raw content, as asked.
     if content_type == DictContentType::RawContent {
-        zstd_load_dictionary_content(ms, ldm, params, dict, 0, dict.len(), dtlm, tfp)?;
+        zstd_load_dictionary_content(
+            ms,
+            ldm,
+            params,
+            dict,
+            WindowBuffer::Dict,
+            0,
+            dict.len(),
+            dtlm,
+            tfp,
+        )?;
         return Ok(0);
     }
 
     if read_le32(dict, 0) != ZSTD_MAGIC_DICTIONARY {
         if content_type == DictContentType::Auto {
             // Raw content, as it is not a zstd dictionary.
-            zstd_load_dictionary_content(ms, ldm, params, dict, 0, dict.len(), dtlm, tfp)?;
+            zstd_load_dictionary_content(
+                ms,
+                ldm,
+                params,
+                dict,
+                WindowBuffer::Dict,
+                0,
+                dict.len(),
+                dtlm,
+                tfp,
+            )?;
             return Ok(0);
         }
         return error!(DictionaryWrong);

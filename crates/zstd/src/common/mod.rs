@@ -8,5 +8,6 @@ pub(crate) mod fse;
 pub(crate) mod fse_decompress;
 pub(crate) mod huf;
 pub(crate) mod mem;
+pub(crate) mod pool;
 pub(crate) mod xxhash;
 pub(crate) mod zstd_internal;

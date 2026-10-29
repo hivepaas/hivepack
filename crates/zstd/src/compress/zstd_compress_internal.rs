@@ -1153,6 +1153,49 @@ impl LdmState {
 }
 
 // ---------------------------------------------------------------------------
+// Rolling hash
+
+/// `ZSTD_ROLL_HASH_CHAR_OFFSET`: added to each byte, so that runs of zeros
+/// still change the hash.
+const ZSTD_ROLL_HASH_CHAR_OFFSET: u64 = 10;
+
+/// `ZSTD_rollingHash_append`: `hash` with the bytes of `buf` after.
+pub(crate) fn zstd_rolling_hash_append(mut hash: u64, buf: &[u8]) -> u64 {
+    for &byte in buf {
+        hash = hash.wrapping_mul(PRIME8BYTES);
+        hash = hash.wrapping_add(u64::from(byte) + ZSTD_ROLL_HASH_CHAR_OFFSET);
+    }
+    hash
+}
+
+/// `ZSTD_rollingHash_compute`: the rolling hash of `buf`.
+pub(crate) fn zstd_rolling_hash_compute(buf: &[u8]) -> u64 {
+    zstd_rolling_hash_append(0, buf)
+}
+
+/// `ZSTD_rollingHash_primePower`: what [`zstd_rolling_hash_rotate`] takes
+/// for a hash of `length` bytes (`ZSTD_ipow(prime8bytes, length - 1)`).
+pub(crate) fn zstd_rolling_hash_prime_power(length: u32) -> u64 {
+    PRIME8BYTES.wrapping_pow(length - 1)
+}
+
+/// `ZSTD_rollingHash_rotate`: the hash one byte on, `to_remove` out and
+/// `to_add` in.
+#[inline(always)]
+pub(crate) fn zstd_rolling_hash_rotate(
+    mut hash: u64,
+    to_remove: u8,
+    to_add: u8,
+    prime_power: u64,
+) -> u64 {
+    hash = hash.wrapping_sub(
+        (u64::from(to_remove) + ZSTD_ROLL_HASH_CHAR_OFFSET).wrapping_mul(prime_power),
+    );
+    hash = hash.wrapping_mul(PRIME8BYTES);
+    hash.wrapping_add(u64::from(to_add) + ZSTD_ROLL_HASH_CHAR_OFFSET)
+}
+
+// ---------------------------------------------------------------------------
 // Hashes
 
 /// `MEM_readLE16` on the input, its index masked with `idx`: the compiler
@@ -1485,6 +1528,23 @@ impl SeqStore {
             long_length_type: LongLengthType::None,
             long_length_pos: 0,
         }
+    }
+
+    /// [`SeqStore::with_capacity`] again, keeping the memory it has: a
+    /// context reset for a frame, as libzstd's workspace keeps its own.
+    /// Only the literals stored are read, so what the buffer held before
+    /// does not matter.
+    pub(crate) fn reset_for(&mut self, block_size: usize, max_nb_seq: usize) {
+        for codes in [&mut self.ll_code, &mut self.ml_code, &mut self.of_code] {
+            codes.clear();
+            codes.reserve_exact(max_nb_seq);
+        }
+        self.sequences.clear();
+        self.sequences.reserve_exact(max_nb_seq);
+        self.lit_buffer.resize(block_size + WILDCOPY_OVERLENGTH, 0);
+        self.lit_len = 0;
+        self.long_length_type = LongLengthType::None;
+        self.long_length_pos = 0;
     }
 
     /// A store of `literals` and room for `nb_seq` sequences, for tests.

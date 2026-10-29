@@ -5,10 +5,11 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, ErrorKind};
 use crate::name::{Name, NameError};
+use crate::progress::{Cancel, ProgressFn};
 
 /// Limits on what an archive may write, against archive bombs. They count
 /// the bytes actually written, not what the archive says: the declared
@@ -123,9 +124,17 @@ pub struct Options {
     /// directories. Nothing is overwritten otherwise.
     pub overwrite: bool,
     pub permissions: Permissions,
+    /// How long the extraction may take, from when it starts; none by
+    /// default. It stops with [`ErrorKind::TimeLimit`] once past it.
+    pub time_limit: Option<Duration>,
+    /// A token that stops the extraction with [`ErrorKind::Cancelled`].
+    pub cancel: Option<Cancel>,
+    /// Told how far the extraction is: once the entries are checked, after
+    /// each piece of data written (at most 64 KiB), and after each entry.
+    pub progress: Option<ProgressFn>,
 }
 
-/// Shows the options, not the password.
+/// Shows the options, not the password or the progress function.
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Options")
@@ -137,6 +146,9 @@ impl std::fmt::Debug for Options {
             .field("on_refused", &self.on_refused)
             .field("overwrite", &self.overwrite)
             .field("permissions", &self.permissions)
+            .field("time_limit", &self.time_limit)
+            .field("cancel", &self.cancel)
+            .field("progress", &self.progress.as_ref().map(|_| ".."))
             .finish()
     }
 }

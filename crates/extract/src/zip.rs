@@ -11,6 +11,7 @@ use crate::destination::Destination;
 use crate::error::{Error, ErrorKind};
 use crate::name::{NameError, check_name, link_target, prepare};
 use crate::plan::{Item, Kind, Links, Names, OnRefused, Options, Permissions, check, fold};
+use crate::progress::Run;
 
 /// What was extracted.
 #[derive(Debug, Default)]
@@ -120,10 +121,12 @@ struct Link<'a> {
 }
 
 /// Reads the data of `item` with `f`, a piece at a time, checked as any
-/// entry's data is: what `f` returns, or why it stopped.
+/// entry's data is, and stopping if `run` is to stop: what `f` returns, or
+/// why it stopped.
 fn read_entry<R: ReadAt>(
     archive: &Archive<R>,
     item: &Item,
+    run: &Run<'_>,
     options: &Options,
     mut f: impl FnMut(&[u8]) -> Result<(), ErrorKind>,
 ) -> Result<(), ErrorKind> {
@@ -132,6 +135,7 @@ fn read_entry<R: ReadAt>(
         .map_err(ErrorKind::Archive)?;
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
+        run.check()?;
         let n = match zf.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
@@ -152,10 +156,11 @@ fn read_entry<R: ReadAt>(
 fn read_target<R: ReadAt>(
     archive: &Archive<R>,
     item: &Item,
+    run: &Run<'_>,
     options: &Options,
 ) -> Result<Vec<u8>, ErrorKind> {
     let mut target = Vec::new();
-    read_entry(archive, item, options, |piece| {
+    read_entry(archive, item, run, options, |piece| {
         target.extend_from_slice(piece);
         if target.len() > MAX_LINK_TARGET {
             return Err(ErrorKind::LinkTarget(NameError::TooLong));
@@ -171,6 +176,7 @@ fn read_target<R: ReadAt>(
 fn links<'a, R: ReadAt>(
     archive: &Archive<R>,
     kept: &[&'a Item],
+    run: &Run<'_>,
     options: &Options,
     skipped: &mut Vec<Error>,
 ) -> Result<Vec<Link<'a>>, Error> {
@@ -192,7 +198,7 @@ fn links<'a, R: ReadAt>(
             continue;
         };
         let parent = &name.components[..name.components.len().saturating_sub(1)];
-        let checked = read_target(archive, item, options).and_then(|target| {
+        let checked = read_target(archive, item, run, options).and_then(|target| {
             let resolved = link_target(&target, parent).map_err(ErrorKind::LinkTarget)?;
             // A link on the way, which the system would follow.
             for end in 1..resolved.len() {
@@ -239,6 +245,11 @@ fn links<'a, R: ReadAt>(
 /// Files and directories get the time the archive has, and files on Unix
 /// their permission bits, as [`Options::permissions`] says.
 ///
+/// [`Options::time_limit`] and [`Options::cancel`] stop the extraction
+/// between pieces of data and between entries; a file cut off is removed,
+/// and what was written before stays. [`Options::progress`] is told how
+/// far it is.
+///
 /// Open the archive with
 /// [`OpenFlags::CHECKCONS`](hivepack_zip::OpenFlags::CHECKCONS), so that
 /// local headers that disagree with the central directory are refused.
@@ -248,18 +259,31 @@ pub fn extract_zip<R: ReadAt>(
     options: &Options,
 ) -> Result<Summary, Error> {
     let limits = &options.limits;
+    let run = Run::new(options);
     let n = archive.get_num_entries(Flags::NONE);
     if n > limits.max_entries {
         return Err(Error::global(ErrorKind::TooManyEntries));
     }
     let items = (0..n)
-        .map(|i| item(archive, i, options))
+        .map(|i| {
+            run.check().map_err(Error::global)?;
+            item(archive, i, options)
+        })
         .collect::<Result<Vec<Item>, Error>>()?;
     let (kept, mut skipped) = check(&items, options)?;
     let links = match options.links {
-        Links::Inside => links(archive, &kept, options, &mut skipped)?,
+        Links::Inside => links(archive, &kept, &run, options, &mut skipped)?,
         _ => Vec::new(),
     };
+    // Links to create are written after the rest; the others are files.
+    let created_later = |item: &Item| item.kind == Kind::Link && options.links == Links::Inside;
+    run.start(
+        kept.iter().filter(|item| !created_later(item)).count() as u64 + links.len() as u64,
+        kept.iter()
+            .filter(|item| item.kind != Kind::Dir && !created_later(item))
+            .map(|item| item.size)
+            .fold(0, u64::saturating_add),
+    );
 
     let destination =
         Destination::open(destination).map_err(|e| Error::global(ErrorKind::Io(e)))?;
@@ -273,14 +297,15 @@ pub fn extract_zip<R: ReadAt>(
         };
         let error = |kind| item.error(kind);
         let components = &name.components;
-        match (item.kind, options.links) {
-            (Kind::Dir, _) => {
-                destination.directory(components).map_err(error)?;
-                summary.directories += 1;
-                continue;
-            }
-            (Kind::Link, Links::Inside) => continue,
-            _ => {}
+        if created_later(item) {
+            continue;
+        }
+        run.check().map_err(error)?;
+        if item.kind == Kind::Dir {
+            destination.directory(components).map_err(error)?;
+            summary.directories += 1;
+            run.entry_done();
+            continue;
         }
         let (last, parents) = components
             .split_last()
@@ -288,10 +313,11 @@ pub fn extract_zip<R: ReadAt>(
         let dir = destination.directory(parents).map_err(error)?;
         let file = Destination::create_file(&dir, last, options.overwrite).map_err(error)?;
         let remaining = limits.max_total_size.saturating_sub(summary.bytes);
-        match write_file(archive, item, file, remaining, options) {
+        match write_file(archive, item, file, remaining, &run, options) {
             Ok(written) => {
                 summary.files += 1;
                 summary.bytes += written;
+                run.entry_done();
             }
             Err(kind) => {
                 // A file whose data failed is not left.
@@ -310,9 +336,11 @@ pub fn extract_zip<R: ReadAt>(
             .components
             .split_last()
             .ok_or_else(|| error(ErrorKind::Name(NameError::Empty)))?;
+        run.check().map_err(error)?;
         let dir = destination.directory(parents).map_err(error)?;
         Destination::symlink(&dir, last, &link.target, link.to_dir).map_err(error)?;
         summary.links += 1;
+        run.entry_done();
     }
 
     // The directories' times, the deepest first, once nothing more is
@@ -331,6 +359,7 @@ pub fn extract_zip<R: ReadAt>(
             continue;
         };
         let error = |kind| item.error(kind);
+        run.check().map_err(error)?;
         let dir = destination.directory(parents).map_err(error)?;
         Destination::set_time(&dir, last, mtime).map_err(error)?;
     }
@@ -344,12 +373,13 @@ fn write_file<R: ReadAt>(
     item: &Item,
     file: cap_std::fs::File,
     remaining: u64,
+    run: &Run<'_>,
     options: &Options,
 ) -> Result<u64, ErrorKind> {
     let limits = &options.limits;
     let mut file = file.into_std();
     let mut written: u64 = 0;
-    read_entry(archive, item, options, |piece| {
+    read_entry(archive, item, run, options, |piece| {
         written += piece.len() as u64;
         if written > limits.max_entry_size {
             return Err(ErrorKind::EntryTooLarge);
@@ -365,7 +395,9 @@ fn write_file<R: ReadAt>(
         {
             return Err(ErrorKind::Ratio);
         }
-        file.write_all(piece).map_err(ErrorKind::Io)
+        file.write_all(piece).map_err(ErrorKind::Io)?;
+        run.wrote(piece.len() as u64);
+        Ok(())
     })?;
     if written != item.size {
         return Err(ErrorKind::SizeMismatch);

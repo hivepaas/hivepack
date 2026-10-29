@@ -2,16 +2,20 @@
 //! the destination, the same path twice, links in the archive and on disk,
 //! files already there, archive bombs past the limits or sharing their
 //! data, and data that fails its check. Each must stop with its reason,
-//! and leave nothing outside the destination.
+//! and leave nothing outside the destination. Then the options, the time
+//! limit, cancelling and progress.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hivepack_extract::{
-    ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Summary, extract_zip,
+    Cancel, ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Progress, Summary,
+    extract_zip,
 };
 use hivepack_zip::{Archive, BufferSource, Flags, OpenFlags, cm, em, opsys};
 
@@ -749,6 +753,125 @@ fn directories_get_their_time() {
             "{dir}"
         );
     }
+}
+
+#[test]
+fn a_time_limit_stops_the_extraction() {
+    let scratch = Scratch::new();
+    let data = zip(&[Entry::File(b"a.txt", b"a")]);
+    let error = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| o.time_limit = Some(Duration::ZERO)),
+    )
+    .unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::TimeLimit), "{error}");
+    assert!(!scratch.out().exists());
+    // A limit too far to count is none.
+    let summary = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| o.time_limit = Some(Duration::MAX)),
+    )
+    .unwrap();
+    assert_eq!(summary.files, 1);
+}
+
+#[test]
+fn cancelling_stops_the_extraction() {
+    // Options, with their token and progress function, go to another
+    // thread, and the token is cancelled from any.
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Options>();
+    send_sync::<Cancel>();
+
+    let scratch = Scratch::new();
+    let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let data = zip(&[Entry::File(b"a", b"a"), Entry::File(b"big", &big)]);
+
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let error = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| o.cancel = Some(cancel.clone())),
+    )
+    .unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Cancelled), "{error}");
+    assert_eq!(error.index, None);
+    assert!(!scratch.out().exists());
+
+    // Cancelled once the second file has written a piece: it is removed,
+    // and the first stays.
+    let cancel = Cancel::new();
+    let token = cancel.clone();
+    let error = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| {
+            o.cancel = Some(cancel);
+            o.progress = Some(Arc::new(move |progress: &Progress| {
+                if progress.entries == 1 && progress.bytes > 1 {
+                    token.cancel();
+                }
+            }));
+        }),
+    )
+    .unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::Cancelled), "{error}");
+    assert_eq!(error.index, Some(1));
+    assert_eq!(listing(&scratch.out()), ["a"]);
+}
+
+#[test]
+fn progress_counts_what_is_written() {
+    let scratch = Scratch::new();
+    let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let data = zip(&[
+        Entry::Dir(b"d/"),
+        Entry::File(b"d/big", &big),
+        Entry::File(b"b", b"abc"),
+    ]);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let summary = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| {
+            o.progress = Some(Arc::new(move |progress: &Progress| {
+                record.lock().unwrap().push(*progress);
+            }));
+        }),
+    )
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    let total_bytes = big.len() as u64 + 3;
+    // Told the totals before anything is written, then each piece and
+    // each entry, never going back.
+    let first = seen.first().unwrap();
+    assert_eq!((first.entries, first.bytes), (0, 0));
+    for progress in seen.iter() {
+        assert_eq!(
+            (progress.total_entries, progress.total_bytes),
+            (3, total_bytes)
+        );
+    }
+    for pair in seen.windows(2) {
+        assert!(pair[0].entries <= pair[1].entries && pair[0].bytes <= pair[1].bytes);
+    }
+    // Pieces of 64 KiB at most: two for the big file, one for the small.
+    let pieces: Vec<u64> = seen
+        .windows(2)
+        .map(|pair| pair[1].bytes - pair[0].bytes)
+        .filter(|&n| n > 0)
+        .collect();
+    assert!(
+        pieces.len() >= 3 && pieces.iter().all(|&n| n <= 64 * 1024),
+        "{pieces:?}"
+    );
+    let last = seen.last().unwrap();
+    assert_eq!((last.entries, last.bytes), (3, total_bytes));
+    assert_eq!(summary.bytes, total_bytes);
 }
 
 /// The archives of libzip's tests, where the libzip sources are fetched.

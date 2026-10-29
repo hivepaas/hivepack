@@ -4,7 +4,7 @@
 
 Extractors no longer break on memory, which safe Rust settles, but on logic, and memory-safe code gets that wrong as often as C: writing through a link (the `zip` crate's CVE-2025-29787, adm-zip's CVE-2026-76845), keeping setuid bits or chmod through a link (RUSTSEC-2026-0367 and 0369), links that point outside (RUSTSEC-2026-0368), alternate data streams on Windows (WinRAR's CVE-2025-8088, exploited), and Python's tarfile filter, which took five CVEs in June 2025 for checking strings and `realpath`. The rules below answer those, and come from the research behind this repository's ZIP plan.
 
-> **Status:** names, the same path twice, links and special files, overlapping data, the limits, writing by handle, integrity, masked permissions and times: done, for ZIP. Next: the options to relax them, marks of origin, tar and RAR (see [What comes next](#what-comes-next)).
+> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, and the options that relax them: done, for ZIP, checked on libzip's test archives and fuzzed. Next: marks of origin, Unicode normalization, tar and RAR (see [What comes next](#what-comes-next)).
 
 ## Refuse, do not repair
 
@@ -29,7 +29,9 @@ Two entries may not name the same path either: compared with case folded (`str::
 
 ## Links and special files
 
-Symbolic links, and devices, FIFOs and sockets (from the Unix mode of the external attributes), are refused, not created.
+Symbolic links (from the Unix mode of the external attributes) are refused, unless the options say otherwise.
+
+A device, FIFO or socket in a ZIP archive is only a mode with data: Info-ZIP's `zip` records the mode of what it reads, a pipe for standard input (the entry `-` of libzip's `streamed.zip` and `zip64.zip`). Such an entry is written as a file with its data; nothing is ever created as what the mode says.
 
 ## Writing by handle
 
@@ -60,21 +62,39 @@ The defaults are a judgment, to be tuned on real archives; each can be raised.
 
 Every entry's data is checked at its end, its CRC-32, or for WinZip AES its authentication code, by `hivepack-zip`; a file whose data fails is removed, as is one cut off at a limit, and the extraction stops. Encrypted entries are read with `Options::password`.
 
-On Unix, a file gets the permission bits its entry has, masked as Python's `data` filter masks them: no setuid, setgid or sticky bit, nothing writable by group or others, and readable and writable by its owner. Owners, ACLs and extended attributes are not restored. Directories get the system's defaults. Files get the time the entry has.
+On Unix, a file gets the permission bits its entry has, masked as Python's `data` filter masks them: no setuid, setgid or sticky bit, nothing writable by group or others, and readable and writable by its owner. Owners, ACLs and extended attributes are not restored. Directories get the system's default permissions. Files and directories get the time their entry has, the directories once nothing more is written in them, the deepest first, without following a link.
+
+## Options
+
+Each rule that is not about writing outside the destination can be relaxed, by name (`Options`):
+
+| Option | Default | Otherwise |
+|---|---|---|
+| `links` | `Links::Refuse` | `AsFile`: a file holding the target, as extractors on Windows write links. `Inside`: links whose target is relative and stays inside the destination by its text (`..` allowed, as long as it does not climb out), and does not pass through another link of the archive, which the system would follow where the text does not; read and checked before anything is written, and created after every other entry, so nothing is written through them. On Windows, creating a link takes a privilege that most accounts lack |
+| `names` | `Names::Strict` | `Sanitize`: first drops what Python's `zipfile` drops, a leading `/`, a drive (`C:`, a letter and a colon, as Windows reads it) and `.`, `..` and empty components, then refuses what is still refused |
+| `backslash_separator` | `false` | `\` taken for a separator, as PowerShell 5.1's `Compress-Archive` writes it |
+| `on_refused` | `OnRefused::Stop` | `Skip`: an entry refused for its name, as a link or as the same path as another is left out, listed in `Summary::skipped` with its reason, and the rest extracted. The limits and overlapping data still stop the extraction: they are about the archive, not one entry |
+| `overwrite` | `false` | Files that are there are replaced, if they are files: opened without following a link and emptied. A link or a directory there still stops it |
+| `permissions` | `Permissions::Masked` | `Preserve`: the entry's bits but setuid, setgid and sticky. `Ignore`: the system's |
+| `limits` | see [Limits](#limits) | each raised or lowered |
+| `password` | none | the password encrypted entries are read with |
 
 ## Errors
 
-An extraction stops at the first entry refused, with its index, its name as the archive has it, and the reason (`Error`, `ErrorKind`). What is checked before writing (names, the same path, links, overlaps, declared sizes) stops it before anything is written, the destination included.
+An extraction stops at the first entry refused (unless `on_refused` is `Skip`), with its index, its name as the archive has it, and the reason (`Error`, `ErrorKind`). What is checked before writing (names, the same path, links, overlaps, declared sizes) stops it before anything is written, the destination included.
 
 ## How it is shown
 
-`crates/extract/tests/extract.rs` extracts archives made to attack extractors, written by `hivepack-zip` and changed by hand where it would not write them: names that climb, are absolute, carry backslashes, drives, streams, device names or control characters (as CP437 too); the same path in two cases, as a file and a directory; links, FIFOs and devices; links already in the destination, to a directory and to a file outside it (Unix); files already there; the limits; two entries sharing one stream, as Fifield's bombs do; data whose CRC-32 fails, and more data than the header says; and encrypted entries, with and without the password. Each must stop with its reason, leave nothing outside the destination, and nothing at all when the checks before writing stop it. The name rules have unit tests of their own, and random bytes are checked without panicking.
+`crates/extract/tests/extract.rs` extracts archives made to attack extractors, written by `hivepack-zip` and changed by hand where it would not write them: names that climb, are absolute, carry backslashes, drives, streams, device names or control characters (as CP437 too); the same path in two cases, as a file and a directory; links; FIFOs and devices, written as files; links already in the destination, to a directory and to a file outside it (Unix); files already there; the limits; two entries sharing one stream, as Fifield's bombs do; data whose CRC-32 fails, and more data than the header says; and encrypted entries, with and without the password. Each must stop with its reason, leave nothing outside the destination, and nothing at all when the checks before writing stop it. Each option has its test: links inside, climbing out, absolute and through another link; links as files; names cleaned up and backslashes; entries skipped; files overwritten but not links; permissions kept or left; directory times. The name rules have unit tests of their own, and random bytes are checked without panicking.
+
+The same test extracts every archive of libzip's `regress/` that opens with `ZIP_CHECKCONS` (112 of 180), beside a file that must stay as it was. 80 extract; 29 stop on their data, as they were made to (wrong passwords, CRC errors, garbage after a stream, and bzip2, LZMA, XZ and Zstandard, which the port does not read yet); 3 stop on their names (an empty one, and two whose CP437 names have control characters). It was this run that found the FIFOs of `streamed.zip`, which were refused before they were written as files.
+
+The `extract` fuzz target (see [fuzz/README.md](../fuzz/README.md)) extracts its input with options its first byte picks, and checks that nothing is written beside the destination, that every link created stays inside it by its text, and that the summary counts what is there: 11 million inputs over four minutes found nothing before the first commit.
 
 ## What comes next
 
-- **Options to relax the rules**, each named: names cleaned up as Python does, `\` taken as a separator (PowerShell 5.1's `Compress-Archive` writes it), links kept when they point inside the destination (created last) or written as files, permissions kept, entries refused skipped rather than stopping, and a time budget.
+- **A time budget**, and cancelling.
 - **Unicode normalization** of names before they are compared, which needs Unicode's tables.
 - **Marks of origin**: the archive's `Zone.Identifier` on Windows and `com.apple.quarantine` on macOS, carried to every file written, a failure to write one being a failure to extract. The macOS one takes a system call the standard library does not wrap.
-- **Directory times**, set once their contents are written.
 - **tar and RAR**, through the same checks and writing.
-- **Corpora**: ZipDiff's archives, Fifield's bombs and the archives behind recent CVEs, and fuzzing.
+- **Corpora**: ZipDiff's archives, Fifield's bombs and the archives behind recent CVEs.

@@ -41,9 +41,13 @@ use crate::compress::zstd_compress_sequences::{
     zstd_fse_bit_cost, zstd_select_encoding_type,
 };
 use crate::compress::zstd_double_fast::{
-    zstd_compress_block_double_fast, zstd_compress_block_double_fast_ext_dict,
+    zstd_compress_block_double_fast, zstd_compress_block_double_fast_dict_match_state,
+    zstd_compress_block_double_fast_ext_dict,
 };
-use crate::compress::zstd_fast::{zstd_compress_block_fast, zstd_compress_block_fast_ext_dict};
+use crate::compress::zstd_fast::{
+    zstd_compress_block_fast, zstd_compress_block_fast_dict_match_state,
+    zstd_compress_block_fast_ext_dict,
+};
 use crate::compress::zstd_lazy::{
     ZSTD_ROW_HASH_TAG_BITS, zstd_compress_block_btlazy2, zstd_compress_block_lazy_hc,
     zstd_compress_block_lazy_row,
@@ -1187,8 +1191,9 @@ pub(crate) fn zstd_frame_ported(_params: &CCtxParams) -> bool {
 pub(crate) fn zstd_dict_match_state_ported(params: &CCtxParams, dedicated: bool) -> bool {
     let _ = (params.use_row_match_finder, dedicated);
     match params.c_params.strategy {
-        // Phase 1: fast and dfast.
-        Strategy::Fast | Strategy::Dfast => false,
+        // ZSTD_compressBlock_fast_dictMatchState and
+        // ZSTD_compressBlock_doubleFast_dictMatchState.
+        Strategy::Fast | Strategy::Dfast => true,
         // Phase 1: greedy, lazy and lazy2: the hash chain, the row match
         // finder, and the dedicated dictionary search.
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => false,
@@ -1990,11 +1995,17 @@ impl BlockCompressor<'_> {
         dms: DictMatchState<'_>,
         ldm: Option<&RawSeqStore>,
     ) -> Result<usize> {
-        let _ = (ms, seq_store, rep, istart, iend, dms, ldm);
+        // Only the optimal parser takes the matches of long distance
+        // matching as candidates.
+        let _ = ldm;
+        let src = self.src;
         match self.strategy {
-            // Phase 1: ZSTD_compressBlock_fast_dictMatchState and
-            // ZSTD_compressBlock_doubleFast_dictMatchState.
-            Strategy::Fast | Strategy::Dfast => error!(ParameterUnsupported),
+            Strategy::Fast => Ok(zstd_compress_block_fast_dict_match_state(
+                ms, seq_store, rep, src, dms, istart, iend,
+            )),
+            Strategy::Dfast => Ok(zstd_compress_block_double_fast_dict_match_state(
+                ms, seq_store, rep, src, dms, istart, iend,
+            )),
             // Phase 1: ZSTD_compressBlock_{greedy,lazy,lazy2}_dictMatchState,
             // their _row variants (self.use_row_match_finder), and
             // _dedicatedDictSearch (dms.ms.dedicated_dict_search).

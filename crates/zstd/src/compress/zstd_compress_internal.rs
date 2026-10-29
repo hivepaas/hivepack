@@ -1193,6 +1193,14 @@ pub(crate) fn zstd_hash_ptr(src: &[u8], at: usize, h_bits: u32, mls: u32) -> usi
     (zstd_hash_top(src, at, mls) >> (64 - h_bits)) as usize
 }
 
+/// [`zstd_hash_ptr`] of the 8 bytes `u`, read at a position already: the
+/// hash of their low `mls` bytes, `h_bits` long.
+#[inline(always)]
+pub(crate) fn zstd_hash_u64(u: u64, h_bits: u32, mls: u32) -> usize {
+    debug_assert!(h_bits <= 32);
+    (zstd_hash_top_u64(u, mls) >> (64 - h_bits)) as usize
+}
+
 /// The hash of the `mls` bytes at `at` before its shift: the hash `h_bits`
 /// long is the top `h_bits` of it.
 ///

@@ -82,6 +82,9 @@ The stronger levels have had no speed work yet. On five of the files (`dickens`,
 | 9 | row (`lazy2`) | 0.75× | 0.67–0.84× |
 | 12 | row (`lazy2`) | 0.71× | 0.60–0.89× |
 | 13 and 15 | binary tree (`btlazy2`) | 1.00–1.05× | 1.00–1.14× |
+| 16 | optimal parser (`btopt`) | 0.89× | 0.83–0.92× |
+| 19 | optimal parser (`btultra2`) | 0.93× | 0.86–0.96× |
+| 22 | optimal parser (`btultra2`), long distance matching for large inputs | 0.93× | 0.86–0.96× |
 | 16, 18 and 19 | the optimal parser (`btopt`, `btultra`, `btultra2`)\* | 0.94–0.96× | 0.88–1.02× |
 
 \* On the first 4 MB of each file, with the block splitter after the sequences off on both sides, as the port does not have it yet.

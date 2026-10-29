@@ -3099,14 +3099,6 @@ impl CCtx {
     /// for [`compress_bound`] bytes is always enough. The parameters set
     /// with [`CCtx::set_parameter`] do not apply; [`CCtx::compress2`] takes
     /// them.
-    ///
-    /// Work in progress: the port has every strategy of libzstd, but not
-    /// yet the block splitter after the sequences, which the optimal
-    /// parser's levels (`btopt` and up) use for inputs over 64 KB. So every
-    /// level works for inputs up to 64 KB; for larger ones, the levels up to
-    /// 15 over 256 KB (or of unknown size), and up to 12 below. Other levels
-    /// fail with
-    /// [`ErrorCode::ParameterUnsupported`](crate::ErrorCode::ParameterUnsupported).
     pub fn compress(
         &mut self,
         dst: &mut [u8],

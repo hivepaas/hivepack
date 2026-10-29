@@ -72,10 +72,18 @@ version = "0.0.0"
 dependencies = [
  "flate2",
  "hivepack-deflate",
+ "hivepack-zip",
  "hivepack-zstd",
  "libfuzzer-sys",
  "libz-sys",
  "zstd",
+]
+
+[[package]]
+name = "hivepack-zip"
+version = "0.0.0"
+dependencies = [
+ "hivepack-deflate",
 ]
 
 [[package]]

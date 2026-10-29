@@ -1,7 +1,11 @@
 //! Decodes the input as a Deflate64 stream with hivepack-deflate's
 //! `InflateBack9`, all given at the start and in pieces, and checks that
 //! both agree: the same result and message, the same input used, and the
-//! same output in the same calls. A panic or a difference is a bug. zlib's
+//! same output in the same calls. Then decodes it with `Inflate9`, in
+//! pieces of input and output, which must end as `InflateBack9` does, with
+//! the same message, and give its output (which `InflateBack9` gives a
+//! full window at a time before an error, and in full at the end). A panic
+//! or a difference is a bug. zlib's
 //! `contrib/infback9`, which the port follows, is not in libz-sys:
 //! `crates/deflate/tests/deflate64.rs` compares the two through the oracle.
 //!
@@ -9,7 +13,9 @@
 
 #![no_main]
 
-use hivepack_deflate::{Back9, BackIn, BackOut, InflateBack9};
+use hivepack_deflate::{
+    Back9, BackIn, BackOut, ErrorCode, InBuffer, Inflate9, InflateBack9, OutBuffer, Status,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// The input after the first piece, in pieces of random sizes.
@@ -68,4 +74,45 @@ fuzz_target!(|data: &[u8]| {
 
     assert_eq!(got, want);
     assert!(pieces_out.0 == whole_out.0, "different output");
+
+    // Inflate9, with input and output in pieces the seed picks.
+    let mut rng = rng;
+    let mut next = move |n: usize| {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        (rng.wrapping_mul(0x2545_f491_4f6c_dd1d) % n as u64) as usize
+    };
+    let mut inflate = Inflate9::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 70_000];
+    let mut pos = 0;
+    let end = loop {
+        let left = stream.len() - pos;
+        let in_len = if next(3) == 0 { left } else { next(left.min(300) + 1) };
+        let space = 1 + next(buf.len());
+        let mut input = InBuffer::new(&stream[pos..pos + in_len]);
+        let mut output = OutBuffer::new(&mut buf[..space]);
+        let ret = inflate.inflate(&mut output, &mut input);
+        pos += input.pos;
+        let written = output.pos;
+        out.extend_from_slice(&buf[..written]);
+        match ret {
+            Ok(Status::Ok) => {}
+            Err(e) if e.code() == ErrorCode::Buf && pos < stream.len() => {}
+            ret => break ret,
+        }
+    };
+    let back_out: Vec<u8> = whole_out.0.concat();
+    match back.result {
+        Ok(_) => {
+            assert_eq!(end, Ok(Status::StreamEnd));
+            assert!(out == back_out, "different output from Inflate9");
+        }
+        Err(e) => {
+            assert_eq!(end.map_err(|e| e.code()), Err(e.code()));
+            assert_eq!(inflate.msg(), decoder.msg());
+            assert!(out.starts_with(&back_out), "different output from Inflate9");
+        }
+    }
 });

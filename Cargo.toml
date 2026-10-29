@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deflate", "crates/zstd", "tools/deflate-bench", "tools/zstd-bench"]
+members = ["crates/deflate", "crates/zip", "crates/zstd", "tools/deflate-bench", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -12,6 +12,7 @@ homepage = "https://github.com/hivepaas/hivepack-rs"
 
 [workspace.dependencies]
 hivepack-deflate = { path = "crates/deflate" }
+hivepack-zip = { path = "crates/zip" }
 hivepack-zstd = { path = "crates/zstd" }
 # The official libraries, used only as the reference in tests and
 # benchmarks. zstd 0.14.3 builds libzstd 1.5.7, the release hivepack-zstd

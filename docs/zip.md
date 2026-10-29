@@ -2,7 +2,7 @@
 
 `hivepack-zip` will read and write ZIP archives. Its container logic is a port of [libzip](https://libzip.org) to safe Rust; its compression and encryption come from hivepack's own crates, each ported from or checked against an official library. What libzip does not do, such as split archives, legacy file name encodings and extracting to disk, is written for hivepack and checked against other implementations.
 
-> **Status:** a plan. Nothing here is implemented yet.
+> **Status:** step 2 is under way. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored and deflated entries as libzip does, compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). Deflate64 entries and `tools/ziptool` are next.
 
 ## Why libzip
 
@@ -72,11 +72,42 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 
 ## How it is shown
 
-- **Reading.** Every archive in libzip's `regress/` is opened by the port and by libzip, with and without `ZIP_CHECKCONS`. Both must accept or refuse it, with the same error code and detail. The comparison goes through `tools/zip-oracle`, a small C program built from libzip 1.12.1's sources, as `tools/zstd-oracle` is built from libzstd's. Its earlier answers are recorded in `testdata/oracle/` and replayed where it is not built.
+- **Reading.** Every archive in libzip's `regress/` is opened by the port and by libzip, with and without `ZIP_CHECKCONS`, from a buffer and from a file. Both must accept or refuse it, with the same error code and detail. The comparison goes through `tools/zip-oracle`, a small C program built from libzip 1.12.1's sources, as `tools/zstd-oracle` is built from libzstd's. For an archive that opens, the oracle answers what the reading API says about every entry: its name raw, guessed and strict, `zip_stat_index`, the external attributes, the comment, the extra fields of the central directory and of the local header, where its data starts, and `zip_name_locate` of its name with each flag. `crates/zip/tests/oracle.rs` also generates archives: names in ASCII, UTF-8, CP437, with NUL bytes, repeated, and with Info-ZIP Unicode fields whose CRC is right or wrong; Zip64 fields and records, right and wrong; WinZip AES fields; data descriptors; padding and garbage after extra fields; local headers that disagree with the central directory; torrentzip comments; prefixes, trailing bytes, wrong counts and disks; and some of them damaged. 1,500 are compared on each run, and 40,000 were before the first commit: every detail libzip reports when opening came up but two, `ZIP_ER_DETAIL_CDIR_LENGTH_INVALID` and `ZIP_ER_DETAIL_EOCD64_WRONG_MAGIC`, which the checks before them leave almost no way to reach. `testdata/oracle/zip-open.txt` replays 742 earlier answers where the oracle is not built (Windows, and the emulated i686 and s390x jobs).
+
+  Reading entries is compared the same way, through the oracle's `read` requests: every entry opened with `zip_fopen_index` (decompressed, or raw with `ZIP_FL_COMPRESSED` or `ZIP_FL_ENCRYPTED`), read with `zip_fread` in pieces of one byte to 64 KiB, to its end or to a limit, then closed. The port must return the same from every read, the same data, the same error at the end and the same from `zip_fclose`. The generated entries hold deflate streams from `hivepack-deflate`'s compressor, some cut short, followed by garbage or with a byte changed, and CRCs and sizes right or wrong; what came up includes CRC errors when the end is read and when an entry read to its last byte is closed, wrong lengths, zlib data errors, garbage after a stream with `ZIP_CHECKCONS`, compressed sizes past the end of the file, and local headers that cannot be read. 10,000 requests agreed before the first commit, every regress archive is read four ways on each run, and `testdata/oracle/zip-read.txt` replays 560 answers. libzip's build writes `config.h`, `zipconf.h` and its error strings with CMake; `scripts/testdata.py` builds the oracle with the C compiler alone, from `tools/zip-oracle/config.h` and `zipconf.h` and the strings generated as CMake would.
 - **libzip's own tests.** The 199 `.test` files in `regress/` are scripts for libzip's test programs (`ziptool`, `tryopen` and a few others), run by nihtest. The port gets a `tools/ziptool` that takes the same commands, so the tests run unchanged. Most of them open, read or build archives; the others delete, rename, undo changes or change sizes in place, which the editor above covers.
 - **Writing.** For the same input, the port writes the same archive as libzip, byte for byte. libzip compresses with zlib's raw deflate (`windowBits` −15) at level 9 and `memLevel` 9 unless told otherwise (`zip_algorithm_deflate.c`), so this needs `hivepack-deflate` to give zlib's output at those settings. Torrentzip output is compared too.
-- **Fuzzing.** A fuzzer compares the port with the libzip oracle under AddressSanitizer, seeded with libzip's OSS-Fuzz corpus.
+- **Fuzzing.** A fuzzer compares the port with the libzip oracle under AddressSanitizer, seeded with libzip's OSS-Fuzz corpus. For now `fuzz/fuzz_targets/zip_open.rs` opens its input and asks the reading API everything, which must not panic, seeded with the archives of `zip-open.txt`.
 - **Beyond libzip.** Info-ZIP `unzip`, 7-Zip, bsdtar, Python and Go read everything the port writes; ZipDiff's ambiguous archives are read, and where the oracles disagree, the manifest records which one hivepack follows.
+
+## Progress
+
+| libzip | Port | Status |
+|---|---|---|
+| `zip_error.c`, `zip_error_strerror.c`, `zip_err_str.c` (generated) | `error.rs` | done |
+| `zip_buffer.c`, `zip_io_util.c`, `zip_string.c` | `buffer.rs`, `io_util.rs`, `string.rs` | reading done; writing with step 3 |
+| `zip_utf-8.c` | `utf_8.rs` | done |
+| `zip_extra_field.c`, `zip_extra_field_api.c` | `extra_field.rs`, `extra_field_api.rs` | reading done |
+| `zip_dirent.c` | `dirent.rs` | reading done |
+| `zip_open.c`, `zip_new.c` | `open.rs` | done for reading; `ZIP_CREATE`, `ZIP_EXCL` and `ZIP_TRUNCATE` with step 3 |
+| `zip_hash.c` | `hash.rs` | its rules, on `HashMap` |
+| `zip_name_locate.c`, `zip_get_name.c`, `zip_stat_index.c`, `zip_stat_init.c`, `zip_file_get_comment.c`, `zip_file_get_external_attributes.c`, `zip_get_archive_comment.c`, `zip_get_archive_flag.c`, `zip_get_num_entries.c` | modules of the same names, `zip.rs` | done |
+| `zip_file_get_offset.c` | `file_get_offset.rs` | `_zip_file_get_offset`; `_zip_file_get_end` next |
+| The reading rules of `zip_source_seek.c`, `zip_source_read.c`, `zip_source_tell.c`, `zip_source_accept_empty.c`, and the file and buffer sources | `source.rs` | done |
+| `zip_fopen.c`, `zip_fopen_index.c`, `zip_fopen_index_encrypted.c`, `zip_fread.c`, `zip_fclose.c` | modules of the same names | done, without decryption |
+| `zip_source_zip_new.c`, `zip_source_window.c`, `zip_source_crc.c` | modules of the same names | the reading of a whole entry |
+| `zip_source_compress.c`, `zip_algorithm_deflate.c` | `source_compress.rs`, `algorithm_deflate.rs` | decompressing deflate |
+| The rules of `zip_source_read.c`, `zip_source_open.c`, `zip_source_close.c`, `zip_source_at_eof.c`, `zip_source_stat.c`, `zip_source_layered.c` for those layers | `source_stack.rs` | done |
+| Deflate64, `tools/ziptool` and libzip's `.test` files | | next |
+
+Where the port differs from libzip, a `Differs from libzip:` comment says so. The differences so far:
+
+- An archive is read through `ReadAt`, reads at a position, in place of a stack of `zip_source_t` callbacks; `Source` keeps the position and the rules of libzip's file and buffer sources (a seek outside the source fails with `ZIP_ER_INVAL`, reads stop at the length it had when opened, a failed read fails all later ones, and an empty buffer is an empty archive but an empty file is not one).
+- Names are returned whole: libzip returns C strings, which end at a NUL byte in a name (`ZIP_CHECKCONS` refuses such names). Lookups compare names as libzip does, up to their first NUL.
+- Times are taken as UTC, where libzip calls `mktime` in the machine's time zone; the oracle runs with `TZ=UTC`. `Archive::file_get_dos_time` gives the time as stored.
+- The system error of an error is described by the standard library, whose text is `strerror`'s on Unix.
+- An entry is read through a struct of layers (a window on the archive, then decompression, then the CRC check), each with the state libzip keeps in its `zip_source_t`, in place of a chain of callbacks. Each open entry reads through a view of the archive's source with its own position, so several can be read at once from `&Archive`; a failed read fails only that entry's later reads.
+- Decryption comes with step 4: an encrypted entry fails with `ZIP_ER_NOPASSWD`, as in libzip without a password. Of the compression methods, deflate is read, as the oracle's libzip is built without bzip2, LZMA and Zstandard.
 
 ## The order of work
 
@@ -95,6 +126,6 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 
 ## Licences
 
-The port is derived from libzip, which is under BSD-3-Clause (Copyright (C) Dieter Baron and Thomas Klausner). That is why `hivepack-zip` will be under BSD-3-Clause, with libzip's notice in its `LICENSE`, as `hivepack-zstd` keeps Meta's. `hivepack-deflate`, which `hivepack-zip` takes CRC-32 from too, is derived from zlib and is under the zlib license, which asks that altered versions be marked as such. The rest of hivepack stays MIT.
+The port is derived from libzip, which is under BSD-3-Clause (Copyright (C) Dieter Baron and Thomas Klausner). That is why `hivepack-zip` is under BSD-3-Clause, with libzip's notice in its `LICENSE`, as `hivepack-zstd` keeps Meta's. `hivepack-deflate`, which `hivepack-zip` takes CRC-32 from too, is derived from zlib and is under the zlib license, which asks that altered versions be marked as such. The rest of hivepack stays MIT.
 
 APPNOTE.TXT may not be redistributed (its section 1.4.2), so the repository links to it and does not include it. The test archives from libzip, libarchive, Go, Commons Compress and .NET keep their own licences, listed in [testdata/README.md](../testdata/README.md).

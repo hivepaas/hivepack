@@ -34,10 +34,11 @@ The reference is zlib 1.3.2 itself, reached two ways: built from the sources bun
 - **`tests/oracle.rs`** reaches what `flate2` cannot: `Flush::Block` and `Flush::Trees`, `data_type`, `inflateMark`, `inflatePrime`, `inflateSync`, `inflateValidate`, dictionaries set at any point, and the gzip header fields, on streams from every level, window, memory level, strategy and flush (`Z_BLOCK` included) of zlib's compressor, some of them damaged. Each request is a stream and a list of calls; the port must answer each call as zlib does: the result, bytes read and written, `data_type`, `inflateMark` and `msg`, then the totals, the check value, a hash of the output and the header. About 1,800 requests are compared with zlib where the oracle is built (Linux and macOS in CI), and `testdata/oracle/inflate.txt` replays 1,173 earlier answers everywhere else, including Windows, 32-bit and big-endian machines.
 
   The compressor is compared the same way, through the oracle's `deflate2` requests, for what `flate2` cannot set: every memory level and strategy (`Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`), parameters out of range, gzip headers with every field, dictionaries before and between blocks, `deflateParams` and `deflateTune` between calls, `deflatePrime`, `deflateBound`, `Z_BLOCK`, and output space from none up. Each call is answered with the result, bytes read and written, `data_type`, `deflatePending`, `deflateUsed` and `msg`, then the totals, the check value and a hash of the output. About 800 requests are compared live, and `testdata/oracle/deflate.txt` replays 586.
+- **`tests/deflate64.rs`** compares `Inflate9` with `infback9.c` too, on the oracle's answers live and recorded: with its input and output in pieces of random sizes, it must end as `infback9.c` ends, with the same message, and give the same output (`infback9.c` gives a full window at a time before an error). 19,000 requests over 40 seeds agreed before the first commit, every message among them, and the end and the output never depended on the pieces.
 - **`tests/deflate64.rs`** compares Deflate64 decoding with zlib's `contrib/infback9`, through the oracle's `inflate9` requests. zlib has no Deflate64 compressor, so the test makes the streams: stored, fixed and dynamic blocks, with random complete codes up to 15 bits, lengths up to 65,538 and distances up to 65,536, knowing the data each decodes to. Some are damaged, some code a distance their table leaves out, and deflate streams and random bytes are given too. Each is decoded by `inflateBack9` with its input in random pieces and an `out()` that fails now and then; the port must give the same result and message, the same input left unused, the same number of `in()` and `out()` calls and the same output. Every message of `infback9.c` comes up. About 600 requests are compared live, `testdata/oracle/inflate9.txt` replays 414, and on every machine the generated streams must decode to their data.
 - **`tests/infcover.rs`** is zlib's own coverage test of inflate, `test/infcover.c`, ported with the same inputs and expected results, including the messages of every data error.
 - **Unit tests** compare the CRC tables with `crc32.h` and the static trees with `trees.h`, build `inffixed.h`'s tables with the ported `inflate_table` as zlib's `makefixed()` does, and `inffix9.h`'s with `inflate_table9` (whose entries for the two unused length symbols, 286 and 287, are from an older table, but are invalid codes either way), and check CRC-32 and Adler-32, combined or not, against their definitions.
-- **`fuzz/fuzz_targets/inflate.rs`** and **`deflate.rs`** do what `tests/zlib.rs` and `tests/deflate.rs` do, with the fuzzer's input as the stream or the data (see [fuzz/README.md](../fuzz/README.md)). **`inflate9.rs`** decodes its input as Deflate64 all at once and in pieces, which must agree.
+- **`fuzz/fuzz_targets/inflate.rs`** and **`deflate.rs`** do what `tests/zlib.rs` and `tests/deflate.rs` do, with the fuzzer's input as the stream or the data (see [fuzz/README.md](../fuzz/README.md)). **`inflate9.rs`** decodes its input as Deflate64 all at once and in pieces, which must agree, and with `Inflate9`, which must end as `InflateBack9` does with the same output.
 
 ## The speed target
 
@@ -93,6 +94,15 @@ zlib's `contrib/infback9` has no fast loop: it decodes one code at a time and pu
 
 It was 0.92–0.94× as first ported. The codes of a block are now decoded in a loop of their own, with the block's tables looked up once, and a match that does not overlap the bytes it writes is copied at once rather than byte by byte.
 
+`InflateBack9` takes the whole stream through call-backs, so a reader that pulls data a piece at a time, as a ZIP reader does, cannot use it. `Inflate9` is for that: hivepack's own, with the structure of `inflate.c` (a mode for each place where the input or the output can run out, the 64K window kept between calls, copies from the output or the window) and the decoding and messages of `infback9.c`. It reads input a byte at a time as it needs it, as `inflate.c`'s slow loop does, so at the end of a stream what is left of the input is what follows it. On the same files and machine:
+
+| File | One call | In pieces of 16 KiB | zlib's `infback9` |
+|---|---|---|---|
+| osdb | 530 MB/s (1.11×) | 482 MB/s (1.00×) | 479 MB/s |
+| sao | 343 MB/s (0.97×) | 321 MB/s (0.91×) | 353 MB/s |
+| x-ray | 233 MB/s (0.89×) | 223 MB/s (0.85×) | 262 MB/s |
+
+Its literals are written in the loop that decodes the length codes, while there is room, without going through a mode of their own; that took it from 0.75–0.91×. Masking the root table's index, to spare a bounds check, made it slower and was left out. On mostly literals it is still below the 0.95× target: a fast loop as `inflate.c` has would be the next step.
 ## Progress
 
 | zlib | Port | Status | Checked against zlib by |
@@ -107,6 +117,7 @@ It was 0.92–0.94× as first ported. The codes of a block are now decoded in a 
 | `deflate.{h,c}` | `deflate.rs` | done | `tests/deflate.rs`, byte for byte, call by call; `tests/oracle.rs`, for every function, strategy, memory level and flush |
 | `compress.c`, `uncompr.c` | | later | |
 | `contrib/infback9`: `infback9.{h,c}`, `inftree9.{h,c}`, `inffix9.h`, `inflate9.h` (Deflate64) | `infback9.rs`, `inftree9.rs`, `inffix9.rs` | done | `tests/deflate64.rs`, through the oracle; `inffix9.h` rebuilt |
+| Deflate64 a piece at a time (hivepack's own, from `inflate.c` and `infback9.c`) | `inflate9.rs` | done | `tests/deflate64.rs`: the same ends, messages and output as `infback9.c` |
 
 ## Not ported, for now
 

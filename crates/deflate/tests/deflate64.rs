@@ -24,7 +24,8 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hivepack_deflate::{
-    BackIn, BackOut, Deflate, Flush, InBuffer, InflateBack9, OutBuffer, Status,
+    BackIn, BackOut, Deflate, ErrorCode, Flush, InBuffer, Inflate9, InflateBack9, OutBuffer,
+    Result, Status,
 };
 use support::{Oracle, Rng, damage, fnv64, hex, recorded_form, repository, unhex};
 
@@ -688,4 +689,140 @@ fn record_inflate9_answers() {
         let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
     }
     std::fs::write(recorded_path(), text).expect("written");
+}
+
+/// Decodes `stream` with [`Inflate9`], giving it input and output space in
+/// pieces of random sizes: the result, and all the output. The result is
+/// `ErrorCode::Buf` if the stream needs more input than there is.
+fn decode9(rng: &mut Rng, stream: &[u8]) -> (Result<Status>, Vec<u8>, Option<&'static str>) {
+    let mut inflate = Inflate9::new();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let whole = rng.below(4) == 0;
+    loop {
+        let left = stream.len() - pos;
+        let in_len = if whole || rng.below(3) == 0 {
+            left
+        } else {
+            (1 + rng.below(300) as usize).min(left)
+        };
+        let space = if whole {
+            stream.len() * 1100 + 70_000
+        } else {
+            1 + rng.below(70_000) as usize
+        };
+        let mut buf = vec![0; space];
+        let mut input = InBuffer::new(&stream[pos..pos + in_len]);
+        let mut output = OutBuffer::new(&mut buf);
+        let ret = inflate.inflate(&mut output, &mut input);
+        pos += input.pos;
+        let written = output.pos;
+        out.extend_from_slice(&buf[..written]);
+        match ret {
+            Ok(Status::Ok) => {}
+            Err(e) if e.code() == ErrorCode::Buf && pos < stream.len() => {}
+            ret => return (ret, out, inflate.msg()),
+        }
+    }
+}
+
+/// Whether [`Inflate9`] decodes `stream` as infback9.c answered `want`
+/// (the oracle's `inflate9` answer, with out() never failing): the same
+/// end and message, and the same output, of which infback9.c gives out
+/// only full windows before an error.
+fn check9(rng: &mut Rng, stream: &[u8], want: &str) {
+    let (ret, out, msg) = decode9(rng, stream);
+    let fields: Vec<&str> = want
+        .split_once(' ')
+        .unwrap()
+        .1
+        .split(&['/', ' '][..])
+        .collect();
+    let [code, _, want_msg, _, _, written, hash] = fields[..] else {
+        panic!("{want}")
+    };
+    let written: usize = written.parse().unwrap();
+    let got_msg = msg.map_or("-".to_string(), |m| hex(m.as_bytes()));
+    match code {
+        "1" => assert_eq!(ret, Ok(Status::StreamEnd), "{want}"),
+        "-3" => {
+            assert_eq!(ret.map_err(|e| e.code()), Err(ErrorCode::Data), "{want}");
+            assert_eq!(got_msg, want_msg, "{want}");
+        }
+        _ => assert_eq!(ret.map_err(|e| e.code()), Err(ErrorCode::Buf), "{want}"),
+    }
+    if code == "1" {
+        assert_eq!(out.len(), written, "{want}");
+    }
+    assert!(
+        out.len() >= written,
+        "{} bytes, not {written}: {want}",
+        out.len()
+    );
+    assert_eq!(format!("{:016x}", fnv64(&out[..written])), hash, "{want}");
+}
+
+/// The stream of an `inflate9` request, if infback9.c gets all of it
+/// (no zero piece ends its input) and out() never fails.
+fn stream_of(request: &str) -> Option<Vec<u8>> {
+    let words: Vec<&str> = request.split(' ').collect();
+    let whole = !words[1].split(',').skip(1).any(|p| p == "0");
+    (whole && words[2] == "-1").then(|| unhex(words[3]))
+}
+
+#[test]
+fn inflate9_decodes_generated_streams() {
+    let mut rng = Rng(0x5eed_0067);
+    let mut checked = 0;
+    for (request, data) in requests(&mut rng, 300, 200_000) {
+        let Some(data) = data else { continue };
+        let stream = stream_of(&request).unwrap();
+        let (ret, out, _) = decode9(&mut rng, &stream);
+        assert_eq!(ret, Ok(Status::StreamEnd), "{request:.200}");
+        assert!(
+            out == data,
+            "{} bytes, not {}: {request:.200}",
+            out.len(),
+            data.len()
+        );
+        checked += 1;
+    }
+    assert!(checked > 80, "only {checked} streams");
+}
+
+#[test]
+fn inflate9_matches_recorded_answers() {
+    let text = std::fs::read_to_string(recorded_path()).expect("testdata/oracle/inflate9.txt");
+    let mut rng = Rng(0x5eed_0068);
+    let mut checked = 0;
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        let Some(stream) = stream_of(request) else {
+            continue;
+        };
+        if want.starts_with("fnv64:") {
+            continue;
+        }
+        check9(&mut rng, &stream, want);
+        checked += 1;
+    }
+    assert!(checked > 250, "only {checked} recorded answers");
+}
+
+#[test]
+fn inflate9_matches_zlib() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x5eed_0069);
+    for (request, _) in requests(&mut rng, 600, 200_000) {
+        let Some(stream) = stream_of(&request) else {
+            continue;
+        };
+        let want = oracle.ask(&request);
+        check9(&mut rng, &stream, &want);
+    }
 }

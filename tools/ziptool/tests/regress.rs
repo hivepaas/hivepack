@@ -52,7 +52,9 @@ const COMMANDS: &[(&str, usize)] = &[
     ("set_file_compression", 3),
     ("set_file_dostime", 3),
     ("set_file_mtime", 2),
+    ("set_file_encryption", 3),
     ("set_file_mtime_all", 1),
+    ("set_password", 1),
     ("stat", 1),
     ("unchange", 1),
     ("unchange_all", 0),
@@ -163,6 +165,8 @@ fn parse(text: &str) -> Test {
                 let after = parts.get(2).map(|p| content(p));
                 test.files.push((parts[0].into(), before, after));
             }
+            // WinZip AES, which needs a crypto library in libzip.
+            "features" if rest == "HAVE_CRYPTO" => {}
             "stdin" if rest.is_empty() => test.stdin = inline(&mut lines),
             "stdout" if rest.is_empty() => test.stdout = inline(&mut lines),
             "stderr" if rest.is_empty() => test.stderr = inline(&mut lines),
@@ -181,7 +185,7 @@ fn unsupported(test: &Test) -> Option<String> {
     }
     match test.program.as_deref() {
         Some("tryopen") => None,
-        None => {
+        None | Some("ziptool_regress_nonrandom") => {
             let mut i = 0;
             let args = &test.arguments;
             while i < args.len() && args[i].starts_with('-') {
@@ -265,7 +269,12 @@ fn run(test: &Test, regress: &Path, extracted: &Path, folder: &Path) -> Result<(
         Some("tryopen") => env!("CARGO_BIN_EXE_tryopen"),
         _ => env!("CARGO_BIN_EXE_ziptool"),
     };
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    // The port's ziptool_regress_nonrandom.
+    if test.program.as_deref() == Some("ziptool_regress_nonrandom") {
+        command.env("HIVEPACK_ZIPTOOL_NONRANDOM", "1");
+    }
+    let mut child = command
         .args(&test.arguments)
         .current_dir(folder)
         .stdin(Stdio::piped())
@@ -317,8 +326,18 @@ fn run(test: &Test, regress: &Path, extracted: &Path, folder: &Path) -> Result<(
             Content::File(file) => Some(read(file)?),
         };
         // nihtest.conf's comparators: an archive written as one with the
-        // same name is compared with `zipcmp -pv`, anything else byte for
-        // byte.
+        // same name is compared with `zipcmp -pv`; one written as `.nzip`
+        // must differ from the `.zip` (`files_differ`: encrypted with random
+        // bytes, not as without them); anything else byte for byte.
+        if let (Content::File(expected), Some(want)) = (after.as_ref().unwrap_or(before), &want)
+            && name.ends_with(".nzip")
+            && expected.ends_with(".zip")
+        {
+            if std::fs::read(folder.join(name)).ok().as_ref() == Some(want) {
+                problems.push(format!("{name} does not differ from {expected}"));
+            }
+            continue;
+        }
         if let (Content::File(expected), Some(_)) = (after.as_ref().unwrap_or(before), &want)
             && name.ends_with(".zip")
             && expected.ends_with(".zip")

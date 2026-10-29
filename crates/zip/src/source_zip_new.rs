@@ -3,6 +3,7 @@
 
 use crate::dirent::Dirent;
 use crate::error::{Detail, Error, ErrorCode, Result};
+use crate::get_encryption_implementation::Decrypt;
 use crate::open::Archive;
 use crate::source::ReadAt;
 use crate::source_compress::Decompress;
@@ -16,11 +17,9 @@ impl<R: ReadAt> Archive<R> {
     /// The stack of sources that reads entry `srcidx` from byte `start`,
     /// `len` bytes of it (or to its end if `len` is -1): decompressed unless
     /// `flags` has [`Flags::COMPRESSED`], with its CRC checked when all of
-    /// it is read. Port of `zip_source_zip_file_create`.
-    ///
-    /// Differs from libzip: decryption comes later, so an encrypted entry
-    /// is refused with `ZIP_ER_NOPASSWD` without a password and
-    /// `ZIP_ER_ENCRNOTSUPP` with one.
+    /// it is read. Port of `zip_source_zip_file_create`. An encrypted
+    /// entry is decrypted with `password`, or else the archive's default
+    /// password.
     pub(crate) fn source_zip_file_create(
         &self,
         srcidx: u64,
@@ -106,6 +105,7 @@ impl<R: ReadAt> Archive<R> {
             && !partial_data
             && st.valid & stat::CRC != 0;
 
+        let password = password.or(self.default_password.as_deref());
         if needs_decrypt && password.is_none() {
             return Err(Error::new(ErrorCode::NoPasswd, 0));
         }
@@ -200,9 +200,17 @@ impl<R: ReadAt> Archive<R> {
             )?
         };
 
-        if needs_decrypt {
-            return Err(Error::new(ErrorCode::EncrNotSupp, 0));
-        }
+        let decrypt = if needs_decrypt {
+            let mut st_window = lower.stat();
+            window.stat(&mut st_window);
+            Some(Layer::new(Decrypt::new(
+                st.encryption_method,
+                password,
+                &st_window,
+            )?))
+        } else {
+            None
+        };
 
         let decompress = if needs_decompress {
             let check_consistency = self.open_flags.intersects(OpenFlags::CHECKCONS);
@@ -219,6 +227,7 @@ impl<R: ReadAt> Archive<R> {
         let mut stack = Stack {
             lower,
             window: Layer::new(window),
+            decrypt,
             decompress,
             crc,
             partial: None,

@@ -8,12 +8,14 @@
 //! or CP437 and the Info-ZIP Unicode extra fields, WinZip AES headers,
 //! torrentzip, and, with [`OpenFlags::CHECKCONS`], the comparison of every
 //! local header with the central directory. It reads stored and deflated
-//! entries, and checks the CRC-32 and length of an entry read to its end,
-//! as libzip does. It edits archives as libzip does too: entries are
+//! entries, decrypts ZipCrypto and WinZip AES ones with a password, and
+//! checks the CRC-32 and length of an entry read to its end, as libzip
+//! does. It edits archives as libzip does too: entries are
 //! added from a [`DataSource`], replaced, deleted, renamed, given comments,
-//! times, attributes and compression methods, the archive a comment, and
-//! [`Archive::close_to`] writes the archive with its changes, byte for byte
-//! as libzip writes it. The rules the port follows are in the repository's `docs/zip.md`.
+//! times, attributes, compression methods and encryption (ZipCrypto or
+//! WinZip AES, with [`Archive::file_set_encryption`]), the archive a
+//! comment, and [`Archive::close_to`] writes the archive with its changes,
+//! byte for byte as libzip writes it with the same random bytes. The rules the port follows are in the repository's `docs/zip.md`.
 //!
 //! ```
 //! use std::io::Read;
@@ -76,30 +78,40 @@ mod file_get_offset;
 mod file_rename;
 mod file_replace;
 mod file_set_comment;
+mod file_set_encryption;
 mod file_set_external_attributes;
 mod file_set_mtime;
 mod fopen;
+mod fopen_encrypted;
 mod fopen_index;
 mod fopen_index_encrypted;
 mod fread;
 mod get_archive_comment;
 mod get_archive_flag;
+mod get_encryption_implementation;
 mod get_name;
 mod get_num_entries;
 mod hash;
 mod io_util;
 mod name_locate;
 mod open;
+mod pkware;
+mod random;
 mod set_archive_comment;
 mod set_archive_flag;
+mod set_default_password;
 mod set_file_compression;
 mod set_name;
 mod source;
 mod source_compress;
 mod source_crc;
 mod source_data;
+mod source_pkware_decode;
+mod source_pkware_encode;
 mod source_stack;
 mod source_window;
+mod source_winzip_aes_decode;
+mod source_winzip_aes_encode;
 mod source_write;
 mod source_zip;
 mod source_zip_new;
@@ -109,13 +121,16 @@ mod unchange;
 mod unchange_all;
 mod unchange_archive;
 mod utf_8;
+mod winzip_aes;
 mod zip;
 mod zipint;
 
 pub use close::Closed;
 pub use error::{Detail, Error, ErrorCode, Result, SystemType};
 pub use fopen_index_encrypted::ZipFile;
+pub use get_encryption_implementation::encryption_method_supported;
 pub use open::Archive;
+pub use random::RandomSource;
 pub use source::ReadAt;
 pub use source_data::{BufferSource, DataSource, FileAttributes, FileSource, file_attributes};
 pub use source_zip::ZipFileSource;

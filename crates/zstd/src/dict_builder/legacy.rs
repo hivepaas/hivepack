@@ -102,11 +102,13 @@ pub(crate) struct DictItem {
 pub(crate) static PATH_RUNS: [std::sync::atomic::AtomicUsize; 9] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 9];
 
+/// Counts a run of the path `which` (see `PATH_RUNS`).
 #[cfg(test)]
 fn count_path(which: usize) {
     PATH_RUNS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Nothing, outside the tests.
 #[cfg(not(test))]
 #[inline(always)]
 fn count_path(_which: usize) {}
@@ -927,5 +929,51 @@ mod tests {
                 .map_err(|e| e.code()),
             Err(crate::ErrorCode::SrcSizeWrong)
         );
+    }
+
+    /// Samples that repeat the guard band, where libzstd reads past its
+    /// buffers: the port stops at their ends, without a panic, and with no
+    /// band at all too.
+    #[test]
+    fn samples_that_repeat_the_guard_band() {
+        let mut band = [0u8; NOISELENGTH];
+        fill_noise(&mut band);
+        let mut rng = crate::oracle::Rng::new(0xBA5D);
+        for round in 0..40 {
+            let mut samples = Vec::new();
+            while samples.len() < 3000 + round * 100 {
+                match rng.range(0, 3) {
+                    0 => samples.extend_from_slice(&band),
+                    1 => samples.extend_from_slice(&band[..rng.range(1, 31) as usize]),
+                    2 => samples.extend_from_slice(&band[rng.range(1, 31) as usize..]),
+                    _ => {
+                        let len = rng.range(0, 9) as usize;
+                        samples.extend(rng.bytes(len));
+                    }
+                }
+            }
+            // The band itself at the very end, as long as it can be.
+            samples.extend_from_slice(&band);
+            let sizes: Vec<usize> = samples.chunks(97).map(<[u8]>::len).collect();
+            let params = LegacyParams {
+                selectivity_level: rng.range(0, 12) as u32,
+                ..LegacyParams::default()
+            };
+            let total = samples.len();
+            for with_band in [true, false] {
+                let mut buffer = samples.clone();
+                if with_band {
+                    buffer.extend_from_slice(&band);
+                }
+                let mut dict = vec![0u8; 2048];
+                if let Ok(mut list) = legacy_segments(dict.len(), &buffer, &sizes, &params) {
+                    for item in &list[1..list[0].pos as usize] {
+                        assert!(item.length > 0);
+                        assert!(item.pos as usize <= total + NOISELENGTH);
+                    }
+                    let _ = legacy_content(&mut list, &mut dict, &buffer);
+                }
+            }
+        }
     }
 }

@@ -85,11 +85,13 @@ const TR_STACKSIZE: usize = 64;
 pub(crate) static PATH_RUNS: [std::sync::atomic::AtomicUsize; 12] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 12];
 
+/// Counts a run of the path `which` (see `PATH_RUNS`).
 #[cfg(test)]
 fn count_path(which: usize) {
     PATH_RUNS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Nothing, outside the tests.
 #[cfg(not(test))]
 #[inline(always)]
 fn count_path(_which: usize) {}
@@ -139,8 +141,8 @@ impl Ints<'_> {
         (self[p], self[p + 1])
     }
 
-    /// `PA + v`, or `PA + ~v` when `v` is marked (`GETIDX`): where the
-    /// type B* suffix `v` is.
+    /// `PA + v`: where the start of the type B* suffix `v` is, in their
+    /// list at `pa`.
     #[inline(always)]
     fn at_pa(pa: isize, v: i32) -> isize {
         pa + v as isize

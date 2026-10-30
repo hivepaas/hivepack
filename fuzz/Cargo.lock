@@ -157,6 +157,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-age"
+version = "0.0.0"
+dependencies = [
+ "hivepack-crypto",
+]
+
+[[package]]
 name = "hivepack-bzip2"
 version = "0.0.0"
 
@@ -183,20 +190,34 @@ version = "0.0.0"
 dependencies = [
  "bzip2",
  "flate2",
+ "hivepack-age",
  "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
+ "hivepack-tar",
+ "hivepack-xz",
  "hivepack-zip",
  "hivepack-zstd",
  "libfuzzer-sys",
+ "liblzma",
+ "liblzma-sys",
  "libz-sys",
  "zstd",
 ]
 
 [[package]]
+name = "hivepack-tar"
+version = "0.0.0"
+
+[[package]]
+name = "hivepack-xz"
+version = "0.0.0"
+
+[[package]]
 name = "hivepack-zip"
 version = "0.0.0"
 dependencies = [
+ "hivepack-bzip2",
  "hivepack-crypto",
  "hivepack-deflate",
 ]
@@ -257,6 +278,26 @@ checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
+]
+
+[[package]]
+name = "liblzma"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa980ea6744074a5b5e0ac6b164aca94fc970121869b3e78ae12a2b0097dbea7"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c7e3581f367a78d7b7e7ae948d023310556f0cfc13156c2e4e00e25616492b9"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]

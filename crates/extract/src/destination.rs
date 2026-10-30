@@ -20,31 +20,34 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
 use crate::error::ErrorKind;
+use crate::origin::Origin;
 
-/// The destination, open.
-pub(crate) struct Destination {
+/// The destination, open, and the mark of origin of what is written in it.
+pub(crate) struct Destination<'a> {
     root: Dir,
+    origin: Option<&'a Origin>,
 }
 
-impl Destination {
+impl<'a> Destination<'a> {
     /// Opens `path`, creating it first if it is not there. The path itself
     /// is the caller's, and is followed as given.
-    pub(crate) fn open(path: &Path) -> io::Result<Destination> {
+    pub(crate) fn open(path: &Path, origin: Option<&'a Origin>) -> io::Result<Destination<'a>> {
         std::fs::create_dir_all(path)?;
         let root = Dir::open_ambient_dir(path, ambient_authority())?;
-        Ok(Destination { root })
+        Ok(Destination { root, origin })
     }
 
     /// The directory at `components`, created where it is not there, each
-    /// opened from the one before without following a link.
+    /// opened from the one before without following a link; those created
+    /// get the mark of origin.
     pub(crate) fn directory(&self, components: &[String]) -> Result<Dir, ErrorKind> {
         let mut dir = self.root.try_clone().map_err(ErrorKind::Io)?;
         for component in components {
-            match dir.create_dir(component) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            let created = match dir.create_dir(component) {
+                Ok(()) => true,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
                 Err(e) => return Err(ErrorKind::Io(e)),
-            }
+            };
             dir = match dir.open_dir_nofollow(component) {
                 Ok(next) => next,
                 Err(e) => {
@@ -55,6 +58,9 @@ impl Destination {
                     });
                 }
             };
+            if let (true, Some(origin)) = (created, self.origin) {
+                origin.write_dir(&dir).map_err(ErrorKind::Origin)?;
+            }
         }
         Ok(dir)
     }

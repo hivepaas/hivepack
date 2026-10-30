@@ -98,6 +98,21 @@ fn archive_state<R: ReadAt>(za: &Archive<R>) -> (Vec<EntryState>, Vec<u8>) {
 /// edited. What libzip writes from an edited archive is not always what
 /// its API said before (see `check_written` in `crates/zip/tests/oracle.rs`,
 /// which this follows).
+/// Whether an MS-DOS time and date name a moment as they are, which the
+/// conversions to and from a `time_t` leave as it was.
+fn dos_time_in_range(time: u16, date: u16) -> bool {
+    let (seconds, minutes, hours) = (time & 0x1f, (time >> 5) & 0x3f, time >> 11);
+    let (day, month, year) = (date & 0x1f, (date >> 5) & 0xf, 1980 + (date >> 9));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    seconds < 30 && minutes < 60 && hours < 24 && (1..=12).contains(&month) && (1..=days).contains(&day)
+}
+
 fn check_written(
     expected: &(Vec<EntryState>, Vec<u8>),
     encrypted: &[u64],
@@ -193,10 +208,23 @@ fn check_written(
         // had, as libzip reads it.
         // ZipCrypto encrypts with an empty password, but reading takes an
         // empty password for none, as libzip does: such an entry cannot be
-        // read.
+        // read. Nor can one compressed again and encrypted with ZipCrypto
+        // from an MS-DOS time out of range: the header keeps the time,
+        // but the check byte comes from the time of its stat, back in
+        // range, as in libzip.
+        let check_byte_moved = recompressed
+            && a.encryption_method == em::TRAD_PKWARE
+            && e.dos_time.is_some_and(|(time, date)| !dos_time_in_range(time, date));
+        // A WinZip AES entry of AE-2 written as AE-1 (see below) has its CRC
+        // checked now, which AE-2 left as it was. And one encrypted with an
+        // unknown method (see above) is decrypted by nothing.
+        let crc_checked_now = a.valid & stat::CRC != 0 && b.valid & stat::CRC == 0;
         if let Some(data) = &e.data
             && e.dos_time.is_some()
             && !unreadable.contains(&e.index)
+            && !check_byte_moved
+            && !crc_checked_now
+            && a.encryption_method != em::UNKNOWN
         {
             assert!(reads_as(&new, j, data), "data of entry {j}");
         }
@@ -321,7 +349,8 @@ fuzz_target!(|data: &[u8]| {
             }
             _ => za.set_file_compression(
                 i,
-                [i32::from(cm::STORE), i32::from(cm::DEFLATE), cm::DEFAULT][usize::from(arg % 3)],
+                [i32::from(cm::STORE), i32::from(cm::DEFLATE), cm::DEFAULT, i32::from(cm::BZIP2)]
+                    [usize::from(arg % 4)],
                 u32::from(kind >> 4),
             ),
         };

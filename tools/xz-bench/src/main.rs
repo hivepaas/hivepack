@@ -1,0 +1,271 @@
+//! Times hivepack-xz against liblzma on the same inputs: decoding the .xz
+//! Streams liblzma wrote at each preset, with a check, CRC64 unless
+//! `--check` says otherwise. Both must give the input back.
+//!
+//! ```text
+//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--rounds 3] [--seconds 1] PATH...
+//! ```
+//!
+//! Each run is one call, with all the input and room for all the output,
+//! on a new .xz decoder, as `lzma_stream_buffer_decode` does.
+//!
+//! Each PATH is a file, or a folder whose files are each an input. Rounds
+//! take turns between the implementations, so a noisy machine slows them
+//! alike. Speeds are the range over rounds in MB/s of uncompressed data
+//! (10^6 bytes per second), and the output is a Markdown table.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+type Result<T> = std::result::Result<T, String>;
+
+trait Codec {
+    fn name(&self) -> String;
+    /// Decodes `input`, whose content is `size` bytes long.
+    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
+}
+
+/// liblzma 5.8.4 through the liblzma crate.
+struct Liblzma;
+
+impl Liblzma {
+    /// `input` as `xz -<preset>` writes it, with `check`.
+    fn compress(preset: u32, check: liblzma::stream::Check, input: &[u8]) -> Result<Vec<u8>> {
+        let mut stream = liblzma::stream::Stream::new_easy_encoder(preset, check)
+            .map_err(|e| format!("liblzma: {e}"))?;
+        let mut output = Vec::with_capacity(input.len() + input.len() / 2 + 4096);
+        match stream.process_vec(input, &mut output, liblzma::stream::Action::Finish) {
+            Ok(liblzma::stream::Status::StreamEnd) => Ok(output),
+            other => Err(format!("liblzma: {other:?}")),
+        }
+    }
+}
+
+impl Codec for Liblzma {
+    fn name(&self) -> String {
+        "liblzma 5.8.4".into()
+    }
+
+    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
+        let mut stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0)
+            .map_err(|e| format!("liblzma: {e}"))?;
+        output.clear();
+        output.resize(size, 0);
+        match stream.process(input, output, liblzma::stream::Action::Finish) {
+            Ok(liblzma::stream::Status::StreamEnd) if stream.total_out() == size as u64 => Ok(()),
+            other => Err(format!("liblzma: {other:?}")),
+        }
+    }
+}
+
+/// hivepack-xz.
+struct Port;
+
+impl Codec for Port {
+    fn name(&self) -> String {
+        "hivepack-xz".into()
+    }
+
+    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
+        let mut stream =
+            hivepack_xz::Stream::stream_decoder(u64::MAX, 0).map_err(|e| format!("port: {e}"))?;
+        output.clear();
+        output.resize(size, 0);
+        let mut out = hivepack_xz::OutBuffer::new(output);
+        let status = stream.code(
+            &mut out,
+            &mut hivepack_xz::InBuffer::new(input),
+            hivepack_xz::Action::Finish,
+        );
+        match status {
+            Ok(hivepack_xz::Status::StreamEnd) if out.pos == size => Ok(()),
+            other => Err(format!("port: {other:?}")),
+        }
+    }
+}
+
+struct Options {
+    presets: Vec<u32>,
+    check: liblzma::stream::Check,
+    rounds: u32,
+    budget: Duration,
+    paths: Vec<PathBuf>,
+}
+
+fn options(args: impl Iterator<Item = String>) -> Result<Options> {
+    let mut options = Options {
+        presets: vec![0, 6, 9],
+        check: liblzma::stream::Check::Crc64,
+        rounds: 3,
+        budget: Duration::from_secs(1),
+        paths: Vec::new(),
+    };
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--presets" => {
+                options.presets = value()?
+                    .split(',')
+                    .map(|p| match p.parse() {
+                        Ok(preset @ 0..=9) => Ok(preset),
+                        _ => Err(format!("bad preset {p:?}")),
+                    })
+                    .collect::<Result<_>>()?;
+            }
+            "--check" => {
+                options.check = match value()?.as_str() {
+                    "none" => liblzma::stream::Check::None,
+                    "crc32" => liblzma::stream::Check::Crc32,
+                    "crc64" => liblzma::stream::Check::Crc64,
+                    "sha256" => liblzma::stream::Check::Sha256,
+                    other => return Err(format!("bad check {other:?}")),
+                };
+            }
+            "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
+            "--seconds" => {
+                let seconds: f64 = value()?.parse().map_err(|_| "bad --seconds")?;
+                options.budget =
+                    Duration::try_from_secs_f64(seconds).map_err(|_| "bad --seconds")?;
+            }
+            "-h" | "--help" => {
+                return Err(
+                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--rounds N] [--seconds S] PATH..."
+                        .into(),
+                );
+            }
+            _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
+            _ => options.paths.push(PathBuf::from(arg)),
+        }
+    }
+    if options.paths.is_empty() || options.rounds == 0 {
+        return Err("give at least one input file or folder, and at least one round".into());
+    }
+    Ok(options)
+}
+
+fn inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+                .filter(|p| {
+                    !p.file_name()
+                        .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."))
+                })
+                .collect();
+            files.sort();
+            found.extend(files);
+        } else {
+            found.push(path.clone());
+        }
+    }
+    Ok(found)
+}
+
+fn time(budget: Duration, mut op: impl FnMut() -> Result<()>) -> Result<f64> {
+    op()?;
+    let start = Instant::now();
+    let mut runs = 0u32;
+    loop {
+        op()?;
+        runs += 1;
+        if start.elapsed() >= budget {
+            return Ok(start.elapsed().as_secs_f64() / f64::from(runs));
+        }
+    }
+}
+
+struct Range(f64, f64);
+
+impl Range {
+    fn add(range: Option<Range>, value: f64) -> Option<Range> {
+        Some(match range {
+            None => Range(value, value),
+            Some(Range(low, high)) => Range(low.min(value), high.max(value)),
+        })
+    }
+}
+
+impl std::fmt::Display for Range {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.round() == self.1.round() {
+            write!(f, "{:.1}", self.0)
+        } else {
+            write!(f, "{:.1}–{:.1}", self.0, self.1)
+        }
+    }
+}
+
+fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Result<()> {
+    let data = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let name = input.file_name().map_or_else(
+        || input.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let megabytes = data.len() as f64 / 1e6;
+    let mut scratch = Vec::new();
+    for &preset in &options.presets {
+        let compressed = Liblzma::compress(preset, options.check, &data)?;
+        let ratio = data.len() as f64 / compressed.len().max(1) as f64;
+        let mut speeds: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
+        for _ in 0..options.rounds {
+            for (i, codec) in codecs.iter_mut().enumerate() {
+                let seconds = time(options.budget, || {
+                    codec.decompress(&compressed, data.len(), &mut scratch)
+                })?;
+                if scratch != data {
+                    return Err(format!(
+                        "{}: {name} preset {preset} does not round trip",
+                        codec.name()
+                    ));
+                }
+                speeds[i] = Range::add(speeds[i].take(), megabytes / seconds);
+            }
+        }
+        let best: Vec<f64> = speeds
+            .iter()
+            .map(|r| r.as_ref().map_or(0.0, |r| r.1))
+            .collect();
+        let cells: Vec<String> = speeds
+            .iter()
+            .map(|r| r.as_ref().map_or_else(String::new, Range::to_string))
+            .collect();
+        println!(
+            "| {name} | {megabytes:.1} | {preset} | {ratio:.2} | {} | {:.2}× |",
+            cells.join(" | "),
+            best[1] / best[0]
+        );
+    }
+    Ok(())
+}
+
+fn run() -> Result<()> {
+    let options = options(std::env::args().skip(1))?;
+    let mut codecs: Vec<Box<dyn Codec>> = vec![Box::new(Liblzma), Box::new(Port)];
+    let header: Vec<String> = codecs.iter().map(|c| c.name()).collect();
+    println!("Decompression, MB/s:\n");
+    println!(
+        "| input | MB | preset | ratio | {} | port/liblzma |",
+        header.join(" | ")
+    );
+    println!("|---|---|---|---|{}---|", "---|".repeat(codecs.len()));
+    for input in inputs(&options.paths)? {
+        bench(&options, &mut codecs, &input)?;
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("xz-bench: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}

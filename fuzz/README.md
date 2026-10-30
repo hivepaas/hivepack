@@ -1,7 +1,9 @@
 # Fuzzing
 
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd,
-hivepack-deflate with zlib, and hivepack-bzip2 with libbzip2. They need
+hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, and hivepack-xz with
+liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age and
+hivepack-tar any input. They need
 nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 (`NIGHTLY` in `.github/workflows/ci.yml`), chosen for the shell with
 `export RUSTUP_TOOLCHAIN=<that nightly>`, and
@@ -20,6 +22,10 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick (encrypting among them) and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data, read with the passwords the edits set (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
+| `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). Where the port refuses a Block's filters and liblzma, which has the delta and BCJ filters, goes on, the comparison stops; and the automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
+| `age` | Decrypting the input as an age file, armored or not, with CCTV's usual X25519 key and the passphrase `password` (work factors up to 2^4), twice, in pieces of different sizes its first eight bytes pick: the same plaintext and the same end both times, and no panic (`crates/age/tests/oracle.rs` compares the outcomes with age) |
+| `age_keys` | Reading the input as an identity file, as `age -i` does (a file of keys, an SSH key, a file of keys encrypted with age): no panic. Only the parsing, as decrypting an encrypted key file could ask scrypt for 4 GiB |
+| `tar` | Reading the input as a tar archive, every entry and up to 4 MiB of each one's data, twice, in pieces of different sizes its first eight bytes pick: the same headers, data and end both times, and no panic (`crates/tar/tests/oracle.rs` compares the answers with Go's archive/tar) |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:
@@ -38,14 +44,16 @@ so fuzz them both ways (CI runs `compress` with it, `compress_stream`
 without).
 
 The `inflate`, `deflate` and `inflate9` targets start from an empty
-corpus, and CI seeds `bzip2` with the streams and inputs of
-`testdata/oracle/bzip2.txt`:
+corpus, CI seeds `bzip2` with the streams and inputs of
+`testdata/oracle/bzip2.txt`, and `xz` with the inputs of
+`testdata/oracle/xz.txt`, behind the byte for their decoder:
 
 ```sh
 cargo fuzz run inflate -- -max_total_time=3600
 cargo fuzz run deflate -- -max_total_time=3600
 cargo fuzz run inflate9 -- -max_total_time=3600
 cargo fuzz run bzip2 -- -max_total_time=3600
+cargo fuzz run xz -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and

@@ -1,5 +1,5 @@
-//! What the tests share: the oracle program, built with nettle by
-//! `scripts/testdata.py`, a seeded generator, and the text forms of the
+//! What the tests share: the oracle programs, built with nettle and with Go
+//! by `scripts/testdata.py`, a seeded generator, and the text forms of the
 //! requests and answers.
 
 // Test helpers: a broken oracle should stop the test.
@@ -22,15 +22,15 @@ pub struct Oracle {
 }
 
 impl Oracle {
-    /// The oracle built by `scripts/testdata.py`, or `None` with a note when
-    /// it has not been built. CI lists the `generated` group in
-    /// `HIVEPACK_TESTDATA_REQUIRED` where it builds the oracle, and then a
-    /// missing oracle fails the test.
-    pub fn spawn() -> Option<Oracle> {
+    /// The oracle `name` (`nettle-oracle` or `age-oracle`) built by
+    /// `scripts/testdata.py`, or `None` with a note when it has not been
+    /// built. CI lists the `generated` group in `HIVEPACK_TESTDATA_REQUIRED`
+    /// where it builds the oracles, and then a missing oracle fails the test.
+    pub fn spawn(name: &str) -> Option<Oracle> {
         let cache = std::env::var_os("HIVEPACK_TESTDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| repository().join("target/testdata"));
-        let folder = cache.join("nettle-oracle");
+        let folder = cache.join(name);
         if !folder.join(".complete").exists() {
             let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
             assert!(

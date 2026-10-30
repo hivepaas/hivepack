@@ -187,6 +187,11 @@ impl DeflateDecompress {
         }
     }
 
+    /// `general_purpose_bit_flags`: none, when decompressing.
+    pub(crate) fn general_purpose_bit_flags(&self) -> u16 {
+        0
+    }
+
     /// `start`: a raw inflate stream (`windowBits` -15).
     pub(crate) fn start(&mut self) -> Result<(), Error> {
         self.next_in = 0;

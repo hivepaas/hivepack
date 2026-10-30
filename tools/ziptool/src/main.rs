@@ -483,6 +483,7 @@ fn get_compression_method(arg: &str) -> i32 {
         "default" => cm::DEFAULT,
         "store" => i32::from(cm::STORE),
         "deflate" => i32::from(cm::DEFLATE),
+        "bzip2" => i32::from(cm::BZIP2),
         "unknown" => 100,
         // TODO in libzip: error handling
         _ => 0,

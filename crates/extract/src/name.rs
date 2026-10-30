@@ -25,6 +25,9 @@ pub enum NameError {
     Absolute,
     /// A colon: a drive (`C:`) or an NTFS alternate data stream (`a:b`).
     Colon,
+    /// A character Windows does not allow in names: `<`, `>`, `"`, `|`,
+    /// `?` or `*`.
+    Reserved,
     /// A component `.` or `..`.
     Dot,
     /// A Windows device name, with or without an extension (`CON`,
@@ -45,6 +48,7 @@ impl fmt::Display for NameError {
             NameError::Backslash => "backslash",
             NameError::Absolute => "absolute path",
             NameError::Colon => "colon (drive or alternate data stream)",
+            NameError::Reserved => "character Windows does not allow (< > \" | ? *)",
             NameError::Dot => "component \".\" or \"..\"",
             NameError::Device => "Windows device name",
             NameError::TrailingSpaceOrDot => "component ending in a space or a dot",
@@ -87,6 +91,10 @@ fn is_device(component: &str) -> bool {
     }
 }
 
+/// The characters Windows does not allow in names, besides `\`, `/`, `:`
+/// and control characters, which are refused for their own reasons.
+const RESERVED: [char; 6] = ['<', '>', '"', '|', '?', '*'];
+
 /// Checks `raw`, an entry's name as the archive gives it, `/` its only
 /// separator: [`Name`], or why it is refused.
 pub fn check_name(raw: &[u8]) -> Result<Name, NameError> {
@@ -105,6 +113,9 @@ pub fn check_name(raw: &[u8]) -> Result<Name, NameError> {
     }
     if name.contains(':') {
         return Err(NameError::Colon);
+    }
+    if name.contains(RESERVED) {
+        return Err(NameError::Reserved);
     }
     let (path, is_dir) = match name.strip_suffix('/') {
         Some(path) => (path, true),
@@ -186,6 +197,9 @@ pub(crate) fn link_target(target: &[u8], parent: &[String]) -> Result<Vec<String
     if text.contains(':') {
         return Err(NameError::Colon);
     }
+    if text.contains(RESERVED) {
+        return Err(NameError::Reserved);
+    }
     let mut resolved = parent.to_vec();
     for component in text.split('/') {
         match component {
@@ -257,6 +271,12 @@ mod tests {
             (b"//server/share", NameError::Absolute),
             (b"C:x", NameError::Colon),
             (b"file.txt:stream", NameError::Colon),
+            (b"a<b", NameError::Reserved),
+            (b"a>b", NameError::Reserved),
+            (b"a\"b", NameError::Reserved),
+            (b"dir/a|b", NameError::Reserved),
+            (b"what?", NameError::Reserved),
+            (b"*.txt", NameError::Reserved),
             (b"../x", NameError::Dot),
             (b"a/../b", NameError::Dot),
             (b"./a", NameError::Dot),

@@ -17,7 +17,8 @@
 //!
 //! lz4_flex is built with its safe code (`safe-decode`, its default), or
 //! with its unsafe code when the tool is built with
-//! `--no-default-features`.
+//! `--no-default-features`. `--features unsafe-fast` builds the port with
+//! its feature.
 //!
 //! Each PATH is a file, or a folder whose files are each an input. Rounds
 //! take turns between the implementations, so a noisy machine slows them
@@ -78,7 +79,11 @@ struct Port;
 
 impl Codec for Port {
     fn name(&self) -> String {
-        "hivepack-lz4".into()
+        if hivepack_lz4::UNSAFE_FAST {
+            "hivepack-lz4 (unsafe-fast)".into()
+        } else {
+            "hivepack-lz4".into()
+        }
     }
 
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {

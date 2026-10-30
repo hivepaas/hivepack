@@ -6,8 +6,8 @@ testdata/manifest.json lists every set:
 - Sets with "fetch" are downloaded, checked against their SHA-256 and unpacked
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
-  by the oracles in tools/, built from the pinned zstd, zlib, bzip2, libzip
-  and nettle releases.
+  by the oracles in tools/, built from the pinned zstd, zlib, bzip2, XZ
+  Utils, libzip and nettle releases.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -187,6 +187,16 @@ BZIP2_SOURCES = [
 ]
 
 
+# liblzma: the folders of its C files, without the multithreaded coders, the
+# hardware queries (which need tuklib), the small CRCs of HAVE_SMALL, and
+# the programs that write tables. delta/ and simple/ are left out with
+# their filters (see tools/xz-oracle/config.h); only their headers, which
+# the filter tables include, are on the include path.
+LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder"]
+LIBLZMA_LEFT_OUT = ["stream_encoder_mt", "stream_decoder_mt", "outqueue", "hardware_",
+                    "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
+
+
 # nettle's AES (encryption only), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, in
 # C: what the oracles call, without the assembly versions or the fat
 # builds that choose between them.
@@ -258,7 +268,9 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
-    Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES.
+    Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES,
+    and tools/xz-oracle with liblzma's, from LIBLZMA_DIRS, and its own
+    config.h.
     tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
@@ -294,6 +306,17 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(infback9 / "infback9.c"), str(infback9 / "inftree9.c")]
         subprocess.run([compiler, "-O2", f"-I{zlib}", f"-I{infback9}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
+    xz = next(source.glob("xz-*/src/liblzma"), None)
+    if xz is not None:
+        dirs = [xz / d for d in LIBLZMA_DIRS]
+        files += sorted(str(f) for d in dirs for f in d.glob("*.c")
+                        if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
+        config = ROOT / Path(sources[0]).parent
+        headers = [xz / "api", *dirs, xz / "delta", xz / "simple", xz.parent / "common"]
+        includes = [f"-I{d}" for d in [config, *headers]]
+        subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", *includes, *files,
                         "-o", str(folder / "oracle")], check=True)
         return
     bzip2 = next(source.glob("bzip2-*"), None)

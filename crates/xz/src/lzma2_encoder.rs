@@ -53,12 +53,41 @@ pub(crate) struct Lzma2Encoder {
 }
 
 impl Lzma2Encoder {
-    /// `lzma2_encoder_init`: the encoder and the LZ encoder's options.
+    /// `lzma2_encoder_init` without an encoder: the encoder and the LZ
+    /// encoder's options.
     pub(crate) fn new(options: &LzmaOptions) -> Result<(Lzma2Encoder, LzEncOptions), Ret> {
-        let opt_cur = options.clone();
+        let mut coder = Lzma2Encoder {
+            sequence: Sequence::Init,
+            lzma: LzmaEncoder::blank(),
+            opt_cur: options.clone(),
+            need_properties: true,
+            need_state_reset: false,
+            need_dictionary_reset: false,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            buf_pos: 0,
+            buf: vec![0; LZMA2_HEADER_MAX + LZMA2_CHUNK_MAX as usize].into_boxed_slice(),
+        };
+        let lz_options = coder.init(options)?;
+        Ok((coder, lz_options))
+    }
+
+    /// `lzma2_encoder_init` with an encoder, whose memory is kept; the LZ
+    /// encoder's options.
+    pub(crate) fn init(&mut self, options: &LzmaOptions) -> Result<LzEncOptions, Ret> {
+        self.opt_cur = options.clone();
+
+        self.sequence = Sequence::Init;
+        self.need_properties = true;
+        self.need_state_reset = false;
+        self.need_dictionary_reset = self
+            .opt_cur
+            .preset_dict
+            .as_ref()
+            .is_none_or(|d| d.is_empty());
 
         // Initialize LZMA encoder
-        let (lzma, mut lz_options) = LzmaEncoder::create(FILTER_LZMA2, &opt_cur)?;
+        let mut lz_options = self.lzma.init(FILTER_LZMA2, &self.opt_cur)?;
 
         // Make sure that we will always have enough history available in
         // case we need to use uncompressed chunks. They are used when the
@@ -69,22 +98,7 @@ impl Lzma2Encoder {
             lz_options.before_size = LZMA2_CHUNK_MAX - lz_options.dict_size;
         }
 
-        let need_dictionary_reset = opt_cur.preset_dict.as_ref().is_none_or(|d| d.is_empty());
-        Ok((
-            Lzma2Encoder {
-                sequence: Sequence::Init,
-                lzma,
-                opt_cur,
-                need_properties: true,
-                need_state_reset: false,
-                need_dictionary_reset,
-                uncompressed_size: 0,
-                compressed_size: 0,
-                buf_pos: 0,
-                buf: vec![0; LZMA2_HEADER_MAX + LZMA2_CHUNK_MAX as usize].into_boxed_slice(),
-            },
-            lz_options,
-        ))
+        Ok(lz_options)
     }
 
     /// `lzma2_header_lzma`.

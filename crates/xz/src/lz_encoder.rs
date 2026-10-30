@@ -10,7 +10,8 @@
 //! yet, are called 'read ahead'.
 
 use crate::common::{Action, NextCoder, Ret, bufcpy};
-use crate::lzma_common::{DICT_SIZE_MIN, MatchFinder};
+use crate::filter::{FILTER_LZMA1, FILTER_LZMA1EXT, FILTER_LZMA2};
+use crate::lzma_common::{DICT_SIZE_MIN, LzmaOptions, MatchFinder};
 use crate::lzma_encoder::LzmaEncoder;
 use crate::lzma2_encoder::Lzma2Encoder;
 
@@ -1010,6 +1011,8 @@ impl Mf {
 /// `lz_encoder_prepare`: the sizes into `mf`; true if the options are
 /// invalid.
 fn lz_encoder_prepare(mf: &mut Mf, lz_options: &LzEncOptions) -> bool {
+    let (old_size, old_hash_count, old_sons_count) = (mf.size, mf.hash_count, mf.sons_count);
+
     // For now, the dictionary size is limited to 1.5 GiB. This may grow in
     // the future if needed, but it needs a little more work than just
     // changing this check.
@@ -1034,6 +1037,12 @@ fn lz_encoder_prepare(mf: &mut Mf, lz_options: &LzEncOptions) -> bool {
         (lz_options.before_size + lz_options.match_len_max + lz_options.after_size) / 2 + (1 << 19);
 
     mf.size = mf.keep_size_before + reserve + mf.keep_size_after;
+
+    // Deallocate the old history buffer if it exists but has different
+    // size than what is needed now.
+    if old_size != mf.size {
+        mf.buffer = Vec::new();
+    }
 
     // Match finder options
     mf.match_len_max = lz_options.match_len_max;
@@ -1096,6 +1105,13 @@ fn lz_encoder_prepare(mf: &mut Mf, lz_options: &LzEncOptions) -> bool {
         mf.sons_count *= 2;
     }
 
+    // Deallocate the old hash array if it exists and has different size
+    // than what is needed now.
+    if old_hash_count != mf.hash_count || old_sons_count != mf.sons_count {
+        mf.hash = Vec::new();
+        mf.son = Vec::new();
+    }
+
     // Maximum number of match finder cycles
     mf.depth = lz_options.depth;
     if mf.depth == 0 {
@@ -1112,29 +1128,38 @@ fn lz_encoder_prepare(mf: &mut Mf, lz_options: &LzEncOptions) -> bool {
 /// `lz_encoder_init`: the buffers, and the preset dictionary; Err if the
 /// memory cannot be had.
 fn lz_encoder_init(mf: &mut Mf, lz_options: &LzEncOptions) -> Result<(), Ret> {
-    // The history buffer, the hash table and the binary trees: their
-    // memory is reserved here, as liblzma allocates it, and only the hash
-    // table is filled (with zeros, EMPTY_HASH_VALUE) at once.
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(mf.size as usize)
-        .map_err(|_| Ret::MemError)?;
-    let mut son = Vec::new();
-    son.try_reserve_exact(mf.sons_count as usize)
-        .map_err(|_| Ret::MemError)?;
-    // The hash table is asked of the allocator as zeroed memory, as
-    // liblzma's lzma_alloc_zero() asks calloc(): a big one comes as pages
-    // the system zeroes when they are first touched, so that a short input
-    // does not pay for a big dictionary.
-    //
-    // Differs from liblzma: if that fails, the process aborts, where
-    // liblzma returns LZMA_MEM_ERROR, as safe Rust has no zeroed allocation
-    // that can fail. The table is at most 64 MiB (hs is capped at 2^24),
-    // and the bigger buffers before it are reserved with that check.
-    let hash = vec![EMPTY_HASH_VALUE; mf.hash_count as usize];
-    mf.buffer = buffer;
-    mf.son = son;
-    mf.hash = hash;
+    // Allocate the history buffer: its memory is reserved here, as liblzma
+    // allocates it. One that is kept starts empty again, as it grows as it
+    // is written.
+    if mf.buffer.capacity() == 0 {
+        mf.buffer
+            .try_reserve_exact(mf.size as usize)
+            .map_err(|_| Ret::MemError)?;
+    } else {
+        mf.buffer.clear();
+    }
+
+    if mf.hash.is_empty() {
+        // The binary trees are reserved as the buffer is.
+        mf.son
+            .try_reserve_exact(mf.sons_count as usize)
+            .map_err(|_| Ret::MemError)?;
+
+        // The hash table is asked of the allocator as zeroed memory, as
+        // liblzma's lzma_alloc_zero() asks calloc(): a big one comes as
+        // pages the system zeroes when they are first touched, so that a
+        // short input does not pay for a big dictionary.
+        //
+        // Differs from liblzma: if that fails, the process aborts, where
+        // liblzma returns LZMA_MEM_ERROR, as safe Rust has no zeroed
+        // allocation that can fail. The table is at most 64 MiB (hs is
+        // capped at 2^24), and the bigger buffers before it are reserved
+        // with that check.
+        mf.hash = vec![EMPTY_HASH_VALUE; mf.hash_count as usize];
+    } else {
+        mf.son.clear();
+        mf.hash.fill(EMPTY_HASH_VALUE);
+    }
 
     // Use cyclic_size as initial mf->offset. This allows avoiding a few
     // branches in the match finders. The downside is that match finder
@@ -1231,6 +1256,37 @@ impl LzEncCoder {
         lz_encoder_init(&mut mf, lz_options)?;
 
         Ok(LzEncCoder { lz, mf, next: None })
+    }
+
+    /// `lzma_lz_encoder_init` with this coder, whose memory is kept where
+    /// the sizes are the same: it becomes the encoder of `id` with
+    /// `options`, as liblzma's does when `lzma_next_coder_init()` has kept
+    /// a coder of the same kind.
+    pub(crate) fn reinit(&mut self, id: u64, options: &LzmaOptions) -> Result<(), Ret> {
+        // Initialize the LZ-based encoder.
+        let lz_options = match &mut self.lz {
+            LzEnc::Lzma(lzma) => lzma.init(id, options)?,
+            LzEnc::Lzma2(lzma2) => lzma2.init(options)?,
+        };
+
+        // Setup the size information into coder->mf and deallocate old
+        // buffers if they have wrong size.
+        if lz_encoder_prepare(&mut self.mf, &lz_options) {
+            return Err(Ret::OptionsError);
+        }
+
+        // Allocate new buffers if needed, and do the rest of the
+        // initialization.
+        lz_encoder_init(&mut self.mf, &lz_options)
+    }
+
+    /// Whether this coder is of the kind `id` needs: liblzma's init
+    /// functions are one for LZMA1 and LZMA1EXT, and another for LZMA2.
+    pub(crate) fn is_kind_of(&self, id: u64) -> bool {
+        match self.lz {
+            LzEnc::Lzma(_) => id == FILTER_LZMA1 || id == FILTER_LZMA1EXT,
+            LzEnc::Lzma2(_) => id == FILTER_LZMA2,
+        }
     }
 
     /// The next filter in the chain, made after this one: the encoder
@@ -1330,6 +1386,10 @@ impl LzEncCoder {
 }
 
 impl NextCoder for LzEncCoder {
+    fn into_lz_encoder(self: Box<Self>) -> Option<Box<LzEncCoder>> {
+        Some(self)
+    }
+
     /// `lz_encode`.
     fn code(
         &mut self,

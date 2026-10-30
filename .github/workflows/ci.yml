@@ -175,7 +175,7 @@ jobs:
       # decoder, so only the decoder's tests run again with it.
       - run: >-
           cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
-          --test decompress --test stream --test dctx --test testdata --test unchecked
+          --test decompress --test stream --test dctx --test testdata --test unchecked --test bufferless
       - run: >-
           cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
           --lib -- decompress:: oracle::
@@ -330,6 +330,18 @@ jobs:
               pathlib.Path(f"fuzz/corpus/rar_headers/r{i}").write_bytes(bytes([int(words[1])]) + data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_headers -- -max_total_time=45
+      - name: Seed the RAR test corpus with the recorded archives
+        run: |
+          mkdir -p fuzz/corpus/rar_test
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-test.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("test ")):
+              word = line.split("\t")[0].split(" ")[1]
+              data = b"" if word == "-" else bytes.fromhex(word)
+              pathlib.Path(f"fuzz/corpus/rar_test/r{i}").write_bytes(data)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_test -- -max_total_time=45
       - name: Seed the bzip2 corpus
         run: |
           mkdir -p fuzz/corpus/bzip2

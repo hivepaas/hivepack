@@ -438,6 +438,18 @@ pub(crate) fn answer(request: &str) -> String {
             let _ = write!(text, " {:016x}", fnv64(&out[..out_pos]));
             text
         }
+        ["bufferless", mode, room, kind, dict, steps, src] => {
+            let steps: Vec<usize> = unlist(steps).into_iter().map(|v| v as usize).collect();
+            let dict = if dict == "-" { Vec::new() } else { unhex(dict) };
+            bufferless(
+                mode.parse().expect("mode"),
+                room.parse().expect("room"),
+                kind.parse().expect("dictionary kind"),
+                &dict,
+                &steps,
+                &unhex(src),
+            )
+        }
         ["frames", max_block_size, capacity, src] => {
             let capacity: usize = capacity.parse().expect("capacity");
             let mut out = vec![0u8; capacity];
@@ -458,6 +470,119 @@ pub(crate) fn answer(request: &str) -> String {
         // The encoder's requests.
         _ => crate::oracle_compress::answer(request),
     }
+}
+
+/// The oracle's `bufferless`: the frames of `src` through
+/// [`DCtx::decompress_continue`], each begun without a dictionary (`kind`
+/// 0), with `dict` loaded (1; 3 with it at the start of the output, which
+/// follows it) or as a `DDict` (2); the output after the last (`mode` 0), in
+/// a round buffer of `room` bytes (1), or in a buffer of its own each call
+/// (2), all within one buffer of the oracle's size, laid out as the
+/// oracle's. Each call takes the input asked for or the step's, and the
+/// step's room; once the steps are used up, the input asked for and the
+/// last room.
+fn bufferless(
+    mode: usize,
+    room: usize,
+    kind: u32,
+    dict: &[u8],
+    steps: &[usize],
+    src: &[u8],
+) -> String {
+    const MAX_BYTES: usize = 1 << 20;
+    if !steps.len().is_multiple_of(2)
+        || room == 0
+        || room > MAX_BYTES / 2
+        || mode > 2
+        || kind > 3
+        || (kind == 3 && (mode != 0 || dict.is_empty()))
+    {
+        return "bad".into();
+    }
+    let ddict = match kind {
+        2 => match crate::DDict::new(dict) {
+            Ok(ddict) => Some(std::sync::Arc::new(ddict)),
+            Err(_) => return "nodict".into(),
+        },
+        _ => None,
+    };
+    let mut output = vec![0u8; MAX_BYTES];
+    let mut pos = 0;
+    if kind == 3 {
+        output[..dict.len()].copy_from_slice(dict);
+        pos = dict.len();
+    }
+    let mut dctx = DCtx::new();
+    let mut text = String::from("ok");
+    let mut hash = FNV_OFFSET;
+    let (mut in_pos, mut begin) = (0, true);
+    let mut call = 0;
+    while call < 100_000 && (in_pos < src.len() || !begin) {
+        let step = (2 * call < steps.len()).then_some(2 * call);
+        // Once the steps are used up, the last room.
+        let last = step.or_else(|| steps.len().checked_sub(2));
+        let want = match last.map_or(0, |s| steps[s + 1]) {
+            0 => 1 << 17,
+            want => want,
+        };
+        if begin {
+            let begun = match (kind, &ddict) {
+                (1, _) => dctx.decompress_begin_using_dict(dict),
+                (3, _) => dctx.decompress_begin_using_dict(&output[..dict.len()]),
+                (2, Some(ddict)) => {
+                    dctx.decompress_begin_using_ddict(ddict.clone());
+                    Ok(())
+                }
+                _ => {
+                    dctx.decompress_begin();
+                    Ok(())
+                }
+            };
+            if let Err(error) = begun {
+                let _ = write!(text, " b{}", error.code().number());
+                break;
+            }
+        }
+        let next = dctx.next_src_size_to_decompress();
+        let size = match step.map_or(0, |s| steps[s]) {
+            0 => next,
+            size => size,
+        }
+        .min(src.len() - in_pos);
+        let (start, cap) = match mode {
+            0 => (pos, (MAX_BYTES - pos).min(want)),
+            1 => {
+                if room - pos < want {
+                    pos = 0;
+                }
+                (pos, (room - pos).min(want))
+            }
+            _ => {
+                let slots = MAX_BYTES / (room + 1);
+                ((call % slots) * (room + 1), room.min(want))
+            }
+        };
+        match dctx.decompress_continue(&mut output[start..start + cap], &src[in_pos..in_pos + size])
+        {
+            Err(error) => {
+                let _ = write!(text, " e{}", error.code().number());
+                break;
+            }
+            Ok(written) => {
+                hash = fnv64_from(hash, &output[start..start + written]);
+                in_pos += size;
+                if mode != 2 {
+                    pos += written;
+                }
+                let next = dctx.next_src_size_to_decompress();
+                let _ = write!(text, " {written}/{next}/{}", dctx.next_input_type() as u32);
+                begin = next == 0;
+            }
+        }
+        call += 1;
+    }
+    let _ = write!(text, " {hash:016x}");
+    text
 }
 
 /// Small, fast and reproducible: SplitMix64.
@@ -940,7 +1065,154 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
         ));
     }
 
+    for i in 0..per_command / 10 {
+        requests.push(bufferless_request(rng, i));
+    }
+
     requests
+}
+
+/// A `bufferless` request: frames made by the port's encoder (libzstd's
+/// frames), with a dictionary for some, a skippable frame before some, and
+/// damaged now and then; decoded into one buffer, a round buffer as
+/// libzstd's documentation describes it, or a buffer for each call. Every
+/// fifth one is frames longer than twice their window and 1 MB, in a
+/// round buffer, through which the port drops the oldest part of its copy.
+fn bufferless_request(rng: &mut Rng, i: usize) -> String {
+    use crate::{CCtx, CParameter, FrameHeaderState};
+    let kind = rng.range(0, 3);
+    let big = i % 5 == 4;
+    let mode = match kind {
+        3 => 0,
+        _ if big => 1,
+        _ => rng.range(0, 2),
+    };
+    let dict = if kind == 0 {
+        Vec::new()
+    } else {
+        let size = rng.range(1, 30_000) as usize;
+        let content = rng.lz_data(size);
+        let mut trained = vec![0u8; 8192];
+        let sizes = vec![content.len() / 64; 64];
+        match crate::train_from_buffer(&mut trained, &content, &sizes) {
+            Ok(size) if rng.range(0, 2) != 0 => {
+                trained.truncate(size);
+                if rng.range(0, 9) == 0 {
+                    // Tables that do not read.
+                    trained = mutate(rng, &trained);
+                }
+                trained
+            }
+            _ => content,
+        }
+    };
+    let level = [-5i32, 1, 3, 9, 19][rng.range(0, 4) as usize];
+    let (mut window_max, mut block_max) = (0u64, 1usize);
+    let mut src = Vec::new();
+    for _ in 0..rng.range(1, 2) {
+        let len = if big {
+            rng.range(1 << 20, 3 << 20)
+        } else if i.is_multiple_of(2) {
+            rng.range(0, 4000)
+        } else {
+            rng.range(0, 200_000)
+        } as usize;
+        let mut data = Vec::with_capacity(len);
+        let piece = rng.lz_data(20_000);
+        while data.len() < len {
+            // Pieces of the dictionary, of a piece repeated, and new data.
+            match rng.range(0, 2) {
+                0 if !dict.is_empty() => {
+                    let at = rng.range(0, dict.len() as u64 - 1) as usize;
+                    let end = (at + rng.range(1, 3000) as usize).min(dict.len());
+                    data.extend_from_slice(&dict[at..end]);
+                }
+                1 => {
+                    let at = rng.range(0, piece.len() as u64 - 1) as usize;
+                    let end = (at + rng.range(1, 5000) as usize).min(piece.len());
+                    data.extend_from_slice(&piece[at..end]);
+                }
+                _ => {
+                    let size = rng.range(1, if big { 50 } else { 3000 }) as usize;
+                    data.extend(rng.lz_data(size));
+                }
+            }
+        }
+        data.truncate(len);
+        let mut cctx = CCtx::new();
+        let mut set = cctx
+            .set_parameter(CParameter::CompressionLevel(level))
+            .and_then(|()| cctx.set_parameter(CParameter::ChecksumFlag(rng.range(0, 1) == 1)));
+        if big || rng.range(0, 3) == 0 {
+            let window_log = rng.range(10, 18) as u32;
+            set = set.and_then(|()| cctx.set_parameter(CParameter::WindowLog(window_log)));
+        }
+        if !dict.is_empty() && rng.range(0, 4) != 0 {
+            // A damaged dictionary is refused: the frame goes without.
+            let _ = cctx.load_dictionary(&dict);
+        }
+        let mut frame = vec![0u8; crate::compress_bound(len).expect("a bound")];
+        let Ok(size) = set.and_then(|()| cctx.compress2(&mut frame, &data)) else {
+            continue;
+        };
+        frame.truncate(size);
+        if let Ok(FrameHeaderState::Complete(header)) = crate::get_frame_header(&frame) {
+            window_max = window_max.max(header.window_size);
+            block_max = block_max.max(header.block_size_max as usize);
+        }
+        if rng.range(0, 3) == 0 {
+            // A skippable frame first.
+            let size = rng.range(0, 300) as usize;
+            let content = rng.bytes(size);
+            src.extend_from_slice(&(0x184D_2A50u32 + rng.range(0, 15) as u32).to_le_bytes());
+            src.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            src.extend_from_slice(&content);
+        }
+        src.extend_from_slice(&frame);
+    }
+    if i.is_multiple_of(4) && !big {
+        src = mutate(rng, &src);
+    }
+    let room = match mode {
+        // Enough for the window and a block, as libzstd's documentation
+        // asks, and some.
+        1 => crate::decoding_buffer_size_min(window_max, crate::CONTENTSIZE_UNKNOWN)
+            .unwrap_or(1 << 19)
+            .saturating_add(rng.range(0, 1000) as usize)
+            .min(1 << 19),
+        2 => rng.range(block_max as u64 / 2, block_max as u64 * 2).max(1) as usize,
+        _ => 1000,
+    };
+    let mut steps = Vec::new();
+    for _ in 0..rng.range(0, 60) {
+        // The input asked for, but now and then a size of the step's own;
+        // the room: in a round buffer, a block's, from its start again when
+        // less is left; otherwise any.
+        steps.push(if rng.range(0, 79) == 0 {
+            rng.range(1, 300)
+        } else {
+            0
+        });
+        steps.push(match (mode, rng.range(0, 3)) {
+            (1, _) => block_max as u64,
+            (_, 0) => 0,
+            (_, 1) => block_max as u64,
+            _ => rng.range(1, 2 * block_max as u64),
+        });
+    }
+    if mode == 1 && steps.is_empty() {
+        steps.extend([0, block_max as u64]);
+    }
+    format!(
+        "bufferless {mode} {room} {kind} {} {} {}",
+        if dict.is_empty() {
+            "-".to_string()
+        } else {
+            hex(&dict)
+        },
+        list(steps),
+        hex(&src)
+    )
 }
 
 /// Requests made from zstd's fuzzing corpora for the same functions, when
@@ -984,7 +1256,14 @@ fn corpus_requests() -> Vec<String> {
 /// FNV-1a, to record long answers by their hash, and to answer with outputs
 /// briefly.
 pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+    fnv64_from(FNV_OFFSET, bytes)
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes`, continuing `hash`.
+fn fnv64_from(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
@@ -1054,6 +1333,7 @@ fn port_matches_libzstd() {
     eprintln!(
         "literals (extra, input, output, split), then sequence loops (plain, split, long): {paths:?}"
     );
+
     // With the `unsafe-fast` feature, the plain loop always runs unchecked:
     // the decoder's buffers always meet the limits it checks.
     #[cfg(all(feature = "unsafe-fast", target_pointer_width = "64"))]

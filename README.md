@@ -4,22 +4,6 @@ Read and write archives and compressed files in Rust: one library for many forma
 
 > **Status:** early development. Nothing is published on crates.io yet.
 
-## 🎯 Plans
-
-- **zstd**: a Rust port of the official [Zstandard](https://github.com/facebook/zstd) library, for both compressing and decompressing.
-- **Deflate**: a Rust port of [zlib](https://zlib.net), for both too, with the zlib and gzip formats.
-- **bzip2**: a Rust port of [libbzip2](https://sourceware.org/bzip2/), for both too.
-- **LZ4**: a Rust port of [liblz4](https://github.com/lz4/lz4), for both too, blocks and frames (`.lz4`).
-- **XZ and LZMA**: a Rust port of liblzma from [XZ Utils](https://tukaani.org/xz/), for both too, with `.xz`, `.lzma` and `.lz`.
-- **ZIP**: reading and writing, including split archives (`.z01`, `.z02`, …, `.zip`), its rules ported from [libzip](https://libzip.org) (see [docs/zip.md](docs/zip.md)).
-- **7z**: reading, ported from the 7z decoder of the [LZMA SDK](https://7-zip.org/sdk.html) (see [docs/7z.md](docs/7z.md)).
-- **RAR**: reading through [rars](https://github.com/bitplane/rars).
-- **tar**: reading, ported from Go's `archive/tar` (see [docs/tar.md](docs/tar.md)), and tar inside zstd, xz, gzip, bzip2 and age (`.tar.zst`, `.tar.zst.age`).
-- **ISO 9660**: reading CD and DVD images (`.iso`, and `.iso.xz` & co.), with Rock Ridge, Joliet and zisofs, ported from [libarchive](https://github.com/libarchive/libarchive) (see [docs/iso.md](docs/iso.md)), and extracting them.
-- **UDF**: reading DVD, Blu-ray and disk images, ported from NetBSD's UDF file system (see [docs/udf.md](docs/udf.md)), and extracting them.
-- **age**: decrypting files of the [age](https://age-encryption.org) encryption tool, often archives (`.tar.zst.age`), its rules ported from age's Go code (see [docs/age.md](docs/age.md)).
-- **Safe extraction by default**: no writing outside the destination, through links, or past size limits set for archive bombs (see [docs/extract.md](docs/extract.md)).
-
 ## 📦 Crates
 
 | Crate | What it is | Status |
@@ -33,7 +17,7 @@ Read and write archives and compressed files in Rust: one library for many forma
 | [`hivepack-iso`](crates/iso) | ISO 9660 images in safe Rust, ported from libarchive 3.8.10's reader | Reads ISO 9660 with Rock Ridge, Joliet, files in several extents and zisofs, with libarchive's headers, warnings, data and errors, on its test images, images its writer makes and tens of thousands of damaged ones. UDF and writing are not ported |
 | [`hivepack-lz4`](crates/lz4) | LZ4 in safe Rust, ported from liblz4 1.10.0: blocks, frames and `.lz4` files | Compresses blocks and frames with liblz4's output, byte for byte, at every acceleration and level, with dictionaries, call by call; decodes blocks with liblz4's results, error positions included, and the same bytes in the output; decodes frames call by call as `LZ4F_decompress` does; writes `.lz4` files as liblz4 does and reads them, legacy ones included, as `lz4 -d` does; decodes at 0.75× liblz4's speed, or 0.96× with its `unsafe-fast` feature |
 | [`hivepack-open`](crates/open) | Opening what hivepack reads through the layers around it: age, zstd, xz, lzip, .lzma, LZ4, gzip and bzip2, found by their first bytes and stacked, then the container told | Opens `.tar.zst.age`, `.iso.xz` and any stack of these layers with hivepack's ports, each read as its tools read it, a passphrase asked for once however often the file is read; a tar archive or ISO 9660 image under them extracts with `hivepack-extract`, which reads the stream to its end to check it before writing; UDF volumes are told too |
-| [`hivepack-rar`](crates/rar) | Reading RAR archives in safe Rust, ported from RARLAB's UnRAR 7.3.2, under UnRAR's license: it reads RAR and never writes it | Reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, broken ones included, with UnRAR's fields, positions and exit codes on libarchive's RAR archives and a quarter of a million damaged ones. Data, decompression and decryption come next |
+| [`hivepack-rar`](crates/rar) | Reading RAR archives in safe Rust, ported from RARLAB's UnRAR 7.3.2, under UnRAR's license: it reads RAR and never writes it | Reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, broken ones included, with UnRAR's fields, positions and exit codes on libarchive's RAR archives and a quarter of a million damaged ones, and reads stored entries, checked against CRC-32 or BLAKE2sp, as UnRAR tests them. Decompression and decryption come next |
 | [`hivepack-tar`](crates/tar) | tar archives in safe Rust, ported from Go 1.27.2's `archive/tar`, its reading half | Reads V7, USTAR, PAX, GNU and STAR archives, PAX records, GNU long names and sparse files included, with Go's headers, data and errors on Go's test archives, archives Go writes and thousands of damaged ones |
 | [`hivepack-udf`](crates/udf) | Reading UDF volumes in safe Rust, ported from NetBSD's UDF file system (`sys/fs/udf`): DVD, Blu-ray and disk images | Reads UDF 1.02 to 2.60 on physical, sparable, virtual (VAT) and metadata partitions, with blocks of 512 to 4096 bytes, as NetBSD mounts them, but where NetBSD loops, crashes or reads wrong; the same as Linux's udf file system on 36 images mkudffs, genisoimage and its tests make; extracted by `hivepack-extract` |
 | [`hivepack-xz`](crates/xz) | XZ and LZMA in safe Rust, ported from liblzma of XZ Utils 5.8.4: the same output, at the same speed | Compresses `.xz`, `.lzma`, and raw LZMA1 and LZMA2 with liblzma's output, byte for byte, with every preset, option and match finder, at about its speed; decompresses those and `.lz` with its results, call by call, at 1.06–1.34× the speed of liblzma's C and 0.74–0.89× of its x86-64 assembly; with the delta and BCJ filters, and in threads for `.xz` |
@@ -72,8 +56,12 @@ The test files come from zstd itself and from other zstd implementations (Go, Ja
 hivepack is built and maintained by HivePaaS, who also make:
 
 - [hivepaas](https://github.com/hivepaas/hivepaas): a self-hosted PaaS.
+- [context-menu-rs](https://github.com/hivepaas/context-menu-rs): put your app in the right-click menu of Windows Explorer, macOS Finder and Linux file managers, from Rust.
 - [shellwing](https://shellwing.app): a fast, native SSH client for macOS, Windows and Linux.
 - [authwing](https://github.com/hivepaas/authwing): a two-factor code app for macOS, Windows and Linux that knows the window you are in.
+- [packwing](https://github.com/hivepaas/packwing): a file archiver for macOS, Windows and Linux that opens archives safely, built on hivepack.
+
+⭐ If hivepack, or any of these, is useful to you, please give it a star on GitHub: it helps others find it, and helps us keep making them.
 
 ## 📜 License
 

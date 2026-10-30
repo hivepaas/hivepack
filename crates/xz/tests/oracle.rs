@@ -34,7 +34,7 @@ use hivepack_xz::{
     Action, BcjOptions, CONCATENATED, Check, DeltaOptions, FAIL_FAST, FILTER_ARM, FILTER_ARM64,
     FILTER_ARMTHUMB, FILTER_DELTA, FILTER_IA64, FILTER_LZMA1, FILTER_LZMA1EXT, FILTER_LZMA2,
     FILTER_POWERPC, FILTER_RISCV, FILTER_SPARC, Filter, FilterOptions, IGNORE_CHECK, InBuffer,
-    LzmaOptions, MatchFinder, Mode, OutBuffer, Result, Status, Stream, TELL_ANY_CHECK,
+    LzmaOptions, MatchFinder, Mode, MtOptions, OutBuffer, Result, Status, Stream, TELL_ANY_CHECK,
     TELL_NO_CHECK, TELL_UNSUPPORTED_CHECK,
 };
 use support::{Oracle, Rng, cache, damage, fnv64, hex, input, recorded_form, repository, unhex};
@@ -151,6 +151,74 @@ fn parse_chain(text: &str, encoder: bool) -> Vec<Filter> {
             None => parse_lzma(element),
         })
         .collect()
+}
+
+/// The threaded encoder's options from the oracle's text: `<threads>:
+/// <block_size>:<timeout>:<preset>:<check>:<flags>:<echain>`, the chain
+/// `-` for the preset.
+fn parse_mt(text: &str) -> MtOptions {
+    let f: Vec<&str> = text.splitn(7, ':').collect();
+    let n = |i: usize| f[i].parse::<u64>().unwrap();
+    MtOptions {
+        threads: n(0) as u32,
+        block_size: n(1),
+        timeout: n(2) as u32,
+        preset: n(3) as u32,
+        check: Check(n(4) as u32),
+        flags: n(5) as u32,
+        filters: (f[6] != "-").then(|| parse_chain(f[6], true)),
+    }
+}
+
+/// The port's answer to an `mtcode` request: the threaded encoder driven
+/// by the steps, each call with an action other than LZMA_RUN made again
+/// until it returns something else than LZMA_OK, as the oracle does.
+fn mt_answer(args: &str, steps: &str, data: &str) -> String {
+    let mut strm = match Stream::stream_encoder_mt(&parse_mt(args)) {
+        Ok(strm) => strm,
+        Err(e) => return format!("err {}", e.number()),
+    };
+    let data = unhex(data);
+    let mut out = Vec::new();
+    let (mut consumed, mut end) = (0, 0);
+    let mut last = 0;
+    for step in steps.split(',') {
+        let Some(rest) = step.strip_prefix('c') else {
+            break;
+        };
+        let args: Vec<&str> = rest.split('/').collect();
+        if args[0] != "=" {
+            let n: usize = args[0].parse().unwrap();
+            end = consumed + n.min(data.len() - consumed);
+        }
+        let room: usize = args[1].parse().unwrap();
+        let action = action(args[2].parse().unwrap());
+        loop {
+            let written = out.len();
+            out.resize(written + room, 0);
+            let mut input = InBuffer {
+                src: &data[..end],
+                pos: consumed,
+            };
+            let mut output = OutBuffer::new(&mut out[written..]);
+            last = code(strm.code(&mut output, &mut input, action));
+            let made = output.pos;
+            consumed = input.pos;
+            out.truncate(written + made);
+            if action == Action::Run || last != 0 {
+                break;
+            }
+        }
+        if last != 0 && last != 1 {
+            return format!("fail {last}");
+        }
+    }
+    format!(
+        "ok {last} {}/{} {:016x}",
+        strm.total_in(),
+        strm.total_out(),
+        fnv64(&out)
+    )
 }
 
 /// The output space all the steps can ask for.
@@ -823,10 +891,16 @@ fn port_answer(request: &str) -> String {
             hivepack_xz::easy_decoder_memusage(preset)
         );
     }
+    if let Some(args) = request.strip_prefix("mtmem ") {
+        return hivepack_xz::stream_encoder_mt_memusage(&parse_mt(args)).to_string();
+    }
     if let Some(size) = request.strip_prefix("bound ") {
         return hivepack_xz::stream_buffer_bound(size.parse().unwrap()).to_string();
     }
     let words: Vec<&str> = request.split(' ').collect();
+    if let ["mtcode", args, steps, data] = words[..] {
+        return mt_answer(args, steps, data);
+    }
     if let ["bcj", arch, direction, start, data] = words[..] {
         let mut buf = unhex(data);
         let start = start.parse().unwrap();
@@ -1354,6 +1428,112 @@ fn encoder_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
             hex(&data)
         ));
     }
+
+    requests.extend(mt_requests(rng, count, max));
+    requests
+}
+
+/// The threaded encoder's options as the oracle reads them, for `len`
+/// bytes of input: one to four threads, Blocks from one byte to the
+/// chain's own size (at most 2,000 of them), a preset or a chain, and now
+/// and then options it refuses.
+fn mt_options(rng: &mut Rng, len: usize) -> String {
+    let threads = match rng.below(30) {
+        0 => rng.pick(&[0, 16385]),
+        _ => 1 + rng.below(4) as u32,
+    };
+    let block_size = match rng.below(10) {
+        0 => 0,
+        1 => rng.pick(&[(u64::MAX / 16384) + 1, u64::MAX]),
+        2 => (len as u64 / 2000).max(1 + rng.below(100)),
+        3 => 1 << 20,
+        _ => (len as u64 / 2000).max(rng.pick(&[4096, 10_000, 65_536, 100_000])),
+    };
+    let preset = rng.below(7) as u32
+        | if rng.below(6) == 0 {
+            hivepack_xz::PRESET_EXTREME
+        } else {
+            0
+        };
+    let chain = match rng.below(3) {
+        0 => {
+            let id = if rng.below(10) == 0 {
+                encoder_id(rng)
+            } else {
+                FILTER_LZMA2
+            };
+            let before = if rng.below(2) == 0 {
+                let refused = rng.below(5) == 0;
+                filters_before(rng, refused)
+            } else {
+                String::new()
+            };
+            format!("{before}{}", efilter(rng, id, 1 << 20))
+        }
+        _ => "-".to_string(),
+    };
+    let flags = u32::from(rng.below(30) == 0);
+    format!(
+        "{threads}:{block_size}:0:{preset}:{}:{flags}:{chain}",
+        check(rng)
+    )
+}
+
+/// Requests for the threaded encoder: `count / 2` encodings and the memory
+/// usage of encoders. The steps give the input in pieces with LZMA_RUN and
+/// room for all the output (so that each call reads all its input, as
+/// liblzma's threads may otherwise not let it), with LZMA_FULL_FLUSH and
+/// LZMA_FULL_BARRIER, and finish, these with random room.
+fn mt_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
+    let mut requests = Vec::new();
+    for _ in 0..count / 2 {
+        let len = length(rng, max.min(300_000));
+        let data = if rng.below(2) == 0 {
+            code_input(rng, len)
+        } else {
+            input(rng, len)
+        };
+        let options = mt_options(rng, len);
+        // Each Block may take some 100 bytes beyond its data.
+        let all = len * 100 + 100_000;
+        let mut steps = Vec::new();
+        let mut offered = 0;
+        while offered < len && steps.len() < 40 {
+            let n = 1 + chunk(rng, len - offered);
+            offered += n;
+            let room = 1 + room(rng);
+            steps.push(match rng.below(8) {
+                0 => format!("c{n}/{room}/2"),
+                1 => format!("c{n}/{room}/4"),
+                _ => format!("c{n}/{all}/0"),
+            });
+        }
+        steps.push(format!("c{len}/{}/3", 1 + room(rng)));
+        requests.push(format!(
+            "mtcode {options} {} {}",
+            steps.join(","),
+            hex(&data)
+        ));
+    }
+    for _ in 0..count / 6 {
+        let len = rng.below(1 << 20) as usize;
+        requests.push(format!("mtmem {}", mt_options(rng, len)));
+    }
+
+    // Inputs of several Blocks of 256 KiB to 1 MiB in four threads.
+    if max > 100_000 {
+        for _ in 0..4 {
+            let len = 2_000_000 + rng.below(3_000_000) as usize;
+            let data = input(rng, len);
+            let block_size = 1 << (18 + rng.below(3));
+            let preset = rng.below(4);
+            let room = 1 + room(rng);
+            requests.push(format!(
+                "mtcode 4:{block_size}:0:{preset}:4:0:- c{len}/{room}/3 {}",
+                hex(&data)
+            ));
+        }
+    }
     requests
 }
 
@@ -1367,9 +1547,16 @@ fn port_encoders_match_liblzma() {
     let mut seen = [0usize; 12];
     let (mut ends, mut chain_ends) = (0, 0);
     let (mut big, mut big_ends) = (0, 0);
+    let mut mt_ends = 0;
     for request in &requests {
+        // liblzma's threads' structures, which the threaded encoder's
+        // memory usage counts, are of another size on other systems.
+        if request.starts_with("mtmem ") && !cfg!(target_os = "linux") {
+            continue;
+        }
         let want = oracle.ask(request);
         assert_eq!(port_answer(request), want, "{request:.300}");
+        mt_ends += usize::from(request.starts_with("mtcode ") && want.starts_with("ok 1 "));
         for ret in returned(&want) {
             seen[ret] += 1;
         }
@@ -1394,10 +1581,11 @@ fn port_encoders_match_liblzma() {
     }
     eprintln!(
         "{} requests, {ends} reach LZMA_STREAM_END ({chain_ends} with delta or BCJ), \
-         return codes seen {seen:?}",
+         {mt_ends} threaded encodings end, return codes seen {seen:?}",
         requests.len()
     );
     assert!(chain_ends > 20, "only {chain_ends} chains end");
+    assert!(mt_ends > 60, "only {mt_ends} threaded encodings end");
     assert!(
         big_ends * 3 >= big,
         "only {big_ends} of {big} big inputs are read"

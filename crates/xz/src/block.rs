@@ -918,6 +918,28 @@ pub(crate) fn block_buffer_encode(
     out: &mut [u8],
     out_pos: &mut usize,
 ) -> Ret {
+    block_buffer_encode_with(block, input, out, out_pos, true)
+}
+
+/// `lzma_block_uncomp_encode`: `input` as one Block of uncompressed LZMA2
+/// chunks, in one call.
+pub(crate) fn block_uncomp_encode(
+    block: &mut Block,
+    input: &[u8],
+    out: &mut [u8],
+    out_pos: &mut usize,
+) -> Ret {
+    block_buffer_encode_with(block, input, out, out_pos, false)
+}
+
+/// `block_buffer_encode` of `block_buffer_encoder.c`.
+fn block_buffer_encode_with(
+    block: &mut Block,
+    input: &[u8],
+    out: &mut [u8],
+    out_pos: &mut usize,
+    try_to_compress: bool,
+) -> Ret {
     // Validate the arguments.
     if *out_pos > out.len() {
         return Ret::ProgError;
@@ -961,7 +983,10 @@ pub(crate) fn block_buffer_encode(
     }
 
     // Do the actual compression.
-    let mut ret = block_encode_normal(block, input, &mut out[..out_size], out_pos);
+    let mut ret = Ret::BufError;
+    if try_to_compress {
+        ret = block_encode_normal(block, input, &mut out[..out_size], out_pos);
+    }
 
     if ret != Ret::Ok {
         // If the error was something else than output buffer becoming

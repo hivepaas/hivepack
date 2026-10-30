@@ -12,5 +12,5 @@ workspace = true
 
 [dependencies]
 hivepack-xz.workspace = true
-liblzma.workspace = true
-liblzma-sys.workspace = true
+liblzma = { workspace = true, features = ["parallel"] }
+liblzma-sys = { workspace = true, features = ["parallel"] }

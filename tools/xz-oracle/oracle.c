@@ -74,6 +74,20 @@
  *   bcj <x86|arm64|riscv> <enc|dec> <start_offset> <hex>
  *       lzma_bcj_*_encode or lzma_bcj_*_decode on <hex>. Answered with
  *       the number of bytes filtered and the bytes.
+ *
+ *   mtmem <mt>
+ *       lzma_stream_encoder_mt_memusage, where an <mt> is
+ *       <threads>:<block_size>:<timeout>:<preset>:<check>:<flags>:<echain>,
+ *       <echain> "-" for the preset.
+ *
+ *   mtcode <mt> <steps> <hex>
+ *       lzma_stream_encoder_mt, then the steps on <hex>: c<in>/<out>/<action>
+ *       as above, each call with an action other than LZMA_RUN made again
+ *       until it returns something else than LZMA_OK. How much each call
+ *       reads and writes depends on the threads, so the answer is only
+ *       "ok <ret> <total_in>/<total_out> <hash>" with the last call's result,
+ *       "fail <ret>" for a call that failed, or "err <code>" for an encoder
+ *       refused.
  */
 
 #include <stdio.h>
@@ -291,6 +305,106 @@ static int parse_filter(const char *text, lzma_filter *filters) {
 
 static int parse_efilter(const char *text, lzma_filter *filters) {
     return parse_chain(text, filters, 1);
+}
+
+/* The threaded encoder's options: <threads>:<block_size>:<timeout>:<preset>:
+ * <check>:<flags>:<echain>, the chain "-" for the preset. */
+static int parse_mt(const char *text, lzma_mt *mt, lzma_filter *filters) {
+    unsigned long threads, timeout, preset, check, flags;
+    unsigned long long block_size;
+    const char *rest = text;
+    int colons = 0;
+    if (sscanf(text, "%lu:%llu:%lu:%lu:%lu:%lu:", &threads, &block_size, &timeout, &preset, &check,
+               &flags) != 6)
+        return 0;
+    while (colons < 6 && (rest = strchr(rest, ':')) != NULL) {
+        rest++;
+        colons++;
+    }
+    if (rest == NULL || *rest == '\0')
+        return 0;
+    memset(mt, 0, sizeof(*mt));
+    mt->threads = (uint32_t)threads;
+    mt->block_size = block_size;
+    mt->timeout = (uint32_t)timeout;
+    mt->preset = (uint32_t)preset;
+    mt->check = (lzma_check)check;
+    mt->flags = (uint32_t)flags;
+    if (strcmp(rest, "-") == 0)
+        mt->filters = NULL;
+    else if (parse_efilter(rest, filters))
+        mt->filters = filters;
+    else
+        return 0;
+    return 1;
+}
+
+/* The threaded encoder, driven by the steps until each flush is done. */
+static void do_mtcode(const char *args, const char *steps, const char *data_hex) {
+    lzma_stream strm = LZMA_STREAM_INIT;
+    lzma_mt mt;
+    lzma_filter filters[ELEMENTS_MAX + 1];
+    unsigned char *data, *out = NULL;
+    size_t len, consumed = 0, written = 0, cap = 0;
+    lzma_ret ret;
+    const char *p;
+
+    if (!parse_mt(args, &mt, filters)) {
+        puts("bad");
+        return;
+    }
+    ret = lzma_stream_encoder_mt(&strm, &mt);
+    if (ret != LZMA_OK) {
+        printf("err %d\n", ret);
+        lzma_end(&strm);
+        return;
+    }
+    data = unhex(data_hex, &len);
+    strm.next_in = data;
+    strm.avail_in = 0;
+    p = steps;
+    while (*p == 'c') {
+        unsigned long room;
+        int action;
+        const char *q = p + 1;
+        if (*q == '=') {
+            q++;
+        } else {
+            char *end;
+            unsigned long in = strtoul(q, &end, 10);
+            strm.next_in = data + consumed;
+            strm.avail_in = in < len - consumed ? in : len - consumed;
+            q = end;
+        }
+        if (sscanf(q, "/%lu/%d", &room, &action) != 2)
+            break;
+        do {
+            size_t before_in = strm.avail_in;
+            if (cap < written + room + 1) {
+                cap = (written + room) * 2 + 1;
+                out = realloc(out, cap);
+            }
+            strm.next_out = out + written;
+            strm.avail_out = room;
+            ret = lzma_code(&strm, (lzma_action)action);
+            consumed += before_in - strm.avail_in;
+            written += room - strm.avail_out;
+        } while (action != LZMA_RUN && ret == LZMA_OK);
+        if (ret != LZMA_OK && ret != LZMA_STREAM_END)
+            break;
+        p = strchr(p, ',');
+        if (!p)
+            break;
+        p++;
+    }
+    if (ret != LZMA_OK && ret != LZMA_STREAM_END)
+        printf("fail %d\n", ret);
+    else
+        printf("ok %d %llu/%llu %016llx\n", ret, (unsigned long long)strm.total_in,
+               (unsigned long long)strm.total_out, fnv64(out, written));
+    lzma_end(&strm);
+    free(data);
+    free(out);
 }
 
 /* The single-call BCJ functions of liblzma 5.8. */
@@ -554,7 +668,16 @@ int main(void) {
             uint32_t level = (uint32_t)strtoul(words[1], NULL, 10);
             printf("%llu %llu\n", (unsigned long long)lzma_easy_encoder_memusage(level),
                    (unsigned long long)lzma_easy_decoder_memusage(level));
-        } else if (count == 5 && strcmp(words[0], "bcj") == 0)
+        } else if (count == 2 && strcmp(words[0], "mtmem") == 0) {
+            lzma_mt mt;
+            lzma_filter filters[ELEMENTS_MAX + 1];
+            if (parse_mt(words[1], &mt, filters))
+                printf("%llu\n", (unsigned long long)lzma_stream_encoder_mt_memusage(&mt));
+            else
+                puts("bad");
+        } else if (count == 4 && strcmp(words[0], "mtcode") == 0)
+            do_mtcode(words[1], words[2], words[3]);
+        else if (count == 5 && strcmp(words[0], "bcj") == 0)
             do_bcj(words[1], words[2], words[3], words[4]);
         else if (count == 2 && strcmp(words[0], "bound") == 0)
             printf("%zu\n", lzma_stream_buffer_bound((size_t)strtoull(words[1], NULL, 10)));

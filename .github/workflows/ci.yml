@@ -64,6 +64,7 @@ jobs:
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-extract --lib --locked
+      - run: cargo check -p hivepack-tar --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast
@@ -115,12 +116,13 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      # The oracle written in Go, tools/age-oracle, with the Go its go.mod
-      # names.
+      # The oracles written in Go, tools/age-oracle and tools/tar-oracle,
+      # with the Go tar-oracle's go.mod names: the release whose archive/tar
+      # hivepack-tar ports, new enough for age-oracle.
       - if: contains(matrix.groups, 'generated')
         uses: actions/setup-go@v7
         with:
-          go-version-file: tools/age-oracle/go.mod
+          go-version-file: tools/tar-oracle/go.mod
           cache-dependency-path: tools/age-oracle/go.sum
       - uses: actions/cache@v6
         with:
@@ -322,6 +324,11 @@ jobs:
                       n += 1
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu age_keys -- -max_total_time=30
+      - name: Seed the tar corpus with Go's test archives
+        run: |
+          mkdir -p fuzz/corpus/tar
+          cp testdata/go-tar/*.tar fuzz/corpus/tar/
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu tar -- -max_total_time=60
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

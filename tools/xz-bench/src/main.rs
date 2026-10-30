@@ -1,13 +1,14 @@
 //! Times hivepack-xz against liblzma on the same inputs: decoding the .xz
 //! Streams liblzma wrote at each preset, with a check, CRC64 unless
-//! `--check` says otherwise. Both must give the input back.
+//! `--check` says otherwise, or with `--compress`, encoding them. Both must
+//! give the input back, and the same Streams.
 //!
 //! ```text
-//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--rounds 3] [--seconds 1] PATH...
+//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--compress] [--rounds 3] [--seconds 1] PATH...
 //! ```
 //!
 //! Each run is one call, with all the input and room for all the output,
-//! on a new .xz decoder, as `lzma_stream_buffer_decode` does.
+//! on a new .xz decoder or encoder.
 //!
 //! Each PATH is a file, or a folder whose files are each an input. Rounds
 //! take turns between the implementations, so a noisy machine slows them
@@ -24,6 +25,24 @@ trait Codec {
     fn name(&self) -> String;
     /// Decodes `input`, whose content is `size` bytes long.
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
+    /// Encodes `input` as a .xz Stream at `preset`, with `check`.
+    fn compress(
+        &mut self,
+        preset: u32,
+        check: liblzma::stream::Check,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()>;
+}
+
+/// liblzma's number for a check.
+fn check_number(check: liblzma::stream::Check) -> u32 {
+    match check {
+        liblzma::stream::Check::None => 0,
+        liblzma::stream::Check::Crc32 => 1,
+        liblzma::stream::Check::Crc64 => 4,
+        _ => 10,
+    }
 }
 
 /// liblzma 5.8.4 through the liblzma crate.
@@ -47,6 +66,26 @@ impl Codec for Liblzma {
         "liblzma 5.8.4".into()
     }
 
+    fn compress(
+        &mut self,
+        preset: u32,
+        check: liblzma::stream::Check,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut stream = liblzma::stream::Stream::new_easy_encoder(preset, check)
+            .map_err(|e| format!("liblzma: {e}"))?;
+        output.clear();
+        output.resize(hivepack_xz::stream_buffer_bound(input.len()), 0);
+        match stream.process(input, output, liblzma::stream::Action::Finish) {
+            Ok(liblzma::stream::Status::StreamEnd) => {
+                output.truncate(stream.total_out() as usize);
+                Ok(())
+            }
+            other => Err(format!("liblzma: {other:?}")),
+        }
+    }
+
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
         let mut stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0)
             .map_err(|e| format!("liblzma: {e}"))?;
@@ -65,6 +104,34 @@ struct Port;
 impl Codec for Port {
     fn name(&self) -> String {
         "hivepack-xz".into()
+    }
+
+    fn compress(
+        &mut self,
+        preset: u32,
+        check: liblzma::stream::Check,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut stream =
+            hivepack_xz::Stream::easy_encoder(preset, hivepack_xz::Check(check_number(check)))
+                .map_err(|e| format!("port: {e}"))?;
+        output.clear();
+        output.resize(hivepack_xz::stream_buffer_bound(input.len()), 0);
+        let mut out = hivepack_xz::OutBuffer::new(output);
+        let status = stream.code(
+            &mut out,
+            &mut hivepack_xz::InBuffer::new(input),
+            hivepack_xz::Action::Finish,
+        );
+        let len = out.pos;
+        match status {
+            Ok(hivepack_xz::Status::StreamEnd) => {
+                output.truncate(len);
+                Ok(())
+            }
+            other => Err(format!("port: {other:?}")),
+        }
     }
 
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
@@ -86,6 +153,7 @@ impl Codec for Port {
 }
 
 struct Options {
+    compress: bool,
     presets: Vec<u32>,
     check: liblzma::stream::Check,
     rounds: u32,
@@ -95,6 +163,7 @@ struct Options {
 
 fn options(args: impl Iterator<Item = String>) -> Result<Options> {
     let mut options = Options {
+        compress: false,
         presets: vec![0, 6, 9],
         check: liblzma::stream::Check::Crc64,
         rounds: 3,
@@ -123,6 +192,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
                     other => return Err(format!("bad check {other:?}")),
                 };
             }
+            "--compress" => options.compress = true,
             "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
             "--seconds" => {
                 let seconds: f64 = value()?.parse().map_err(|_| "bad --seconds")?;
@@ -131,7 +201,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--rounds N] [--seconds S] PATH..."
+                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--compress] [--rounds N] [--seconds S] PATH..."
                         .into(),
                 );
             }
@@ -215,15 +285,29 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
         let mut speeds: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
         for _ in 0..options.rounds {
             for (i, codec) in codecs.iter_mut().enumerate() {
-                let seconds = time(options.budget, || {
-                    codec.decompress(&compressed, data.len(), &mut scratch)
-                })?;
-                if scratch != data {
-                    return Err(format!(
-                        "{}: {name} preset {preset} does not round trip",
-                        codec.name()
-                    ));
-                }
+                let seconds = if options.compress {
+                    let seconds = time(options.budget, || {
+                        codec.compress(preset, options.check, &data, &mut scratch)
+                    })?;
+                    if scratch != compressed {
+                        return Err(format!(
+                            "{}: {name} preset {preset} is not liblzma's Stream",
+                            codec.name()
+                        ));
+                    }
+                    seconds
+                } else {
+                    let seconds = time(options.budget, || {
+                        codec.decompress(&compressed, data.len(), &mut scratch)
+                    })?;
+                    if scratch != data {
+                        return Err(format!(
+                            "{}: {name} preset {preset} does not round trip",
+                            codec.name()
+                        ));
+                    }
+                    seconds
+                };
                 speeds[i] = Range::add(speeds[i].take(), megabytes / seconds);
             }
         }
@@ -248,7 +332,14 @@ fn run() -> Result<()> {
     let options = options(std::env::args().skip(1))?;
     let mut codecs: Vec<Box<dyn Codec>> = vec![Box::new(Liblzma), Box::new(Port)];
     let header: Vec<String> = codecs.iter().map(|c| c.name()).collect();
-    println!("Decompression, MB/s:\n");
+    println!(
+        "{}, MB/s:\n",
+        if options.compress {
+            "Compression"
+        } else {
+            "Decompression"
+        }
+    );
     println!(
         "| input | MB | preset | ratio | {} | port/liblzma |",
         header.join(" | ")

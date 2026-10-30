@@ -2,7 +2,7 @@
 //! and `common/stream_flags_decoder.c`.
 
 use crate::check::{CHECK_ID_MAX, Check, crc32};
-use crate::common::{Ret, VLI_UNKNOWN, read32le};
+use crate::common::{Ret, VLI_UNKNOWN, read32le, write32le};
 
 /// `LZMA_STREAM_HEADER_SIZE`: the size of the Stream Header and of the
 /// Stream Footer.
@@ -133,5 +133,62 @@ pub(crate) fn compare(a: &StreamFlags, b: &StreamFlags) -> Ret {
             return Ret::DataError;
         }
     }
+    Ret::Ok
+}
+
+/// `stream_flags_encode`: true if the check is out of range.
+fn stream_flags_encode(options: &StreamFlags, out: &mut [u8]) -> bool {
+    if options.check.0 > CHECK_ID_MAX {
+        return true;
+    }
+    out[0] = 0x00;
+    out[1] = options.check.0 as u8;
+    false
+}
+
+/// `lzma_stream_header_encode`: the Stream Header into `out[..12]`.
+pub(crate) fn header_encode(options: &StreamFlags, out: &mut [u8]) -> Ret {
+    if options.version != 0 {
+        return Ret::OptionsError;
+    }
+
+    out[..HEADER_MAGIC.len()].copy_from_slice(&HEADER_MAGIC);
+
+    if stream_flags_encode(options, &mut out[HEADER_MAGIC.len()..]) {
+        return Ret::ProgError;
+    }
+
+    let crc = crc32(
+        &out[HEADER_MAGIC.len()..HEADER_MAGIC.len() + STREAM_FLAGS_SIZE],
+        0,
+    );
+    write32le(&mut out[HEADER_MAGIC.len() + STREAM_FLAGS_SIZE..], crc);
+
+    Ret::Ok
+}
+
+/// `lzma_stream_footer_encode`: the Stream Footer into `out[..12]`.
+pub(crate) fn footer_encode(options: &StreamFlags, out: &mut [u8]) -> Ret {
+    if options.version != 0 {
+        return Ret::OptionsError;
+    }
+
+    if !is_backward_size_valid(options) {
+        return Ret::ProgError;
+    }
+
+    write32le(&mut out[4..], (options.backward_size / 4 - 1) as u32);
+
+    if stream_flags_encode(options, &mut out[2 * 4..]) {
+        return Ret::ProgError;
+    }
+
+    let crc = crc32(&out[4..4 + 4 + STREAM_FLAGS_SIZE], 0);
+
+    write32le(out, crc);
+
+    out[2 * 4 + STREAM_FLAGS_SIZE..2 * 4 + STREAM_FLAGS_SIZE + FOOTER_MAGIC.len()]
+        .copy_from_slice(&FOOTER_MAGIC);
+
     Ret::Ok
 }

@@ -290,6 +290,21 @@ LIBARCHIVE_SOURCES = [
 ]
 
 
+# libarchive: the cpio reader, the RPM filter and the raw format that shows
+# what it gives, the cpio writers, what they call, and the memory and
+# callback inputs and outputs tools/cpio-oracle uses.
+LIBARCHIVE_CPIO_SOURCES = [
+    "archive_acl.c", "archive_check_magic.c", "archive_entry.c", "archive_entry_sparse.c",
+    "archive_entry_xattr.c", "archive_options.c", "archive_read.c", "archive_read_open_memory.c",
+    "archive_read_set_options.c", "archive_read_support_filter_rpm.c",
+    "archive_read_support_format_cpio.c", "archive_read_support_format_empty.c",
+    "archive_read_support_format_raw.c", "archive_string.c", "archive_string_sprintf.c",
+    "archive_util.c", "archive_virtual.c", "archive_write.c", "archive_write_add_filter_none.c",
+    "archive_write_set_format_cpio_binary.c", "archive_write_set_format_cpio_newc.c",
+    "archive_write_set_format_cpio_odc.c",
+]
+
+
 # archive_string.c without the Unicode normalization of names converted from
 # UTF-16 or UTF-8 (NFC, or NFD on macOS), which hivepack-iso leaves out: Joliet
 # names come out as the image has them.
@@ -390,7 +405,8 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
     tools/iso-oracle is built with libarchive's LIBARCHIVE_SOURCES, its
     archive_string.c without the Unicode normalization (libarchive_string),
-    its own config.h, and zlib's (the `extra` set).
+    its own config.h, and zlib's (the `extra` set); tools/cpio-oracle, told
+    by its folder, with LIBARCHIVE_CPIO_SOURCES and its own config.h.
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, the part of
@@ -455,6 +471,12 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                        check=True)
         return
     libarchive = next(source.glob("libarchive-*/libarchive"), None)
+    if libarchive is not None and folder.name == "cpio-oracle":
+        files += [str(libarchive / name) for name in LIBARCHIVE_CPIO_SOURCES]
+        config = ROOT / Path(sources[0]).parent
+        subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", f"-I{config}", f"-I{libarchive}",
+                        *files, "-o", str(folder / "oracle")], check=True)
+        return
     if libarchive is not None:
         zlib = next(extra[0].glob("zlib-*"))
         files += [str(libarchive / name) for name in LIBARCHIVE_SOURCES]
@@ -551,9 +573,11 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     if generate["tool"] == "7zz":
         build_7zz(cache / origin["name"], folder)
     elif generate["tool"] == "uudecode":
-        # Each file the glob finds, decoded, named without its `.uu` and
-        # libarchive's `test_read_format_`.
-        for uu in sorted((cache / origin["name"]).glob(generate["glob"])):
+        # Each file the glob (or globs) finds, decoded, named without its
+        # `.uu` and libarchive's `test_read_format_`.
+        globs = generate["glob"] if isinstance(generate["glob"], list) else [generate["glob"]]
+        found = {uu for pattern in globs for uu in (cache / origin["name"]).glob(pattern)}
+        for uu in sorted(found):
             name = uu.name[:-3].replace("test_read_format_", "")
             (folder / name).write_bytes(uudecode(uu.read_text(errors="replace")))
     elif generate["tool"] == "oracle":

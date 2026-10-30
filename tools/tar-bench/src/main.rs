@@ -17,8 +17,8 @@
 //! Go runs in a program of its own, `tools/tar-bench/go`. Most rows read from
 //! memory, so that only the reader is timed, through a plain reader on both sides.
 //! Others read from a file: through a buffer of 64 KiB on each side, or one read
-//! at a time. A file given as it is lets Go seek past data; the port takes any
-//! `Read`, and goes through it.
+//! at a time. A file given as it is lets Go seek past data, as does
+//! `Reader::seekable` on the port's side.
 //!
 //! Rounds take turns between the two, so that a noisy machine slows them alike,
 //! and each round runs for at least `--seconds`. The output is a Markdown table of
@@ -58,7 +58,7 @@ enum Where {
     Memory,
     Buffered,
     File,
-    /// The file as it is, which Go seeks and the port reads through.
+    /// The file as it is, which both seek.
     Seekable,
 }
 
@@ -220,10 +220,16 @@ const WORKLOADS: &[Workload] = &[
     ),
     data(
         "Skipping data",
-        "Big entries, a file given as it is (Go seeks)",
+        "Big entries, seeking in a file",
         Archive::Big,
         Where::Seekable,
         false,
+    ),
+    entries(
+        "Skipping data",
+        "Small entries, seeking in a file",
+        Archive::Small,
+        Where::Seekable,
     ),
 ];
 
@@ -289,7 +295,10 @@ fn text(path: &Path) -> Result<&str> {
 
 /// Each entry, with its data skipped.
 fn go_through<R: Read>(reader: R) -> Result<(Duration, u64)> {
-    let mut tar = Reader::new(reader);
+    go_through_all(Reader::new(reader))
+}
+
+fn go_through_all<R: Read>(mut tar: Reader<R>) -> Result<(Duration, u64)> {
     let mut value = 0;
     let start = Instant::now();
     while let Some(header) = tar.next().map_err(|e| e.to_string())? {
@@ -300,7 +309,10 @@ fn go_through<R: Read>(reader: R) -> Result<(Duration, u64)> {
 
 /// Each entry, and its data.
 fn read_all<R: Read>(reader: R) -> Result<(Duration, u64)> {
-    let mut tar = Reader::new(reader);
+    read_all_of(Reader::new(reader))
+}
+
+fn read_all_of<R: Read>(mut tar: Reader<R>) -> Result<(Duration, u64)> {
     let mut buf = vec![0; CHUNK];
     let mut value = 0;
     let start = Instant::now();
@@ -323,8 +335,10 @@ fn port(path: &Path, memory: &[u8], from: Where, read: bool) -> Result<(Duration
         (Where::Memory, false) => go_through(memory),
         (Where::Buffered, true) => read_all(BufReader::with_capacity(CHUNK, file()?)),
         (Where::Buffered, false) => go_through(BufReader::with_capacity(CHUNK, file()?)),
-        (Where::File | Where::Seekable, true) => read_all(file()?),
-        (Where::File | Where::Seekable, false) => go_through(file()?),
+        (Where::File, true) => read_all(file()?),
+        (Where::File, false) => go_through(file()?),
+        (Where::Seekable, true) => read_all_of(Reader::seekable(file()?)),
+        (Where::Seekable, false) => go_through_all(Reader::seekable(file()?)),
     }
 }
 

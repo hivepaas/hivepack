@@ -30,7 +30,7 @@ Against Go 1.27.2's `archive/tar`, with `tools/tar-bench`. Above 1× the port is
 | Reading data, from memory | 1.20–2.00× |
 | Reading data, from a file | 1.02–1.05× |
 | Skipping data, through a buffer | 0.96× |
-| Skipping data, a file given as it is | 0.01×: Go seeks, and the port reads through |
+| Skipping data, seeking in a file | 2.05–2.21× |
 
 **Measured on:** AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, Go 1.27.2, in October 2026. The data is the Silesia corpus cut to 64 MiB, and archives of 200,000 entries, the best of five rounds taken in turn. Both found the same entries and read the same bytes. The whole table and the reasons are in [docs/tar.md](../../docs/tar.md#the-speed).
 

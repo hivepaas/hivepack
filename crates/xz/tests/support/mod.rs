@@ -167,19 +167,8 @@ pub fn input(rng: &mut Rng, len: usize) -> Vec<u8> {
     match rng.below(8) {
         0 => {
             let words: &[&[u8]] = &[
-                b"the ",
-                b"xz ",
-                b"block ",
-                b"stream ",
-                b"of ",
-                b"Lempel ",
-                b"Ziv ",
-                b"and ",
-                b"a ",
-                b"range ",
-                b"coder\n",
-                b"match, ",
-                b"length ",
+                b"the ", b"xz ", b"block ", b"stream ", b"of ", b"Lempel ", b"Ziv ", b"and ",
+                b"a ", b"range ", b"coder\n", b"match, ", b"length ",
             ];
             while data.len() < len {
                 data.extend_from_slice(rng.pick(words));

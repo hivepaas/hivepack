@@ -138,7 +138,7 @@ pub(crate) struct Input<'a> {
  *  Reading
  **************************************/
 
-fn read32(bytes: &[u8], at: usize) -> u32 {
+pub(crate) fn read32(bytes: &[u8], at: usize) -> u32 {
     let mut word = [0; 4];
     word.copy_from_slice(&bytes[at..at + 4]);
     u32::from_ne_bytes(word)
@@ -154,7 +154,7 @@ fn read64(bytes: &[u8], at: usize) -> u64 {
 /// `b[pmatch..]`, up to `a[..limit]`. The bytes are compared 8 at a time;
 /// the count does not depend on how many.
 #[inline(always)]
-fn count(a: &[u8], pin: usize, b: &[u8], pmatch: usize, limit: usize) -> usize {
+pub(crate) fn count(a: &[u8], pin: usize, b: &[u8], pmatch: usize, limit: usize) -> usize {
     let start = pin;
     let (mut pin, mut pmatch) = (pin, pmatch);
     while pin + 8 <= limit {
@@ -854,7 +854,13 @@ fn compress_generic_validated(
 /// `LZ4_wildCopy8` from the input to the output: 8 bytes at a time, at
 /// least once, up to 8 bytes past `end`.
 #[inline(always)]
-fn wild_copy8_from(dst: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, end: usize) {
+pub(crate) fn wild_copy8_from(
+    dst: &mut [u8],
+    mut op: usize,
+    src: &[u8],
+    mut ip: usize,
+    end: usize,
+) {
     loop {
         dst[op..op + 8].copy_from_slice(&src[ip..ip + 8]);
         op += 8;

@@ -40,3 +40,31 @@ fn blocks_are_liblz4s() {
         assert!(back == data);
     }
 }
+
+#[test]
+fn hc_blocks_are_liblz4s() {
+    let mut rng = Rng(0x5eed_1231);
+    for round in 0..260 {
+        let len = match round % 5 {
+            0 => rng.below(40) as usize,
+            1 => rng.below(2000) as usize,
+            2 => 60_000 + rng.below(10_000) as usize,
+            3 => rng.below(200_000) as usize,
+            _ => rng.below(700_000) as usize,
+        };
+        let data = input(&mut rng, len);
+        let level = rng.pick(&[1, 2, 2, 3, 4, 6, 9, 9, 10, 11, 12, 13]);
+        let want = c_compress_block(&data, level);
+        let mut got = vec![0; block::compress_bound(len)];
+        let n = hivepack_lz4::hc::compress_hc(&data, &mut got, level);
+        assert_eq!(n, want.len(), "round {round}, {len} bytes, level {level}");
+        assert!(
+            got[..n] == want[..],
+            "round {round}, {len} bytes, level {level}"
+        );
+
+        let mut back = vec![0; len];
+        assert_eq!(block::decompress_safe(&got[..n], &mut back), Ok(len));
+        assert!(back == data);
+    }
+}

@@ -55,6 +55,7 @@ mod decoder;
 mod lz4;
 mod lz4_compress;
 mod lz4frame;
+mod lz4hc;
 mod xxhash;
 
 pub use decoder::{Decoder, LEGACY_BLOCKSIZE, LEGACY_MAGICNUMBER};
@@ -70,6 +71,13 @@ pub mod block {
     pub use crate::lz4_compress::{
         ACCELERATION_DEFAULT, ACCELERATION_MAX, State, Stream, compress_default,
         compress_dest_size, compress_fast,
+    };
+}
+
+/// High compression: `lz4hc.h`.
+pub mod hc {
+    pub use crate::lz4hc::{
+        CLEVEL_DEFAULT, CLEVEL_MAX, CLEVEL_MIN, CLEVEL_OPT_MIN, StateHc, compress_hc,
     };
 }
 

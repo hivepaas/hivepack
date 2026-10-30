@@ -239,6 +239,59 @@ fn answer(request: &str) -> String {
             }
             text
         }
+        ["hc", level, capacity, blocks] => {
+            let level: i32 = level.parse().unwrap();
+            let capacity: usize = capacity.parse().unwrap();
+            let mut state = hivepack_lz4::hc::StateHc::new();
+            let mut text = String::from("ok");
+            for (i, data) in blocks.split(',').enumerate() {
+                let data = unhex(data);
+                let mut out = pattern(capacity);
+                let ret = if i == 0 {
+                    state.compress_hc_ext_state(&data, &mut out, level)
+                } else {
+                    state.compress_hc_ext_state_fast_reset(&data, &mut out, level)
+                };
+                let _ = write!(text, " {ret}/{:016x}", fnv64(&out));
+            }
+            text
+        }
+        ["hcdest", level, capacity, data] => {
+            let capacity: usize = capacity.parse().unwrap();
+            let mut out = pattern(capacity);
+            let (ret, src_size) = hivepack_lz4::hc::StateHc::new().compress_hc_dest_size(
+                &unhex(data),
+                &mut out,
+                level.parse().unwrap(),
+            );
+            format!("{ret} {src_size} {:016x}", fnv64(&out))
+        }
+        ["hcstream", dict, how, level, capacity, blocks] => {
+            let dict = unhex(dict);
+            let level: i32 = level.parse().unwrap();
+            let capacity: usize = capacity.parse().unwrap();
+            let mut stream = hivepack_lz4::hc::StreamHc::new();
+            let mut dict_stream = hivepack_lz4::hc::StreamHc::new();
+            stream.reset(level);
+            if how == "a" {
+                dict_stream.reset(level);
+                dict_stream.load_dict_hc(&dict);
+                stream.reset_fast(level);
+                stream.attach_hc_dictionary(&dict_stream);
+            } else {
+                if how == "f" {
+                    stream.favor_decompression_speed(true);
+                }
+                stream.load_dict_hc(&dict);
+            }
+            let mut text = String::from("ok");
+            for data in blocks.split(',') {
+                let mut out = pattern(capacity);
+                let ret = stream.compress_hc_continue(&unhex(data), &mut out);
+                let _ = write!(text, " {ret}/{:016x}", fnv64(&out));
+            }
+            text
+        }
         ["header", data] => match hivepack_lz4::frame::header_size(&unhex(data)) {
             Ok(size) => size.to_string(),
             Err(e) => e.name().to_string(),
@@ -924,6 +977,84 @@ fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
         ));
     }
 
+    // High compression, at every level, alone and in streams.
+    let levels = [-1, 0, 1, 2, 2, 3, 4, 6, 9, 9, 10, 11, 12, 13];
+    let hc_max = if max >= 65536 { max / 2 } else { max };
+    for _ in 0..count / 2 {
+        let level = rng.pick(&levels);
+        let n = 1 + rng.below(3) as usize;
+        let mut lens = Vec::new();
+        let blocks: Vec<String> = (0..n)
+            .map(|_| {
+                let len = length(rng, hc_max);
+                lens.push(len);
+                hex(&input(rng, len))
+            })
+            .collect();
+        let biggest = lens.iter().copied().max().unwrap_or(0);
+        let bound = block::compress_bound(biggest);
+        let capacity = match rng.below(4) {
+            0 => bound,
+            1 => bound - rng.below(bound as u64 / 4 + 1) as usize,
+            2 => rng.below(biggest as u64 + 20) as usize,
+            _ => biggest / 2,
+        };
+        requests.push(format!("hc {level} {capacity} {}", blocks.join(",")));
+    }
+    for _ in 0..count / 3 {
+        let len = length(rng, hc_max);
+        let data = input(rng, len);
+        let capacity = match rng.below(4) {
+            0 => rng.below(20) as usize,
+            1 => block::compress_bound(len),
+            _ => rng.below(len as u64 + 50) as usize,
+        };
+        let level = rng.pick(&levels);
+        requests.push(format!("hcdest {level} {capacity} {}", hex(&data)));
+    }
+    for _ in 0..count / 3 {
+        let dict_len = match rng.below(4) {
+            0 => rng.below(10) as usize,
+            _ => rng.below(hc_max.min(70_000) as u64) as usize,
+        };
+        let dict = input(rng, dict_len);
+        let how = rng.pick(&["l", "a", "f"]);
+        let level = rng.pick(&levels);
+        let n = 1 + rng.below(4) as usize;
+        let mut lens = Vec::new();
+        let blocks: Vec<String> = (0..n)
+            .map(|_| {
+                let len = match rng.below(4) {
+                    0 => rng.below(10) as usize,
+                    1 => 4096 + rng.below(4) as usize,
+                    _ => rng.below(hc_max.min(70_000) as u64) as usize,
+                };
+                lens.push(len);
+                let mut data = input(rng, len);
+                if !dict.is_empty() && rng.below(2) == 0 {
+                    for chunk in data.chunks_mut(97) {
+                        let at = rng.below(dict.len() as u64) as usize;
+                        let take = chunk.len().min(dict.len() - at);
+                        chunk[..take].copy_from_slice(&dict[at..at + take]);
+                    }
+                }
+                hex(&data)
+            })
+            .collect();
+        let biggest = lens.iter().copied().max().unwrap_or(0);
+        let bound = block::compress_bound(biggest);
+        let capacity = if rng.below(4) == 0 {
+            biggest / 2 + 1
+        } else {
+            bound
+        };
+        requests.push(format!(
+            "hcstream {} {how} {level} {capacity} {}",
+            hex(&dict),
+            blocks.join(",")
+        ));
+    }
+
     // Header sizes.
     for _ in 0..count / 2 {
         let frame = match rng.below(3) {
@@ -949,6 +1080,12 @@ fn port_matches_liblz4() {
     for request in &requests {
         let want = oracle.ask(request);
         let got = answer(request);
+        if got != want
+            && let Some(path) = std::env::var_os("LZ4_ORACLE_DUMP")
+        {
+            // The whole request, to replay by hand.
+            let _ = std::fs::write(path, request);
+        }
         assert_eq!(got, want, "{request:.400}");
         checked += 1;
     }

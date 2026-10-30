@@ -50,6 +50,8 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// Loops keep liblz4's indices, so the port reads side by side with the C.
+#![allow(clippy::needless_range_loop)]
 
 mod decoder;
 mod lz4;
@@ -77,7 +79,7 @@ pub mod block {
 /// High compression: `lz4hc.h`.
 pub mod hc {
     pub use crate::lz4hc::{
-        CLEVEL_DEFAULT, CLEVEL_MAX, CLEVEL_MIN, CLEVEL_OPT_MIN, StateHc, compress_hc,
+        CLEVEL_DEFAULT, CLEVEL_MAX, CLEVEL_MIN, CLEVEL_OPT_MIN, StateHc, StreamHc, compress_hc,
     };
 }
 

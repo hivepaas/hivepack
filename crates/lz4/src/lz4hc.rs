@@ -38,6 +38,8 @@ const MIN_LENGTH: usize = MFLIMIT + 1;
 
 /*===   Levels definition   ===*/
 
+/// `lz4hc_strat_e`, with liblz4's names.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Strat {
     Lz4Mid,
@@ -803,7 +805,7 @@ fn encode_sequence(
     match_length: usize,
     offset: usize,
     limit: Limit,
-    oend: usize,
+    oend: isize,
 ) -> bool {
     let token = *op;
     *op += 1;
@@ -811,7 +813,9 @@ fn encode_sequence(
     // Encode the literal length.
     let mut length = *ip - *anchor;
     // Check the output limit.
-    if limit != Limit::NotLimited && (*op + length / 255 + length + (2 + 1 + LASTLITERALS)) > oend {
+    if limit != Limit::NotLimited
+        && (*op + length / 255 + length + (2 + 1 + LASTLITERALS)) as isize > oend
+    {
         return true;
     }
     if length >= RUN_MASK {
@@ -840,7 +844,7 @@ fn encode_sequence(
     // Encode the match length.
     debug_assert!(match_length >= MINMATCH);
     length = match_length - MINMATCH;
-    if limit != Limit::NotLimited && (*op + length / 255 + (1 + LASTLITERALS)) > oend {
+    if limit != Limit::NotLimited && (*op + length / 255 + (1 + LASTLITERALS)) as isize > oend {
         // Check the output limit.
         return true;
     }
@@ -933,13 +937,13 @@ fn fill_last_sequence(
     anchor: &mut usize,
     mut ml: usize,
     off: usize,
-    oend: usize,
+    oend: isize,
 ) {
     let ll = *ip - *anchor;
     let ll_addbytes = (ll + 240) / 255;
     let ll_total_cost = 1 + ll_addbytes + ll;
     // 2 for the offset, 1 for the token.
-    let max_lit_pos = oend as isize - 3;
+    let max_lit_pos = oend - 3;
     if (*op + ll_total_cost) as isize <= max_lit_pos {
         // ll validated; now adjust the match length.
         let bytes_left_for_ml = (max_lit_pos - (*op + ll_total_cost) as isize) as usize;
@@ -947,7 +951,7 @@ fn fill_last_sequence(
         if ml > max_ml_size {
             ml = max_ml_size;
         }
-        if (oend + LASTLITERALS) as isize - (*op + ll_total_cost + 2) as isize - 1 + ml as isize
+        if (oend + LASTLITERALS as isize) - (*op + ll_total_cost + 2) as isize - 1 + ml as isize
             >= MFLIMIT as isize
         {
             encode_sequence(src, dst, ip, op, anchor, ml, off, Limit::NotLimited, oend);
@@ -1123,7 +1127,7 @@ fn mid_compress(
     let matchlimit = iend - LASTLITERALS.min(iend);
     let ilimit = iend as isize - MID_HASHSIZE as isize;
     let mut op = 0usize;
-    let mut oend = max_output_size;
+    let mut oend = max_output_size as isize;
 
     let prefix_ptr = v.pstart;
     let prefix_idx = ctx.dict_limit;
@@ -1148,7 +1152,7 @@ fn mid_compress(
     }
     if limit == Limit::FillOutput {
         // A hack for the LZ4 format restriction.
-        oend = oend.wrapping_sub(LASTLITERALS);
+        oend -= LASTLITERALS as isize;
     }
 
     'last_literals: {
@@ -1335,9 +1339,19 @@ fn mid_compress(
     // _lz4mid_last_literals:
     if limit == Limit::FillOutput {
         // Restore the correct value.
-        oend = oend.wrapping_add(LASTLITERALS);
+        oend += LASTLITERALS as isize;
     }
-    last_literals(buf, source, iend, anchor, dst, op, oend, limit, src_size)
+    last_literals(
+        buf,
+        source,
+        iend,
+        anchor,
+        dst,
+        op,
+        oend as usize,
+        limit,
+        src_size,
+    )
 }
 
 /**************************************
@@ -1380,7 +1394,7 @@ fn compress_hash_chain(
 
     let mut optr = 0usize;
     let mut op = 0usize;
-    let mut oend = max_output_size;
+    let mut oend = max_output_size as isize;
 
     let mut start0 = ip;
     let mut start2 = 0usize;
@@ -1394,7 +1408,7 @@ fn compress_hash_chain(
     *src_size = 0;
     if limit == Limit::FillOutput {
         // A hack for the LZ4 format restriction.
-        oend = oend.wrapping_sub(LASTLITERALS);
+        oend -= LASTLITERALS as isize;
     }
 
     let wider = |ctx: &mut HcState, at: usize, low: usize, longest: i32| {
@@ -1676,9 +1690,19 @@ fn compress_hash_chain(
     // _last_literals:
     if limit == Limit::FillOutput {
         // Restore the correct value.
-        oend = oend.wrapping_add(LASTLITERALS);
+        oend += LASTLITERALS as isize;
     }
-    last_literals(buf, source, iend, anchor, dst, op, oend, limit, src_size)
+    last_literals(
+        buf,
+        source,
+        iend,
+        anchor,
+        dst,
+        op,
+        oend as usize,
+        limit,
+        src_size,
+    )
 }
 
 /* ================================================
@@ -1781,7 +1805,7 @@ fn compress_optimal(
     let matchlimit = iend - LASTLITERALS.min(iend);
     let mut op = 0usize;
     let mut op_saved = 0usize;
-    let mut oend = dst_capacity;
+    let mut oend = dst_capacity as isize;
     // Overflow: the last sequence.
     let mut ovml = MINMATCH;
     let mut ovoff = 0usize;
@@ -1790,7 +1814,7 @@ fn compress_optimal(
     *src_size = 0;
     if limit == Limit::FillOutput {
         // A hack for the LZ4 format restriction.
-        oend = oend.wrapping_sub(LASTLITERALS);
+        oend -= LASTLITERALS as isize;
     }
     if sufficient_len >= OPT_NUM {
         sufficient_len = OPT_NUM - 1;
@@ -2089,9 +2113,19 @@ fn compress_optimal(
     // _last_literals:
     if limit == Limit::FillOutput {
         // Restore the correct value.
-        oend = oend.wrapping_add(LASTLITERALS);
+        oend += LASTLITERALS as isize;
     }
-    last_literals(buf, source, iend, anchor, dst, op, oend, limit, src_size)
+    last_literals(
+        buf,
+        source,
+        iend,
+        anchor,
+        dst,
+        op,
+        oend as usize,
+        limit,
+        src_size,
+    )
 }
 
 /**************************************
@@ -2249,7 +2283,8 @@ pub(crate) fn compress_generic(
 
 /// `LZ4HC_setExternalDict`: the prefix, `prefix[pstart..]` (`prefix_size`
 /// bytes), becomes the external dictionary, and the next block starts a new
-/// prefix.
+/// prefix. liblz4 also drops the attached dictionary (`dictCtx`), which is
+/// the caller's to drop.
 pub(crate) fn set_external_dict(ctx: &mut HcState, prefix: &[u8], pstart: usize) {
     if ctx.prefix_size >= 4 && clevel_params(ctx.compression_level).strat != Strat::Lz4Mid {
         // Reference the remaining dictionary content.
@@ -2404,5 +2439,223 @@ impl StateHc {
             .state
             .compress_dest_size(src, dst, &mut src_size, compression_level);
         (written, src_size)
+    }
+}
+
+/**************************************
+ *  Streaming Functions
+ **************************************/
+
+impl HcState {
+    /// `LZ4_loadDictHC`: the state reset (keeping its level) with the last
+    /// 64 KB of `dictionary` as its prefix. Returns their size; the prefix
+    /// is the caller's to keep.
+    pub(crate) fn load_dict(&mut self, dictionary: &[u8]) -> usize {
+        let dict = &dictionary[dictionary.len() - dictionary.len().min(64 * KB)..];
+        // A full initialization: there are bad side effects with the fast
+        // reset.
+        let c_level = self.compression_level;
+        self.init_stream();
+        self.set_compression_level(c_level);
+        let cp = clevel_params(c_level);
+        self.init_internal();
+        self.prefix_size = dict.len();
+        if cp.strat == Strat::Lz4Mid {
+            mid_fill_htable(self, dict);
+        } else if dict.len() >= HASHSIZE {
+            self.insert(dict, 0, dict.len() - 3);
+        }
+        dict.len()
+    }
+
+    /// `LZ4_saveDictHC`'s effect on the state: the prefix is its last
+    /// `dict_size` bytes (at most 64 KB; none for less than 4), moved where
+    /// the caller keeps them. Returns the size kept.
+    pub(crate) fn save_dict(&mut self, dict_size: usize) -> usize {
+        let prefix_size = self.prefix_size;
+        let mut dict_size = dict_size.min(64 * KB);
+        if dict_size < 4 {
+            dict_size = 0;
+        }
+        dict_size = dict_size.min(prefix_size);
+        let end_index = (prefix_size as u32).wrapping_add(self.dict_limit);
+        self.prefix_size = dict_size;
+        self.prefix_null = false;
+        self.dict_limit = end_index.wrapping_sub(dict_size as u32);
+        self.low_limit = end_index.wrapping_sub(dict_size as u32);
+        if self.next_to_update < self.dict_limit {
+            self.next_to_update = self.dict_limit;
+        }
+        dict_size
+    }
+}
+
+/// `LZ4_streamHC_t`, streaming: blocks compressed one after another at a
+/// level, each with the ones before (up to 64 KB) as its history
+/// (`LZ4_compress_HC_continue`), and dictionaries (`LZ4_loadDictHC`,
+/// `LZ4_attach_HC_dictionary`).
+///
+/// Differs from liblz4: as `block::Stream`, the stream keeps a copy of its
+/// history, as liblz4 does when the caller saves it after each block
+/// (`LZ4_saveDictHC`, with 64 KB): the blocks are liblz4's in that case.
+#[derive(Clone, Debug, Default)]
+pub struct StreamHc {
+    state: HcState,
+    /// The prefix: the history, the state's `end - prefixStart` bytes.
+    history: Vec<u8>,
+    dict_ctx: Option<DictCtx>,
+}
+
+impl StreamHc {
+    /// `LZ4_createStreamHC`: a stream at the default level, 9.
+    pub fn new() -> Self {
+        StreamHc::default()
+    }
+
+    /// `LZ4_resetStreamHC`: the stream as new, at `compression_level`.
+    pub fn reset(&mut self, compression_level: i32) {
+        self.state.init_stream();
+        self.state.set_compression_level(compression_level);
+        self.history.clear();
+        self.dict_ctx = None;
+    }
+
+    /// `LZ4_resetStreamHC_fast`: the history forgotten, the tables kept
+    /// where they can be.
+    pub fn reset_fast(&mut self, compression_level: i32) {
+        self.state.reset_fast(compression_level);
+        self.history.clear();
+        self.dict_ctx = None;
+    }
+
+    /// `LZ4_setCompressionLevel`: 2 to 12; 0 or less is 9, more than 12 is
+    /// 12.
+    pub fn set_compression_level(&mut self, compression_level: i32) {
+        self.state.set_compression_level(compression_level);
+    }
+
+    /// `LZ4_favorDecompressionSpeed`: at levels 10 to 12, matches that
+    /// decompress faster.
+    pub fn favor_decompression_speed(&mut self, favor: bool) {
+        self.state.favor_decompression_speed(favor);
+    }
+
+    /// `LZ4_loadDictHC`: the stream reset (keeping its level), with the last
+    /// 64 KB of `dictionary` as the history of the next block. Returns
+    /// their size.
+    pub fn load_dict_hc(&mut self, dictionary: &[u8]) -> usize {
+        self.dict_ctx = None;
+        let size = self.state.load_dict(dictionary);
+        self.history.clear();
+        self.history
+            .extend_from_slice(&dictionary[dictionary.len() - size..]);
+        size
+    }
+
+    /// `LZ4_attach_HC_dictionary`: `dictionary`, a stream a dictionary was
+    /// loaded into, as the history of the next blocks, up to 64 KB of them.
+    /// The stream must have been reset (`reset_fast`) or be new.
+    pub fn attach_hc_dictionary(&mut self, dictionary: &StreamHc) {
+        self.dict_ctx = Some(Arc::new((
+            dictionary.state.clone(),
+            dictionary.history.clone(),
+        )));
+    }
+
+    /// `LZ4_compress_HC_continue`: the next block, with the ones before as
+    /// its history. Returns its compressed size, or 0 if it does not fit in
+    /// `dst`.
+    pub fn compress_hc_continue(&mut self, src: &[u8], dst: &mut [u8]) -> usize {
+        let limit = if dst.len() < compress_bound(src.len()) {
+            Limit::LimitedOutput
+        } else {
+            Limit::NotLimited
+        };
+        let mut src_size = src.len();
+        self.continue_generic(src, dst, &mut src_size, limit)
+    }
+
+    /// `LZ4_compress_HC_continue_destSize`: as much of the next block as
+    /// fits in `dst`. Returns the compressed size and how much of `src` it
+    /// holds.
+    pub fn compress_hc_continue_dest_size(&mut self, src: &[u8], dst: &mut [u8]) -> (usize, usize) {
+        let mut src_size = src.len();
+        let written = self.continue_generic(src, dst, &mut src_size, Limit::FillOutput);
+        (written, src_size)
+    }
+
+    /// `LZ4_compressHC_continue_generic`, then `LZ4_saveDictHC` of 64 KB.
+    fn continue_generic(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        src_size: &mut usize,
+        limit: Limit,
+    ) -> usize {
+        let st = &mut self.state;
+        let mut history = core::mem::take(&mut self.history);
+        // Auto-init if forgotten.
+        let first = st.prefix_null;
+        if first {
+            st.init_internal();
+        }
+
+        // Check for overflow.
+        if st.prefix_size + st.dict_limit as usize > 2 * GB {
+            let dict_size = st.prefix_size.min(64 * KB);
+            let keep = history.len() - dict_size;
+            history.drain(..keep);
+            st.load_dict(&history);
+        }
+
+        // The blocks do not follow each other: the history becomes the
+        // external dictionary.
+        if !first {
+            set_external_dict(st, &history, 0);
+            // An external dictionary and an attached one cannot be
+            // referenced at the same time.
+            self.dict_ctx = None;
+        }
+        let dict: &[u8] = if first { &[] } else { &history };
+        let view = View {
+            buf: src,
+            pstart: 0,
+            dict,
+        };
+        let capacity = dst.len();
+        let c_level = st.compression_level;
+        let result = compress_generic(
+            st,
+            view,
+            &mut self.dict_ctx,
+            0,
+            dst,
+            src_size,
+            capacity,
+            c_level,
+            limit,
+        );
+
+        // `LZ4_saveDictHC(stream, safeBuffer, 64 KB)`: the end of the block,
+        // which is the prefix now.
+        let size = st.save_dict(64 * KB);
+        history.clear();
+        history.extend_from_slice(&src[src.len() - size..]);
+        self.history = history;
+        result
+    }
+
+    /// `LZ4_saveDictHC`: the history cut to its last `dict_size` bytes (at
+    /// most 64 KB, none for less than 4). Returns the size kept.
+    pub fn save_dict_hc(&mut self, dict_size: usize) -> usize {
+        let size = self.state.save_dict(dict_size);
+        let len = self.history.len();
+        self.history.drain(..len - size.min(len));
+        size
+    }
+
+    /// The history: what the next block may refer to.
+    pub fn history(&self) -> &[u8] {
+        &self.history
     }
 }

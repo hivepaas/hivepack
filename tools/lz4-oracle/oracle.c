@@ -71,6 +71,21 @@
  *       bytes, then LZ4_saveDict of 64 KB into a buffer apart. Answered as
  *       compress.
  *
+ *   hc <level> <capacity> <blocks>
+ *       As compress, with LZ4_compress_HC_extStateHC and its _fastReset form
+ *       at <level>.
+ *
+ *   hcdest <level> <capacity> <hex>
+ *       LZ4_compress_HC_destSize. Answered as destsize.
+ *
+ *   hcstream <dict> <how> <level> <capacity> <blocks>
+ *       A stream reset at <level> (LZ4_resetStreamHC), then the dictionary
+ *       loaded (<how> l: LZ4_loadDictHC; a: loaded into another stream at
+ *       <level> and attached to this one, reset with LZ4_resetStreamHC_fast;
+ *       f: as l, with LZ4_favorDecompressionSpeed), then each block
+ *       compressed with LZ4_compress_HC_continue and the history saved with
+ *       LZ4_saveDictHC, as cstream. Answered as compress.
+ *
  *   header <hex>
  *       LZ4F_headerSize. Answered with the size or the error's name.
  *
@@ -88,6 +103,8 @@
 #define LZ4F_STATIC_LINKING_ONLY
 #define XXH_STATIC_LINKING_ONLY
 #include "lz4.h"
+#define LZ4_HC_STATIC_LINKING_ONLY
+#include "lz4hc.h"
 #include "lz4frame.h"
 #include "xxhash.h"
 
@@ -414,6 +431,87 @@ static void do_cstream(const char *dict_hex, const char *how, int accel, int cap
     free(safe);
 }
 
+static void do_hc(int level, int capacity, char *blocks) {
+    LZ4_streamHC_t *state = LZ4_createStreamHC();
+    unsigned char *out = malloc((size_t)capacity + 1);
+    char *item;
+    int first = 1;
+    printf("ok");
+    while ((item = next_item(&blocks)) != NULL) {
+        size_t len;
+        unsigned char *data = unhex(item, &len);
+        int ret;
+        fill_pattern(out, (size_t)capacity);
+        if (first)
+            ret = LZ4_compress_HC_extStateHC(state, (const char *)data, (char *)out, (int)len,
+                                             capacity, level);
+        else
+            ret = LZ4_compress_HC_extStateHC_fastReset(state, (const char *)data, (char *)out,
+                                                       (int)len, capacity, level);
+        first = 0;
+        printf(" %d/%016llx", ret, fnv64(out, (size_t)capacity));
+        free(data);
+    }
+    printf("\n");
+    LZ4_freeStreamHC(state);
+    free(out);
+}
+
+static void do_hcdest(int level, int capacity, const char *data_hex) {
+    size_t len;
+    unsigned char *data = unhex(data_hex, &len);
+    unsigned char *out = malloc((size_t)capacity + 1);
+    LZ4_streamHC_t *state = LZ4_createStreamHC();
+    int src_size = (int)len, ret;
+    fill_pattern(out, (size_t)capacity);
+    ret = LZ4_compress_HC_destSize(state, (const char *)data, (char *)out, &src_size, capacity,
+                                   level);
+    printf("%d %d %016llx\n", ret, src_size, fnv64(out, (size_t)capacity));
+    LZ4_freeStreamHC(state);
+    free(data);
+    free(out);
+}
+
+static void do_hcstream(const char *dict_hex, const char *how, int level, int capacity,
+                        char *blocks) {
+    size_t dict_len;
+    unsigned char *dict = unhex(dict_hex, &dict_len);
+    LZ4_streamHC_t *stream = LZ4_createStreamHC();
+    LZ4_streamHC_t *dict_stream = LZ4_createStreamHC();
+    unsigned char *out = malloc((size_t)capacity + 1);
+    char *safe = malloc(64 * 1024);
+    char *item;
+    LZ4_resetStreamHC(stream, level);
+    if (how[0] == 'a') {
+        LZ4_resetStreamHC(dict_stream, level);
+        LZ4_loadDictHC(dict_stream, (const char *)dict, (int)dict_len);
+        LZ4_resetStreamHC_fast(stream, level);
+        LZ4_attach_HC_dictionary(stream, dict_stream);
+    } else {
+        if (how[0] == 'f')
+            LZ4_favorDecompressionSpeed(stream, 1);
+        LZ4_loadDictHC(stream, (const char *)dict, (int)dict_len);
+    }
+    printf("ok");
+    while ((item = next_item(&blocks)) != NULL) {
+        size_t len;
+        unsigned char *data = unhex(item, &len);
+        int ret;
+        fill_pattern(out, (size_t)capacity);
+        ret = LZ4_compress_HC_continue(stream, (const char *)data, (char *)out, (int)len,
+                                       capacity);
+        printf(" %d/%016llx", ret, fnv64(out, (size_t)capacity));
+        LZ4_saveDictHC(stream, safe, 64 * 1024);
+        free(data);
+    }
+    printf("\n");
+    LZ4_freeStreamHC(stream);
+    LZ4_freeStreamHC(dict_stream);
+    free(dict);
+    free(out);
+    free(safe);
+}
+
 static void do_header(const char *data_hex) {
     size_t len;
     unsigned char *data = unhex(data_hex, &len);
@@ -463,6 +561,12 @@ int main(void) {
             do_destsize(atoi(words[1]), atoi(words[2]), words[3]);
         else if (n == 6 && strcmp(words[0], "cstream") == 0)
             do_cstream(words[1], words[2], atoi(words[3]), atoi(words[4]), words[5]);
+        else if (n == 4 && strcmp(words[0], "hc") == 0)
+            do_hc(atoi(words[1]), atoi(words[2]), words[3]);
+        else if (n == 4 && strcmp(words[0], "hcdest") == 0)
+            do_hcdest(atoi(words[1]), atoi(words[2]), words[3]);
+        else if (n == 6 && strcmp(words[0], "hcstream") == 0)
+            do_hcstream(words[1], words[2], atoi(words[3]), atoi(words[4]), words[5]);
         else if (n == 2 && strcmp(words[0], "header") == 0)
             do_header(words[1]);
         else if (n == 4 && strcmp(words[0], "xxh32") == 0)

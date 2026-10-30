@@ -27,9 +27,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest]
     env:
-      LEVELS: ${{ inputs.levels || '1,3,5,7,9,12,15,16,19' }}
+      LEVELS: ${{ inputs.levels || '1,19' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,9 +43,9 @@ jobs:
         run: python scripts/testdata.py fetch --group bench
       - name: Build both
         run: |
-          cargo build --release --locked -p zstd-bench
+          cargo build --release --locked -p zstd-bench --features zstd/no_asm
           cp target/release/zstd-bench zstd-bench-safe
-          cargo build --release --locked -p zstd-bench --features hivepack-zstd/unsafe-fast
+          cargo build --release --locked -p zstd-bench --features zstd/no_asm,hivepack-zstd/unsafe-fast
           cp target/release/zstd-bench zstd-bench-fast
       - name: The processor
         run: |

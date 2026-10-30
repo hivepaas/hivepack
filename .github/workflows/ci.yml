@@ -60,6 +60,7 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
       - run: cargo check -p hivepack-age --lib --locked
       - run: cargo check -p hivepack-bzip2 --lib --locked
+      - run: cargo check -p hivepack-xz --lib --locked
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-extract --lib --locked
@@ -193,13 +194,13 @@ jobs:
 
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
   # feature, the compressor's frames and streaming calls against libzstd's,
-  # inflate and deflate against zlib, and bzip2 against libbzip2, under
-  # AddressSanitizer. A few minutes per target; longer runs are done by
-  # hand (see fuzz/README.md).
+  # inflate and deflate against zlib, bzip2 against libbzip2, and the xz
+  # decoders against liblzma, under AddressSanitizer. A few minutes per
+  # target; longer runs are done by hand (see fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
         with:
@@ -321,3 +322,21 @@ jobs:
                       n += 1
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu age_keys -- -max_total_time=30
+      - name: Seed the xz corpus
+        run: |
+          mkdir -p fuzz/corpus/xz
+          python3 - <<'PY'
+          import pathlib
+          # The inputs of the recorded requests, each after a mode byte that
+          # picks their decoder (raw LZMA1 for the filters 1 and 2, raw LZMA2
+          # for 21) and a seed.
+          modes = {"stream": 0, "auto": 1, "lzip": 2, "alone": 3}
+          lines = pathlib.Path("testdata/oracle/xz.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("decode ")):
+              words = line.split("\t")[0].split(" ")
+              kind = words[1].split(":")[0]
+              mode = modes.get(kind, 4 if words[1].startswith(("raw:1:", "raw:2:")) else 5)
+              data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
+              pathlib.Path(f"fuzz/corpus/xz/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu xz -- -max_total_time=90 -rss_limit_mb=4096

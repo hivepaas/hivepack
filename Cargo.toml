@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,7 @@ hivepack-bzip2 = { path = "crates/bzip2" }
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-extract = { path = "crates/extract" }
+hivepack-xz = { path = "crates/xz" }
 hivepack-zip = { path = "crates/zip" }
 hivepack-zstd = { path = "crates/zstd" }
 # The official libraries, used only as the reference in tests and
@@ -36,6 +37,12 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 # interface to it, with its default backend, libbz2-rs-sys (a translation
 # of the same C), left out.
 bzip2 = { version = "0.6.1", default-features = false, features = ["bzip2-sys", "static"] }
+# liblzma-sys 0.4.9 bundles liblzma 5.8.4, the release hivepack-xz ports,
+# and its `static` feature builds that rather than linking the system's
+# liblzma, which may be another version. The liblzma crate is the safe
+# interface to it.
+liblzma = { version = "0.4.9", features = ["static"] }
+liblzma-sys = { version = "=0.4.9", features = ["static"] }
 # Directories opened by handle, where nothing resolves outside them or
 # through a symbolic link: hivepack-extract's way to write, until the
 # standard library's directory handles (`std::fs::Dir`) are stable. The one
@@ -66,6 +73,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bzip2-sys]
+opt-level = 3
+
+[profile.dev.package.liblzma-sys]
 opt-level = 3
 
 # hivepack-zip's tests compress and decompress gigabytes (libzip's

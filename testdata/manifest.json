@@ -256,6 +256,20 @@
       "kind": "tool"
     },
     {
+      "name": "xz-5.8.4-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.gz", "sha256": "0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9", "unpack": "tar.gz" }] },
+      "source": "https://github.com/tukaani-project/xz/releases/tag/v5.8.4, signed by Lasse Collin (key 3690C240CE51B4670D30AD1C38EE757D69184620); its src/liblzma and tests/files are those of the git tag",
+      "license": "0BSD",
+      "kind": "source"
+    },
+    {
+      "name": "xz-oracle",
+      "generate": { "group": "generated", "from": "xz-5.8.4-source", "tool": "oracle", "sources": ["tools/xz-oracle/oracle.c", "tools/xz-oracle/config.h"] },
+      "source": "tools/xz-oracle/oracle.c, built with the liblzma sources of XZ Utils 5.8.4",
+      "license": "MIT (the program) and 0BSD (liblzma)",
+      "kind": "tool"
+    },
+    {
       "name": "fifield-zipbombs",
       "fetch": { "group": "core", "files": [{ "url": "https://www.bamsoftware.com/hacks/zipbomb/zbsm.zip", "sha256": "fb4ff972d21189beec11e05109c4354d0cd6d3b629263d6c950cf8cc3f78bd99" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zblg.zip", "sha256": "f1dc920869794df3e258f42f9b99157104cd3f8c14394c1b9d043d6fcda14c0a" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zbxl.zip", "sha256": "eafd8f574ea7fd0f345eaa19eae8d0d78d5323c8154592c850a2d78a86817744" }] },
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",

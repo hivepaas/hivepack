@@ -1093,6 +1093,16 @@ fn port_encoders_match_liblzma() {
     assert!(ends > 200, "only {ends} encodings end");
 }
 
+/// Whether `request` can be made on this machine: not a `bound` of a size
+/// past `usize`, which a 32-bit `size_t` cannot hold either (the answers
+/// were recorded on a 64-bit one).
+fn fits_this_machine(request: &str) -> bool {
+    match request.strip_prefix("bound ") {
+        Some(size) => size.parse::<usize>().is_ok(),
+        None => true,
+    }
+}
+
 #[test]
 fn port_encoders_match_recorded_answers() {
     let text =
@@ -1103,6 +1113,9 @@ fn port_encoders_match_recorded_answers() {
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
         let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        if !fits_this_machine(request) {
+            continue;
+        }
         assert_eq!(recorded_form(&port_answer(request)), want, "{request:.300}");
         checked += 1;
     }

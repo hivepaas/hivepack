@@ -3,7 +3,7 @@
 //! `--frame`, reading the frames it wrote.
 //!
 //! ```text
-//! cargo run --release -p lz4-bench -- [--levels 1,9] [--rounds 3] [--seconds 1] [--frame] PATH...
+//! cargo run --release -p lz4-bench -- [--levels 1,9] [--rounds 3] [--seconds 1] [--frame | --compress] PATH...
 //! ```
 //!
 //! Level 1 is `LZ4_compress_default`, levels 2 to 12 `LZ4_compress_HC`, and
@@ -14,6 +14,10 @@
 //! of the content's size: for liblz4 the lz4 crate's `Decoder`, which feeds
 //! `LZ4F_decompress` 32 KB at a time; for the port its `Decoder`, and its
 //! frame context in one call (the "context" column).
+//!
+//! With `--compress`, blocks are compressed, at level 1 or negative
+//! levels: the port's must be liblz4's, byte for byte; lz4_flex has one
+//! level, its own.
 //!
 //! lz4_flex is built with its safe code (`safe-decode`, its default), or
 //! with its unsafe code when the tool is built with
@@ -37,6 +41,13 @@ trait Codec {
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
     /// Reads the frame `input`, whose content is `size` bytes long.
     fn read_frame(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
+    /// Compresses `input` as a block at `level` (1, or a negative
+    /// acceleration).
+    fn compress(&mut self, input: &[u8], level: i32, output: &mut Vec<u8>) -> Result<()>;
+}
+
+fn bound(len: usize) -> usize {
+    len + len / 255 + 16
 }
 
 fn read_all(mut reader: impl Read, size: usize, output: &mut Vec<u8>) -> Result<()> {
@@ -71,6 +82,20 @@ impl Codec for Liblz4 {
         let decoder = lz4::Decoder::new(input).map_err(|e| e.to_string())?;
         read_all(decoder, size, output)
     }
+
+    fn compress(&mut self, input: &[u8], level: i32, output: &mut Vec<u8>) -> Result<()> {
+        output.clear();
+        output.resize(bound(input.len()), 0);
+        let mode = if level == 1 {
+            lz4::block::CompressionMode::DEFAULT
+        } else {
+            lz4::block::CompressionMode::FAST(-level)
+        };
+        let n = lz4::block::compress_to_buffer(input, Some(mode), false, output)
+            .map_err(|e| e.to_string())?;
+        output.truncate(n);
+        Ok(())
+    }
 }
 
 /// hivepack-lz4.
@@ -92,6 +117,15 @@ impl Codec for Port {
 
     fn read_frame(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
         read_all(hivepack_lz4::Decoder::new(input), size, output)
+    }
+
+    fn compress(&mut self, input: &[u8], level: i32, output: &mut Vec<u8>) -> Result<()> {
+        output.clear();
+        output.resize(bound(input.len()), 0);
+        let n =
+            hivepack_lz4::block::compress_fast(input, output, if level == 1 { 1 } else { -level });
+        output.truncate(n);
+        Ok(())
     }
 }
 
@@ -123,6 +157,10 @@ impl Codec for PortContext {
             )),
         }
     }
+
+    fn compress(&mut self, input: &[u8], level: i32, output: &mut Vec<u8>) -> Result<()> {
+        Port.compress(input, level, output)
+    }
 }
 
 /// lz4_flex.
@@ -148,6 +186,15 @@ impl Codec for Flex {
 
     fn read_frame(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
         read_all(lz4_flex::frame::FrameDecoder::new(input), size, output)
+    }
+
+    /// lz4_flex has one level, its own: its blocks are not liblz4's.
+    fn compress(&mut self, input: &[u8], _level: i32, output: &mut Vec<u8>) -> Result<()> {
+        output.clear();
+        output.resize(lz4_flex::block::get_maximum_output_size(input.len()), 0);
+        let n = lz4_flex::block::compress_into(input, output).map_err(|e| e.to_string())?;
+        output.truncate(n);
+        Ok(())
     }
 }
 
@@ -180,6 +227,7 @@ struct Options {
     rounds: u32,
     budget: Duration,
     frame: bool,
+    compress: bool,
     paths: Vec<PathBuf>,
 }
 
@@ -189,6 +237,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
         rounds: 3,
         budget: Duration::from_secs(1),
         frame: false,
+        compress: false,
         paths: Vec::new(),
     };
     let mut args = args.peekable();
@@ -205,6 +254,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
                     .collect::<Result<_>>()?;
             }
             "--frame" => options.frame = true,
+            "--compress" => options.compress = true,
             "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
             "--seconds" => {
                 let seconds: f64 = value()?.parse().map_err(|_| "bad --seconds")?;
@@ -298,13 +348,23 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
         for _ in 0..options.rounds {
             for (i, codec) in codecs.iter_mut().enumerate() {
                 let seconds = time(options.budget, || {
-                    if options.frame {
+                    if options.compress {
+                        codec.compress(&data, level, &mut scratch)
+                    } else if options.frame {
                         codec.read_frame(&compressed, data.len(), &mut scratch)
                     } else {
                         codec.decompress(&compressed, data.len(), &mut scratch)
                     }
                 })?;
-                if scratch != data {
+                if options.compress {
+                    // liblz4's block, byte for byte, but for lz4_flex's own.
+                    if i < 2 && scratch != compressed {
+                        return Err(format!(
+                            "{}: {name} level {level} is not liblz4's block",
+                            codec.name()
+                        ));
+                    }
+                } else if scratch != data {
                     return Err(format!(
                         "{}: {name} level {level} does not round trip",
                         codec.name()
@@ -337,7 +397,7 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
 fn run() -> Result<()> {
     let options = options(std::env::args().skip(1))?;
     let mut codecs: Vec<Box<dyn Codec>> = vec![Box::new(Liblz4), Box::new(Port), Box::new(Flex)];
-    if options.frame {
+    if options.frame && !options.compress {
         codecs.insert(2, Box::new(PortContext));
     }
     let header: Vec<String> = codecs.iter().map(|c| c.name()).collect();
@@ -345,7 +405,9 @@ fn run() -> Result<()> {
         .iter()
         .map(|c| format!("{}/liblz4", c.name()))
         .collect();
-    let mode = if options.frame {
+    let mode = if options.compress {
+        "Blocks compressed"
+    } else if options.frame {
         "Frames read"
     } else {
         "Blocks decoded"

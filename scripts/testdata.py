@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -173,13 +174,21 @@ def build_tool(source: Path, tool: str) -> Path:
 
 def build_7zz(source: Path, folder: Path) -> None:
     """7-Zip's console program from the release's sources, with its own
-    makefile, without assembly: what makes the archives the tests read."""
+    makefile: what makes the archives the tests read. The makefile for GCC
+    leaves out assembly; the one for arm64 macs has it."""
     bundle = source / "CPP" / "7zip" / "Bundles" / "Alone2"
     print(f"  building 7zz from {source.name}")
+    makefile = "cmpl_gcc.mak"
+    if sys.platform == "darwin":
+        makefile = "cmpl_mac_arm64.mak" if platform.machine() == "arm64" else "cmpl_mac_x64.mak"
     jobs = str(os.cpu_count() or 2)
-    subprocess.run(["make", "-f", "../../cmpl_gcc.mak", "-j", jobs], cwd=bundle, check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    shutil.copy2(bundle / "b" / "g" / "7zz", folder / "7zz")
+    build = subprocess.run(["make", "-f", f"../../{makefile}", "-j", jobs], cwd=bundle,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if build.returncode != 0:
+        # The end of what it said: it warns a lot before an error.
+        print(build.stderr[-4000:], file=sys.stderr)
+        raise SystemExit(f"building 7zz failed with {build.returncode}")
+    shutil.copy2(next(bundle.glob("b/*/7zz")), folder / "7zz")
 
 
 def libzip_sources(lib: Path) -> list:

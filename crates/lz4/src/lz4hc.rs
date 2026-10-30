@@ -1109,6 +1109,7 @@ fn mid_search_ext_dict(
 // C-style: locals set on every path the C sets them, before use.
 #[allow(unused_assignments)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn mid_compress(
     ctx: &mut HcState,
     v: View<'_>,
@@ -1370,6 +1371,7 @@ enum Step {
 // C-style: locals set on every path the C sets them, before use.
 #[allow(unused_assignments)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn compress_hash_chain(
     ctx: &mut HcState,
     v: View<'_>,
@@ -1781,6 +1783,7 @@ fn find_longer_match(
 // C-style: locals set on every path the C sets them, before use.
 #[allow(unused_assignments)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn compress_optimal(
     ctx: &mut HcState,
     v: View<'_>,
@@ -2135,6 +2138,7 @@ fn compress_optimal(
 /// `LZ4HC_compress_generic_internal`: the source, at `source` in `v.buf`,
 /// right after the prefix, compressed at `c_level`.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn compress_generic_internal(
     ctx: &mut HcState,
     v: View<'_>,

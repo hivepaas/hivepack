@@ -99,16 +99,16 @@ python3 scripts/testdata.py fetch --group bench
 cargo run --release -p zip-bench -- [--only TEXT] [--rounds 5] [--seconds 0.5]
 ```
 
-AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
+AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. Opening, finding and editing were measured after the work on opening below, the other rows just before it, which does not touch them. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
 
 | Workload | hivepack-zip | libzip | Port / libzip |
 |---|---|---|---|
 | **Opening many entries** | | | |
-| Open | 2114 k entries/s | 6395 k entries/s | 0.33× |
-| Open with `ZIP_CHECKCONS` | 1167 k entries/s | 3352 k entries/s | 0.35× |
+| Open | 5028 k entries/s | 6477 k entries/s | 0.78× |
+| Open with `ZIP_CHECKCONS` | 4325 k entries/s | 3327 k entries/s | 1.30× |
 | **Finding, many entries** | | | |
-| `zip_stat_index`, each entry | 51479 k entries/s | 18923 k entries/s | 2.72× |
-| `zip_name_locate`, each entry | 12519 k entries/s | 11235 k entries/s | 1.11× |
+| `zip_stat_index`, each entry | 51041 k entries/s | 19098 k entries/s | 2.67× |
+| `zip_name_locate`, each entry | 12497 k entries/s | 10783 k entries/s | 1.16× |
 | **Reading** | | | |
 | Stored | 5170 MB/s | 3773 MB/s | 1.37× |
 | Deflate | 495 MB/s | 469 MB/s | 1.06× |
@@ -141,17 +141,17 @@ AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 
 | WinZip AES-256 | 160 MB/s | 251 MB/s | 0.64× |
 | WinZip AES-256, small entries | 1.2 k entries/s | 2.1 k entries/s | 0.57× |
 | **Editing** | | | |
-| Rename one entry, the data copied | 8652 MB/s | 5916 MB/s | 1.46× |
-| Add one entry, the data copied | 8600 MB/s | 5671 MB/s | 1.52× |
-| Rename each of many entries | 622 k entries/s | 1021 k entries/s | 0.61× |
-| Set each of many entries' comment | 796 k entries/s | 1626 k entries/s | 0.49× |
-| Delete half of many entries | 1415 k entries/s | 3036 k entries/s | 0.47× |
+| Rename one entry, the data copied | 8776 MB/s | 5909 MB/s | 1.49× |
+| Add one entry, the data copied | 8677 MB/s | 5958 MB/s | 1.46× |
+| Rename each of many entries | 621 k entries/s | 1016 k entries/s | 0.61× |
+| Set each of many entries' comment | 788 k entries/s | 1640 k entries/s | 0.48× |
+| Delete half of many entries | 1437 k entries/s | 3009 k entries/s | 0.48× |
 
 What to read in it:
 
 - **Compression and decompression** are the speed of hivepack's other ports, which their own documents go into: Deflate and bzip2 at their libraries' speed, and LZMA and XZ reading below liblzma's on x86-64, where its range decoder is inline assembly ([xz.md](xz.md)). Writing them, where the compressor is most of the time, is even.
-- **Opening many entries** is the widest gap. A profile puts the most time in filling the table of names (`hash::Names::add`, and hashing with the standard library's SipHash), and much of the rest in small allocations. An archive of a few hundred entries opens in well under a millisecond either way.
-- **Editing many entries** has the same cause in part, as it writes the central directory again and looks names up, with no single place standing out in the profile.
+- **Opening many entries** went from 0.33× to 0.78×, and with `ZIP_CHECKCONS` from 0.35× to 1.30×, once the port read ahead (`stdio` does that for libzip, and without it each entry was a system call or two) and stopped allocating and copying for each entry. About a quarter of what is left is hashing names. libzip hashes with SipHash and random keys too, and the port keeps them, so that an archive cannot be made to collide on purpose.
+- **Editing many entries** is now the widest gap, and it is not in opening, which is not timed here. It has not been looked into yet.
 - **AES** compares two different things. libzip here uses nettle's C code, with no AES instructions and table lookups, where BearSSL's `aes_ct64`, which the port uses, runs in constant time. A profile of the AES-256 workloads, reading and writing, gives 44% to SHA-1 (WinZip AES authenticates with HMAC-SHA1, and hashes its key with PBKDF2) and about 30% to AES. A libzip that uses the processor's AES instructions, as a usual build with GnuTLS or OpenSSL does, would be further ahead than this table shows.
 - **Not compared:** Deflate64, which libzip does not have, and split archives. Files are read and written on the machine's disk, through its cache.
 

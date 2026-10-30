@@ -223,10 +223,12 @@ dependencies = [
  "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
+ "hivepack-lz4",
  "hivepack-tar",
  "hivepack-xz",
  "hivepack-zstd",
  "liblzma",
+ "lz4",
  "zstd",
 ]
 

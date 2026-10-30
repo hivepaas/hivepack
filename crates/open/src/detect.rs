@@ -9,6 +9,8 @@ pub enum Layer {
     Age,
     /// Zstandard: frames, skippable ones among them.
     Zstd,
+    /// LZ4's frames, skippable ones among them, or its legacy format.
+    Lz4,
     /// .xz.
     Xz,
     /// .lz (lzip).
@@ -47,6 +49,32 @@ pub const HEAD_LEN: usize = 1024 + 34 + 512;
 
 const AGE_INTRO: &[u8] = b"age-encryption.org/";
 const AGE_ARMOR: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
+const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+const LZ4_MAGIC: &[u8] = &[0x04, 0x22, 0x4D, 0x18];
+const LZ4_LEGACY_MAGIC: &[u8] = &[0x02, 0x21, 0x4C, 0x18];
+
+/// Whether `head` starts with a skippable frame's magic, 0x184D2A50 to
+/// 0x184D2A5F, little-endian: zstd's and LZ4's, which share them.
+pub(crate) fn is_skippable(head: &[u8]) -> bool {
+    head.len() >= 4 && head[0] & 0xF0 == 0x50 && head[1..4] == [0x2A, 0x4D, 0x18]
+}
+
+/// What comes after the skippable frames that start `head`, as far as it
+/// goes: nothing if one goes on past its end.
+fn past_skippable(head: &[u8]) -> &[u8] {
+    let mut rest = head;
+    while is_skippable(rest) {
+        let Some(size) = rest.get(4..8) else {
+            return &[];
+        };
+        let size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]) as usize;
+        match rest.get(8 + size..) {
+            Some(after) => rest = after,
+            None => return &[],
+        }
+    }
+    rest
+}
 
 /// Whether `head` is a tar header block: USTAR's or GNU's magic, or a
 /// checksum that adds up, as V7 has nothing else.
@@ -96,11 +124,19 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     if head.len() - text.len() <= 1024 && text.starts_with(AGE_ARMOR) {
         return Detected::Layer(Layer::Age);
     }
-    if starts(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    if starts(ZSTD_MAGIC) {
         return Detected::Layer(Layer::Zstd);
     }
-    // A skippable frame: 0x184D2A50 to 0x184D2A5F, little-endian.
-    if head.len() >= 4 && head[0] & 0xF0 == 0x50 && head[1..4] == [0x2A, 0x4D, 0x18] {
+    if starts(LZ4_MAGIC) || starts(LZ4_LEGACY_MAGIC) {
+        return Detected::Layer(Layer::Lz4);
+    }
+    // Skippable frames, zstd's or LZ4's: the frame after them tells. zstd
+    // when it is past what `head` holds.
+    if is_skippable(head) {
+        let next = past_skippable(head);
+        if next.starts_with(LZ4_MAGIC) || next.starts_with(LZ4_LEGACY_MAGIC) {
+            return Detected::Layer(Layer::Lz4);
+        }
         return Detected::Layer(Layer::Zstd);
     }
     if starts(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
@@ -157,6 +193,8 @@ mod tests {
             (&[0x28, 0xB5, 0x2F, 0xFD, 0x04], Layer::Zstd),
             (&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0], Layer::Zstd),
             (&[0x5F, 0x2A, 0x4D, 0x18, 0, 0, 0, 0], Layer::Zstd),
+            (&[0x04, 0x22, 0x4D, 0x18, 0x64], Layer::Lz4),
+            (&[0x02, 0x21, 0x4C, 0x18, 0x10], Layer::Lz4),
             (b"\xFD7zXZ\0\0\x04", Layer::Xz),
             (b"LZIP\x01\x14", Layer::Lzip),
             (&[0x1F, 0x8B, 0x08], Layer::Gzip),
@@ -179,6 +217,28 @@ mod tests {
                 Detected::Container(Container::Data),
                 "{head:?}"
             );
+        }
+    }
+
+    #[test]
+    fn skippable_frames_are_zstd_s_or_lz4_s() {
+        let skip = |size: u32| {
+            let mut frame = vec![0x53, 0x2A, 0x4D, 0x18];
+            frame.extend(size.to_le_bytes());
+            frame.extend(vec![9; size as usize]);
+            frame
+        };
+        let mut head = [skip(3), skip(0), LZ4_MAGIC.to_vec()].concat();
+        assert_eq!(layer(&head), Detected::Layer(Layer::Lz4));
+        head = [skip(10), LZ4_LEGACY_MAGIC.to_vec()].concat();
+        assert_eq!(layer(&head), Detected::Layer(Layer::Lz4));
+        head = [skip(10), ZSTD_MAGIC.to_vec()].concat();
+        assert_eq!(layer(&head), Detected::Layer(Layer::Zstd));
+        // What comes after is past the head, or nothing: zstd.
+        head = [skip(HEAD_LEN as u32), LZ4_MAGIC.to_vec()].concat();
+        assert_eq!(layer(&head[..HEAD_LEN]), Detected::Layer(Layer::Zstd));
+        for head in [&skip(4)[..], &skip(4)[..6], &[0x50, 0x2A, 0x4D, 0x18]] {
+            assert_eq!(layer(head), Detected::Layer(Layer::Zstd));
         }
     }
 

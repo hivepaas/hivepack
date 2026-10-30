@@ -221,6 +221,13 @@
       "kind": "tool"
     },
     {
+      "name": "tar-oracle",
+      "generate": { "group": "generated", "tool": "go", "sources": ["tools/tar-oracle/main.go", "tools/tar-oracle/go.mod", "tools/tar-oracle/go.sum"] },
+      "source": "tools/tar-oracle/main.go, built with the archive/tar of Go 1.27.2, the release hivepack-tar ports, which its go.mod names",
+      "license": "MIT (the program) and BSD-3-Clause (Go)",
+      "kind": "tool"
+    },
+    {
       "name": "age-oracle",
       "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/identities.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
       "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0, the release age requires",
@@ -282,6 +289,13 @@
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",
       "license": "public domain",
       "kind": "archives"
+    },
+    {
+      "name": "go-tar",
+      "path": "go-tar",
+      "source": "https://github.com/golang/go/tree/go1.27.2/src/archive/tar/testdata (Go 1.27.2's archive/tar tests), with Go's LICENSE",
+      "license": "BSD-3-Clause",
+      "kind": "vectors"
     },
     {
       "name": "cctv-age",

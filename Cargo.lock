@@ -542,6 +542,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sevenz-bench"
+version = "0.0.0"
+dependencies = [
+ "hivepack-7z",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

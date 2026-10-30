@@ -312,6 +312,13 @@
       "kind": "tool"
     },
     {
+      "name": "7z-bench-sdk",
+      "generate": { "group": "bench", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/bench.c"] },
+      "source": "tools/7z-oracle/bench.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
+      "license": "MIT (the program), public domain (the LZMA SDK's files)",
+      "kind": "tool"
+    },
+    {
       "name": "7zz",
       "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "7zz" },
       "source": "7-Zip 26.05's console program, built from the release's sources with its makefile (CPP/7zip/Bundles/Alone2)",

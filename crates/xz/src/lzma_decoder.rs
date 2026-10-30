@@ -25,30 +25,6 @@ use crate::range_decoder::{
     RC_MOVE_BITS, RC_SHIFT_BITS, RC_TOP_VALUE, RangeDecoder,
 };
 
-// Where each probability array starts, in the order of the fields of
-// lzma_lzma1_decoder.
-const LITERAL: usize = 0;
-const IS_MATCH: usize = LITERAL + LITERAL_CODERS_MAX * LITERAL_CODER_SIZE;
-const IS_REP: usize = IS_MATCH + STATES * POS_STATES_MAX;
-const IS_REP0: usize = IS_REP + STATES;
-const IS_REP1: usize = IS_REP0 + STATES;
-const IS_REP2: usize = IS_REP1 + STATES;
-const IS_REP0_LONG: usize = IS_REP2 + STATES;
-const DIST_SLOT: usize = IS_REP0_LONG + STATES * POS_STATES_MAX;
-const POS_SPECIAL: usize = DIST_SLOT + (DIST_STATES * DIST_SLOTS) as usize;
-const POS_ALIGN: usize = POS_SPECIAL + (FULL_DISTANCES - DIST_MODEL_END) as usize;
-const MATCH_LEN_DECODER: usize = POS_ALIGN + ALIGN_SIZE as usize;
-const REP_LEN_DECODER: usize = MATCH_LEN_DECODER + LEN_DECODER_SIZE;
-const PROBS: usize = REP_LEN_DECODER + LEN_DECODER_SIZE;
-
-// lzma_length_decoder: choice, choice2, low, mid, high.
-const LEN_CHOICE: usize = 0;
-const LEN_CHOICE2: usize = 1;
-const LEN_LOW: usize = 2;
-const LEN_MID: usize = LEN_LOW + POS_STATES_MAX * LEN_LOW_SYMBOLS as usize;
-const LEN_HIGH: usize = LEN_MID + POS_STATES_MAX * LEN_MID_SYMBOLS as usize;
-const LEN_DECODER_SIZE: usize = LEN_HIGH + LEN_HIGH_SYMBOLS as usize;
-
 /// Minimum number of input bytes to safely decode one LZMA symbol. The
 /// worst case is that we decode 22 bits using probabilities and 26 direct
 /// bits. This may decode at maximum 20 bytes of input.

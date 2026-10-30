@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, ErrorKind};
 use crate::name::{Name, NameError};
+use crate::origin::Origin;
 use crate::progress::{Cancel, ProgressFn};
 
 /// Limits on what an archive may write, against archive bombs. They count
@@ -132,6 +133,11 @@ pub struct Options {
     /// Told how far the extraction is: once the entries are checked, after
     /// each piece of data written (at most 64 KiB), and after each entry.
     pub progress: Option<ProgressFn>,
+    /// The archive's mark of origin ([`Origin::of`]), written on every file
+    /// extracted, and on macOS every directory created; a mark not written
+    /// stops the extraction. None by default: the archive's path is the
+    /// caller's.
+    pub origin: Option<Origin>,
 }
 
 /// Shows the options, not the password or the progress function.
@@ -149,6 +155,7 @@ impl std::fmt::Debug for Options {
             .field("time_limit", &self.time_limit)
             .field("cancel", &self.cancel)
             .field("progress", &self.progress.as_ref().map(|_| ".."))
+            .field("origin", &self.origin)
             .finish()
     }
 }
@@ -184,10 +191,11 @@ impl Item {
     }
 }
 
-/// A path as the checks see it: case folded, as a case-insensitive file
-/// system would.
+/// A path as the checks see it: case folded and canonically decomposed, as
+/// a case-insensitive file system, and macOS, would (see
+/// [`unicode::key`](crate::unicode::key)).
 pub(crate) fn fold(components: &[String]) -> String {
-    components.join("/").to_lowercase()
+    crate::unicode::key(&components.join("/"))
 }
 
 /// What a path already is, among the entries checked.

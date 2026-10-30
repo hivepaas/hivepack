@@ -270,6 +270,13 @@
       "kind": "tool"
     },
     {
+      "name": "zipdiff-constructions",
+      "path": "zipdiff",
+      "source": "https://github.com/ouuan/ZipDiff at commit 7c427ed254bb3a5985d54870c12f97db78118e67: the archives its construction program writes, packed into constructions.zip (see zipdiff/README.md)",
+      "license": "Apache-2.0",
+      "kind": "archives"
+    },
+    {
       "name": "lz4-1.10.0-source",
       "fetch": { "group": "generated", "files": [{ "url": "https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz", "sha256": "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b", "unpack": "tar.gz" }] },
       "source": "https://github.com/lz4/lz4/releases/tag/v1.10.0 (commit ebb370ca83af193212df4dcbadcc5d87bc0de2f0), the SHA-256 the release gives",
@@ -296,6 +303,13 @@
       "source": "https://github.com/C2SP/CCTV/tree/4448f2097b2d/age (the Go module c2sp.org/CCTV/age, which age v1.3.2 tests with), from Go's module proxy",
       "license": "0BSD OR CC0-1.0 OR Unlicense (the vectors)",
       "kind": "vectors"
+    },
+    {
+      "name": "unicode-18.0.0",
+      "fetch": { "group": "core", "files": [{ "url": "https://www.unicode.org/Public/18.0.0/ucd/UnicodeData.txt", "sha256": "0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950" }, { "url": "https://www.unicode.org/Public/18.0.0/ucd/CaseFolding.txt", "sha256": "a004797658a457bec4dc11683e39f69249ea3b595b752dbea6721c4c9f587b0d" }, { "url": "https://www.unicode.org/Public/18.0.0/ucd/NormalizationTest.txt", "sha256": "25a50d816764b04abfb4a646d3eb2b2a803284c3873d9a06757b94fe4513dde3" }] },
+      "source": "https://www.unicode.org/Public/18.0.0/ucd/ (the Unicode Character Database 18.0.0)",
+      "license": "Unicode-3.0",
+      "kind": "source"
     },
     {
       "name": "decodecorpus",

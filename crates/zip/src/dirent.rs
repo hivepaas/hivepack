@@ -15,7 +15,7 @@ use crate::error::{Detail, Error, ErrorCode};
 use crate::extra_field::{
     EFBIG, ExtraField, ExtraFields, ef_parse, ef_remove_internal, ef_size, ef_write,
 };
-use crate::io_util::{read_data, read_string};
+use crate::io_util::{read, read_data, read_string};
 use crate::source::{ReadAt, Source, Whence};
 use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK, file_attributes};
 use crate::source_write::Output;
@@ -139,72 +139,36 @@ impl Dirent {
         central_compressed_size: u64,
         check_consistency: bool,
         error: &mut Error,
-    ) -> Option<(Dirent, u64)> {
+    ) -> Option<(Box<Dirent>, u64)> {
         let size = if local { LENTRYSIZE } else { CDENTRYSIZE };
 
-        let mut own;
-        let fixed: &mut Buffer<'_> = match buffer.as_deref_mut() {
+        // On the stack, and below for what is short: this is done for each
+        // entry of the central directory.
+        let mut fixed_bytes = [0; CDENTRYSIZE as usize];
+        let head = match buffer.as_deref_mut() {
             Some(buffer) => {
                 if buffer.left() < size {
                     *error = Error::new(ErrorCode::NoZip, 0);
                     return None;
                 }
-                buffer
+                read_fixed(buffer, local)
             }
-            None => match Buffer::from_source(src, size) {
-                Ok(b) => {
-                    own = b;
-                    &mut own
-                }
-                Err(e) => {
+            None => {
+                let bytes = &mut fixed_bytes[..size as usize];
+                if let Err(e) = read(src, bytes) {
                     *error = e;
                     return None;
                 }
-            },
+                read_fixed(&mut Buffer::new(bytes), local)
+            }
         };
-
-        let magic: &[u8; 4] = if local { LOCAL_MAGIC } else { CENTRAL_MAGIC };
-        if fixed.get(4) != Some(&magic[..]) {
-            *error = Error::new(ErrorCode::NoZip, 0);
-            return None;
-        }
-
-        // convert buffercontents to zip_dirent
-        let mut zde = Dirent::default();
-        zde.version_madeby = if local { 0 } else { fixed.get_16() };
-        zde.version_needed = fixed.get_16();
-        zde.bitflags = fixed.get_16();
-        zde.comp_method = i32::from(fixed.get_16());
-
-        zde.last_mod.time = fixed.get_16();
-        zde.last_mod.date = fixed.get_16();
-
-        zde.crc = fixed.get_32();
-        zde.comp_size = u64::from(fixed.get_32());
-        zde.uncomp_size = u64::from(fixed.get_32());
-
-        let filename_len = fixed.get_16();
-        let ef_len = fixed.get_16();
-
-        let comment_len;
-        if local {
-            comment_len = 0;
-            zde.disk_number = 0;
-            zde.int_attrib = 0;
-            zde.ext_attrib = 0;
-            zde.offset = 0;
-        } else {
-            comment_len = fixed.get_16();
-            zde.disk_number = u32::from(fixed.get_16());
-            zde.int_attrib = fixed.get_16();
-            zde.ext_attrib = fixed.get_32();
-            zde.offset = u64::from(fixed.get_32());
-        }
-
-        if !fixed.ok() {
-            *error = Error::new(ErrorCode::Internal, 0);
-            return None;
-        }
+        let (mut zde, filename_len, ef_len, comment_len) = match head {
+            Ok(head) => head,
+            Err(e) => {
+                *error = e;
+                return None;
+            }
+        };
 
         zde.encryption_method = if zde.bitflags & GPBF_ENCRYPTED != 0 {
             if zde.bitflags & GPBF_STRONG_ENCRYPTION != 0 {
@@ -218,222 +182,310 @@ impl Dirent {
 
         let variable_size = u64::from(filename_len) + u64::from(ef_len) + u64::from(comment_len);
 
-        let mut own_variable;
-        let variable: &mut Buffer<'_> = match buffer {
+        let lengths = (filename_len, ef_len, comment_len);
+        let zde = match buffer {
             Some(buffer) => {
                 if buffer.left() < variable_size {
                     *error = Error::incons(Detail::VariableSizeOverflow);
                     return None;
                 }
-                buffer
+                read_variable(
+                    zde,
+                    buffer,
+                    src,
+                    lengths,
+                    local,
+                    is_zip64,
+                    central_compressed_size,
+                    check_consistency,
+                    error,
+                )?
             }
-            None => match Buffer::from_source(src, variable_size) {
-                Ok(b) => {
-                    own_variable = b;
-                    &mut own_variable
-                }
-                Err(e) => {
+            None => {
+                let mut short_bytes = [0; 1024];
+                let mut long_bytes;
+                let bytes = if variable_size as usize <= short_bytes.len() {
+                    &mut short_bytes[..variable_size as usize]
+                } else {
+                    long_bytes = vec![0; variable_size as usize];
+                    &mut long_bytes[..]
+                };
+                if let Err(e) = read(src, bytes) {
                     *error = e;
                     return None;
                 }
-            },
+                read_variable(
+                    zde,
+                    &mut Buffer::new(bytes),
+                    src,
+                    lengths,
+                    local,
+                    is_zip64,
+                    central_compressed_size,
+                    check_consistency,
+                    error,
+                )?
+            }
         };
+        Some((zde, size + variable_size))
+    }
+}
 
-        if filename_len > 0 {
-            match read_string(Some(&mut *variable), src, filename_len) {
-                Ok(name) => zde.filename = name,
-                Err(e) => {
-                    *error = if e.code() == ErrorCode::Eof {
-                        Error::incons(Detail::VariableSizeOverflow)
-                    } else {
-                        e
-                    };
-                    return None;
-                }
-            }
-            if zde.bitflags & GPBF_ENCODING_UTF_8 != 0
-                && let Some(name) = zde.filename.as_mut()
-                && name.guess_encoding(Encoding::Utf8Known) == Encoding::Error
-            {
-                *error = Error::incons(Detail::InvalidUtf8InFilename);
+/// The fixed part of a directory entry, and the lengths of what follows it: the
+/// file name, the extra fields and the comment.
+fn read_fixed(fixed: &mut Buffer<'_>, local: bool) -> Result<(Box<Dirent>, u16, u16, u16), Error> {
+    let magic: &[u8; 4] = if local { LOCAL_MAGIC } else { CENTRAL_MAGIC };
+    if fixed.get(4) != Some(&magic[..]) {
+        return Err(Error::new(ErrorCode::NoZip, 0));
+    }
+
+    // convert buffercontents to zip_dirent
+    let mut zde = Box::<Dirent>::default();
+    zde.version_madeby = if local { 0 } else { fixed.get_16() };
+    zde.version_needed = fixed.get_16();
+    zde.bitflags = fixed.get_16();
+    zde.comp_method = i32::from(fixed.get_16());
+
+    zde.last_mod.time = fixed.get_16();
+    zde.last_mod.date = fixed.get_16();
+
+    zde.crc = fixed.get_32();
+    zde.comp_size = u64::from(fixed.get_32());
+    zde.uncomp_size = u64::from(fixed.get_32());
+
+    let filename_len = fixed.get_16();
+    let ef_len = fixed.get_16();
+
+    let comment_len;
+    if local {
+        comment_len = 0;
+        zde.disk_number = 0;
+        zde.int_attrib = 0;
+        zde.ext_attrib = 0;
+        zde.offset = 0;
+    } else {
+        comment_len = fixed.get_16();
+        zde.disk_number = u32::from(fixed.get_16());
+        zde.int_attrib = fixed.get_16();
+        zde.ext_attrib = fixed.get_32();
+        zde.offset = u64::from(fixed.get_32());
+    }
+
+    if !fixed.ok() {
+        return Err(Error::new(ErrorCode::Internal, 0));
+    }
+
+    Ok((zde, filename_len, ef_len, comment_len))
+}
+
+/// The file name, the extra fields and the comment of a directory entry, what
+/// they say, and the data descriptor of a local one.
+#[allow(clippy::too_many_arguments)]
+fn read_variable<R: ReadAt + ?Sized>(
+    mut zde: Box<Dirent>,
+    variable: &mut Buffer<'_>,
+    src: &mut Source<R>,
+    (filename_len, ef_len, comment_len): (u16, u16, u16),
+    local: bool,
+    is_zip64: bool,
+    central_compressed_size: u64,
+    check_consistency: bool,
+    error: &mut Error,
+) -> Option<Box<Dirent>> {
+    if filename_len > 0 {
+        match read_string(Some(&mut *variable), src, filename_len) {
+            Ok(name) => zde.filename = name,
+            Err(e) => {
+                *error = if e.code() == ErrorCode::Eof {
+                    Error::incons(Detail::VariableSizeOverflow)
+                } else {
+                    e
+                };
                 return None;
             }
         }
-
-        if ef_len > 0 {
-            let ef = match read_data(Some(&mut *variable), src, usize::from(ef_len)) {
-                Ok(ef) => ef,
-                Err(e) => {
-                    *error = e;
-                    return None;
-                }
-            };
-            match ef_parse(&ef) {
-                Ok(fields) if local => zde.extra_fields.local = OnceLock::from(fields),
-                Ok(fields) => zde.extra_fields.central = fields,
-                Err(e) => {
-                    *error = e;
-                    return None;
-                }
-            }
+        if zde.bitflags & GPBF_ENCODING_UTF_8 != 0
+            && let Some(name) = zde.filename.as_mut()
+            && name.guess_encoding(Encoding::Utf8Known) == Encoding::Error
+        {
+            *error = Error::incons(Detail::InvalidUtf8InFilename);
+            return None;
         }
+    }
 
-        if comment_len > 0 {
-            match read_string(Some(&mut *variable), src, comment_len) {
-                Ok(comment) => zde.comment = comment,
-                Err(e) => {
-                    *error = e;
-                    return None;
-                }
+    if ef_len > 0 {
+        let ef = match read_data(Some(&mut *variable), src, usize::from(ef_len)) {
+            Ok(ef) => ef,
+            Err(e) => {
+                *error = e;
+                return None;
             }
-            if zde.bitflags & GPBF_ENCODING_UTF_8 != 0
-                && let Some(comment) = zde.comment.as_mut()
-                && comment.guess_encoding(Encoding::Utf8Known) == Encoding::Error
-            {
-                *error = Error::incons(Detail::InvalidUtf8InComment);
+        };
+        match ef_parse(&ef) {
+            Ok(fields) if local => zde.extra_fields.local = OnceLock::from(fields),
+            Ok(fields) => zde.extra_fields.central = fields,
+            Err(e) => {
+                *error = e;
                 return None;
             }
         }
+    }
 
-        let filename = zde.filename.take();
-        let had_filename = filename.is_some();
-        match process_ef_utf_8(&zde, EF_UTF_8_NAME, filename, check_consistency) {
-            Some(name) => zde.filename = name,
-            None if had_filename => {
-                *error = Error::incons(Detail::Utf8FilenameMismatch);
+    if comment_len > 0 {
+        match read_string(Some(&mut *variable), src, comment_len) {
+            Ok(comment) => zde.comment = comment,
+            Err(e) => {
+                *error = e;
+                return None;
+            }
+        }
+        if zde.bitflags & GPBF_ENCODING_UTF_8 != 0
+            && let Some(comment) = zde.comment.as_mut()
+            && comment.guess_encoding(Encoding::Utf8Known) == Encoding::Error
+        {
+            *error = Error::incons(Detail::InvalidUtf8InComment);
+            return None;
+        }
+    }
+
+    let filename = zde.filename.take();
+    let had_filename = filename.is_some();
+    match process_ef_utf_8(&zde, EF_UTF_8_NAME, filename, check_consistency) {
+        Some(name) => zde.filename = name,
+        None if had_filename => {
+            *error = Error::incons(Detail::Utf8FilenameMismatch);
+            return None;
+        }
+        None => {}
+    }
+
+    // Check for a NUL byte in the final name; the Info-ZIP Unicode Path
+    // extra field can replace zde->filename above, so this must run
+    // after that.
+    if check_consistency
+        && zde
+            .filename
+            .as_ref()
+            .is_some_and(|name| name.raw().contains(&0))
+    {
+        *error = Error::incons(Detail::NulInFilename);
+        return None;
+    }
+
+    if !local {
+        let comment = zde.comment.take();
+        let had_comment = comment.is_some();
+        match process_ef_utf_8(&zde, EF_UTF_8_COMMENT, comment, check_consistency) {
+            Some(comment) => zde.comment = comment,
+            None if had_comment => {
+                *error = Error::incons(Detail::Utf8CommentMismatch);
                 return None;
             }
             None => {}
         }
+    }
 
-        // Check for a NUL byte in the final name; the Info-ZIP Unicode Path
-        // extra field can replace zde->filename above, so this must run
-        // after that.
-        if check_consistency
-            && zde
-                .filename
-                .as_ref()
-                .is_some_and(|name| name.raw().contains(&0))
-        {
-            *error = Error::incons(Detail::NulInFilename);
-            return None;
-        }
+    // Zip64
 
-        if !local {
-            let comment = zde.comment.take();
-            let had_comment = comment.is_some();
-            match process_ef_utf_8(&zde, EF_UTF_8_COMMENT, comment, check_consistency) {
-                Some(comment) => zde.comment = comment,
-                None if had_comment => {
-                    *error = Error::incons(Detail::Utf8CommentMismatch);
+    if zde.uncomp_size == u64::from(u32::MAX)
+        || zde.comp_size == u64::from(u32::MAX)
+        || zde.offset == u64::from(u32::MAX)
+    {
+        let flags = if local { EF_LOCAL } else { EF_CENTRAL };
+        match zde.extra_fields.get_by_id(EF_ZIP64, 0, flags) {
+            Ok(ef) => {
+                let ef = ef.to_vec();
+                if let Err(e) = process_ef_zip64(&mut zde, &ef, local) {
+                    *error = e;
                     return None;
                 }
-                None => {}
+            }
+            Err(e) => {
+                *error = e;
+                if is_zip64 {
+                    *error = Error::incons(Detail::MissingZip64Ef);
+                    return None;
+                }
             }
         }
+    }
 
-        // Zip64
+    if !variable.ok() {
+        *error = Error::new(ErrorCode::Internal, 0);
+        return None;
+    }
 
-        if zde.uncomp_size == u64::from(u32::MAX)
-            || zde.comp_size == u64::from(u32::MAX)
-            || zde.offset == u64::from(u32::MAX)
+    if local && zde.bitflags & GPBF_DATA_DESCRIPTOR != 0 {
+        // libzip returns here without setting the error when the seek
+        // fails; so does the port.
+        if src
+            .seek(central_compressed_size as i64, Whence::Cur)
+            .is_err()
         {
-            let flags = if local { EF_LOCAL } else { EF_CENTRAL };
-            match zde.extra_fields.get_by_id(EF_ZIP64, 0, flags) {
-                Ok(ef) => {
-                    let ef = ef.to_vec();
-                    if let Err(e) = process_ef_zip64(&mut zde, &ef, local) {
-                        *error = e;
-                        return None;
-                    }
-                }
-                Err(e) => {
-                    *error = e;
-                    if is_zip64 {
-                        *error = Error::incons(Detail::MissingZip64Ef);
-                        return None;
-                    }
-                }
-            }
+            return None;
         }
+        let mut dd = match Buffer::from_source(src, MAX_DATA_DESCRIPTOR_LENGTH) {
+            Ok(dd) => dd,
+            Err(e) => {
+                *error = e;
+                return None;
+            }
+        };
+        if dd.peek(MAGIC_LEN) == Some(&DATADES_MAGIC[..]) {
+            dd.skip(MAGIC_LEN);
+        }
+        let df_crc = dd.get_32();
+        let df_comp_size = if is_zip64 {
+            dd.get_64()
+        } else {
+            u64::from(dd.get_32())
+        };
+        let df_uncomp_size = if is_zip64 {
+            dd.get_64()
+        } else {
+            u64::from(dd.get_32())
+        };
 
-        if !variable.ok() {
+        if !dd.ok() {
             *error = Error::new(ErrorCode::Internal, 0);
             return None;
         }
 
-        if local && zde.bitflags & GPBF_DATA_DESCRIPTOR != 0 {
-            // libzip returns here without setting the error when the seek
-            // fails; so does the port.
-            if src
-                .seek(central_compressed_size as i64, Whence::Cur)
-                .is_err()
-            {
-                return None;
-            }
-            let mut dd = match Buffer::from_source(src, MAX_DATA_DESCRIPTOR_LENGTH) {
-                Ok(dd) => dd,
-                Err(e) => {
-                    *error = e;
-                    return None;
-                }
-            };
-            if dd.peek(MAGIC_LEN) == Some(&DATADES_MAGIC[..]) {
-                dd.skip(MAGIC_LEN);
-            }
-            let df_crc = dd.get_32();
-            let df_comp_size = if is_zip64 {
-                dd.get_64()
-            } else {
-                u64::from(dd.get_32())
-            };
-            let df_uncomp_size = if is_zip64 {
-                dd.get_64()
-            } else {
-                u64::from(dd.get_32())
-            };
-
-            if !dd.ok() {
-                *error = Error::new(ErrorCode::Internal, 0);
-                return None;
-            }
-
-            // According to the appnote, it should be 0, but some
-            // implementations write the actual value.
-            if (zde.crc != 0 && zde.crc != df_crc)
-                || (zde.comp_size != 0 && zde.comp_size != df_comp_size)
-                || (zde.uncomp_size != 0 && zde.uncomp_size != df_uncomp_size)
-            {
-                *error = Error::incons(Detail::DataDescriptorMismatch);
-                return None;
-            }
-            zde.crc = df_crc;
-            zde.comp_size = df_comp_size;
-            zde.uncomp_size = df_uncomp_size;
-        }
-
-        // zip_source_seek / zip_source_tell don't support values >
-        // ZIP_INT64_MAX
-        if zde.offset > i64::MAX as u64 {
-            *error = Error::new(ErrorCode::Seek, EFBIG);
+        // According to the appnote, it should be 0, but some
+        // implementations write the actual value.
+        if (zde.crc != 0 && zde.crc != df_crc)
+            || (zde.comp_size != 0 && zde.comp_size != df_comp_size)
+            || (zde.uncomp_size != 0 && zde.uncomp_size != df_uncomp_size)
+        {
+            *error = Error::incons(Detail::DataDescriptorMismatch);
             return None;
         }
-
-        if let Err(e) = process_winzip_aes(&mut zde) {
-            *error = e;
-            return None;
-        }
-
-        if local {
-            if let Some(efp) = zde.extra_fields.local.get_mut() {
-                ef_remove_internal(efp);
-            }
-        } else {
-            ef_remove_internal(&mut zde.extra_fields.central);
-        }
-
-        Some((zde, size + variable_size))
+        zde.crc = df_crc;
+        zde.comp_size = df_comp_size;
+        zde.uncomp_size = df_uncomp_size;
     }
+
+    // zip_source_seek / zip_source_tell don't support values >
+    // ZIP_INT64_MAX
+    if zde.offset > i64::MAX as u64 {
+        *error = Error::new(ErrorCode::Seek, EFBIG);
+        return None;
+    }
+
+    if let Err(e) = process_winzip_aes(&mut zde) {
+        *error = e;
+        return None;
+    }
+
+    if local {
+        if let Some(efp) = zde.extra_fields.local.get_mut() {
+            ef_remove_internal(efp);
+        }
+    } else {
+        ef_remove_internal(&mut zde.extra_fields.central);
+    }
+
+    Some(zde)
 }
 
 /// Takes the sizes, offset and disk number the header leaves to the Zip64

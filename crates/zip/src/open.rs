@@ -117,7 +117,10 @@ impl<R: ReadAt> Archive<R> {
             return Ok(za);
         }
 
-        let cdir = match za.find_central_dir(len) {
+        za.src.start_read_ahead();
+        let found = za.find_central_dir(len);
+        za.src.stop_read_ahead();
+        let cdir = match found {
             Ok(cdir) => cdir,
             Err(e) => {
                 // not a zip - find out if it's truncated
@@ -392,7 +395,7 @@ impl<R: ReadAt> Archive<R> {
                 error,
             ) {
                 Some((dirent, entry_size)) => {
-                    cd.entry[i].orig = Some(Box::new(dirent));
+                    cd.entry[i].orig = Some(dirent);
                     i += 1;
                     left = left.wrapping_sub(entry_size);
                 }

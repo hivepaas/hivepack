@@ -56,6 +56,7 @@ Each set has a `kind`:
 | `lz4-oracle` | `tools/lz4-oracle`, built with the lz4 1.10.0 library sources: liblz4's block, stream, high-compression, frame and XXH32 functions, for comparing hivepack-lz4 with them | MIT and BSD-2-Clause | generated |
 | `7zip-26.05-source` | the 7-Zip 26.05 release, to build the next two sets from; pinned by its SHA-256 | public domain (the LZMA SDK's `C/` files), LGPL-2.1-or-later and BSD-3-Clause (7-Zip) | fetched, `generated` |
 | `7z-oracle` | `tools/7z-oracle`, built with the LZMA SDK's 7z decoder: `SzArEx_Open`, `SzAr_DecodeFolder` and `SzArEx_Extract`, for comparing hivepack-7z with them; and its PPMd var.I (`Ppmd8.c`), for comparing hivepack-zip's PPMd with it | MIT and public domain | generated |
+| `7z-bench-sdk` | `tools/7z-oracle/bench.c`, built with the same LZMA SDK files as `7z-oracle`: the SDK's side of `tools/7z-bench` | MIT and public domain | generated, `bench` |
 | `7zz` | 7-Zip's console program, built with its makefile: the archives hivepack-7z's tests read. Only a tool: nothing is linked with it | LGPL-2.1-or-later, BSD-3-Clause, and the unRAR restriction for its RAR code | generated |
 | `nettle-oracle` | `tools/nettle-oracle`, built with nettle 3.10.2's AES, SHA-1, HMAC and PBKDF2 sources: for comparing hivepack-crypto with them | MIT, and nettle's licenses | generated |
 | `tar-oracle` | `tools/tar-oracle`, built with Go 1.27.2's archive/tar, the release its `go.mod` names: for comparing hivepack-tar with it | MIT, and BSD-3-Clause (Go) | generated |

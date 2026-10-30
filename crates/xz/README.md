@@ -26,6 +26,18 @@ The goals:
 
 How the port follows liblzma, how it is checked, and what is left are in [docs/xz.md](../../docs/xz.md).
 
+## Speed
+
+Against liblzma 5.8.4, with `tools/xz-bench`, on the 12 Silesia files with CRC64. Above 1× the port is faster.
+
+| | Mean | Range |
+|---|---|---|
+| Compression, presets 0, 3, 6 and 9 | 1.02× | 0.93–1.18× |
+| Decompression, against liblzma with its x86-64 assembly | 0.81× | 0.74–0.89× |
+| Decompression, against liblzma's C | 1.18× | 1.06–1.34× |
+
+**Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of two or three rounds taken in turn. Threads and more are in [docs/xz.md](../../docs/xz.md#the-speed-target).
+
 ## License
 
 The BSD Zero Clause License (`0BSD`), liblzma's license. See [LICENSE](LICENSE). Copyright (C) The XZ Utils authors and contributors, and (c) 2026 HivePaaS.

@@ -21,6 +21,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
 | `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). Where the port refuses a Block's filters and liblzma, which has the delta and BCJ filters, goes on, the comparison stops; and the automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
+| `xz_encode` | Encoding the rest of the input with the encoder its first byte picks (`.xz` of a preset, `.xz` of LZMA2 with options, `.lzma`, raw LZMA1 or LZMA2), with the preset, check, options, pieces and flushes its next eight bytes pick: every call gives the same result, bytes read and written, and output as liblzma |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:
@@ -38,8 +39,10 @@ without).
 
 The `inflate`, `deflate` and `inflate9` targets start from an empty
 corpus, CI seeds `bzip2` with the streams and inputs of
-`testdata/oracle/bzip2.txt`, and `xz` with the inputs of
-`testdata/oracle/xz.txt`, behind the byte for their decoder:
+`testdata/oracle/bzip2.txt`, `xz` with the inputs of
+`testdata/oracle/xz.txt`, behind the byte for their decoder, and `xz_encode`
+with those of `testdata/oracle/xz-encode.txt`, behind the byte for their
+encoder:
 
 ```sh
 cargo fuzz run inflate -- -max_total_time=3600
@@ -47,6 +50,7 @@ cargo fuzz run deflate -- -max_total_time=3600
 cargo fuzz run inflate9 -- -max_total_time=3600
 cargo fuzz run bzip2 -- -max_total_time=3600
 cargo fuzz run xz -- -max_total_time=3600 -rss_limit_mb=4096
+cargo fuzz run xz_encode -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and

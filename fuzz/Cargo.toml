@@ -111,6 +111,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "xz_encode"
+path = "fuzz_targets/xz_encode.rs"
+test = false
+doc = false
+bench = false
+
 # Not in the main workspace: cargo-fuzz builds it with nightly and its own
 # flags.
 [workspace]

@@ -122,6 +122,73 @@ fn other_contents() {
     );
 }
 
+/// An ISO 9660 image, as libarchive's tests have it (xz-compressed in
+/// `testdata/libarchive-iso`): ISO 9660 in a layer, read in order.
+#[test]
+fn an_iso_image_under_layers_reads() {
+    let path =
+        support::repository().join("testdata/libarchive-iso/test_read_format_iso_joliet.iso.xz");
+    let file = std::fs::read(path).unwrap();
+    let (layers, container, image) = open(&file).unwrap();
+    assert_eq!((layers, container), (vec![Layer::Xz], Container::Iso));
+    for compressed in [gzip(&image), zstd(&image)] {
+        let (_, container, data) = open(&compressed).unwrap();
+        assert_eq!((container, data.len()), (Container::Iso, image.len()));
+    }
+    assert_eq!(open(&image).unwrap().1, Container::Iso);
+    // What hivepack-iso reads through the layer is what it reads of the
+    // image itself.
+    let entries = |r: Box<dyn Read + Send + '_>| {
+        let mut iso = hivepack_iso::Reader::new(r);
+        let mut out = Vec::new();
+        while let Some(h) = iso.next().unwrap() {
+            let mut data = Vec::new();
+            iso.read_to_end(&mut data).unwrap();
+            out.push((h, data));
+        }
+        out
+    };
+    let mut opener = Opener::new(|| Ok(Cursor::new(file.clone())));
+    let through_layer = entries(Box::new(opener.open().unwrap()));
+    assert_eq!(through_layer, entries(Box::new(Cursor::new(image))));
+    let names: Vec<_> = through_layer
+        .iter()
+        .filter_map(|(h, _)| h.path.clone())
+        .collect();
+    assert!(
+        names.contains(&b"long-joliet-file-name.textfile".to_vec()),
+        "{names:?}"
+    );
+}
+
+/// Data looked into for an ISO 9660 image, cut short in what is looked
+/// at: it opens, and the error comes after the data before it, as without
+/// the look.
+#[test]
+fn data_cut_short_where_an_iso_image_is_looked_for() {
+    // Random bytes, which do not compress: half the stream is half of them.
+    let mut x = 0x9e37_79b9u32;
+    let text: Vec<u8> = (0..20_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    let file = gzip(&text);
+    let cut = &file[..file.len() / 2];
+    let mut opener = Opener::new(|| Ok(Cursor::new(cut.to_vec())));
+    let mut opened = opener.open().unwrap();
+    assert_eq!(opened.container(), Container::Data);
+    let mut data = Vec::new();
+    let error = opened.read_to_end(&mut data).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(
+        data.len() > 1570 && text.starts_with(&data),
+        "{}",
+        data.len()
+    );
+}
+
 #[test]
 fn streams_one_after_another() {
     let tar = sample_tar();

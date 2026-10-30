@@ -231,6 +231,7 @@ dependencies = [
  "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
+ "hivepack-iso",
  "hivepack-lz4",
  "hivepack-tar",
  "hivepack-xz",

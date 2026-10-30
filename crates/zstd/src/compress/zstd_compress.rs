@@ -41,6 +41,7 @@ use crate::compress::zstd_compress_sequences::{
     DefaultPolicy, zstd_build_ctable, zstd_cross_entropy_cost, zstd_encode_sequences,
     zstd_fse_bit_cost, zstd_select_encoding_type,
 };
+use crate::compress::zstd_compress_superblock::zstd_compress_super_block;
 use crate::compress::zstd_double_fast::{
     zstd_compress_block_double_fast, zstd_compress_block_double_fast_dict_match_state,
     zstd_compress_block_double_fast_ext_dict,
@@ -70,7 +71,16 @@ use crate::compress::zstdmt_compress::{
 use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+// Compression from sequences the caller gives, or a sequence producer of
+// the caller's, and the sequences a frame would have.
+mod sequences;
+pub use sequences::{
+    SEQUENCE_PRODUCER_ERROR, Sequence, SequenceFormat, SequenceProducer, merge_block_delimiters,
+    sequence_bound,
+};
+use sequences::{SeqCollector, copy_block_sequences, zstd_resolve_external_repcode_search};
 
 /// `ZSTD_seqToCodes`: the codes of the sequences' lengths and offsets, into
 /// the store (or the chunk of it). Returns `longOffsets`, which is only
@@ -460,37 +470,38 @@ const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300;
 const ZSTD_MAX_NB_BLOCK_SPLITS: usize = 196;
 
 /// `ZSTD_hufCTablesMetadata_t`: how the literals would be encoded, and the
-/// size of a new table's description.
-///
-/// Differs from libzstd: without the description itself, which libzstd
-/// keeps for its superblocks (`ZSTD_c_targetCBlockSize`). The port writes
-/// it into a buffer as large, so that it fails where libzstd's does, and
-/// keeps only its size. The estimates read nothing else.
+/// description of a new table, which the superblocks of
+/// `ZSTD_c_targetCBlockSize` write.
 #[derive(Clone, Copy, Debug)]
-struct HufCTablesMetadata {
-    h_type: SymbolEncodingType,
-    huf_des_size: usize,
+pub(crate) struct HufCTablesMetadata {
+    pub(crate) h_type: SymbolEncodingType,
+    /// `hufDesBuffer`: the new table's description, its first
+    /// `huf_des_size` bytes, for `h_type` `Compressed`.
+    pub(crate) huf_des_buffer: [u8; ZSTD_MAX_HUF_HEADER_SIZE],
+    pub(crate) huf_des_size: usize,
 }
 
 /// `ZSTD_fseCTablesMetadata_t`: how each kind of code would be encoded,
-/// and the size of the new tables' descriptions.
-///
-/// Differs from libzstd: without the descriptions themselves, nor the
-/// size of the last one, which only its superblocks read. The port writes
-/// them into a buffer as large, as libzstd does.
+/// and the descriptions of the new tables.
 #[derive(Clone, Copy, Debug)]
-struct FseCTablesMetadata {
-    ll_type: SymbolEncodingType,
-    of_type: SymbolEncodingType,
-    ml_type: SymbolEncodingType,
-    fse_tables_size: usize,
+pub(crate) struct FseCTablesMetadata {
+    pub(crate) ll_type: SymbolEncodingType,
+    pub(crate) of_type: SymbolEncodingType,
+    pub(crate) ml_type: SymbolEncodingType,
+    /// `fseTablesBuffer`: the new tables' descriptions, their first
+    /// `fse_tables_size` bytes.
+    pub(crate) fse_tables_buffer: [u8; ZSTD_MAX_FSE_HEADERS_SIZE],
+    pub(crate) fse_tables_size: usize,
+    /// The size of the last new table's description: see
+    /// [`zstd_entropy_compress_seq_store_internal`].
+    pub(crate) last_count_size: usize,
 }
 
 /// `ZSTD_entropyCTablesMetadata_t`
 #[derive(Clone, Copy, Debug)]
-struct EntropyCTablesMetadata {
-    huf: HufCTablesMetadata,
-    fse: FseCTablesMetadata,
+pub(crate) struct EntropyCTablesMetadata {
+    pub(crate) huf: HufCTablesMetadata,
+    pub(crate) fse: FseCTablesMetadata,
 }
 
 /// libzstd's `size_t` for `result`: the size, or the error's code, as
@@ -518,8 +529,10 @@ fn zstd_build_block_entropy_stats_literals(
     let mut max_symbol_value = HUF_SYMBOLVALUE_MAX;
     let mut huff_log = LIT_HUF_LOG;
     let mut repeat = prev_huf.repeat_mode;
-    let metadata = |h_type, huf_des_size| HufCTablesMetadata {
+    let mut huf_des_buffer = [0u8; ZSTD_MAX_HUF_HEADER_SIZE];
+    let metadata = |h_type, huf_des_buffer, huf_des_size| HufCTablesMetadata {
         h_type,
+        huf_des_buffer,
         huf_des_size,
     };
 
@@ -527,7 +540,7 @@ fn zstd_build_block_entropy_stats_literals(
     next_huf.clone_from(prev_huf);
 
     if literals_compression_is_disabled {
-        return Ok(metadata(SymbolEncodingType::Basic, 0));
+        return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
     }
 
     // Too few to try compressing (a speed optimization).
@@ -537,7 +550,7 @@ fn zstd_build_block_entropy_stats_literals(
         COMPRESS_LITERALS_SIZE_MIN
     };
     if src_size <= min_lit_size {
-        return Ok(metadata(SymbolEncodingType::Basic, 0));
+        return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
     }
 
     // The symbol statistics.
@@ -545,11 +558,11 @@ fn zstd_build_block_entropy_stats_literals(
         let largest = hist_count_wksp(&mut count, &mut max_symbol_value, src, &mut hist_wksp)?;
         if largest == src_size {
             // A single symbol.
-            return Ok(metadata(SymbolEncodingType::Rle, 0));
+            return Ok(metadata(SymbolEncodingType::Rle, huf_des_buffer, 0));
         }
         if largest <= (src_size >> 7) + 4 {
             // A heuristic: probably not compressible.
-            return Ok(metadata(SymbolEncodingType::Basic, 0));
+            return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
         }
     }
 
@@ -575,7 +588,6 @@ fn zstd_build_block_entropy_stats_literals(
 
     // The table's description; or the previous table, or none, if better.
     let new_c_size = huf_estimate_compressed_size(&next_huf.ctable, &count, max_symbol_value);
-    let mut huf_des_buffer = [0u8; ZSTD_MAX_HUF_HEADER_SIZE];
     let h_size = huf_write_ctable_wksp(
         &mut huf_des_buffer,
         &next_huf.ctable,
@@ -593,16 +605,20 @@ fn zstd_build_block_entropy_stats_literals(
                 || h_size_or_code.wrapping_add(12) >= src_size)
         {
             next_huf.clone_from(prev_huf);
-            return Ok(metadata(SymbolEncodingType::Repeat, 0));
+            return Ok(metadata(SymbolEncodingType::Repeat, huf_des_buffer, 0));
         }
     }
     if new_c_size.wrapping_add(h_size_or_code) >= src_size {
         // No gain.
         next_huf.clone_from(prev_huf);
-        return Ok(metadata(SymbolEncodingType::Basic, 0));
+        return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
     }
     next_huf.repeat_mode = HufRepeat::Check;
-    Ok(metadata(SymbolEncodingType::Compressed, h_size?))
+    Ok(metadata(
+        SymbolEncodingType::Compressed,
+        huf_des_buffer,
+        h_size?,
+    ))
 }
 
 /// `ZSTD_buildDummySequencesStatistics`: the encodings of no sequences;
@@ -651,13 +667,17 @@ fn zstd_build_block_entropy_stats_sequences(
         ll_type: stats.ll_type,
         of_type: stats.off_type,
         ml_type: stats.ml_type,
+        fse_tables_buffer,
         fse_tables_size: stats.size,
+        last_count_size: stats.last_count_size,
     })
 }
 
 /// `ZSTD_buildBlockEntropyStats`: how the literals and the sequences of
-/// `seqs` would be encoded, and the tables, into `next_entropy`.
-fn zstd_build_block_entropy_stats(
+/// `seqs` would be encoded, and the tables, into `next_entropy`. The block
+/// splitter's estimates and the superblocks of `ZSTD_c_targetCBlockSize`
+/// start from them.
+pub(crate) fn zstd_build_block_entropy_stats(
     seqs: &mut SeqStoreView<'_>,
     prev_entropy: &EntropyCTables,
     next_entropy: &mut EntropyCTables,
@@ -930,7 +950,7 @@ fn offbase_is_repcode(off_base: u32) -> bool {
 
 /// `ZSTD_updateRep`: the repeat offsets `rep` after a sequence of
 /// `off_base`, its literal length 0 if `ll0` is 1.
-fn zstd_update_rep(rep: &mut [u32; ZSTD_REP_NUM], off_base: u32, ll0: u32) {
+pub(crate) fn zstd_update_rep(rep: &mut [u32; ZSTD_REP_NUM], off_base: u32, ll0: u32) {
     if off_base > ZSTD_REP_NUM as u32 {
         // An offset.
         rep[2] = rep[1];
@@ -1036,6 +1056,12 @@ fn write_block_header(dst: &mut [u8], c_size: usize, block_size: usize, last_blo
     dst[..3].copy_from_slice(&c_block_header.to_le_bytes()[..3]);
 }
 
+/// `ZSTD_useTargetCBlockSize`: whether a frame with `params` cuts its
+/// blocks to a target size, compressed (`ZSTD_c_targetCBlockSize`).
+fn zstd_use_target_cblock_size(params: &CCtxParams) -> bool {
+    params.target_cblock_size != 0
+}
+
 /// `ZSTD_blockSplitterEnabled`: whether a frame with `params` splits its
 /// blocks after finding their sequences.
 fn zstd_block_splitter_enabled(params: &CCtxParams) -> bool {
@@ -1071,6 +1097,11 @@ const ZSTD_MINMATCH_MAX: u32 = 7;
 const ZSTD_TARGETLENGTH_MIN: u32 = 0;
 /// `ZSTD_TARGETLENGTH_MAX`
 const ZSTD_TARGETLENGTH_MAX: u32 = ZSTD_BLOCKSIZE_MAX as u32;
+/// `ZSTD_TARGETCBLOCKSIZE_MIN`: the smallest target for compressed blocks,
+/// to fit an Ethernet, Wi-Fi or 4G transport frame.
+pub(crate) const ZSTD_TARGETCBLOCKSIZE_MIN: u32 = 1340;
+/// `ZSTD_TARGETCBLOCKSIZE_MAX`
+const ZSTD_TARGETCBLOCKSIZE_MAX: u32 = ZSTD_BLOCKSIZE_MAX as u32;
 /// `ZSTD_SRCSIZEHINT_MIN`
 const ZSTD_SRCSIZEHINT_MIN: u32 = 0;
 /// `ZSTD_SRCSIZEHINT_MAX`
@@ -1674,6 +1705,10 @@ pub(crate) struct CCtxParams {
     pub(crate) c_params: CompressionParameters,
     pub(crate) f_params: FrameParameters,
     pub(crate) compression_level: i32,
+    /// `targetCBlockSize`: about how large to make compressed blocks
+    /// (`ZSTD_c_targetCBlockSize`), cutting each block into several; 0
+    /// for no target.
+    pub(crate) target_cblock_size: usize,
     /// The input size to choose the parameters for when it is not known;
     /// 0 for none.
     pub(crate) src_size_hint: u32,
@@ -1722,10 +1757,35 @@ pub(crate) struct CCtxParams {
     pub(crate) rsyncable: bool,
     /// `forceWindow` (`ZSTD_c_forceMaxWindow`): whether a dictionary's
     /// content is part of the window, its matches no farther than the
-    /// window's size, rather than reached whole. Not a parameter the port
-    /// offers: only the jobs of multithreaded compression after the first
-    /// set it, for the content of the job before that they load.
+    /// window's size, rather than reached whole. The jobs of multithreaded
+    /// compression after the first set it, for the content of the job
+    /// before that they load.
     pub(crate) force_window: bool,
+    /// `deterministicRefPrefix` (`ZSTD_c_deterministicRefPrefix`): whether
+    /// a dictionary's content is a segment of its own, apart from the
+    /// input, even where the input follows it in memory.
+    pub(crate) deterministic_ref_prefix: bool,
+    /// `prefetchCDictTables` (`ZSTD_c_prefetchCDictTables`).
+    pub(crate) prefetch_cdict_tables: ParamSwitch,
+    /// `blockDelimiters`: whether the sequences given to
+    /// `ZSTD_compressSequences` mark the ends of blocks
+    /// (`ZSTD_c_blockDelimiters`).
+    pub(crate) block_delimiters: SequenceFormat,
+    /// `validateSequences`: whether the sequences given are checked
+    /// (`ZSTD_c_validateSequences`).
+    pub(crate) validate_sequences: bool,
+    /// `enableMatchFinderFallback`: whether a block the sequence producer
+    /// fails on is compressed with the context's own match finder
+    /// (`ZSTD_c_enableSeqProducerFallback`).
+    pub(crate) enable_match_finder_fallback: bool,
+    /// `searchForExternalRepcodes`: whether the offsets of the sequences
+    /// given are written as repeat codes where they can be
+    /// (`ZSTD_c_repcodeResolution`); `Auto` until a frame resolves it from
+    /// the level.
+    pub(crate) search_for_external_repcodes: ParamSwitch,
+    /// `ZSTD_hasExtSeqProd`: whether a sequence producer is registered
+    /// (`extSeqProdFunc`), which the context holds itself.
+    pub(crate) ext_seq_prod: bool,
 }
 
 impl CCtxParams {
@@ -1740,6 +1800,7 @@ impl CCtxParams {
             c_params,
             f_params,
             compression_level,
+            target_cblock_size: 0,
             src_size_hint: 0,
             literal_compression_mode: ParamSwitch::Auto,
             in_buffer_mode: BufferMode::Buffered,
@@ -1757,6 +1818,16 @@ impl CCtxParams {
             overlap_log: 0,
             rsyncable: false,
             force_window: false,
+            deterministic_ref_prefix: false,
+            prefetch_cdict_tables: ParamSwitch::Auto,
+            block_delimiters: SequenceFormat::NoBlockDelimiters,
+            validate_sequences: false,
+            enable_match_finder_fallback: false,
+            search_for_external_repcodes: zstd_resolve_external_repcode_search(
+                ParamSwitch::Auto,
+                compression_level,
+            ),
+            ext_seq_prod: false,
         }
     }
 
@@ -1774,6 +1845,7 @@ impl CCtxParams {
         params.use_row_match_finder = ParamSwitch::Auto;
         params.post_block_splitter = ParamSwitch::Auto;
         params.ldm_enable = ParamSwitch::Auto;
+        params.search_for_external_repcodes = ParamSwitch::Auto;
         (params, CParamOverrides::default())
     }
 }
@@ -1818,9 +1890,15 @@ fn zstd_resolve_max_block_size(max_block_size: usize) -> usize {
     }
 }
 
-/// `ZSTD_maxNbSeq`: the most sequences a block can have.
-fn zstd_max_nb_seq(block_size: usize, min_match: u32) -> usize {
-    let divider = if min_match == 3 { 3 } else { 4 };
+/// `ZSTD_maxNbSeq`: the most sequences a block can have; with a sequence
+/// producer, whose matches may be of 3 bytes, as with a shortest match of
+/// 3.
+fn zstd_max_nb_seq(block_size: usize, min_match: u32, use_sequence_producer: bool) -> usize {
+    let divider = if min_match == 3 || use_sequence_producer {
+        3
+    } else {
+        4
+    };
     block_size / divider
 }
 
@@ -2143,6 +2221,16 @@ pub enum CParameter {
     TargetLength(u32),
     /// The match finder.
     Strategy(Option<Strategy>),
+    /// About how large to make compressed blocks
+    /// (`ZSTD_c_targetCBlockSize`): each block is cut into several of
+    /// about this size, compressed, that a decoder can use as each arrives,
+    /// which helps streaming over slow links, at some cost in compression
+    /// and speed. A target, not a limit: blocks can come out larger, and
+    /// what does not compress is stored as it is. With a target, blocks are
+    /// not split after their sequences ([`CParameter::SplitAfterSequences`]
+    /// is not used). 1340 to 131072; smaller values but 0 are raised to
+    /// 1340, larger ones refused; 0, the default, for none.
+    TargetCBlockSize(u32),
     /// Write the content size in the frame header when it is known: when
     /// compressing in one call, or after [`CCtx::set_pledged_src_size`].
     /// On by default.
@@ -2263,6 +2351,52 @@ pub enum CParameter {
     /// input changes, which helps `rsync`, at a small cost in compression.
     /// Off by default.
     Rsyncable(bool),
+    /// Whether a dictionary's matches, like the input's, are no farther
+    /// back than the window's size (`ZSTD_c_forceMaxWindow`): its content
+    /// then is part of the window rather than reached whole, and the parts
+    /// of it more than a window behind are not searched. Off by default.
+    ForceMaxWindow(bool),
+    /// Whether a prefix ([`CCtx::ref_prefix`]) or a dictionary loaded is a
+    /// segment of its own even where the input follows it in memory
+    /// (`ZSTD_c_deterministicRefPrefix`), so that the frames do not depend
+    /// on where the two are. Off by default: then a prefix that ends where
+    /// the input starts makes one segment with it, as libzstd does.
+    DeterministicRefPrefix(bool),
+    /// Whether frames attached to a [`CDict`] at `fast` and `dfast`
+    /// prefetch its hash tables first (`ZSTD_c_prefetchCDictTables`), which
+    /// helps where few blocks search a large `CDict`. Off by default
+    /// ([`ParamSwitch::Auto`] is off).
+    ///
+    /// Differs from libzstd: the port takes the parameter, but does not
+    /// prefetch the tables. It changes no frame.
+    PrefetchCDictTables(ParamSwitch),
+    /// Whether the sequences given to [`CCtx::compress_sequences`] mark
+    /// where the blocks end, with a delimiter after each block's sequences
+    /// that holds its last literals (`ZSTD_c_blockDelimiters`). Without
+    /// delimiters, the default, the context cuts the frame into blocks
+    /// itself, splitting sequences where it must;
+    /// [`CCtx::compress_sequences_and_literals`] takes them only with.
+    BlockDelimiters(SequenceFormat),
+    /// Whether [`CCtx::compress_sequences`] checks the sequences given
+    /// (`ZSTD_c_validateSequences`): their offsets within the window and
+    /// the dictionary, their matches of 4 bytes or more (3 with a shortest
+    /// match of 3, or a sequence producer). Off by default: the sequences
+    /// are trusted, and wrong ones can make a frame that does not decode to
+    /// the input. A sequence producer's are checked too.
+    ValidateSequences(bool),
+    /// With a sequence producer registered
+    /// ([`CCtx::register_sequence_producer`]), whether a block it fails on
+    /// is compressed with the context's own match finder, as the other
+    /// parameters say, rather than failing the frame
+    /// (`ZSTD_c_enableSeqProducerFallback`). Off by default.
+    EnableSeqProducerFallback(bool),
+    /// Whether the offsets of the sequences given, by the caller with
+    /// explicit block delimiters or by a sequence producer, are written as
+    /// repeat codes where they repeat one of the last three
+    /// (`ZSTD_c_repcodeResolution`): better compression, at some cost in
+    /// speed. `Auto`, the default, does from level 10 on. The sequences'
+    /// [`Sequence::rep`] is not read.
+    RepcodeResolution(ParamSwitch),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -2276,6 +2410,7 @@ pub enum CParameterKind {
     MinMatch,
     TargetLength,
     Strategy,
+    TargetCBlockSize,
     ContentSizeFlag,
     ChecksumFlag,
     DictIdFlag,
@@ -2299,6 +2434,13 @@ pub enum CParameterKind {
     JobSize,
     OverlapLog,
     Rsyncable,
+    ForceMaxWindow,
+    DeterministicRefPrefix,
+    PrefetchCDictTables,
+    BlockDelimiters,
+    ValidateSequences,
+    EnableSeqProducerFallback,
+    RepcodeResolution,
 }
 
 impl CParameter {
@@ -2313,6 +2455,7 @@ impl CParameter {
             CParameter::MinMatch(_) => CParameterKind::MinMatch,
             CParameter::TargetLength(_) => CParameterKind::TargetLength,
             CParameter::Strategy(_) => CParameterKind::Strategy,
+            CParameter::TargetCBlockSize(_) => CParameterKind::TargetCBlockSize,
             CParameter::ContentSizeFlag(_) => CParameterKind::ContentSizeFlag,
             CParameter::ChecksumFlag(_) => CParameterKind::ChecksumFlag,
             CParameter::DictIdFlag(_) => CParameterKind::DictIdFlag,
@@ -2336,6 +2479,13 @@ impl CParameter {
             CParameter::JobSize(_) => CParameterKind::JobSize,
             CParameter::OverlapLog(_) => CParameterKind::OverlapLog,
             CParameter::Rsyncable(_) => CParameterKind::Rsyncable,
+            CParameter::ForceMaxWindow(_) => CParameterKind::ForceMaxWindow,
+            CParameter::DeterministicRefPrefix(_) => CParameterKind::DeterministicRefPrefix,
+            CParameter::PrefetchCDictTables(_) => CParameterKind::PrefetchCDictTables,
+            CParameter::BlockDelimiters(_) => CParameterKind::BlockDelimiters,
+            CParameter::ValidateSequences(_) => CParameterKind::ValidateSequences,
+            CParameter::EnableSeqProducerFallback(_) => CParameterKind::EnableSeqProducerFallback,
+            CParameter::RepcodeResolution(_) => CParameterKind::RepcodeResolution,
         }
     }
 }
@@ -2417,6 +2567,18 @@ pub(crate) fn set_cctx_parameter(
             c_params.target_length = value;
         }
         CParameter::Strategy(strategy) => c_params.strategy = strategy,
+        CParameter::TargetCBlockSize(mut value) => {
+            if value != 0 {
+                // Raised to the smallest target, but 0. Differs from
+                // libzstd: libzstd takes an int, so values past i32::MAX
+                // would be negative there, and raised to the smallest
+                // target too; the port takes them as large ones, and
+                // refuses them as it refuses those up to i32::MAX.
+                value = value.max(ZSTD_TARGETCBLOCKSIZE_MIN);
+                bound_check(value, ZSTD_TARGETCBLOCKSIZE_MIN..=ZSTD_TARGETCBLOCKSIZE_MAX)?;
+            }
+            params.target_cblock_size = value as usize;
+        }
         CParameter::ContentSizeFlag(flag) => params.f_params.content_size_flag = flag,
         CParameter::ChecksumFlag(flag) => params.f_params.checksum_flag = flag,
         CParameter::DictIdFlag(flag) => params.f_params.no_dict_id_flag = !flag,
@@ -2504,6 +2666,18 @@ pub(crate) fn set_cctx_parameter(
         // libzstd clamps the value to the overlap log's bounds and keeps
         // it; any but 0 is on.
         CParameter::Rsyncable(rsyncable) => params.rsyncable = rsyncable,
+        CParameter::ForceMaxWindow(force) => params.force_window = force,
+        CParameter::DeterministicRefPrefix(deterministic) => {
+            params.deterministic_ref_prefix = deterministic;
+        }
+        CParameter::PrefetchCDictTables(prefetch) => params.prefetch_cdict_tables = prefetch,
+        // Their types hold only the values libzstd's bounds allow.
+        CParameter::BlockDelimiters(format) => params.block_delimiters = format,
+        CParameter::ValidateSequences(validate) => params.validate_sequences = validate,
+        CParameter::EnableSeqProducerFallback(enable) => {
+            params.enable_match_finder_fallback = enable;
+        }
+        CParameter::RepcodeResolution(mode) => params.search_for_external_repcodes = mode,
     }
     Ok(())
 }
@@ -2568,6 +2742,14 @@ struct LocalDict {
 /// (`dictMatchState`), for small inputs and inputs of unknown size, and
 /// copied in or its content loaded again otherwise, as libzstd decides;
 /// [`CParameter::ForceAttachDict`] can force one way.
+///
+/// The sequences of a frame can come from outside its match finder: from
+/// the caller, found beforehand ([`CCtx::compress_sequences`], or
+/// [`CCtx::compress_sequences_and_literals`] with the literals apart), or
+/// from a match finder of the caller's that the context asks for each
+/// block's ([`CCtx::register_sequence_producer`]). And the context gives
+/// the sequences it finds ([`CCtx::generate_sequences`]), as libzstd does
+/// for debugging.
 pub struct CCtx {
     stage: CompressionStage,
     /// The parameters set for the next frames (`requestedParams`); the
@@ -2643,6 +2825,23 @@ pub struct CCtx {
     /// sequences long distance matching found for the job, which its
     /// blocks take in turn.
     extern_seq_store: RawSeqStore,
+
+    // Sequences given by the caller.
+    /// The sequence producer registered (`extSeqProdFunc` and
+    /// `extSeqProdState`), which `ext_seq_prod` of the parameters says
+    /// there is. In a mutex only for the context to be `Sync`: it is only
+    /// reached through `&mut self`, never locked.
+    seq_producer: Option<Mutex<Box<dyn SequenceProducer>>>,
+    /// One registered while a frame is streamed (or `Some(None)` for none):
+    /// that frame goes on with the one it started with, as libzstd's
+    /// applied parameters keep theirs, and the next frame takes it.
+    pending_seq_producer: Option<Option<Mutex<Box<dyn SequenceProducer>>>>,
+    /// `extSeqBuf`: the producer's sequences for a block, room for
+    /// `ZSTD_sequenceBound` of the largest block (`extSeqBufCapacity`).
+    ext_seq_buf: Vec<Sequence>,
+    /// `seqCollector`: with [`CCtx::generate_sequences`], the sequences of
+    /// each block, gathered instead of compressing it.
+    seq_collector: Option<SeqCollector>,
 }
 
 impl CCtx {
@@ -2687,6 +2886,10 @@ impl CCtx {
             mtctx: None,
             c_params_changed: false,
             extern_seq_store: RawSeqStore::default(),
+            seq_producer: None,
+            pending_seq_producer: None,
+            ext_seq_buf: Vec::new(),
+            seq_collector: None,
         }
     }
 
@@ -2736,7 +2939,7 @@ impl CCtx {
 
         let window_size = (1u64 << c_params.window_log).min(pledged_src_size).max(1) as usize;
         let block_size = params.max_block_size.min(window_size);
-        let max_nb_seq = zstd_max_nb_seq(block_size, c_params.min_match);
+        let max_nb_seq = zstd_max_nb_seq(block_size, c_params.min_match, params.ext_seq_prod);
         let max_nb_ldm_seq = zstd_ldm_get_max_nb_seq(params.ldm_enable, &params.ldm, block_size);
         let buff_out_size = if buffered && params.out_buffer_mode == BufferMode::Buffered {
             zstd_compress_bound(block_size)? + 1
@@ -2806,6 +3009,15 @@ impl CCtx {
         // 0)).
         self.extern_seq_store.reset();
         self.extern_seq_store.capacity = 0;
+
+        // The sequence producer's room, for the largest block; and the one
+        // registered while the last frame was streamed, if any.
+        self.commit_pending_seq_producer();
+        if params.ext_seq_prod {
+            let max_nb_external_seq = sequence_bound(block_size);
+            self.ext_seq_buf
+                .resize(max_nb_external_seq, Sequence::default());
+        }
 
         // The buffers. What they hold is not used again: the window starts
         // over.
@@ -3086,15 +3298,33 @@ impl CCtx {
         }
         self.seq_store.reset();
 
-        let ms = &mut self.match_state;
         // A limited update after a very long match.
         {
+            let ms = &mut self.match_state;
             let curr = ms.window.index(istart);
             if curr > ms.next_to_update + 384 {
                 ms.next_to_update = curr - 192.min(curr - ms.next_to_update - 384);
             }
         }
+        self.next_cblock.rep = self.prev_cblock.rep;
 
+        if self.applied_params.ext_seq_prod {
+            // External sequences with long distance matching are not
+            // implemented in libzstd, from either source.
+            if self.extern_seq_store.pos < self.extern_seq_store.size()
+                || self.applied_params.ldm_enable == ParamSwitch::Enable
+            {
+                return error!(ParameterCombinationUnsupported);
+            }
+            // The sequence producer's, or the block compressor's below
+            // when it fails and falling back is allowed.
+            let src = bufs.get(self.match_state.window.buffer);
+            if self.build_seq_store_with_producer(&src[istart..iend])? {
+                return Ok(true);
+            }
+        }
+
+        let ms = &mut self.match_state;
         // Find and store the sequences, with the window's older segment if
         // it has one, or else the attached CDict's match state if the
         // frame has one (ZSTD_matchState_dictMode).
@@ -3108,7 +3338,6 @@ impl CCtx {
         } else {
             bufs.dict_match_state(ms)
         };
-        self.next_cblock.rep = self.prev_cblock.rep;
         let rep = &mut self.next_cblock.rep;
         let seq_store = &mut self.seq_store;
         let params = &self.applied_params;
@@ -3193,7 +3422,26 @@ impl CCtx {
         const RLE_MAX_LENGTH: usize = 25;
         let block = &bufs.get(self.match_state.window.buffer)[istart..iend];
         let mut c_size = 0;
-        if self.build_seq_store(bufs, istart, iend)? {
+        let compress = self.build_seq_store(bufs, istart, iend)?;
+        if let Some(collector) = &mut self.seq_collector {
+            // Gathering the sequences: the block is not compressed, and
+            // one too small to have sequences fails.
+            if !compress {
+                return error!(SequenceProducerFailed);
+            }
+            let seq_store = &self.seq_store;
+            copy_block_sequences(
+                collector,
+                &seq_store.sequences,
+                seq_store.literals().len(),
+                seq_store.long_length_type,
+                seq_store.long_length_pos,
+                &self.prev_cblock.rep,
+            )?;
+            self.confirm_repcodes_and_entropy_tables();
+            return Ok(0);
+        }
+        if compress {
             // Encode the sequences and the literals.
             let params = &self.applied_params;
             let disable = zstd_literals_compression_is_disabled(
@@ -3231,6 +3479,79 @@ impl CCtx {
             self.prev_cblock.entropy.fse.offcode_repeat_mode = FseRepeat::Check;
         }
 
+        Ok(c_size)
+    }
+
+    /// `ZSTD_compressBlock_targetCBlockSize_body`: the block `src`, its
+    /// sequences found if `compress` (`bss`), into `dst` with its headers:
+    /// as superblocks of the target size, one byte repeated, or raw.
+    /// Returns their size.
+    fn compress_block_target_cblock_size_body(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        compress: bool,
+        last_block: bool,
+    ) -> Result<usize> {
+        if compress {
+            // The first block is never RLE, though it may qualify: zstd
+            // 1.4.3 and earlier (the command line) then report that not all
+            // input was consumed.
+            if !self.is_first_block && zstd_maybe_rle(&self.seq_store) && zstd_is_rle(src) {
+                return zstd_rle_compress_block(dst, src[0], src.len(), last_block);
+            }
+            // The superblocks are not bound by ZSTD_compressBound(): even
+            // with room now, a byte more here could leave too little for
+            // the frame later. So the block is stored raw when they fail
+            // (0), may have run past blockBound(srcSize), the block plus
+            // its header (DstSizeTooSmall; storing it raw then fails if
+            // there is really no room), or come out that large or larger.
+            let c_size = zstd_compress_super_block(
+                &mut self.seq_store,
+                &self.prev_cblock,
+                &mut self.next_cblock,
+                &self.applied_params,
+                dst,
+                src,
+                last_block,
+            );
+            if !c_size
+                .as_ref()
+                .is_err_and(|error| error.code() == ErrorCode::DstSizeTooSmall)
+            {
+                let max_c_size =
+                    src.len() - zstd_min_gain(src.len(), self.applied_params.c_params.strategy);
+                let c_size = c_size?;
+                if c_size != 0 && c_size < max_c_size + ZSTD_BLOCKHEADERSIZE {
+                    self.confirm_repcodes_and_entropy_tables();
+                    return Ok(c_size);
+                }
+            }
+        }
+        // As one raw block, which a decoder can stream too.
+        zstd_no_compress_block(dst, src, last_block)
+    }
+
+    /// `ZSTD_compressBlock_targetCBlockSize`: the block `istart..iend` of
+    /// the window's prefix, its sequences found, into `dst` with its
+    /// headers, as superblocks of about the target size compressed
+    /// (`ZSTD_c_targetCBlockSize`). Returns their size.
+    fn compress_block_target_cblock_size(
+        &mut self,
+        dst: &mut [u8],
+        bufs: Buffers<'_>,
+        istart: usize,
+        iend: usize,
+        last_block: bool,
+    ) -> Result<usize> {
+        let src = &bufs.get(self.match_state.window.buffer)[istart..iend];
+        let compress = self.build_seq_store(bufs, istart, iend)?;
+        let c_size = self.compress_block_target_cblock_size_body(dst, src, compress, last_block)?;
+        // A dictionary's offset codes are checked for the first block; after
+        // it the table might not have codes far enough for the data.
+        if self.prev_cblock.entropy.fse.offcode_repeat_mode == FseRepeat::Valid {
+            self.prev_cblock.entropy.fse.offcode_repeat_mode = FseRepeat::Check;
+        }
         Ok(c_size)
     }
 
@@ -3322,6 +3643,21 @@ impl CCtx {
         // was consumed. Nor are its partitions.
         if !self.is_first_block && c_seqs_size < RLE_MAX_LENGTH && zstd_is_rle(src) {
             c_seqs_size = 1;
+        }
+
+        if let Some(collector) = &mut self.seq_collector {
+            // Gathering the sequences: the chunk's, as the decoder's
+            // repeat offsets left them.
+            copy_block_sequences(
+                collector,
+                &self.seq_store.sequences[chunk.seq_start..chunk.seq_end],
+                chunk.lit_end - chunk.lit_start,
+                chunk.long_length_type,
+                chunk.long_length_pos,
+                &d_rep_original,
+            )?;
+            self.confirm_repcodes_and_entropy_tables();
+            return Ok(0);
         }
 
         let c_size = match c_seqs_size {
@@ -3426,7 +3762,7 @@ impl CCtx {
         nb_seq: u32,
     ) -> Result<usize> {
         let block_size = src.len();
-        let mut ip = 0;
+        let mut ip = 0usize;
         let mut op = 0;
         let mut src_bytes_total = 0;
         let mut partitions = Vec::new();
@@ -3466,16 +3802,24 @@ impl CCtx {
             src_bytes_total += src_bytes;
             if last_partition {
                 // The last partition: with the block's last literals.
-                src_bytes += block_size - src_bytes_total;
+                src_bytes = src_bytes.wrapping_add(block_size.wrapping_sub(src_bytes_total));
                 last_block_entire_src = last_block;
             }
+            // Differs from libzstd: a sequence producer's sequences that do
+            // not add up to the block (match lengths under 3, without
+            // ZSTD_c_validateSequences) make partitions that reach past it,
+            // which libzstd reads; the port fails. Sequences that add up,
+            // as every match finder's, never do.
+            let Some(chunk_src) = ip.checked_add(src_bytes).and_then(|end| src.get(ip..end)) else {
+                return error!(ExternalSequencesInvalid);
+            };
 
             let c_size_chunk = self.compress_seq_store_single_block(
                 &chunk,
                 &mut d_rep,
                 &mut c_rep,
                 &mut dst[op..],
-                &src[ip..ip + src_bytes],
+                chunk_src,
                 last_block_entire_src,
                 true,
             )?;
@@ -3508,6 +3852,10 @@ impl CCtx {
             // Too small to compress.
             if self.prev_cblock.entropy.fse.offcode_repeat_mode == FseRepeat::Valid {
                 self.prev_cblock.entropy.fse.offcode_repeat_mode = FseRepeat::Check;
+            }
+            if self.seq_collector.is_some() {
+                // Gathering the sequences: a block without any fails.
+                return error!(SequenceProducerFailed);
             }
             return zstd_no_compress_block(dst, src, last_block);
         }
@@ -3599,7 +3947,22 @@ impl CCtx {
                 ms.next_to_update = ms.window.low_limit;
             }
 
-            let c_size = if zstd_block_splitter_enabled(&self.applied_params) {
+            // A target size for compressed blocks takes precedence over the
+            // block splitter.
+            let c_size = if zstd_use_target_cblock_size(&self.applied_params) {
+                // In blocks of about the target size, their headers
+                // included.
+                let c_size = self.compress_block_target_cblock_size(
+                    &mut dst[op..op + dst_capacity],
+                    bufs,
+                    ip,
+                    ip + block_size,
+                    last_block,
+                )?;
+                debug_assert!(c_size > 0);
+                debug_assert!(c_size <= block_size + ZSTD_BLOCKHEADERSIZE);
+                c_size
+            } else if zstd_block_splitter_enabled(&self.applied_params) {
                 // Perhaps in several blocks, their headers included.
                 let c_size = self.compress_block_split_block(
                     &mut dst[op..op + dst_capacity],
@@ -3608,7 +3971,8 @@ impl CCtx {
                     ip + block_size,
                     last_block,
                 )?;
-                debug_assert!(c_size > 0);
+                // Nothing written when gathering the sequences.
+                debug_assert!(c_size > 0 || self.seq_collector.is_some());
                 c_size
             } else {
                 let c_size = self.compress_block_internal(
@@ -3778,7 +4142,11 @@ impl CCtx {
         }
 
         let ms = &mut self.match_state;
-        if !ms.window.update(which, start, end - start, false) {
+        if !ms
+            .window
+            .update(which, start, end - start, ms.force_non_contiguous)
+        {
+            ms.force_non_contiguous = false;
             ms.next_to_update = ms.window.dict_limit;
         }
         if !zstd_window_in_buffers(&ms.window, &bufs) {
@@ -4092,6 +4460,7 @@ impl CCtx {
             CParameterKind::MinMatch => c_params.min_match as i32,
             CParameterKind::TargetLength => c_params.target_length as i32,
             CParameterKind::Strategy => c_params.strategy.map_or(0, |strategy| strategy as i32),
+            CParameterKind::TargetCBlockSize => params.target_cblock_size as i32,
             CParameterKind::ContentSizeFlag => i32::from(params.f_params.content_size_flag),
             CParameterKind::ChecksumFlag => i32::from(params.f_params.checksum_flag),
             CParameterKind::DictIdFlag => i32::from(!params.f_params.no_dict_id_flag),
@@ -4120,6 +4489,15 @@ impl CCtx {
             CParameterKind::JobSize => params.job_size as i32,
             CParameterKind::OverlapLog => params.overlap_log,
             CParameterKind::Rsyncable => i32::from(params.rsyncable),
+            CParameterKind::ForceMaxWindow => i32::from(params.force_window),
+            CParameterKind::DeterministicRefPrefix => i32::from(params.deterministic_ref_prefix),
+            CParameterKind::PrefetchCDictTables => params.prefetch_cdict_tables as i32,
+            CParameterKind::BlockDelimiters => params.block_delimiters as i32,
+            CParameterKind::ValidateSequences => i32::from(params.validate_sequences),
+            CParameterKind::EnableSeqProducerFallback => {
+                i32::from(params.enable_match_finder_fallback)
+            }
+            CParameterKind::RepcodeResolution => params.search_for_external_repcodes as i32,
         }
     }
 
@@ -4159,6 +4537,9 @@ impl CCtx {
             }
             self.clear_all_dicts();
             (self.requested_params, self.requested_c_params) = CCtxParams::requested_default();
+            // No sequence producer either.
+            self.seq_producer = None;
+            self.pending_seq_producer = None;
         }
         Ok(())
     }
@@ -4588,6 +4969,8 @@ impl CCtx {
     /// `ZSTD_CCtx_init_compressStream2`: starts a frame, with the parameters
     /// set. With [`EndDirective::End`], `in_size` is its size.
     fn init_compress_stream2(&mut self, end_op: EndDirective, in_size: usize) -> Result<()> {
+        // A sequence producer registered while the last frame was streamed.
+        self.commit_pending_seq_producer();
         let mut params = self.requested_params;
         // The dictionary loaded, made a CDict if not yet.
         self.init_local_dict()?;
@@ -4628,7 +5011,19 @@ impl CCtx {
         params.ldm_enable = zstd_resolve_enable_ldm(params.ldm_enable, &params.c_params);
         params.use_row_match_finder =
             zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
+        // (ZSTD_resolveExternalSequenceValidation leaves validateSequences
+        // as it is.)
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
+        params.search_for_external_repcodes = zstd_resolve_external_repcode_search(
+            params.search_for_external_repcodes,
+            params.compression_level,
+        );
+
+        // A sequence producer is not for worker threads: refused before the
+        // size is looked at, whatever it is.
+        if params.ext_seq_prod && params.nb_workers >= 1 {
+            return error!(ParameterCombinationUnsupported);
+        }
 
         // A frame of a known size of ZSTDMT_JOBSIZE_MIN or less is
         // compressed without workers.
@@ -5030,6 +5425,15 @@ impl CCtx {
 /// `ZSTD_isRLE`: whether `src` is one byte repeated.
 fn zstd_is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
+}
+
+/// `ZSTD_maybeRLE`: whether the block of these sequences and literals may
+/// be one byte repeated, from how well it compresses (a heuristic, wrong
+/// either way at times): fewer than 4 sequences and 10 literals.
+pub(crate) fn zstd_maybe_rle(seq_store: &SeqStore) -> bool {
+    let nb_seqs = seq_store.sequences.len();
+    let nb_lits = seq_store.whole().lit_end;
+    nb_seqs < 4 && nb_lits < 10
 }
 
 impl Default for CCtx {

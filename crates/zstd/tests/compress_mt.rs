@@ -44,6 +44,11 @@ const JOBSIZE_MIN: usize = 512 << 10;
 /// Calls more than this for one step mean no progress.
 const MAX_CALLS: usize = 1_000_000;
 
+/// Room past the end of the room the stable output buffers are given: with
+/// a target size for compressed blocks and little room, libzstd's
+/// superblocks write past it (see `tests/compress_target.rs`).
+const SLACK: usize = 1 << 18;
+
 /// `n` bytes, less for slower runs.
 fn scaled(n: usize) -> usize {
     if EMULATED {
@@ -229,6 +234,11 @@ fn parameters(rng: &mut Rng) -> Vec<Param> {
     if rng.chance(5) {
         let value = [1024, 5000, 65_536][rng.range(0, 2) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
+    }
+    if rng.chance(5) {
+        // A target size for compressed blocks, in the jobs too.
+        let value = [1, 1340, 4096, 30_000, 131_072][rng.range(0, 4) as usize];
+        list.push((P::TargetCBlockSize(value), C::TargetCBlockSize(value)));
     }
     if rng.chance(3) {
         // Long distance matching, run in order apart from the jobs, with
@@ -822,14 +832,14 @@ fn stream_frame(
     let mut ends = Vec::new();
     let mut sets = Vec::new();
     // With a stable output buffer, one buffer for the frame.
-    let mut stable = vec![0u8; stable_room.unwrap_or(0)];
+    let mut stable = vec![0u8; stable_room.unwrap_or(0) + SLACK];
     let mut fresh = Vec::new();
     let mut taken = 0;
     'steps: for step in steps {
         let mut stalled = 0;
         for _ in 0..MAX_CALLS {
             let (dst, out_pos) = match stable_room {
-                Some(_) => (&mut stable[..], frame.len()),
+                Some(room) => (&mut stable[..room], frame.len()),
                 None => {
                     fresh.clear();
                     fresh.resize(step.room, 0);

@@ -9,7 +9,10 @@
 //! With another, worker threads (`ZSTD_c_nbWorkers`), a different number
 //! on each side: through `compress2`, where an input this small takes
 //! none, and streamed with its size unknown, which takes them; the frames
-//! do not depend on their number. A panic or a difference is a bug.
+//! do not depend on their number. With a size of 5, 6 or 7 modulo 8, a
+//! target size for compressed blocks (`ZSTD_c_targetCBlockSize`: below the
+//! smallest, raised to it, a small one and the largest), through
+//! `compress2`. A panic or a difference is a bug.
 
 #![no_main]
 
@@ -123,11 +126,12 @@ fuzz_target!(|input: &[u8]| {
     }
     let split = pick & 0x10 != 0;
     let workers = pick & 0x40 != 0;
+    let target = [0, 0, 0, 0, 0, 1, 4096, 131_072][src.len() % 8];
     // Room for the frame, and for a frame of unknown size.
     let capacity = hivepack_zstd::compress_bound(src.len()).unwrap_or(0) + 32;
     let mut c_out = vec![0u8; capacity];
     let mut p_out = vec![0u8; capacity];
-    let (want, got) = if split || workers {
+    let (want, got) = if split || workers || target != 0 {
         let mut c = zstd_safe::CCtx::create();
         let mut p = CCtx::new();
         let mut parameters = vec![(P::CompressionLevel(level), C::CompressionLevel(level))];
@@ -141,6 +145,9 @@ fuzz_target!(|input: &[u8]| {
             let count = 1 + u32::from(pick >> 7);
             parameters.push((P::NbWorkers(count), C::NbWorkers(3 - count)));
             parameters.push((P::ChecksumFlag(true), C::ChecksumFlag(true)));
+        }
+        if target != 0 {
+            parameters.push((P::TargetCBlockSize(target), C::TargetCBlockSize(target)));
         }
         for (pp, cp) in parameters {
             assert!(c.set_parameter(cp).is_ok() && p.set_parameter(pp).is_ok());
@@ -181,14 +188,16 @@ fuzz_target!(|input: &[u8]| {
         (Ok(got), Ok(want)) => {
             assert!(
                 got == want,
-                "level {level}, split {split}, workers {workers}: the frames differ"
+                "level {level}, split {split}, workers {workers}, target {target}: the frames \
+                 differ"
             );
             let mut back = vec![0u8; src.len()];
             let size = hivepack_zstd::decompress(&mut back, got).expect("the frame decodes");
             assert!(back[..size] == *src, "level {level}: does not decode back");
         }
         (got, want) => panic!(
-            "level {level}, split {split}, workers {workers}: port {:?}, libzstd {:?}",
+            "level {level}, split {split}, workers {workers}, target {target}: port {:?}, \
+             libzstd {:?}",
             got.map(<[u8]>::len),
             want.map(<[u8]>::len)
         ),

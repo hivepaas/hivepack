@@ -38,8 +38,8 @@ use crate::compress::huf_compress::{
 };
 use crate::compress::zstd_cdict::CDict;
 use crate::compress::zstd_compress::{
-    CCtx, CParameter, EndDirective, zstd_compress_bound, zstd_entropy_compress_seq_store,
-    zstd_level_ported,
+    CCtx, CParameter, CParameterKind, EndDirective, SequenceFormat, zstd_compress_bound,
+    zstd_entropy_compress_seq_store, zstd_level_ported,
 };
 use crate::compress::zstd_compress_internal::{
     DictAttachPref, EntropyCTables, FseRepeat, LongLengthType, ParamSwitch, SeqDef, SeqStore,
@@ -51,6 +51,7 @@ use crate::decompress::zstd_decompress_internal::Format;
 use crate::oracle::{
     Oracle, Rng, failed, fnv64, hex, list, mutate, recorded_form, repository, unhex, unlist,
 };
+use crate::oracle_sequences::SequenceSteps;
 use std::sync::Arc;
 
 /// The fillers the oracle starts its tables with.
@@ -441,8 +442,9 @@ pub(crate) fn answer(request: &str) -> String {
                 },
             )
         }
-        ["cstream", capacity, steps, src] => cstream(capacity, steps, src, "-"),
-        ["cstream", capacity, steps, src, dict] => cstream(capacity, steps, src, dict),
+        ["cstream", capacity, steps, src] => cstream(capacity, steps, src, "-", "-"),
+        ["cstream", capacity, steps, src, dict] => cstream(capacity, steps, src, dict, "-"),
+        ["cstream", capacity, steps, src, dict, seqs] => cstream(capacity, steps, src, dict, seqs),
         ["seqreset"] => {
             SEQ_ENTROPY.with(|state| {
                 *state.borrow_mut() = (
@@ -543,6 +545,11 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
         401 => CParameter::JobSize(unsigned()),
         402 => CParameter::OverlapLog(value as i32),
         500 => CParameter::Rsyncable(flag),
+        // ZSTD_c_forceMaxWindow, ZSTD_c_deterministicRefPrefix,
+        // ZSTD_c_prefetchCDictTables
+        1000 => CParameter::ForceMaxWindow(flag),
+        1012 => CParameter::DeterministicRefPrefix(flag),
+        1013 => CParameter::PrefetchCDictTables(switch()),
         // ZSTD_c_forceAttachDict
         1001 => CParameter::ForceAttachDict(match value {
             0 => DictAttachPref::DefaultAttach,
@@ -551,6 +558,60 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
             3 => DictAttachPref::ForceLoad,
             _ => panic!("dictionary attach preference {value}"),
         }),
+        // ZSTD_c_blockDelimiters, ZSTD_c_validateSequences,
+        // ZSTD_c_enableSeqProducerFallback, ZSTD_c_repcodeResolution
+        1008 => CParameter::BlockDelimiters(match value {
+            0 => SequenceFormat::NoBlockDelimiters,
+            1 => SequenceFormat::ExplicitBlockDelimiters,
+            _ => panic!("sequence format {value}"),
+        }),
+        1009 => CParameter::ValidateSequences(stable()),
+        1014 => CParameter::EnableSeqProducerFallback(stable()),
+        1016 => CParameter::RepcodeResolution(switch()),
+        _ => panic!("parameter {number}"),
+    }
+}
+
+/// The parameter of libzstd's number `number`, as
+/// `ZSTD_CCtx_getParameter` takes it.
+pub(crate) fn c_parameter_kind(number: i64) -> CParameterKind {
+    use CParameterKind as K;
+    match number {
+        100 => K::CompressionLevel,
+        101 => K::WindowLog,
+        102 => K::HashLog,
+        103 => K::ChainLog,
+        104 => K::SearchLog,
+        105 => K::MinMatch,
+        106 => K::TargetLength,
+        107 => K::Strategy,
+        200 => K::ContentSizeFlag,
+        201 => K::ChecksumFlag,
+        202 => K::DictIdFlag,
+        10 => K::Format,
+        1002 => K::LiteralCompressionMode,
+        1004 => K::SrcSizeHint,
+        1006 => K::StableInBuffer,
+        1007 => K::StableOutBuffer,
+        1015 => K::MaxBlockSize,
+        1017 => K::BlockSplitterLevel,
+        1010 => K::SplitAfterSequences,
+        160 => K::EnableLongDistanceMatching,
+        161 => K::LdmHashLog,
+        162 => K::LdmMinMatch,
+        163 => K::LdmBucketSizeLog,
+        164 => K::LdmHashRateLog,
+        1011 => K::UseRowMatchFinder,
+        1005 => K::EnableDedicatedDictSearch,
+        400 => K::NbWorkers,
+        401 => K::JobSize,
+        402 => K::OverlapLog,
+        500 => K::Rsyncable,
+        1001 => K::ForceAttachDict,
+        1008 => K::BlockDelimiters,
+        1009 => K::ValidateSequences,
+        1014 => K::EnableSeqProducerFallback,
+        1016 => K::RepcodeResolution,
         _ => panic!("parameter {number}"),
     }
 }
@@ -558,13 +619,15 @@ fn c_parameter(number: i64, value: i64) -> CParameter {
 /// `cstream`: a new context through the steps, as the oracle takes it
 /// through them; reset after a failed call, but for buffers not as stable
 /// as promised, which is found before anything changes. `dict` is the
-/// dictionary bytes of the steps that set one.
+/// dictionary bytes of the steps that set one, `seqs` the sequences of the
+/// steps of the sequence API (see [`SequenceSteps`]).
 #[allow(clippy::too_many_lines)]
-fn cstream(capacity: &str, steps: &str, src: &str, dict: &str) -> String {
+fn cstream(capacity: &str, steps: &str, src: &str, dict: &str, seqs: &str) -> String {
     let capacity: usize = number(capacity);
     let steps = unlist(steps);
     let src = unhex(src);
     let dict = unhex(dict);
+    let mut sequence_steps = SequenceSteps::new(seqs);
     let mut cctx = CCtx::new();
     let mut out = vec![0u8; capacity];
     let (mut in_pos, mut out_pos) = (0usize, 0usize);
@@ -603,8 +666,23 @@ fn cstream(capacity: &str, steps: &str, src: &str, dict: &str) -> String {
             };
             let _ = match result {
                 Err(error) => write!(text, " e{}/{in_pos}/{out_pos}", error.code().number()),
-                Ok(()) => write!(text, " s"),
+                Ok(()) => {
+                    sequence_steps.dictionary_set(op, b, dict_piece, dict_head);
+                    write!(text, " s")
+                }
             };
+            continue;
+        }
+        if (19..=28).contains(&op) {
+            let answer = sequence_steps.step(
+                &mut cctx,
+                [op, a, b],
+                &src,
+                &mut out[..capacity],
+                &mut in_pos,
+                &mut out_pos,
+            );
+            text.push_str(&answer);
             continue;
         }
         let in_end = (in_pos + a.max(0) as usize).min(src.len());
@@ -643,6 +721,12 @@ fn cstream(capacity: &str, steps: &str, src: &str, dict: &str) -> String {
                 if let Ok(size) = result {
                     input.pos = in_end;
                     output.pos = out_pos + size;
+                    // With a sequence producer, a check that the frame
+                    // decodes back, when asked for.
+                    text.push_str(sequence_steps.check_frame(
+                        &output.dst[out_pos..out_pos + size],
+                        &input.src[in_pos..in_end],
+                    ));
                 }
                 result.map(Some)
             }
@@ -663,6 +747,9 @@ fn cstream(capacity: &str, steps: &str, src: &str, dict: &str) -> String {
         };
         in_pos = input.pos;
         out_pos = output.pos;
+        if op <= 6 || op == 10 {
+            sequence_steps.frame_started();
+        }
         let unstable = result
             .as_ref()
             .is_err_and(|error| error.code() == ErrorCode::StabilityConditionNotRespected);
@@ -685,7 +772,7 @@ fn cstream(capacity: &str, steps: &str, src: &str, dict: &str) -> String {
 
 /// Bytes for the entropy coders: text-like, skewed, random, one symbol, or
 /// with the structure of LZ77.
-fn data(rng: &mut Rng, len: usize) -> Vec<u8> {
+pub(crate) fn data(rng: &mut Rng, len: usize) -> Vec<u8> {
     match rng.range(0, 5) {
         0 | 1 => rng.huffman_data(len),
         2 => rng.lz_data(len),
@@ -1118,7 +1205,7 @@ pub(crate) fn requests(oracle: &mut Oracle, rng: &mut Rng, per_command: usize) -
 
 /// The data of a frame: as `data`, or pieces of different kinds one after
 /// another, where libzstd may end a block early.
-fn frame_data(rng: &mut Rng, len: usize) -> Vec<u8> {
+pub(crate) fn frame_data(rng: &mut Rng, len: usize) -> Vec<u8> {
     if rng.range(0, 2) != 0 {
         return data(rng, len);
     }
@@ -1484,7 +1571,7 @@ fn cstream_workers_request(rng: &mut Rng) -> String {
 /// The dictionary bytes of a `cstream` request: a zstd dictionary libzstd
 /// trains on pieces of `src` (or of data like it), some cut short; raw
 /// content, a piece of `src`; or random bytes.
-fn cstream_dict(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
+pub(crate) fn cstream_dict(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
     match rng.range(0, 4) {
         0 | 1 => {
             let corpus = if src.len() > 20_000 {
@@ -1524,7 +1611,7 @@ fn cstream_dict(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
 /// With a stable input buffer, none that can fail as the frame starts (a
 /// dictionary read as a zstd one): the oracle then resets the context,
 /// which drops the input waiting in the port (see `CCtx::reset_session`).
-fn cstream_dict_steps(rng: &mut Rng, dict_len: usize, stable_in: bool) -> Vec<i64> {
+pub(crate) fn cstream_dict_steps(rng: &mut Rng, dict_len: usize, stable_in: bool) -> Vec<i64> {
     let len = dict_len as i64;
     let (at, size) = if rng.range(0, 3) == 0 {
         let at = rng.range(0, dict_len as u64) as i64;
@@ -1569,7 +1656,7 @@ struct SeqProfile {
 }
 
 /// One length, mostly small, up to `max`.
-fn small_length(rng: &mut Rng, max: u64) -> u64 {
+pub(crate) fn small_length(rng: &mut Rng, max: u64) -> u64 {
     match rng.range(0, 9) {
         0 => rng.range(0, max),
         1..=3 => rng.range(0, max.min(64)),

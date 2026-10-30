@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sequences"
+path = "fuzz_targets/sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "inflate"
 path = "fuzz_targets/inflate.rs"
 test = false

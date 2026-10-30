@@ -12,8 +12,9 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | Target | What it checks |
 |---|---|
 | `decompress` | Decoding the input in one call: the same output as libzstd, or the same error |
-| `compress` | Compressing the input in one call, at a level its first byte picks, with the blocks split after their sequences when a bit of it is set, and with worker threads when another is (then also streamed with its size unknown, which takes them): the same frame as libzstd, which decodes back |
-| `compress_stream` | Streaming the input, with parameters (long distance matching among them), pieces, directives and room for output its first 8 bytes pick: every call the same as libzstd's, and a frame that decodes back. A quarter of the time with worker threads, a different number on each side, where each side goes through the same steps on its own: the same frame |
+| `compress` | Compressing the input in one call, at a level its first byte picks, with the blocks split after their sequences when a bit of it is set, and with worker threads when another is (then also streamed with its size unknown, which takes them), and with a target size for compressed blocks for some sizes: the same frame as libzstd, which decodes back |
+| `compress_stream` | Streaming the input, with parameters (long distance matching and a target size for compressed blocks among them), pieces, directives and room for output its first 8 bytes pick: every call the same as libzstd's, and a frame that decodes back. A quarter of the time with worker threads, a different number on each side, where each side goes through the same steps on its own: the same frame |
+| `sequences` | The sequence API, which zstd-safe does not offer (the oracle's tests compare it with libzstd): with the input's first byte, its sequences generated at a level and compressed back with `compress_sequences`, with their block delimiters and merged without, and with `compress_sequences_and_literals`, every frame decoding back to it; or sequences of any values read from its start, compressed over the rest as given and as a sequence producer's for every block: a frame or an error, never a panic |
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
 | `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |
 | `zip_open` | Opening the input as a ZIP archive, leniently and with `ZIP_CHECKCONS`, asking the reading API about every entry, and reading every entry's data, decompressed, raw, and decrypted with the password "foo": no panic (`crates/zip/tests/oracle.rs` compares the answers with libzip) |
@@ -21,7 +22,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick (encrypting among them) and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data, read with the passwords the edits set (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
 | `sevenz` | Opening the input as a 7z archive, listing it, reading its files in pieces of all sizes, decoding its folders and extracting its files, with small limits on memory and output: no panic (`crates/7z/tests/oracle.rs` compares the results with the LZMA SDK's) |
-| `lz4` | After a mode byte and eight bytes of seed: decoding the rest as a block with `LZ4_decompress_safe` into an output of a size the seed picks, with the same result and every byte of the output the same, past what is decoded too, as liblz4; reading it as a frame in reads of sizes the seed picks, through the lz4 crate's `Decoder` and the same loop over the port's context, with the same bytes from every read; decoding it partially, with dictionaries, after a prefix and in a stream, and reading it with the port's `Decoder`: no panic (`crates/lz4/tests/oracle.rs` compares those with liblz4) |
+| `lz4` | After a mode byte and eight bytes of seed: decoding the rest as a block with `LZ4_decompress_safe` into an output of a size the seed picks, with the same result and every byte of the output the same, past what is decoded too, as liblz4; reading it as a frame in reads of sizes the seed picks, through the lz4 crate's `Decoder` and the same loop over the port's context, with the same bytes from every read; decoding it partially, with dictionaries, after a prefix and in a stream, and reading it with the port's `Decoder`: no panic (`crates/lz4/tests/oracle.rs` compares those with liblz4); compressing the rest into a block, fast or at a high-compression level, and into a frame through the lz4 crate's `Encoder` and the port's, with preferences, writes and flushes the seed picks, with the same block or frame as liblz4; and compressing it in the ways the lz4 crate cannot reach (dictionaries, digested or not, negative levels, stored blocks, outputs too small, as much as fits): no panic, and all of it decompresses to what was given |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
 | `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2 with up to three delta and BCJ filters before it), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). The automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
 | `xz_encode` | Encoding the rest of the input with the encoder its first byte picks (`.xz` of a preset, `.xz` of LZMA2 with options, `.lzma`, raw LZMA1 or LZMA2, all but `.lzma` and the preset with up to three delta and BCJ filters before LZMA), with the preset, check, options, filters, pieces and flushes its next eight bytes pick: every call gives the same result, bytes read and written, and output as liblzma |
@@ -39,6 +40,8 @@ mkdir -p fuzz/corpus/decompress
 find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
 cargo fuzz run --features unsafe-fast decompress -- -max_total_time=3600
 ```
+
+CI seeds `sequences` with the same files as `compress`.
 
 `compress` and `compress_stream` take the feature too: with it, the row
 match finder gathers its candidates and prefetches them, as libzstd does,
@@ -62,7 +65,8 @@ cargo fuzz run xz_encode -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `lz4` with the blocks and frames of `testdata/oracle/lz4.txt`, each
-behind the mode bytes that decode it as a block and as a frame:
+behind the mode bytes that decode it as a block and as a frame, and with the
+inputs of its compression requests, behind the modes that compress them:
 
 ```sh
 cargo fuzz run lz4 -- -max_total_time=3600 -rss_limit_mb=4096

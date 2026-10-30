@@ -3,7 +3,7 @@
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd,
 hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with
 liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip,
-hivepack-extract, hivepack-age, hivepack-tar, hivepack-open and hivepack-7z any input. They need
+hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open and hivepack-7z any input. They need
 nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 (`NIGHTLY` in `.github/workflows/ci.yml`), chosen for the shell with
 `export RUSTUP_TOOLCHAIN=<that nightly>`, and
@@ -33,6 +33,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `tar` | Reading the input as a tar archive, every entry and up to 4 MiB of each one's data, twice, in pieces of different sizes its first eight bytes pick: the same headers, data and end both times, and no panic (`crates/tar/tests/oracle.rs` compares the answers with Go's archive/tar) |
 | `rar_headers` | Opening the input as a RAR archive, its first byte choosing whether a broken main header is read past, and reading every header, twice: the same headers both times, each past the one before |
 | `extract_tar` | Extracting the input as a tar archive with hivepack-extract, as `extract` does a ZIP archive: options from its first byte, cancelled after some progress if it says so; nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
+| `iso` | Reading the input as an ISO 9660 image, as an input that cannot seek and as one that can, every entry and up to 4 MiB of each one's data, twice each, in pieces of different sizes its first eight bytes pick: the same headers, data, warnings and end both times, and no panic (`crates/iso/tests/oracle.rs` compares the answers with libarchive) |
 | `open` | Opening the input through its layers with hivepack-open (the age key of `crates/open/tests/age.rs`'s files; a name ending in `.lzma` if its first byte is odd; small limits), three times with one opener, the later opens with the file keys kept, and reading up to 4 MiB in pieces of different sizes: the same layers, container and end each time, the same data, or after an error data of which one starts the other (libzstd gives out less before an error when its output buffer is larger), and no panic |
 
 Seed the corpus with the frames in `testdata`, then run, with the
@@ -88,6 +89,14 @@ CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and
 those libzip encrypted in `testdata/oracle/zip-decrypt.txt` (some with
 "foo"), and `zip_edit` with the same archives behind two edits (encrypting, for
 the encrypted ones).
+
+CI seeds `iso` with libarchive's test images, uncompressed:
+
+```sh
+mkdir -p fuzz/corpus/iso
+for f in testdata/libarchive-iso/*.iso.xz; do xz -dc "$f" > "fuzz/corpus/iso/$(basename "$f" .xz)"; done
+cargo fuzz run iso -- -max_total_time=3600 -rss_limit_mb=4096
+```
 
 `cargo fuzz` builds with AddressSanitizer, so with the feature an access out
 of bounds in its unchecked copies stops the run as a crash, as a difference

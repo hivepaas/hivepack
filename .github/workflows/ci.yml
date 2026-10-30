@@ -65,6 +65,7 @@ jobs:
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-extract --lib --locked
+      - run: cargo check -p hivepack-iso --lib --locked
       - run: cargo check -p hivepack-lz4 --lib --locked
       - run: cargo check -p hivepack-lz4 --lib --locked --features unsafe-fast
       - run: cargo check -p hivepack-open --lib --locked
@@ -416,6 +417,11 @@ jobs:
               pathlib.Path(f"fuzz/corpus/extract_tar/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_tar -- -max_total_time=60
+      - name: Seed the ISO 9660 corpus with libarchive's test images
+        run: |
+          mkdir -p fuzz/corpus/iso
+          for f in testdata/libarchive-iso/*.iso.xz; do xz -dc "$f" > "fuzz/corpus/iso/$(basename "$f" .xz)"; done
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu iso -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the layers corpus with the recorded age files and what they hold
         run: |
           mkdir -p fuzz/corpus/open

@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-fuzz"
 version = "0.0.0"
-description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-open and hivepack-7z any input"
+description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open and hivepack-7z any input"
 publish = false
 license = "MIT"
 edition = "2024"
@@ -30,6 +30,7 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 hivepack-bzip2 = { path = "../crates/bzip2" }
 hivepack-age = { path = "../crates/age" }
 hivepack-tar = { path = "../crates/tar" }
+hivepack-iso = { path = "../crates/iso" }
 hivepack-rar = { path = "../crates/rar" }
 hivepack-open = { path = "../crates/open" }
 # libbzip2 1.0.8, built from bzip2-sys's bundled sources, as the tests build
@@ -183,6 +184,13 @@ name = "extract_tar"
 path = "fuzz_targets/extract_tar.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "iso"
+path = "fuzz_targets/iso.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "rar_headers"

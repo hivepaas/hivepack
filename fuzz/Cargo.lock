@@ -208,6 +208,7 @@ dependencies = [
  "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
+ "hivepack-iso",
  "hivepack-lz4",
  "hivepack-open",
  "hivepack-rar",
@@ -222,6 +223,13 @@ dependencies = [
  "lz4",
  "lz4-sys",
  "zstd",
+]
+
+[[package]]
+name = "hivepack-iso"
+version = "0.0.0"
+dependencies = [
+ "hivepack-deflate",
 ]
 
 [[package]]

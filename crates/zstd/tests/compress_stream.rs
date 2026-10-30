@@ -29,6 +29,11 @@ use zstd::zstd_safe::{self, CParameter as C, FrameFormat, zstd_sys::ZSTD_EndDire
 /// Calls more than this for one frame mean no progress.
 const MAX_CALLS: usize = 200_000;
 
+/// Room past the end of the room libzstd's output buffers are given: with a
+/// target size for compressed blocks and little room, libzstd's superblocks
+/// write past it (see `tests/compress_target.rs`).
+const SLACK: usize = 1 << 18;
+
 /// Data with repeats near and far: text-like pieces, and copies of larger
 /// pieces from anywhere before.
 fn data(rng: &mut Rng, len: usize) -> Vec<u8> {
@@ -187,6 +192,12 @@ fn parameters(rng: &mut Rng) -> Vec<(P, C)> {
         let value = [0, 1000, 1024, 5000, 65_536, 131_072, 131_073][rng.range(0, 6) as usize];
         list.push((P::MaxBlockSize(value), C::MaxBlockSize(value)));
     }
+    if rng.chance(5) {
+        // A target size for compressed blocks, some below the smallest
+        // (raised to it) and above the largest (refused), or none.
+        let value = [0, 1, 1340, 1500, 4096, 20_000, 131_072, 131_073][rng.range(0, 7) as usize];
+        list.push((P::TargetCBlockSize(value), C::TargetCBlockSize(value)));
+    }
     if rng.chance(3) {
         // Long distance matching, with small parameters, so that it finds
         // matches in these inputs, some of them out of bounds. zstd-safe
@@ -285,7 +296,7 @@ fn stream_frame(
         hivepack_zstd::compress_bound(data.len()).expect("a bound") + 32
     };
     let (mut c_stable, mut p_stable) = if stable_out {
-        (vec![0u8; stable_room], vec![0u8; stable_room])
+        (vec![0u8; stable_room + SLACK], vec![0u8; stable_room])
     } else {
         (Vec::new(), Vec::new())
     };
@@ -326,7 +337,7 @@ fn stream_frame(
             (vec![0u8; lead + room], vec![0u8; lead + room], lead)
         };
         let (c_dst, p_dst) = if stable_out {
-            (&mut c_stable[..], &mut p_stable[..])
+            (&mut c_stable[..stable_room], &mut p_stable[..])
         } else {
             (&mut c_fresh[..], &mut p_fresh[..])
         };
@@ -430,8 +441,18 @@ impl Dicts {
         }
         let mut c_cdicts = Vec::new();
         let mut p_cdicts = Vec::new();
+        // On big-endian machines, CDicts of `fast` and `dfast` only, levels
+        // up to 3 (level 4 is `greedy` for dictionaries of up to 16 KB): a
+        // frame that attaches one takes its strategy over the one
+        // `parameters` sets there, and libzstd's block splitter of `greedy`
+        // and up hashes pairs of bytes in the machine's order.
+        let levels = if cfg!(target_endian = "big") {
+            [1, 3, 2, 3, -2, 1, 0, 2]
+        } else {
+            [1, 3, 5, 19, -2, 9, 0, 16]
+        };
         for (i, dict) in dicts.iter().enumerate() {
-            let level = [1, 3, 5, 19, -2, 9, 0, 16][i % 8];
+            let level = levels[i % 8];
             c_cdicts.push(zstd_safe::CDict::create(dict, level));
             p_cdicts.push(Arc::new(CDict::new(dict, level).expect("a CDict")));
         }
@@ -793,9 +814,9 @@ fn compress2_compresses_as_libzstd_does() {
             } else {
                 bound
             };
-            let mut c_out = vec![0u8; room];
+            let mut c_out = vec![0u8; room + SLACK];
             let mut p_out = vec![0u8; room];
-            let want = c.compress2(&mut c_out[..], &content).map_err(name);
+            let want = c.compress2(&mut c_out[..room], &content).map_err(name);
             let got = p.compress2(&mut p_out, &content).map_err(message);
             if want != got {
                 problems.add(format!(

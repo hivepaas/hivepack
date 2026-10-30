@@ -187,6 +187,9 @@ pub(crate) struct SeqStore {
     pub(crate) long_length_type: LongLengthType,
     /// The sequence with the long length.
     pub(crate) long_length_pos: u32,
+    /// `maxNbSeq`: the most sequences a block may have, which the
+    /// sequences given by the caller are checked against.
+    pub(crate) max_nb_seq: usize,
 }
 
 /// `ZSTD_LLcode`: the code of a literal length.
@@ -864,6 +867,11 @@ pub(crate) struct MatchState {
     /// `lazySkipping`: the lazy strategies, over input without matches,
     /// insert only the positions they search.
     pub(crate) lazy_skipping: bool,
+    /// `forceNonContiguous`: whether the next window update starts a new
+    /// segment even where the input follows the one before in memory: set
+    /// by a dictionary's loading with `deterministicRefPrefix`, cleared by
+    /// the update it makes.
+    pub(crate) force_non_contiguous: bool,
     pub(crate) c_params: CompressionParameters,
 
     // The row match finder.
@@ -920,6 +928,7 @@ impl MatchState {
             next_to_update: 0,
             loaded_dict_end: 0,
             lazy_skipping: false,
+            force_non_contiguous: false,
             c_params,
             row_hash_log: 0,
             tag_table: Vec::new(),
@@ -1527,6 +1536,7 @@ impl SeqStore {
             of_code: Vec::with_capacity(max_nb_seq),
             long_length_type: LongLengthType::None,
             long_length_pos: 0,
+            max_nb_seq,
         }
     }
 
@@ -1545,6 +1555,7 @@ impl SeqStore {
         self.lit_len = 0;
         self.long_length_type = LongLengthType::None;
         self.long_length_pos = 0;
+        self.max_nb_seq = max_nb_seq;
     }
 
     /// A store of `literals` and room for `nb_seq` sequences, for tests.
@@ -1636,6 +1647,64 @@ impl SeqStore {
         self.lit_buffer[op..op + last_ll_size].copy_from_slice(&src[anchor..anchor + last_ll_size]);
         self.lit_len += last_ll_size;
     }
+
+    /// `ZSTD_storeSeq`, for a sequence the caller gives: its `lit_length`
+    /// literals at `literals` in `src`, which must lie in it. The lengths
+    /// are taken as libzstd's arithmetic takes them, without the checks of
+    /// [`SeqStore::store_seq`] that a match finder's sequences make sense:
+    /// a match length under `MINMATCH` wraps around to a long one, and of
+    /// several long lengths in a block the last is marked.
+    pub(crate) fn store_external_seq(
+        &mut self,
+        src: &[u8],
+        literals: usize,
+        lit_length: u32,
+        off_base: u32,
+        match_length: u32,
+    ) {
+        let lit_length_usize = lit_length as usize;
+        let lit_end = literals + lit_length_usize;
+        let op = self.lit_len;
+        if lit_end + WILDCOPY_OVERLENGTH <= src.len() {
+            copy16(&mut self.lit_buffer, op, src, literals);
+            if lit_length_usize > 16 {
+                wildcopy(
+                    &mut self.lit_buffer,
+                    op + 16,
+                    src,
+                    literals + 16,
+                    lit_length_usize - 16,
+                );
+            }
+        } else {
+            self.lit_buffer[op..op + lit_length_usize].copy_from_slice(&src[literals..lit_end]);
+        }
+        self.lit_len += lit_length_usize;
+        self.push_external_seq(lit_length, off_base, match_length);
+    }
+
+    /// `ZSTD_storeSeqOnly`, for a sequence the caller gives, its literals
+    /// elsewhere: the lengths taken as [`SeqStore::store_external_seq`]
+    /// takes them.
+    pub(crate) fn push_external_seq(&mut self, lit_length: u32, off_base: u32, match_length: u32) {
+        if lit_length > 0xFFFF {
+            self.long_length_type = LongLengthType::LiteralLength;
+            self.long_length_pos = self.sequences.len() as u32;
+        }
+        // libzstd's `size_t` subtraction: under MINMATCH, it wraps around
+        // to a length past 0xFFFF.
+        let ml_base =
+            (match_length as usize).wrapping_sub(crate::common::zstd_internal::MINMATCH as usize);
+        if ml_base > 0xFFFF {
+            self.long_length_type = LongLengthType::MatchLength;
+            self.long_length_pos = self.sequences.len() as u32;
+        }
+        self.sequences.push(SeqDef {
+            off_base,
+            lit_length: lit_length as u16,
+            ml_base: ml_base as u16,
+        });
+    }
 }
 
 /// A run of a block's sequences and their literals, as positions in its
@@ -1698,6 +1767,31 @@ impl SeqStore {
             long_length_pos: chunk.long_length_pos,
         }
     }
+}
+
+/// `ZSTD_SequenceLength`: the lengths of a sequence, as it decodes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SequenceLength {
+    pub(crate) lit_length: u32,
+    pub(crate) match_length: u32,
+}
+
+/// `ZSTD_getSequenceLength`: the lengths of the sequence `idx` of `seqs`,
+/// with the 0x10000 more of the one with a long length.
+pub(crate) fn zstd_get_sequence_length(seqs: &SeqStoreView<'_>, idx: usize) -> SequenceLength {
+    let seq = &seqs.sequences[idx];
+    let mut seq_len = SequenceLength {
+        lit_length: u32::from(seq.lit_length),
+        match_length: u32::from(seq.ml_base) + crate::common::zstd_internal::MINMATCH,
+    };
+    if seqs.long_length_pos as usize == idx {
+        match seqs.long_length_type {
+            LongLengthType::LiteralLength => seq_len.lit_length += 0x10000,
+            LongLengthType::MatchLength => seq_len.match_length += 0x10000,
+            LongLengthType::None => {}
+        }
+    }
+    seq_len
 }
 
 /// `WILDCOPY_OVERLENGTH`: how far past their end copies in pieces may

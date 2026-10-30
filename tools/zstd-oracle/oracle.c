@@ -875,6 +875,141 @@ static void compress(char** args, int nargs)
 }
 
 static unsigned long long fnv64(const unsigned char* bytes, size_t n);
+static unsigned long long fnv64_from(unsigned long long hash, const void* bytes, size_t n);
+
+/* ---- Sequences ---- */
+
+/* ZSTD_sequenceBound(MAX_BYTES): room for the sequences of any input. */
+#define MAX_SEQS (MAX_BYTES / 3 + 1 + MAX_BYTES / 1024 + 1)
+#define MAX_PRODUCERS 64
+
+/* The sequences of the cstream steps 21 to 27: given with the request, or
+ * made by its steps. */
+static ZSTD_Sequence seqs[MAX_SEQS];
+static long long seq_values[4 * MAX_SEQS];
+
+/* FNV-1a of sequences, each as its four fields, little-endian. */
+static unsigned long long seqs_hash(const ZSTD_Sequence* s, size_t n)
+{
+    unsigned long long hash = 0xcbf29ce484222325ULL;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char b[16];
+        MEM_writeLE32(b, s[i].offset);
+        MEM_writeLE32(b + 4, s[i].litLength);
+        MEM_writeLE32(b + 8, s[i].matchLength);
+        MEM_writeLE32(b + 12, s[i].rep);
+        hash = fnv64_from(hash, b, 16);
+    }
+    return hash;
+}
+
+/* The sequence producer of the cstream step 19, mirrored by the Rust tests:
+ * a greedy match finder over the block alone (no history), deterministic,
+ * that fails as it is told.
+ *   kind & 3: 0 matches of 4 bytes or more, from a hash table of 2^(8 +
+ *             level % 8) entries; 1 the same, of 3 bytes or more; 2 only
+ *             literals, one delimiter; 3 as 0, the last offset tried first
+ *             (repeat offsets);
+ *   kind & 4: always ends with a delimiter, of no literals if need be
+ *             (otherwise only when literals are left);
+ *   kind & 8: the delimiter without the last literals (a parse that does
+ *             not add up);
+ *   kind & 16: every fifth match cut to 2 bytes (too short);
+ *   kind & 32: every third match with an offset of 2^31 - 1 (too far).
+ * Every errorEvery-th call (none for 0) fails instead, in turn returning
+ * ZSTD_SEQUENCE_PRODUCER_ERROR, the room plus 1, 0, and the room filled
+ * with sequences, no delimiter last. */
+typedef struct {
+    unsigned kind;
+    unsigned errorEvery;
+    unsigned calls;
+} OracleProducer;
+
+static U32 producer_table[1 << 15];
+
+static size_t oracle_producer(void* opaque, ZSTD_Sequence* outSeqs, size_t outSeqsCapacity,
+                              const void* src, size_t srcSize, const void* dict, size_t dictSize,
+                              int compressionLevel, size_t windowSize)
+{
+    OracleProducer* const state = (OracleProducer*)opaque;
+    const BYTE* const base = (const BYTE*)src;
+    unsigned const call = state->calls++;
+    unsigned const variant = state->kind & 3;
+    size_t const mls = variant == 1 ? 3 : 4;
+    unsigned const hashLog = 8 + (unsigned)(compressionLevel < 0 ? 0 : compressionLevel % 8);
+    size_t pos = 0, anchor = 0, n = 0;
+    U32 lastOffset = 0;
+    (void)dict;
+    (void)dictSize;
+    if (state->errorEvery != 0 && call % state->errorEvery == state->errorEvery - 1) {
+        switch ((call / state->errorEvery) % 4) {
+        case 0: return ZSTD_SEQUENCE_PRODUCER_ERROR;
+        case 1: return outSeqsCapacity + 1;
+        case 2: return 0;
+        default: {
+            size_t i;
+            for (i = 0; i < outSeqsCapacity; i++) {
+                outSeqs[i].offset = 1;
+                outSeqs[i].litLength = 0;
+                outSeqs[i].matchLength = 1;
+                outSeqs[i].rep = 0;
+            }
+            return outSeqsCapacity;
+        } }
+    }
+    if (variant == 2) {
+        outSeqs[0].offset = 0;
+        outSeqs[0].litLength = (U32)srcSize;
+        outSeqs[0].matchLength = 0;
+        outSeqs[0].rep = 0;
+        return 1;
+    }
+    memset(producer_table, 0, sizeof(U32) << hashLog);
+    while (pos + 4 <= srcSize && n + 2 < outSeqsCapacity) {
+        size_t length = 0;
+        int found = 0;
+        size_t matchStart = 0;
+        if (variant == 3 && lastOffset != 0 && lastOffset <= pos) {
+            size_t const cand = pos - lastOffset;
+            while (pos + length < srcSize && base[cand + length] == base[pos + length]) length++;
+            if (length >= mls) { found = 1; matchStart = cand; } else length = 0;
+        }
+        {   U32 const value = mls == 3
+                ? (U32)base[pos] | (U32)base[pos + 1] << 8 | (U32)base[pos + 2] << 16
+                : MEM_readLE32(base + pos);
+            U32 const h = (value * 2654435761u) >> (32 - hashLog);
+            U32 const cand = producer_table[h];
+            producer_table[h] = (U32)pos + 1;
+            if (!found && cand != 0 && pos - (cand - 1) <= windowSize) {
+                size_t const c = cand - 1;
+                while (pos + length < srcSize && base[c + length] == base[pos + length]) length++;
+                if (length >= mls) { found = 1; matchStart = c; } else length = 0;
+            }
+        }
+        if (!found) { pos++; continue; }
+        {   U32 offset = (U32)(pos - matchStart);
+            lastOffset = offset;
+            if ((state->kind & 16) && n % 5 == 4) length = 2;
+            if ((state->kind & 32) && n % 3 == 2) offset = 0x7FFFFFFF;
+            outSeqs[n].offset = offset;
+            outSeqs[n].litLength = (U32)(pos - anchor);
+            outSeqs[n].matchLength = (U32)length;
+            outSeqs[n].rep = 0;
+            n++;
+            pos += length;
+            anchor = pos;
+        }
+    }
+    if ((state->kind & 4) || anchor < srcSize) {
+        outSeqs[n].offset = 0;
+        outSeqs[n].litLength = (state->kind & 8) ? 0 : (U32)(srcSize - anchor);
+        outSeqs[n].matchLength = 0;
+        outSeqs[n].rep = 0;
+        n++;
+    }
+    return n;
+}
 
 /* A new compression context through steps of three numbers, op a b, over
  * `input` and `output` (of capacity `cap`), from where the last step left
@@ -898,22 +1033,63 @@ static unsigned long long fnv64(const unsigned char* bytes, size_t n);
  *       context's requested parameters, as ZSTD_dct_auto, _rawContent,
  *       _fullDict for b 0, 1, 2;
  *   18: ZSTD_CCtx_refCDict(NULL).
- * Answers each step's result (s for success of 7 to 9 and 11 to 18, n for a
- * CDict not made) with the positions, then a hash of the output. After an
- * error of a compression call, the session is reset, as a context must be
- * before it is used again; but for buffers not as stable as promised,
- * which is found before anything changes. */
+ * With the sequences <seqs>, an optional fifth argument (quadruples offset,
+ * litLength, matchLength, rep; <dicthex> "-" for none), the steps of the
+ * sequence API, over "the window": sequences first a, b of them (all of
+ * them at first):
+ *   19: ZSTD_registerSequenceProducer, of the producer above (oracle_producer)
+ *       with the kind a and errorEvery b, a new state;
+ *   20: ZSTD_registerSequenceProducer(NULL);
+ *   21: ZSTD_compressSequences of the window, over the next a bytes of input,
+ *       into the next b of output;
+ *   22: ZSTD_compressSequencesAndLiterals of the window, the next a bytes of
+ *       input as the literals (their capacity the rest of the buffer), into
+ *       the next b of output, of the decompressed size set by 24 (or, if
+ *       negative, the window's lengths); then the input goes on that much
+ *       further, past the bytes the frame stands for;
+ *   23: the window: sequences a to a + b (b < 0: all of those after a);
+ *   24: the decompressed size of 22;
+ *   25: ZSTD_generateSequences of the next a bytes of input, into the
+ *       sequences, b of room (b < 0: ZSTD_sequenceBound), zeroed first;
+ *       the input stays where it is, and the sequences made become the
+ *       window, answered "<result>/<positions>:<FNV-1a of the sequences>";
+ *   26: ZSTD_CCtx_getParameter(a), answered "v<value>";
+ *   27: ZSTD_mergeBlockDelimiters of the window, which becomes the sequences
+ *       left, answered "m<count>:<FNV-1a of them>";
+ *   28: nothing (the Rust side then checks that the frames of 21 and 22
+ *       decode back).
+ * Answers each step's result (s for success of 7 to 9, 11 to 20, 23, 24 and
+ * 28, n for a CDict not made) with the positions, then a hash of the
+ * output. After an error of a compression call (0 to 6, 10), the session is
+ * reset, as a context must be before it is used again; but for buffers not
+ * as stable as promised, which is found before anything changes. */
 static void cstream(char** args, int nargs)
 {
     static long long steps[3 * 4096];
     static unsigned char dict[MAX_BYTES];
     static ZSTD_CDict* cdicts[4096];
+    static OracleProducer producers[MAX_PRODUCERS];
     ZSTD_CCtx* cctx;
     size_t cap, r, inPos = 0, outPos = 0;
-    long n, nsteps, i, dictSize = 0, ncdicts = 0;
+    size_t nseqs = 0, winFirst = 0, winCount = 0;
+    long long decompressed = -1;
+    long n, nsteps, i, dictSize = 0, ncdicts = 0, nproducers = 0;
     char text[80];
-    if ((nargs != 3 && nargs != 4) || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
-    if (nargs == 4 && (dictSize = parse_hex_into(args[3], dict)) < 0) { puts("bad"); return; }
+    if ((nargs < 3 || nargs > 5) || (n = parse_hex(args[2])) < 0) { puts("bad"); return; }
+    if (nargs >= 4 && (dictSize = parse_hex_into(args[3], dict)) < 0) { puts("bad"); return; }
+    if (nargs == 5) {
+        long const values = parse_list(args[4], seq_values, 4 * MAX_SEQS);
+        long k;
+        if (values < 0 || values % 4) { puts("bad"); return; }
+        nseqs = (size_t)values / 4;
+        for (k = 0; k < (long)nseqs; k++) {
+            seqs[k].offset = (unsigned)seq_values[4 * k];
+            seqs[k].litLength = (unsigned)seq_values[4 * k + 1];
+            seqs[k].matchLength = (unsigned)seq_values[4 * k + 2];
+            seqs[k].rep = (unsigned)seq_values[4 * k + 3];
+        }
+        winCount = nseqs;
+    }
     cap = strtoul(args[0], NULL, 10);
     nsteps = parse_list(args[1], steps, 3 * 4096);
     if (cap > MAX_BYTES || nsteps < 0 || nsteps % 3) { puts("bad"); return; }
@@ -928,6 +1104,7 @@ static void cstream(char** args, int nargs)
         size_t const dictAt = (size_t)(a < 0 ? 0 : a) < (size_t)dictSize ? (size_t)(a < 0 ? 0 : a) : (size_t)dictSize;
         size_t const dictLen = (size_t)(b < 0 ? 0 : b) < (size_t)dictSize - dictAt ? (size_t)(b < 0 ? 0 : b) : (size_t)dictSize - dictAt;
         int noCDict = 0;
+        int value = 0;
         ZSTD_inBuffer in;
         ZSTD_outBuffer out;
         in.src = input;
@@ -978,7 +1155,56 @@ static void cstream(char** args, int nargs)
             break;
         }
         case 18: r = ZSTD_CCtx_refCDict(cctx, NULL); break;
+        case 19:
+            if (nproducers == MAX_PRODUCERS) goto bad;
+            producers[nproducers].kind = (unsigned)a;
+            producers[nproducers].errorEvery = (unsigned)b;
+            producers[nproducers].calls = 0;
+            ZSTD_registerSequenceProducer(cctx, &producers[nproducers++], oracle_producer);
+            r = 0;
+            break;
+        case 20: ZSTD_registerSequenceProducer(cctx, NULL, NULL); r = 0; break;
+        case 21:
+            r = ZSTD_compressSequences(cctx, output + outPos, out.size - outPos,
+                                       seqs + winFirst, winCount, input + inPos, in.size - inPos);
+            if (!ZSTD_isError(r)) { in.pos = in.size; out.pos = outPos + r; }
+            break;
+        case 22: {
+            size_t const litSize = in.size - inPos;
+            size_t total = 0, k;
+            for (k = 0; k < winCount; k++)
+                total += (size_t)seqs[winFirst + k].litLength + (size_t)seqs[winFirst + k].matchLength;
+            {   size_t const dSize = decompressed < 0 ? total : (size_t)decompressed;
+                r = ZSTD_compressSequencesAndLiterals(cctx, output + outPos, out.size - outPos,
+                        seqs + winFirst, winCount, input + inPos, litSize, MAX_BYTES - inPos, dSize);
+                if (!ZSTD_isError(r)) {
+                    in.pos = dSize < (size_t)n - in.size ? in.size + dSize : (size_t)n;
+                    out.pos = outPos + r;
+                }
+            }
+            break;
+        }
+        case 23:
+            winFirst = (size_t)(a < 0 ? 0 : a) < nseqs ? (size_t)(a < 0 ? 0 : a) : nseqs;
+            winCount = b < 0 || (size_t)b > nseqs - winFirst ? nseqs - winFirst : (size_t)b;
+            r = 0;
+            break;
+        case 24: decompressed = a; r = 0; break;
+        case 25: {
+            size_t const srcSize = in.size - inPos;
+            size_t const room = b < 0 ? ZSTD_sequenceBound(srcSize) : (size_t)b;
+            if (room > MAX_SEQS) goto bad;
+            memset(seqs, 0, room * sizeof(ZSTD_Sequence));
+            r = ZSTD_generateSequences(cctx, seqs, room, input + inPos, srcSize);
+            if (!ZSTD_isError(r)) { nseqs = r; winFirst = 0; winCount = r; }
+            in.pos = inPos;
+            break;
+        }
+        case 26: r = ZSTD_CCtx_getParameter(cctx, (ZSTD_cParameter)a, &value); break;
+        case 27: winCount = ZSTD_mergeBlockDelimiters(seqs + winFirst, winCount); r = 0; break;
+        case 28: r = 0; break;
         default:
+        bad:
             ZSTD_freeCCtx(cctx);
             while (ncdicts > 0) ZSTD_freeCDict(cdicts[--ncdicts]);
             puts("bad");
@@ -994,7 +1220,15 @@ static void cstream(char** args, int nargs)
                      (unsigned)inPos, (unsigned)outPos);
         else if (noCDict)
             snprintf(text, sizeof(text), " n");
-        else if ((op >= 7 && op <= 9) || op >= 11)
+        else if (op == 25)
+            snprintf(text, sizeof(text), " %u/%u/%u:%016llx", (unsigned)r, (unsigned)inPos,
+                     (unsigned)outPos, seqs_hash(seqs, r));
+        else if (op == 26)
+            snprintf(text, sizeof(text), " v%d", value);
+        else if (op == 27)
+            snprintf(text, sizeof(text), " m%u:%016llx", (unsigned)winCount,
+                     seqs_hash(seqs + winFirst, winCount));
+        else if ((op >= 7 && op <= 9) || (op >= 11 && op != 21 && op != 22))
             snprintf(text, sizeof(text), " s");
         else
             snprintf(text, sizeof(text), " %u/%u/%u", (unsigned)r, (unsigned)inPos,

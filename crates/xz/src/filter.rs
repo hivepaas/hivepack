@@ -519,6 +519,16 @@ fn encoder_filter_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>, Ret> {
 /// the first coder, which reads from the one before it, and so on to the
 /// first filter, which reads the input.
 pub(crate) fn raw_encoder_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>, Ret> {
+    raw_encoder_reinit(filters, None)
+}
+
+/// `lzma_raw_encoder_init` with the coder of an earlier call: an LZ encoder
+/// of the kind the chain needs keeps its memory, as liblzma's does when
+/// `lzma_next_coder_init()` finds a coder of the same kind.
+pub(crate) fn raw_encoder_reinit(
+    filters: &[Filter],
+    old: Option<Box<dyn NextCoder>>,
+) -> Result<Box<dyn NextCoder>, Ret> {
     // Do some basic validation and get the number of filters.
     let count = validate_chain(filters)?;
 
@@ -526,6 +536,20 @@ pub(crate) fn raw_encoder_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>,
         if !encoder_is_supported(filter.id) {
             return Err(Ret::OptionsError);
         }
+    }
+
+    if let (Some((filter, rest)), Some(mut coder)) = (
+        filters[..count].split_last(),
+        old.and_then(NextCoder::into_lz_encoder),
+    ) && coder.is_kind_of(filter.id)
+    {
+        coder.reinit(filter.id, lzma_options(filter)?)?;
+        coder.set_next(if rest.is_empty() {
+            None
+        } else {
+            Some(encoder_filter_init(rest)?)
+        });
+        return Ok(coder);
     }
 
     encoder_filter_init(&filters[..count])
@@ -689,4 +713,119 @@ pub(crate) fn filters_copy(filters: &[Filter]) -> Result<Vec<Filter>, Ret> {
         }
     }
     Ok(filters.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::Action;
+    use crate::lzma_common::{MatchFinder, Mode};
+
+    /// `data` to its end through `coder`, in calls of `room` bytes of output.
+    fn encode(coder: &mut dyn NextCoder, data: &[u8], room: usize) -> Vec<u8> {
+        let mut out = vec![0; data.len() * 2 + 1024];
+        let (mut in_pos, mut out_pos) = (0, 0);
+        loop {
+            let end = (out_pos + room).min(out.len());
+            let ret = coder.code(
+                data,
+                &mut in_pos,
+                &mut out[..end],
+                &mut out_pos,
+                Action::Finish,
+            );
+            if ret == Ret::StreamEnd {
+                out.truncate(out_pos);
+                return out;
+            }
+            assert_eq!(ret, Ret::Ok);
+        }
+    }
+
+    /// Chains of each kind of LZ encoder that differ in what the encoders
+    /// keep: the mode, the match finder, the sizes of the buffers, lc, lp
+    /// and pb, a preset dictionary, and the filters before.
+    fn chains() -> Vec<Vec<Filter>> {
+        let options = |preset| LzmaOptions::preset(preset).unwrap_or_default();
+        let normal = LzmaOptions {
+            dict_size: 1 << 20,
+            ..options(6)
+        };
+        let small = LzmaOptions {
+            dict_size: 4096,
+            lc: 1,
+            lp: 2,
+            pb: 1,
+            mode: Mode::NORMAL,
+            mf: MatchFinder::BT2,
+            ..options(1)
+        };
+        let dictionary = LzmaOptions {
+            preset_dict: Some((0..1000u32).map(|i| (i % 7) as u8).collect()),
+            ..options(2)
+        };
+        let ext = Filter {
+            id: FILTER_LZMA1EXT,
+            options: Some(FilterOptions::Lzma(LzmaOptions {
+                ext_flags: LZMA1EXT_ALLOW_EOPM,
+                ..options(3)
+            })),
+        };
+        vec![
+            vec![Filter::lzma2(options(0))],
+            vec![Filter::lzma2(normal.clone())],
+            vec![Filter::lzma2(small.clone())],
+            vec![Filter::lzma2(dictionary.clone())],
+            vec![Filter::lzma1(options(1))],
+            vec![Filter::lzma1(normal)],
+            vec![Filter::lzma1(dictionary)],
+            vec![ext],
+            vec![Filter::delta(4), Filter::lzma2(options(0))],
+            vec![
+                Filter::bcj(FILTER_X86, 16),
+                Filter::delta(2),
+                Filter::lzma1(small),
+            ],
+        ]
+    }
+
+    /// An encoder made again, as liblzma makes one for the next Block,
+    /// writes what a new one writes: whatever it was before, and whether it
+    /// had finished, was left in the middle of its input, or was left one
+    /// byte before its end, when flushing.
+    #[test]
+    fn an_encoder_made_again_writes_what_a_new_one_writes() {
+        let mut data = Vec::new();
+        for i in 0..30_000u32 {
+            data.push((i.wrapping_mul(2_654_435_761) >> (24 + i % 5)) as u8);
+        }
+
+        let chains = chains();
+        for before in &chains {
+            let whole = encode(raw_encoder_init(before).unwrap().as_mut(), &data, 1 << 20);
+            for after in &chains {
+                let mut new = raw_encoder_init(after).unwrap();
+                let want = encode(new.as_mut(), &data, 1000);
+
+                // Where the encoder before is left: how much output it gets.
+                for (action, room) in [
+                    (Action::Finish, whole.len()),
+                    (Action::Run, 100),
+                    (Action::Finish, whole.len() - 1),
+                ] {
+                    let mut old = raw_encoder_init(before).unwrap();
+                    let mut out = vec![0; room];
+                    let (mut in_pos, mut out_pos) = (0, 0);
+                    let ret = old.code(&data, &mut in_pos, &mut out, &mut out_pos, action);
+                    assert!(ret == Ret::Ok || ret == Ret::StreamEnd);
+
+                    let mut again = raw_encoder_reinit(after, Some(old)).unwrap();
+                    assert!(
+                        encode(again.as_mut(), &data, 777) == want,
+                        "{before:?} left at {room} bytes, then {after:?}",
+                    );
+                }
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use crate::common::{
 };
 use crate::filter::{
     FILTER_LZMA2, FILTERS_MAX, Filter, FilterOptions, filter_flags_decode, filter_flags_encode,
-    filter_flags_size, raw_decoder_init, raw_encoder_init,
+    filter_flags_size, raw_decoder_init, raw_encoder_init, raw_encoder_reinit,
 };
 use crate::lzma_common::{DICT_SIZE_MIN, LzmaOptions};
 use crate::lzma_encoder::LZMA2_CHUNK_MAX;
@@ -596,8 +596,9 @@ pub(crate) struct BlockEncoder {
 }
 
 impl BlockEncoder {
-    /// `lzma_block_encoder_init`.
-    pub(crate) fn new(block: Block) -> Result<BlockEncoder, Ret> {
+    /// `lzma_block_encoder_init`, with the coder of the Block before if
+    /// any, whose LZ encoder keeps its memory, as liblzma's does.
+    pub(crate) fn new(block: Block, old: Option<BlockEncoder>) -> Result<BlockEncoder, Ret> {
         // The contents of the structure may depend on the version so check
         // the version first.
         if block.version > 1 {
@@ -616,7 +617,7 @@ impl BlockEncoder {
 
         // Initialize the check, then the requested filters.
         let check = CheckState::new(block.check);
-        let next = raw_encoder_init(&block.filters)?;
+        let next = raw_encoder_reinit(&block.filters, old.map(|old| old.next))?;
 
         Ok(BlockEncoder {
             next,

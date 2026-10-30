@@ -231,13 +231,20 @@ pub(crate) struct LzmaEncoder {
 }
 
 impl LzmaEncoder {
-    /// `lzma_lzma_encoder_create`: the encoder of `id` with `options`,
-    /// and the LZ encoder's options.
+    /// `lzma_lzma_encoder_create` without an encoder: the encoder of `id`
+    /// with `options`, and the LZ encoder's options.
     pub(crate) fn create(
         id: u64,
         options: &LzmaOptions,
     ) -> Result<(LzmaEncoder, LzEncOptions), Ret> {
-        let mut coder = LzmaEncoder {
+        let mut coder = LzmaEncoder::blank();
+        let lz_options = coder.init(id, options)?;
+        Ok((coder, lz_options))
+    }
+
+    /// The memory of an encoder, not yet ready to encode.
+    pub(crate) fn blank() -> LzmaEncoder {
+        LzmaEncoder {
             rc: RangeEncoder::new(),
             uncomp_size: 0,
             state: STATE_LIT_LIT,
@@ -267,7 +274,13 @@ impl LzmaEncoder {
             // leaves opts[] uninitialised, and only the normal mode uses
             // it; here only the normal mode has it, initialised.
             opts: Box::default(),
-        };
+        }
+    }
+
+    /// `lzma_lzma_encoder_create` with an encoder, whose memory is kept: it
+    /// becomes the encoder of `id` with `options`; the LZ encoder's options.
+    pub(crate) fn init(&mut self, id: u64, options: &LzmaOptions) -> Result<LzEncOptions, Ret> {
+        let coder = self;
 
         // Set compression mode. Note that we haven't validated the options
         // yet. Invalid options will get rejected by
@@ -276,7 +289,9 @@ impl LzmaEncoder {
             Mode::FAST => coder.fast_mode = true,
             Mode::NORMAL => {
                 coder.fast_mode = false;
-                coder.opts = vec![Optimal::default(); OPTS].into_boxed_slice();
+                if coder.opts.is_empty() {
+                    coder.opts = vec![Optimal::default(); OPTS].into_boxed_slice();
+                }
 
                 // Set dist_table_size. Round the dictionary size up to
                 // next 2^n.
@@ -337,7 +352,7 @@ impl LzmaEncoder {
 
         let lz_options = set_lz_options(options);
         coder.reset(options)?;
-        Ok((coder, lz_options))
+        Ok(lz_options)
     }
 
     /// `lzma_lzma_encoder_reset`.

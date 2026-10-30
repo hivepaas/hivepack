@@ -17,8 +17,17 @@
 //! sequences found outside the match finder, the caller's
 //! ([`CCtx::compress_sequences`], [`CCtx::compress_sequences_and_literals`])
 //! or those a match finder of the caller's gives for each block
-//! ([`CCtx::register_sequence_producer`]). The plan, and the rules the port
-//! follows, are in the repository: `docs/porting.md` and `docs/safety.md`.
+//! ([`CCtx::register_sequence_producer`]). Dictionaries are trained from
+//! samples as libzstd trains them, byte for byte: by the default trainer
+//! ([`train_from_buffer`]), the COVER and fast COVER trainers
+//! ([`train_from_buffer_cover`], [`train_from_buffer_fast_cover`]) and
+//! their optimizers ([`optimize_train_from_buffer_cover`],
+//! [`optimize_train_from_buffer_fast_cover`]), on several threads too, and
+//! the legacy trainer ([`train_from_buffer_legacy`]); and a content of the
+//! caller's gets a dictionary's header ([`finalize_dictionary`]). The plan,
+//! and the
+//! rules the port follows, are in the repository: `docs/porting.md` and
+//! `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -123,6 +132,35 @@
 //! # }
 //! ```
 //!
+//! Training a dictionary, then compressing a small input with it:
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_zstd::Error> {
+//! use hivepack_zstd::{CCtx, CDict, DCtx, DDict};
+//!
+//! // Samples like the inputs to come, one after the other, and their sizes.
+//! let mut samples = Vec::new();
+//! let mut sizes = Vec::new();
+//! for i in 0..500 {
+//!     let sample = format!("{{\"id\":{i},\"kind\":\"event\",\"ok\":{}}}", i % 3 == 0);
+//!     samples.extend_from_slice(sample.as_bytes());
+//!     sizes.push(sample.len());
+//! }
+//! let mut dict = vec![0; 2048];
+//! let size = hivepack_zstd::train_from_buffer(&mut dict, &samples, &sizes)?;
+//! dict.truncate(size);
+//!
+//! let input = br#"{"id":1234,"kind":"event","ok":false}"#;
+//! let cdict = CDict::new(&dict, 3)?;
+//! let mut frame = vec![0; hivepack_zstd::compress_bound(input.len()).unwrap_or(0)];
+//! let n = CCtx::new().compress_using_cdict(&mut frame, input, &cdict)?;
+//! let mut out = vec![0; input.len()];
+//! let back = DCtx::new().decompress_using_ddict(&mut out, &frame[..n], &DDict::new(&dict)?)?;
+//! assert_eq!(&out[..back], input);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Decompressing a frame:
 //!
 //! ```
@@ -190,13 +228,18 @@
 mod common;
 mod compress;
 mod decompress;
+mod dict_builder;
 
 #[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod oracle_compress;
 #[cfg(test)]
+mod oracle_dict_legacy;
+#[cfg(test)]
 mod oracle_sequences;
+#[cfg(test)]
+mod oracle_zdict;
 
 pub use common::error_private::{Error, ErrorCode, Result};
 pub use compress::zstd_cdict::CDict;
@@ -218,10 +261,30 @@ pub use decompress::zstd_decompress::{
 pub use decompress::zstd_decompress_internal::{
     CONTENTSIZE_UNKNOWN, DCtx, Format, FrameHeader, FrameType,
 };
+pub use dict_builder::cover::{
+    CoverParams, optimize_train_from_buffer_cover, train_from_buffer_cover,
+};
+pub use dict_builder::fastcover::{
+    FastCoverParams, optimize_train_from_buffer_fast_cover, train_from_buffer_fast_cover,
+};
+pub use dict_builder::legacy::{LegacyParams, train_from_buffer_legacy};
+pub use dict_builder::zdict::{
+    DictParams, add_entropy_tables_from_buffer, finalize_dictionary, get_dict_header_size,
+    get_dict_id, train_from_buffer,
+};
 
 /// The libzstd release this crate follows, as libzstd's
 /// `ZSTD_VERSION_STRING` gives it.
 pub const UPSTREAM_VERSION: &str = "1.5.7";
+
+/// The suffix array of `text` into `sa[..text.len()]`, as the dictionary
+/// builder sorts its samples: libdivsufsort's `divsufsort`, which libzstd
+/// ships. Not part of the API, which libzstd does not have it in either:
+/// it is public for the `divsufsort` fuzzer.
+#[doc(hidden)]
+pub fn divsufsort(text: &[u8], sa: &mut [i32]) -> Result<()> {
+    dict_builder::divsufsort::divsufsort(text, sa)
+}
 
 /// Whether this build has the `unsafe-fast` feature: the decoder's copies
 /// without per-piece bounds checks, and the row match finder's prefetching.

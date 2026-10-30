@@ -441,12 +441,13 @@ impl Dicts {
         }
         let mut c_cdicts = Vec::new();
         let mut p_cdicts = Vec::new();
-        // On big-endian machines, CDicts of `fast` and `dfast` only: a frame
-        // that attaches one takes its strategy over the one `parameters`
-        // sets there, and libzstd's block splitter of `greedy` and up hashes
-        // pairs of bytes in the machine's order.
+        // On big-endian machines, CDicts of `fast` and `dfast` only, levels
+        // up to 3 (level 4 is `greedy` for dictionaries of up to 16 KB): a
+        // frame that attaches one takes its strategy over the one
+        // `parameters` sets there, and libzstd's block splitter of `greedy`
+        // and up hashes pairs of bytes in the machine's order.
         let levels = if cfg!(target_endian = "big") {
-            [1, 3, 2, 4, -2, 1, 0, 3]
+            [1, 3, 2, 3, -2, 1, 0, 2]
         } else {
             [1, 3, 5, 19, -2, 9, 0, 16]
         };

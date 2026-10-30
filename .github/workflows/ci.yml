@@ -292,6 +292,20 @@ jobs:
               pathlib.Path(f"fuzz/corpus/zip_open/d{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_open -- -max_total_time=120
+      - name: Seed the split corpus with Info-ZIP's split archives
+        run: |
+          mkdir -p fuzz/corpus/zip_split
+          python3 - <<'PY'
+          import pathlib, struct
+          folder = pathlib.Path("testdata/zip-split")
+          for last in sorted(folder.glob("*.zip")):
+              # The number of volumes less one, where each but the last ends, then the volumes.
+              parts = sorted(folder.glob(f"{last.stem}.z[0-9][0-9]")) + [last]
+              data = [p.read_bytes() for p in parts]
+              head = bytes([len(data) - 1]) + b"".join(struct.pack("<I", len(d)) for d in data[:-1])
+              pathlib.Path(f"fuzz/corpus/zip_split/{last.stem}").write_bytes(head + b"".join(data))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_split -- -max_total_time=60
       - name: Seed the editing corpus with the same archives, behind a few edits
         run: |
           mkdir -p fuzz/corpus/zip_edit

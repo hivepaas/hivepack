@@ -1284,6 +1284,29 @@ fn bzipped(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The flags of a Zstandard entry: mostly the quicker levels; now and then
+/// the slowest, and those past the ends, which leave the level to libzstd.
+/// Negative ones are among those: `zip_set_file_compression` cuts the flags
+/// to a `u16`.
+fn zstd_flags(rng: &mut Rng) -> u32 {
+    match rng.below(4) {
+        0 => rng.pick(&[
+            -131_073i32,
+            -131_072,
+            -100,
+            -5,
+            -1,
+            13,
+            16,
+            19,
+            22,
+            23,
+            65_535,
+        ]) as u32,
+        _ => rng.below(10) as u32,
+    }
+}
+
 /// `plain` as a ZIP entry's LZMA data, at a random preset: the magic, the
 /// properties, and the data, with the end of stream marker that liblzma's
 /// .lzma encoder writes (`true`), or without it, from raw LZMA1EXT.
@@ -1333,14 +1356,49 @@ fn xzed(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `plain` as Zstandard frames at a random level, with a checksum and the
+/// content size or not: now and then in two frames, after a skippable one.
+fn zstded(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
+    use hivepack_zstd::{CCtx, CParameter};
+    let mut out = Vec::new();
+    if rng.below(8) == 0 {
+        let skip = rng.below(20) as u32;
+        out.extend_from_slice(&(0x184d_2a50 + rng.below(16) as u32).to_le_bytes());
+        out.extend_from_slice(&skip.to_le_bytes());
+        out.extend((0..skip).map(|_| rng.next() as u8));
+    }
+    let at = match rng.below(8) {
+        0 => rng.below(plain.len() as u64 + 1) as usize,
+        _ => plain.len(),
+    };
+    let (first, second) = plain.split_at(at);
+    for (i, part) in [first, second].into_iter().enumerate() {
+        if i == 1 && part.is_empty() {
+            break;
+        }
+        let mut cctx = CCtx::new();
+        let level = rng.below(6) as i32 - 1;
+        cctx.set_parameter(CParameter::CompressionLevel(level))
+            .unwrap();
+        cctx.set_parameter(CParameter::ChecksumFlag(rng.below(2) == 0))
+            .unwrap();
+        cctx.set_parameter(CParameter::ContentSizeFlag(rng.below(2) == 0))
+            .unwrap();
+        let mut frame = vec![0; hivepack_zstd::compress_bound(part.len()).unwrap()];
+        let len = cctx.compress2(&mut frame, part).unwrap();
+        out.extend_from_slice(&frame[..len]);
+    }
+    out
+}
+
 fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
     let name = name(rng, earlier);
-    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 14, 95, 99, 93]);
+    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 14, 95, 93, 99, 98]);
     let plain = plain(rng);
     let mut lzma_eos = false;
     let data = match method {
         0 => plain.clone(),
-        8 | 12 | 14 | 95 => {
+        8 | 12 | 14 | 93 | 95 => {
             let mut data = match method {
                 8 => deflated(rng, &plain),
                 12 => bzipped(rng, &plain),
@@ -1349,6 +1407,7 @@ fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
                     lzma_eos = eos;
                     data
                 }
+                93 => zstded(rng, &plain),
                 _ => xzed(rng, &plain),
             };
             match rng.below(12) {
@@ -2054,9 +2113,13 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
             23 | 24 => {
                 // stored, deflated, the default, bzip2, and methods there
                 // are no compressors for, or that wrap to deflate as a u16
-                let method: i64 =
-                    rng.pick(&[0, 8, 8, -1, -1, 12, 12, 14, 14, 95, 95, 9, 65544, 99]);
-                let flags = rng.pick(&[0, 0, 1, 3, 6, 9, 10, 0xffff, 0x1_0005]);
+                let method: i64 = rng.pick(&[
+                    0, 8, 8, -1, -1, 12, 12, 14, 14, 95, 95, 93, 93, 9, 65544, 99,
+                ]);
+                let flags = match method {
+                    93 => zstd_flags(rng),
+                    _ => rng.pick(&[0, 0, 1, 3, 6, 9, 10, 0xffff, 0x1_0005]),
+                };
                 format!("z{i}:{method}:{flags}")
             }
             _ => {
@@ -2162,7 +2225,7 @@ fn encrypting_ops(rng: &mut Rng, max_len: u64) -> (String, Vec<Vec<u8>>) {
             1 => ops.push(format!("z{i}:8:{}", rng.below(10))),
             2 => ops.push(format!(
                 "z{i}:{}:{}",
-                rng.pick(&[12, 14, 95]),
+                rng.pick(&[12, 14, 93, 95]),
                 rng.below(10)
             )),
             _ => {}
@@ -2222,7 +2285,7 @@ fn encrypt_requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max_len: u
                 3 => format!("P{}", password(rng)),
                 4 => format!(
                     "z{i}:{}:{}",
-                    rng.pick(&[0, 8, -1, 12, 14, 95]),
+                    rng.pick(&[0, 8, -1, 12, 14, 93, 95]),
                     rng.below(10)
                 ),
                 5 => format!("m{i}:{}", 1_000_000_000 + rng.below(500_000_000)),
@@ -2525,6 +2588,31 @@ fn generated_archives_edit_like_libzip() {
     for request in edit_requests(&mut rng, 3000) {
         let want = oracle.ask(&request);
         assert_edit(&request, &want, &format!("{request:.400}"));
+    }
+}
+
+/// The levels libzip can reach, on more data than a block holds: to 22, those
+/// past it and the negative ones, which libzip's `u16` of flags puts past it
+/// too and leaves to libzstd, and those that wrap around into the range.
+#[test]
+fn zstd_entries_written_like_libzip_at_every_level() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x3000_0093);
+    let data = hex(&text(&mut rng, 300_000));
+    let mut levels = vec![-131_073i32, -131_072, -1000, 23, 65_535, 65_536 + 5];
+    levels.extend(-7..=22);
+    for level in levels {
+        let ops = format!(
+            "+{}:0:1000000000:{data}:{},z0:93:{}",
+            hex(b"a"),
+            rng.pick(&["s", "u"]),
+            level as u32
+        );
+        let request = format!("editb 0 0 {ops} -");
+        let want = oracle.ask(&request);
+        assert_edit(&request, &want, &format!("level {level}"));
     }
 }
 

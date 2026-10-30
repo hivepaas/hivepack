@@ -31,8 +31,8 @@
 //!
 //! Each [`Opener::open`] reads the file from its start again: the age
 //! layers' file keys are kept from the first, so that a passphrase is asked
-//! for once. A ZIP archive is read by random access; under layers, it must
-//! be taken out to a file first.
+//! for once. A ZIP archive and a UDF volume are read by random access; under
+//! layers, they must be taken out to a file first.
 //!
 //! The design is in the repository's `docs/open.md`.
 
@@ -42,6 +42,6 @@ mod error;
 mod open;
 
 pub use decode::DecodeError;
-pub use detect::{Container, Detected, HEAD_LEN, ISO_HEAD_LEN, Layer, detect};
+pub use detect::{Container, Detected, HEAD_LEN, ISO_HEAD_LEN, Layer, UDF_HEAD_LEN, detect};
 pub use error::Error;
 pub use open::{Limits, Opened, Opener};

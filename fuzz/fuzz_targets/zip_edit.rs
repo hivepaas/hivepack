@@ -356,8 +356,9 @@ fuzz_target!(|data: &[u8]| {
                     i32::from(cm::BZIP2),
                     i32::from(cm::LZMA),
                     i32::from(cm::XZ),
+                    i32::from(cm::ZSTD),
                 ]
-                    [usize::from(arg % 6)],
+                    [usize::from(arg % 7)],
                 u32::from(kind >> 4),
             ),
         };

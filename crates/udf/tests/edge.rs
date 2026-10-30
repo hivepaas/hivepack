@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use hivepack_udf::{Errno, Error, Options, Udf, VType};
 use support::image::{Entry, Kind, Layout, Map, Node, Volume, image};
@@ -373,4 +373,41 @@ fn damaged_images() {
             }
         }
     }
+}
+
+#[test]
+fn check_data_as_reading() {
+    // Cut short anywhere past the anchor: check_data fails where reading
+    // fails.
+    let bs = 2048;
+    let full = image(&volume(bs, Map::Physical));
+    let (mut ok, mut failed) = (0, 0);
+    for cut in 257..full.len() / bs {
+        let Ok(mut udf) = mount(full[..cut * bs].to_vec()) else {
+            continue;
+        };
+        let root = udf.root().clone();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            let entries: Vec<_> = udf.read_dir(&dir).unwrap().filter_map(Result::ok).collect();
+            for entry in entries.iter().filter(|e| !e.is_parent()) {
+                // A node past the cut does not read.
+                let Ok(node) = udf.node(entry.icb) else {
+                    continue;
+                };
+                match node.kind() {
+                    VType::VDIR => dirs.push(node),
+                    VType::VREG => {
+                        let mut data = Vec::new();
+                        let read = udf.file(&node).read_to_end(&mut data).is_ok();
+                        assert_eq!(udf.check_data(&node).is_ok(), read, "{:?}", entry.name);
+                        if read { ok += 1 } else { failed += 1 }
+                    }
+                    _ => assert!(udf.check_data(&node).is_err()),
+                }
+            }
+        }
+        assert_eq!(errno(udf.check_data(&udf.root().clone())), Errno::EISDIR);
+    }
+    assert!(ok > 0 && failed > 0, "{ok} {failed}");
 }

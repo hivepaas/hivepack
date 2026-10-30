@@ -51,7 +51,7 @@ use udf::{
     Device, UDF_VTOP_TYPE_META, UDF_VTOP_TYPE_PHYS, UDF_VTOP_TYPE_SPARABLE, UDF_VTOP_TYPE_VIRT,
     UdfMount,
 };
-use udf_subr::{udf_get_node, udf_read, udf_to_unix_name};
+use udf_subr::{udf_check_read, udf_get_node, udf_read, udf_to_unix_name};
 use udf_vfsops::{MountArgs, udf_logvol_closed, udf_mountfs};
 use udf_vnops::{DirStream, udf_do_readlink, udf_getattr, udf_lookup_name_in_dir};
 
@@ -276,6 +276,16 @@ impl<R: Read + Seek> Udf<R> {
         )?;
         buf[..out.len()].copy_from_slice(&out);
         Ok(out.len())
+    }
+
+    /// Not in NetBSD: checks that all the data of a regular file reads,
+    /// without reading it: each of its blocks is on the image, or zeros
+    /// (not recorded), or in the node. What reading it would fail with,
+    /// but an error of the image's reader, comes out here: a block past
+    /// the end of an image cut short, or allocation descriptors that do not
+    /// cover the file.
+    pub fn check_data(&mut self, node: &Node) -> Result<(), Error> {
+        udf_check_read(&self.dev, &self.ump, node)
     }
 
     /// The data of a regular file, to read and seek.

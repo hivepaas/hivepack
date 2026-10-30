@@ -2,7 +2,7 @@
 
 `hivepack-zip` will read and write ZIP archives. Its container logic is a port of [libzip](https://libzip.org) to safe Rust; its compression and encryption come from hivepack's own crates, each ported from or checked against an official library. What libzip does not do, such as split archives, legacy file name encodings and extracting to disk, is written for hivepack and checked against other implementations.
 
-> **Status:** steps 1 to 4 are done. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2, LZMA, XZ and Deflate64 entries as libzip does (libzip reads no Deflate64), compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). It edits archives, adds and replaces data, stored, deflated, bzip2, LZMA or XZ, and writes them as libzip does, byte for byte, and encrypts and decrypts ZipCrypto and WinZip AES entries, byte for byte as libzip with the same random bytes; 172 of libzip's own tests pass through `tools/ziptool`. What libzip does not do comes next (step 5).
+> **Status:** steps 1 to 4 are done. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard and Deflate64 entries as libzip does (libzip reads no Deflate64), compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). It edits archives, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes them as libzip does, byte for byte, and encrypts and decrypts ZipCrypto and WinZip AES entries, byte for byte as libzip with the same random bytes; 174 of libzip's own tests pass through `tools/ziptool`. What libzip does not do comes next (step 5).
 
 ## Why libzip
 
@@ -87,8 +87,74 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 - **Editing.** The oracle's `edit` requests open an archive from a file, make a list of edits (delete, rename, set an entry's or the archive's comment, its time in MS-DOS or Unix form, its external attributes, undo one entry's changes or all of them, set an archive flag, add or replace data, add a directory, set the compression method and level), answer each edit's result and what the API then says of every entry, and write the archive with `zip_close`. The port must answer the same and write the same bytes, or nothing where libzip leaves the file as it was or removes it. The generated archives are mostly ones that open, so that the edits are made; the edits take names and comments from the archive or make them up, in each encoding flag, with indices in range and not, and times before 1980, after 2107 and past what `localtime_r` takes. 3,000 requests are compared on each run, every regress archive is edited four ways, an archive of 65,539 entries is written with and without the Zip64 end of central directory records, and `testdata/oracle/zip-edit.txt` replays 556 answers. New data comes from a source in memory with a time, its size known or not (which makes the entry Zip64): empty, text, runs and bytes that do not compress, of 1 byte to 20,000, stored, deflated at each level, or `ZIP_CM_DEFAULT`, which stores what does not get smaller; entries are compressed again when their method changes, and converted to torrentzip. The deflate streams are hivepack-deflate's, which are zlib's. The edits include setting and deleting extra fields in either header or both, and the archives are opened with each of `ZIP_CREATE`, `ZIP_EXCL`, `ZIP_TRUNCATE` and `ZIP_RDONLY`. The oracle's `editb` requests do the same on a buffer source in fragments of 1 byte to 4 KiB, or one, which clones the start of the archive where it can (`Archive::close_to_cloning`): 2,000 are compared on each run, of which about half clone. Each archive the port writes is opened again and must have the entries that are left, in order, with their names, comments, attributes, times, sizes and data, unless bytes in it look like end records (see below).
 - **Writing.** For the same input, the port writes the same archive as libzip, byte for byte. libzip compresses with zlib's raw deflate (`windowBits` −15) at level 9 and `memLevel` 9 unless told otherwise (`zip_algorithm_deflate.c`), so this needs `hivepack-deflate` to give zlib's output at those settings, with libbzip2 at block size 9 and work factor 30 unless told otherwise (`zip_algorithm_bzip2.c`), which `hivepack-bzip2` gives the output of (see [bzip2.md](bzip2.md)), and with liblzma at preset 6 and its extreme flag unless told otherwise (`zip_algorithm_xz.c`), `.lzma` with a ZIP header of its own for method 14 and `.xz` with CRC64 for method 95, which `hivepack-xz` gives the output of (see [xz.md](xz.md)). Torrentzip output is compared too.
 - **LZMA and XZ.** The oracle builds libzip's `zip_algorithm_xz.c` with liblzma 5.8.4. The generated archives have LZMA entries, with the end of stream marker (general purpose bit 1) or without it and with the size from the central directory, now and then with the bit saying otherwise, and `.xz` entries at random presets and checks, cut short, with garbage after them or a byte changed; edits compress entries again with both methods at every level. libzip's five `set_compression` tests of LZMA and XZ, which `tools/ziptool` now takes, pass too. Like libzip built with its defaults, the port sets no limit on the window of an LZMA or XZ entry, so a header can ask for 4 GiB, reserved and written only as far as data is decoded; the fuzz targets are built with a limit of 300 MiB (libzip's `LIMIT_LZMA_WINDOW`), since libFuzzer counts what is reserved.
+- **Zstandard.** The oracle builds libzip's `zip_algorithm_zstd.c` with libzstd 1.5.7. The generated archives have Zstandard entries at low levels, with a checksum and the content size or not, some in two frames or after a skippable frame, cut short, with garbage after them or a byte changed; edits compress entries with it, and a test writes 300 KB at every level libzip can reach. Three things libzip does are kept: its `map_error` is given what libzstd's functions return, not `ZSTD_getErrorCode` of it, so every Zstandard error is `ZIP_ER_INTERNAL`, damaged data included, where `ZIP_ER_COMPRESSED_DATA` was meant; `zip_set_file_compression` cuts the flags to 16 bits, so negative levels are out of range and leave the level to libzstd; and a frame cut short is not an error of the method (it has no end to wait for), so the read ends and the CRC-32 says so (`ZIP_ER_CRC`). libzip's two `set_compression` tests of it pass too.
 - **Fuzzing.** A fuzzer compares the port with the libzip oracle under AddressSanitizer, seeded with libzip's OSS-Fuzz corpus. For now `fuzz/fuzz_targets/zip_open.rs` opens its input and asks the reading API everything, which must not panic, seeded with the archives of `zip-open.txt`, and `fuzz/fuzz_targets/zip_edit.rs` makes the edits its first bytes pick and writes the archive, which must open again with the entries as edited.
 - **Beyond libzip.** Info-ZIP `unzip`, 7-Zip, bsdtar, Python and Go read everything the port writes; ZipDiff's ambiguous archives are read, and where the oracles disagree, the manifest records which one hivepack follows.
+
+## The speed
+
+`tools/zip-bench` times the port against libzip on the same archives, in each thing an archive library does. libzip runs in a program of its own, `tools/zip-oracle/bench.c`, built with the same sources as the oracle: libzip 1.12.1, zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8 and XZ Utils 5.8.4.
+
+```sh
+python3 scripts/testdata.py fetch --group bench
+cargo run --release -p zip-bench -- [--only TEXT] [--rounds 5] [--seconds 0.5]
+```
+
+AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
+
+| Workload | hivepack-zip | libzip | Port / libzip |
+|---|---|---|---|
+| **Opening many entries** | | | |
+| Open | 2114 k entries/s | 6395 k entries/s | 0.33× |
+| Open with `ZIP_CHECKCONS` | 1167 k entries/s | 3352 k entries/s | 0.35× |
+| **Finding, many entries** | | | |
+| `zip_stat_index`, each entry | 51479 k entries/s | 18923 k entries/s | 2.72× |
+| `zip_name_locate`, each entry | 12519 k entries/s | 11235 k entries/s | 1.11× |
+| **Reading** | | | |
+| Stored | 5170 MB/s | 3773 MB/s | 1.37× |
+| Deflate | 495 MB/s | 469 MB/s | 1.06× |
+| bzip2 | 56.3 MB/s | 55.5 MB/s | 1.01× |
+| LZMA | 127 MB/s | 166 MB/s | 0.76× |
+| XZ | 122 MB/s | 154 MB/s | 0.79× |
+| Stored, small entries | 836 k entries/s | 648 k entries/s | 1.29× |
+| Deflate, small entries | 85.2 k entries/s | 86.5 k entries/s | 0.98× |
+| **Writing** | | | |
+| Stored | 2271 MB/s | 1882 MB/s | 1.21× |
+| Deflate, level 1 | 147 MB/s | 139 MB/s | 1.05× |
+| Deflate, level 6 | 42.8 MB/s | 42.7 MB/s | 1.00× |
+| Deflate, level 9 | 22.0 MB/s | 22.0 MB/s | 1.00× |
+| bzip2, level 1 | 26.7 MB/s | 26.0 MB/s | 1.03× |
+| bzip2, level 9 | 25.5 MB/s | 24.9 MB/s | 1.02× |
+| LZMA, level 1 | 5.5 MB/s | 5.4 MB/s | 1.02× |
+| LZMA, level 6 | 4.5 MB/s | 4.5 MB/s | 1.02× |
+| XZ, level 1 | 5.4 MB/s | 5.4 MB/s | 1.02× |
+| XZ, level 6 | 4.6 MB/s | 4.6 MB/s | 1.01× |
+| Stored, small entries | 260 k entries/s | 208 k entries/s | 1.25× |
+| Deflate, small entries | 16.1 k entries/s | 16.8 k entries/s | 0.96× |
+| **Decrypting** | | | |
+| ZipCrypto | 115 MB/s | 124 MB/s | 0.93× |
+| WinZip AES-128 | 206 MB/s | 325 MB/s | 0.64× |
+| WinZip AES-256 | 169 MB/s | 273 MB/s | 0.62× |
+| WinZip AES-256, small entries | 1.2 k entries/s | 2.1 k entries/s | 0.57× |
+| **Encrypting** | | | |
+| ZipCrypto | 221 MB/s | 245 MB/s | 0.90× |
+| WinZip AES-128 | 194 MB/s | 294 MB/s | 0.66× |
+| WinZip AES-256 | 160 MB/s | 251 MB/s | 0.64× |
+| WinZip AES-256, small entries | 1.2 k entries/s | 2.1 k entries/s | 0.57× |
+| **Editing** | | | |
+| Rename one entry, the data copied | 8652 MB/s | 5916 MB/s | 1.46× |
+| Add one entry, the data copied | 8600 MB/s | 5671 MB/s | 1.52× |
+| Rename each of many entries | 622 k entries/s | 1021 k entries/s | 0.61× |
+| Set each of many entries' comment | 796 k entries/s | 1626 k entries/s | 0.49× |
+| Delete half of many entries | 1415 k entries/s | 3036 k entries/s | 0.47× |
+
+What to read in it:
+
+- **Compression and decompression** are the speed of hivepack's other ports, which their own documents go into: Deflate and bzip2 at their libraries' speed, and LZMA and XZ reading below liblzma's on x86-64, where its range decoder is inline assembly ([xz.md](xz.md)). Writing them, where the compressor is most of the time, is even.
+- **Opening many entries** is the widest gap. A profile puts the most time in filling the table of names (`hash::Names::add`, and hashing with the standard library's SipHash), and much of the rest in small allocations. An archive of a few hundred entries opens in well under a millisecond either way.
+- **Editing many entries** has the same cause in part, as it writes the central directory again and looks names up, with no single place standing out in the profile.
+- **AES** compares two different things. libzip here uses nettle's C code, with no AES instructions and table lookups, where BearSSL's `aes_ct64`, which the port uses, runs in constant time. A profile of the AES-256 workloads, reading and writing, gives 44% to SHA-1 (WinZip AES authenticates with HMAC-SHA1, and hashes its key with PBKDF2) and about 30% to AES. A libzip that uses the processor's AES instructions, as a usual build with GnuTLS or OpenSSL does, would be further ahead than this table shows.
+- **Not compared:** Deflate64, which libzip does not have, and split archives. Files are read and written on the machine's disk, through its cache.
 
 ## Progress
 
@@ -108,7 +174,7 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 | `zip_pkware.c`, `zip_source_pkware_decode.c`, `zip_source_pkware_encode.c`, `zip_winzip_aes.c`, `zip_source_winzip_aes_decode.c`, `zip_source_winzip_aes_encode.c`, `zip_get_encryption_implementation.c`, `zip_file_set_encryption.c` | modules of the same names | done, on `hivepack-crypto` |
 | `zip_random_unix.c` (`zip_secure_random`) | `random.rs` | `/dev/urandom` on Unix, or the caller's `RandomSource` |
 | `zip_source_zip_new.c`, `zip_source_window.c`, `zip_source_crc.c` | modules of the same names | the reading of a whole entry |
-| `zip_source_compress.c`, `zip_algorithm_deflate.c`, `zip_algorithm_bzip2.c`, `zip_algorithm_xz.c` | `source_compress.rs`, `algorithm_deflate.rs`, `algorithm_bzip2.rs`, `algorithm_xz.rs` | decompressing deflate, bzip2, LZMA and XZ |
+| `zip_source_compress.c`, `zip_algorithm_deflate.c`, `zip_algorithm_bzip2.c`, `zip_algorithm_xz.c`, `zip_algorithm_zstd.c` | `source_compress.rs`, `algorithm_deflate.rs`, `algorithm_bzip2.rs`, `algorithm_xz.rs`, `algorithm_zstd.rs` | decompressing deflate, bzip2, LZMA, XZ and Zstandard |
 | The rules of `zip_source_read.c`, `zip_source_open.c`, `zip_source_close.c`, `zip_source_at_eof.c`, `zip_source_stat.c`, `zip_source_layered.c` for those layers | `source_stack.rs` | done |
 | Deflate64 (libzip has none) | `algorithm_deflate.rs`, with `Inflate9` | done: `tests/deflate64.rs` reads streams with long and far matches back to their data, checks the CRC and length, and refuses garbage after the stream with `ZIP_CHECKCONS` |
 | `zip_source_zip_file_create` with a start and a length | `source_zip_new.rs`, `source_window.rs` (`UpperWindow`) | done: `Archive::fopen_index_range`, compared through the oracle's `range` requests |
@@ -118,7 +184,7 @@ Two further checks are additions, marked `Differs from libzip:`: entries whose d
 | `zip_file_add.c`, `zip_file_replace.c`, `zip_add_entry.c`, `zip_dir_add.c`, `zip_set_file_compression.c` | modules of the same names | done |
 | `zip_source_buffer.c`, `zip_source_file_common.c`, `zip_source_file_stdio.c`, `zip_source_get_file_attributes.c`, for new data | `source_data.rs` (`BufferSource`, `FileSource`, `DataSource`) | done |
 | `zip_source_zip.c` | `source_zip.rs` (`ZipFileSource`) | done |
-| `zip_source_compress.c`, `zip_algorithm_deflate.c`, `zip_algorithm_bzip2.c`, `zip_algorithm_xz.c`, compressing | `source_compress.rs`, `algorithm_deflate.rs`, `algorithm_bzip2.rs`, `algorithm_xz.rs` | done |
+| `zip_source_compress.c`, `zip_algorithm_deflate.c`, `zip_algorithm_bzip2.c`, `zip_algorithm_xz.c`, `zip_algorithm_zstd.c`, compressing | `source_compress.rs`, `algorithm_deflate.rs`, `algorithm_bzip2.rs`, `algorithm_xz.rs`, `algorithm_zstd.rs` | done |
 | The layering in `add_data`, and `zip_source_get_dostime.c` | `source_stack.rs` (`WriteStack`) | done |
 | The writing commands of `zip_source_write.c`, `zip_source_tell_write.c`, `zip_source_seek_write.c`, `zip_source_commit_write.c` | `source_write.rs` | on a `Write` and `Seek` |
 
@@ -160,7 +226,7 @@ libzip's ways that the port keeps, though they surprise:
 3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md). Editing, adding data and writing archives, `ziptool`'s commands and the tests that use them: done.
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto` (AES, SHA-1, HMAC and PBKDF2, ported from BearSSL and compared with nettle; see [crypto.md](crypto.md)): decrypting and encrypting, done.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.
-6. **More methods.** bzip2, with `hivepack-bzip2` (see [bzip2.md](bzip2.md)), and LZMA and XZ, with `hivepack-xz` (see [xz.md](xz.md)): done. libzip keeps LZMA2 (method 33) disabled, because 7-Zip cannot unpack it, and so does the port. zstd, now that `hivepack-zstd` compresses; PPMd as its crate arrives.
+6. **More methods.** bzip2, with `hivepack-bzip2` (see [bzip2.md](bzip2.md)), LZMA and XZ, with `hivepack-xz` (see [xz.md](xz.md)), and Zstandard, with `hivepack-zstd`: done. libzip keeps LZMA2 (method 33) disabled, because 7-Zip cannot unpack it, and so does the port. PPMd as its crate arrives.
 
 ## Questions to settle first
 

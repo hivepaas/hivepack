@@ -243,9 +243,16 @@
     },
     {
       "name": "zip-oracle",
-      "generate": { "group": "generated", "from": "libzip-1.12.1-source", "with": ["zlib-1.3.2-source", "nettle-3.10.2-source", "bzip2-1.0.8-source", "xz-5.8.4-source"], "tool": "oracle", "sources": ["tools/zip-oracle/oracle.c", "tools/zip-oracle/config.h", "tools/zip-oracle/zipconf.h", "tools/zip-oracle/gnutls/gnutls.h", "tools/zip-oracle/gnutls/crypto.h", "tools/xz-oracle/config.h"] },
-      "source": "tools/zip-oracle/oracle.c, built with the libzip 1.12.1, zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8 and XZ Utils 5.8.4 sources",
-      "license": "MIT (the program), BSD-3-Clause (libzip), Zlib (zlib), LGPL-3.0-or-later OR GPL-2.0-or-later (nettle), bzip2-1.0.6 (libbzip2) and 0BSD (liblzma)",
+      "generate": { "group": "generated", "from": "libzip-1.12.1-source", "with": ["zlib-1.3.2-source", "nettle-3.10.2-source", "bzip2-1.0.8-source", "xz-5.8.4-source", "zstd-1.5.7-source"], "tool": "oracle", "sources": ["tools/zip-oracle/oracle.c", "tools/zip-oracle/config.h", "tools/zip-oracle/zipconf.h", "tools/zip-oracle/gnutls/gnutls.h", "tools/zip-oracle/gnutls/crypto.h", "tools/xz-oracle/config.h"] },
+      "source": "tools/zip-oracle/oracle.c, built with the libzip 1.12.1, zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8, XZ Utils 5.8.4 and zstd 1.5.7 sources",
+      "license": "MIT (the program), BSD-3-Clause (libzip), Zlib (zlib), LGPL-3.0-or-later OR GPL-2.0-or-later (nettle), bzip2-1.0.6 (libbzip2), 0BSD (liblzma) and BSD-3-Clause OR GPL-2.0-only (libzstd)",
+      "kind": "tool"
+    },
+    {
+      "name": "zip-bench-libzip",
+      "generate": { "group": "bench", "from": "libzip-1.12.1-source", "with": ["zlib-1.3.2-source", "nettle-3.10.2-source", "bzip2-1.0.8-source", "xz-5.8.4-source", "zstd-1.5.7-source"], "tool": "oracle", "sources": ["tools/zip-oracle/bench.c", "tools/zip-oracle/config.h", "tools/zip-oracle/zipconf.h", "tools/zip-oracle/gnutls/gnutls.h", "tools/zip-oracle/gnutls/crypto.h", "tools/xz-oracle/config.h"] },
+      "source": "tools/zip-oracle/bench.c, built with the libzip 1.12.1, zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8, XZ Utils 5.8.4 and zstd 1.5.7 sources",
+      "license": "MIT (the program), BSD-3-Clause (libzip), Zlib (zlib), LGPL-3.0-or-later OR GPL-2.0-or-later (nettle), bzip2-1.0.6 (libbzip2), 0BSD (liblzma) and BSD-3-Clause OR GPL-2.0-only (libzstd)",
       "kind": "tool"
     },
     {

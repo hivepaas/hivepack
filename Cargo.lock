@@ -194,6 +194,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-cpio"
+version = "0.0.0"
+dependencies = [
+ "hivepack-bzip2",
+ "hivepack-deflate",
+]
+
+[[package]]
 name = "hivepack-crypto"
 version = "0.0.0"
 

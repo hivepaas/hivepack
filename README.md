@@ -4,22 +4,6 @@ Read and write archives and compressed files in Rust: one library for many forma
 
 > **Status:** early development. Nothing is published on crates.io yet.
 
-## 🎯 Plans
-
-- **zstd**: a Rust port of the official [Zstandard](https://github.com/facebook/zstd) library, for both compressing and decompressing.
-- **Deflate**: a Rust port of [zlib](https://zlib.net), for both too, with the zlib and gzip formats.
-- **bzip2**: a Rust port of [libbzip2](https://sourceware.org/bzip2/), for both too.
-- **LZ4**: a Rust port of [liblz4](https://github.com/lz4/lz4), for both too, blocks and frames (`.lz4`).
-- **XZ and LZMA**: a Rust port of liblzma from [XZ Utils](https://tukaani.org/xz/), for both too, with `.xz`, `.lzma` and `.lz`.
-- **ZIP**: reading and writing, including split archives (`.z01`, `.z02`, …, `.zip`), its rules ported from [libzip](https://libzip.org) (see [docs/zip.md](docs/zip.md)).
-- **7z**: reading, ported from the 7z decoder of the [LZMA SDK](https://7-zip.org/sdk.html) (see [docs/7z.md](docs/7z.md)).
-- **RAR**: reading through [rars](https://github.com/bitplane/rars).
-- **tar**: reading, ported from Go's `archive/tar` (see [docs/tar.md](docs/tar.md)), and tar inside zstd, xz, gzip, bzip2 and age (`.tar.zst`, `.tar.zst.age`).
-- **ISO 9660**: reading CD and DVD images (`.iso`, and `.iso.xz` & co.), with Rock Ridge, Joliet and zisofs, ported from [libarchive](https://github.com/libarchive/libarchive) (see [docs/iso.md](docs/iso.md)), and extracting them.
-- **UDF**: reading DVD, Blu-ray and disk images, ported from NetBSD's UDF file system (see [docs/udf.md](docs/udf.md)).
-- **age**: decrypting files of the [age](https://age-encryption.org) encryption tool, often archives (`.tar.zst.age`), its rules ported from age's Go code (see [docs/age.md](docs/age.md)).
-- **Safe extraction by default**: no writing outside the destination, through links, or past size limits set for archive bombs (see [docs/extract.md](docs/extract.md)).
-
 ## 📦 Crates
 
 | Crate | What it is | Status |
@@ -72,8 +56,12 @@ The test files come from zstd itself and from other zstd implementations (Go, Ja
 hivepack is built and maintained by HivePaaS, who also make:
 
 - [hivepaas](https://github.com/hivepaas/hivepaas): a self-hosted PaaS.
+- [context-menu-rs](https://github.com/hivepaas/context-menu-rs): put your app in the right-click menu of Windows Explorer, macOS Finder and Linux file managers, from Rust.
 - [shellwing](https://shellwing.app): a fast, native SSH client for macOS, Windows and Linux.
 - [authwing](https://github.com/hivepaas/authwing): a two-factor code app for macOS, Windows and Linux that knows the window you are in.
+- [packwing](https://github.com/hivepaas/packwing): a file archiver for macOS, Windows and Linux that opens archives safely, built on hivepack.
+
+⭐ If hivepack, or any of these, is useful to you, please give it a star on GitHub: it helps others find it, and helps us keep making them.
 
 ## 📜 License
 

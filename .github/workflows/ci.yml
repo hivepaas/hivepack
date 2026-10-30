@@ -174,7 +174,7 @@ jobs:
       # decoder, so only the decoder's tests run again with it.
       - run: >-
           cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
-          --test decompress --test stream --test dctx --test testdata --test unchecked
+          --test decompress --test stream --test dctx --test testdata --test unchecked --test bufferless
       - run: >-
           cross test -p hivepack-zstd --locked --target ${{ matrix.target }} --features unsafe-fast
           --lib -- decompress:: oracle::

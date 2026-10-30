@@ -81,6 +81,10 @@ pub enum Kind {
     Tool,
     /// Benchmark inputs, too big for the tests.
     Bench,
+    /// Archives for hivepack-extract's tests, never unpacked here.
+    Archives,
+    /// Test vectors of another format, such as hivepack-age's.
+    Vectors,
 }
 
 #[derive(Deserialize)]

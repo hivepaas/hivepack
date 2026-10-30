@@ -1,10 +1,10 @@
 [package]
 name = "hivepack-crypto"
 version = "0.0.0"
-description = "AES, SHA-1, HMAC and PBKDF2 for ZIP encryption, in safe Rust, ported from BearSSL"
+description = "The cryptography of ZIP encryption and age, in safe Rust, ported from BearSSL"
 license = "MIT"
 readme = "README.md"
-keywords = ["aes", "sha1", "hmac", "pbkdf2", "bearssl"]
+keywords = ["aes", "chacha20", "x25519", "scrypt", "bearssl"]
 categories = ["cryptography"]
 # Nothing to publish yet.
 publish = false

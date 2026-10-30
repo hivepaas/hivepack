@@ -61,6 +61,7 @@
 #![forbid(unsafe_code)]
 
 mod add_entry;
+mod algorithm_bzip2;
 mod algorithm_deflate;
 mod buffer;
 mod close;

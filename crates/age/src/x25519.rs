@@ -1,0 +1,122 @@
+//! age's X25519 keys: port of `x25519.go`, the identity half.
+//!
+//! A stanza is `-> X25519 <ephemeral share>`; its body is the file key
+//! sealed with a key derived from the shared secret, the share and the
+//! recipient's public key.
+
+use hivepack_crypto::{X25519_LENGTH, x25519, x25519_base};
+
+use crate::age::{FILE_KEY_SIZE, FileKey, INCORRECT_IDENTITY, Identity, UnwrapError, multi_unwrap};
+use crate::bech32;
+use crate::format::{Stanza, decode_string};
+use crate::primitives::{AeadError, aead_decrypt, hkdf_32};
+
+/// `x25519Label`.
+const X25519_LABEL: &[u8] = b"age-encryption.org/v1/X25519";
+
+/// An X25519 secret key, `AGE-SECRET-KEY-1…`: `X25519Identity`.
+///
+/// The secret is overwritten when it is dropped (best effort).
+#[derive(Clone)]
+pub struct X25519Identity {
+    secret_key: [u8; X25519_LENGTH],
+    our_public_key: [u8; X25519_LENGTH],
+}
+
+impl X25519Identity {
+    /// `newX25519IdentityFromScalar`.
+    fn from_scalar(secret_key: &[u8]) -> Result<X25519Identity, String> {
+        let secret_key: [u8; X25519_LENGTH] = secret_key
+            .try_into()
+            .map_err(|_| "invalid X25519 secret key".to_string())?;
+        Ok(X25519Identity {
+            our_public_key: x25519_base(&secret_key),
+            secret_key,
+        })
+    }
+
+    /// `ParseX25519Identity`: a key as `age-keygen` writes it,
+    /// `AGE-SECRET-KEY-1` and Bech32.
+    pub fn parse(s: &str) -> Result<X25519Identity, String> {
+        let (t, mut k) = bech32::decode(s).map_err(|e| format!("malformed secret key: {e}"))?;
+        if t != "AGE-SECRET-KEY-" {
+            k.fill(0);
+            return Err(format!("malformed secret key: unknown type {t:?}"));
+        }
+        let identity =
+            X25519Identity::from_scalar(&k).map_err(|e| format!("malformed secret key: {e}"));
+        k.fill(0);
+        identity
+    }
+
+    /// `Recipient`: the public key that files are encrypted to, `age1…`.
+    pub fn recipient(&self) -> String {
+        bech32::encode("age", &self.our_public_key).unwrap_or_default()
+    }
+
+    /// `unwrap` of one stanza.
+    fn unwrap_one(&self, block: &Stanza) -> Result<FileKey, UnwrapError> {
+        if block.kind != "X25519" {
+            return Err(UnwrapError::Incorrect(INCORRECT_IDENTITY.into()));
+        }
+        if block.args.len() != 1 {
+            return Err(UnwrapError::Invalid(
+                "invalid X25519 recipient block".into(),
+            ));
+        }
+        let public_key = decode_string(block.args[0].as_bytes())
+            .map_err(|e| UnwrapError::Invalid(format!("failed to parse X25519 recipient: {e}")))?;
+        let public_key: [u8; X25519_LENGTH] = public_key
+            .try_into()
+            .map_err(|_| UnwrapError::Invalid("invalid X25519 recipient block".into()))?;
+
+        let mut shared_secret = x25519(&self.secret_key, &public_key);
+        if shared_secret == [0; X25519_LENGTH] {
+            return Err(UnwrapError::Invalid(
+                "invalid X25519 recipient: bad input point: low order point".into(),
+            ));
+        }
+
+        let mut salt = [0u8; 2 * X25519_LENGTH];
+        salt[..X25519_LENGTH].copy_from_slice(&public_key);
+        salt[X25519_LENGTH..].copy_from_slice(&self.our_public_key);
+        let mut wrapping_key = hkdf_32(&shared_secret, Some(&salt), X25519_LABEL);
+        shared_secret.fill(0);
+
+        let file_key = aead_decrypt(&wrapping_key, FILE_KEY_SIZE, &block.body);
+        wrapping_key.fill(0);
+        match file_key {
+            Ok(file_key) => Ok(FileKey(file_key)),
+            Err(AeadError::Size) => Err(UnwrapError::Invalid(
+                "invalid X25519 recipient block: incorrect file key size".into(),
+            )),
+            Err(AeadError::Tag) => Err(UnwrapError::Incorrect(INCORRECT_IDENTITY.into())),
+        }
+    }
+}
+
+impl Identity for X25519Identity {
+    fn unwrap(&self, stanzas: &[Stanza]) -> Result<FileKey, UnwrapError> {
+        multi_unwrap(|s| self.unwrap_one(s), stanzas)
+    }
+
+    fn is_native(&self) -> bool {
+        true
+    }
+}
+
+impl Drop for X25519Identity {
+    fn drop(&mut self) {
+        self.secret_key.fill(0);
+        std::hint::black_box(&mut self.secret_key);
+    }
+}
+
+/// Shows the public key, not the secret.
+impl std::fmt::Debug for X25519Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("X25519Identity")
+            .field("recipient", &self.recipient())
+            .finish_non_exhaustive()
+    }
+}

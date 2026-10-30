@@ -2,7 +2,7 @@
 
 ZIP archives in safe Rust, the container logic ported from [libzip](https://libzip.org) 1.12.1.
 
-> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated and Deflate64 entries, with libzip's rules and errors; edits entries' names, comments, times and attributes, deletes them, adds and replaces data, stored or deflated, and writes the archive as libzip writes it, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES entries. All compared with libzip itself. This crate is not on crates.io.
+> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2 and Deflate64 entries, with libzip's rules and errors; edits entries' names, comments, times and attributes, deletes them, adds and replaces data, stored, deflated or bzip2, and writes the archive as libzip writes it, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES entries. All compared with libzip itself. This crate is not on crates.io.
 
 ```rust
 use hivepack_zip::{Archive, Flags, OpenFlags};

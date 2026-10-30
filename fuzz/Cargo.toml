@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-fuzz"
 version = "0.0.0"
-description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, and hivepack-bzip2 with libbzip2"
+description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age and hivepack-tar any input"
 publish = false
 license = "MIT"
 edition = "2024"
@@ -26,9 +26,15 @@ hivepack-extract = { path = "../crates/extract" }
 libz-sys = { version = "=1.1.31", features = ["static"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 hivepack-bzip2 = { path = "../crates/bzip2" }
+hivepack-age = { path = "../crates/age" }
+hivepack-tar = { path = "../crates/tar" }
 # libbzip2 1.0.8, built from bzip2-sys's bundled sources, as the tests build
 # it.
 bzip2 = { version = "0.6.1", default-features = false, features = ["bzip2-sys", "static"] }
+hivepack-xz = { path = "../crates/xz" }
+# liblzma 5.8.4, built from liblzma-sys's bundled sources, not the system's.
+liblzma = { version = "0.4.9", features = ["static"] }
+liblzma-sys = { version = "=0.4.9", features = ["static"] }
 
 [[bin]]
 name = "decompress"
@@ -117,6 +123,34 @@ bench = false
 [[bin]]
 name = "bzip2"
 path = "fuzz_targets/bzip2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "age"
+path = "fuzz_targets/age.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "age_keys"
+path = "fuzz_targets/age_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xz"
+path = "fuzz_targets/xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar"
+path = "fuzz_targets/tar.rs"
 test = false
 doc = false
 bench = false

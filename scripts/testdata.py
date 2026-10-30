@@ -6,8 +6,9 @@ testdata/manifest.json lists every set:
 - Sets with "fetch" are downloaded, checked against their SHA-256 and unpacked
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
-  by the oracles in tools/, built from the pinned zstd, zlib, bzip2, libzip
-  and nettle releases.
+  by the oracles in tools/, built from the pinned zstd, zlib, bzip2, XZ
+  Utils, libzip and nettle releases, or with Go from the modules their go.sum
+  pins.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -187,6 +188,16 @@ BZIP2_SOURCES = [
 ]
 
 
+# liblzma: the folders of its C files, without the multithreaded coders, the
+# hardware queries (which need tuklib), the small CRCs of HAVE_SMALL, and
+# the programs that write tables. delta/ and simple/ are left out with
+# their filters (see tools/xz-oracle/config.h); only their headers, which
+# the filter tables include, are on the include path.
+LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder"]
+LIBLZMA_LEFT_OUT = ["stream_encoder_mt", "stream_decoder_mt", "outqueue", "hardware_",
+                    "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
+
+
 # nettle's AES (encryption only), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, in
 # C: what the oracles call, without the assembly versions or the fat
 # builds that choose between them.
@@ -220,11 +231,12 @@ def nettle_headers(nettle: Path, folder: Path) -> Path:
 
 
 # What lib/CMakeLists.txt adds to ZIP_SOURCES with HAVE_CRYPTO and
-# HAVE_GNUTLS.
+# HAVE_GNUTLS, and with HAVE_LIBBZ2.
 LIBZIP_CRYPTO_SOURCES = [
     "zip_crypto_gnutls.c", "zip_winzip_aes.c", "zip_source_winzip_aes_decode.c",
     "zip_source_winzip_aes_encode.c",
 ]
+LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
 
 
 def zip_err_str(lib: Path) -> str:
@@ -258,12 +270,15 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     as the oracle includes them itself to reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
-    Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES.
+    Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES,
+    and tools/xz-oracle with liblzma's, from LIBLZMA_DIRS, and its own
+    config.h.
     tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
     tools/zip-oracle is built with libzip's, its crypto backend for
-    GnuTLS among them, its own config.h and zipconf.h in place of those
-    libzip's CMake build writes, the part of GnuTLS that backend uses in
-    gnutls/, and zlib's and nettle's (the `extra` sets)."""
+    GnuTLS and its bzip2 algorithm among them, its own config.h and
+    zipconf.h in place of those libzip's CMake build writes, the part of
+    GnuTLS that backend uses in gnutls/, and zlib's, nettle's and
+    libbzip2's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
     libzip = next(source.glob("libzip-*"), None)
@@ -271,17 +286,21 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         lib = libzip / "lib"
         zlib = next(extra[0].glob("zlib-*"))
         nettle = next(extra[1].glob("nettle-*"))
+        bzip2 = next(extra[2].glob("bzip2-*"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
-        files += [str(lib / name) for name in libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES]
+        files += [str(lib / name) for name in
+                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES]
         files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(nettle / name) for name in NETTLE_SOURCES]
+        files += [str(bzip2 / name) for name in BZIP2_SOURCES]
         include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
         subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
-                        f"-I{include}", f"-I{nettle}", *files, "-o", str(folder / "oracle")], check=True)
+                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", *files, "-o", str(folder / "oracle")],
+                       check=True)
         return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:
@@ -289,6 +308,17 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(infback9 / "infback9.c"), str(infback9 / "inftree9.c")]
         subprocess.run([compiler, "-O2", f"-I{zlib}", f"-I{infback9}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
+    xz = next(source.glob("xz-*/src/liblzma"), None)
+    if xz is not None:
+        dirs = [xz / d for d in LIBLZMA_DIRS]
+        files += sorted(str(f) for d in dirs for f in d.glob("*.c")
+                        if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
+        config = ROOT / Path(sources[0]).parent
+        headers = [xz / "api", *dirs, xz / "delta", xz / "simple", xz.parent / "common"]
+        includes = [f"-I{d}" for d in [config, *headers]]
+        subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", *includes, *files,
                         "-o", str(folder / "oracle")], check=True)
         return
     bzip2 = next(source.glob("bzip2-*"), None)
@@ -313,12 +343,34 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                    check=True)
 
 
+def build_go(sources: list, folder: Path) -> None:
+    """An oracle written in Go, built by the go command from its module in
+    tools/. go.sum pins the modules it downloads, which the go command also
+    checks against Go's checksum database; -mod=readonly keeps it from
+    changing go.mod. An installed Go older than the one go.mod asks for
+    downloads that one (GOTOOLCHAIN=auto, the default)."""
+    go = shutil.which("go")
+    if go is None:
+        sys.exit("building the Go oracles needs Go: https://go.dev/dl/")
+    module = ROOT / Path(sources[0]).parent
+    subprocess.run([go, "build", "-trimpath", "-mod=readonly", "-o", str(folder / "oracle"), "."],
+                   cwd=module, check=True, env={**os.environ, "CGO_ENABLED": "0"})
+
+
 def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     folder = cache / entry["name"]
     generate = entry["generate"]
     stamp = stamp_of(entry)
     if is_current(folder, stamp):
         print(f"  {entry['name']}: up to date")
+        return
+    if generate["tool"] == "go":
+        if folder.exists():
+            shutil.rmtree(folder)
+        folder.mkdir(parents=True)
+        build_go(generate["sources"], folder)
+        mark_current(folder, stamp)
+        print(f"  {entry['name']}: generated")
         return
     origin = sets[generate["from"]]
     fetch_set(origin, cache)

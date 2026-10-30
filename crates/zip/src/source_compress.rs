@@ -1,9 +1,8 @@
 //! The decompressing and compressing layers: port of
-//! `zip_source_compress.c`, with deflate its only algorithm for now.
+//! `zip_source_compress.c`, with deflate and bzip2 for algorithms.
 
-use crate::algorithm_deflate::{
-    CompressionStatus, DeflateCompress, DeflateDecompress, VERSION_NEEDED,
-};
+use crate::algorithm_bzip2::{self, Bzip2};
+use crate::algorithm_deflate::{self, CompressionStatus, DeflateCompress, DeflateDecompress};
 use crate::dirent::{CM_DEFAULT, cm_actual};
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK, file_attributes};
@@ -21,17 +20,114 @@ pub(crate) struct Decompress {
     size: u64,
     first_read: i64,
     buffer: Box<[u8; BUFSIZE]>,
-    algorithm: DeflateDecompress,
+    algorithm: DecompressAlgorithm,
 }
+
+/// A decompressing algorithm: the `zip_compression_algorithm_t` of
+/// `implementations[]` for decompressing.
+pub(crate) enum DecompressAlgorithm {
+    Deflate(DeflateDecompress),
+    Bzip2(Bzip2),
+}
+
+/// A compressing algorithm, the same for compressing.
+pub(crate) enum CompressAlgorithm {
+    Deflate(DeflateCompress),
+    Bzip2(Bzip2),
+}
+
+/// The algorithms' functions, the same for both directions.
+macro_rules! algorithm_functions {
+    ($name:ident) => {
+        impl $name {
+            fn version_needed(&self) -> u8 {
+                match self {
+                    Self::Deflate(_) => algorithm_deflate::VERSION_NEEDED,
+                    Self::Bzip2(_) => algorithm_bzip2::VERSION_NEEDED,
+                }
+            }
+
+            fn general_purpose_bit_flags(&self) -> u16 {
+                match self {
+                    Self::Deflate(a) => a.general_purpose_bit_flags(),
+                    Self::Bzip2(a) => a.general_purpose_bit_flags(),
+                }
+            }
+
+            fn start(&mut self) -> Result<()> {
+                match self {
+                    Self::Deflate(a) => a.start(),
+                    Self::Bzip2(a) => a.start(),
+                }
+            }
+
+            fn end(&mut self) -> Result<()> {
+                match self {
+                    Self::Deflate(a) => a.end(),
+                    Self::Bzip2(a) => a.end(),
+                }
+            }
+
+            fn input(&mut self, length: usize) -> Result<()> {
+                match self {
+                    Self::Deflate(a) => a.input(length),
+                    Self::Bzip2(a) => a.input(length),
+                }
+            }
+
+            fn end_of_input(&mut self) -> bool {
+                match self {
+                    Self::Deflate(a) => a.end_of_input(),
+                    Self::Bzip2(a) => a.end_of_input(),
+                }
+            }
+
+            fn process(&mut self, buffer: &[u8], data: &mut [u8]) -> (CompressionStatus, usize) {
+                match self {
+                    Self::Deflate(a) => a.process(buffer, data),
+                    Self::Bzip2(a) => a.process(buffer, data),
+                }
+            }
+        }
+    };
+}
+algorithm_functions!(DecompressAlgorithm);
+algorithm_functions!(CompressAlgorithm);
 
 /// The decompressing algorithm for `method`, if libzip has one: port of
 /// `_zip_get_compression_algorithm`, for decompressing. Differs from
-/// libzip, which is often built with bzip2, LZMA, XZ and Zstandard: those
+/// libzip, which is often built with LZMA, XZ and Zstandard too: those
 /// come with their crates; and libzip has no Deflate64, which is read here.
-pub(crate) fn get_compression_algorithm(method: u16) -> Option<DeflateDecompress> {
+pub(crate) fn get_compression_algorithm(method: u16) -> Option<DecompressAlgorithm> {
     match method {
-        cm::DEFLATE => Some(DeflateDecompress::new(false)),
-        cm::DEFLATE64 => Some(DeflateDecompress::new(true)),
+        cm::DEFLATE => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(false))),
+        cm::DEFLATE64 => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(true))),
+        cm::BZIP2 => Some(DecompressAlgorithm::Bzip2(Bzip2::decompressor())),
+        _ => None,
+    }
+}
+
+/// The compressing algorithm for `method` at `compression_flags`, if
+/// libzip has one: `_zip_get_compression_algorithm` for compressing, then
+/// its `compress_allocate`.
+fn get_compressing_algorithm(method: u16, compression_flags: u32) -> Option<CompressAlgorithm> {
+    match method {
+        cm::DEFLATE => Some(CompressAlgorithm::Deflate(DeflateCompress::new(
+            compression_flags,
+        ))),
+        cm::BZIP2 => Some(CompressAlgorithm::Bzip2(Bzip2::compressor(
+            compression_flags,
+        ))),
+        _ => None,
+    }
+}
+
+/// The most the compressed data of `size` bytes can take with `method`:
+/// its algorithm's `maximum_compressed_size`, or `None` without one.
+pub(crate) fn maximum_compressed_size(method: u16, size: u64) -> Option<u64> {
+    match method {
+        cm::DEFLATE => Some(algorithm_deflate::maximum_compressed_size(size)),
+        cm::BZIP2 => Some(algorithm_bzip2::maximum_compressed_size(size)),
         _ => None,
     }
 }
@@ -44,7 +140,7 @@ pub(crate) fn compression_method_supported(method: i32, compress: bool) -> bool 
     }
     let real_method = cm_actual(method);
     if compress {
-        real_method == cm::DEFLATE
+        get_compressing_algorithm(real_method, 0).is_some()
     } else {
         get_compression_algorithm(real_method).is_some()
     }
@@ -53,10 +149,10 @@ pub(crate) fn compression_method_supported(method: i32, compress: bool) -> bool 
 /// `ZIP_SOURCE_GET_FILE_ATTRIBUTES` of a compression layer: the version
 /// needed for the algorithm, and the general purpose bits it sets, all of
 /// the allowed ones decided here.
-fn compression_attributes(general_purpose_bit_flags: u16) -> FileAttributes {
+fn compression_attributes(version_needed: u8, general_purpose_bit_flags: u16) -> FileAttributes {
     FileAttributes {
         valid: file_attributes::VERSION_NEEDED | file_attributes::GENERAL_PURPOSE_BIT_FLAGS,
-        version_needed: VERSION_NEEDED,
+        version_needed,
         general_purpose_bit_mask: GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK,
         general_purpose_bit_flags,
         ..FileAttributes::default()
@@ -64,10 +160,13 @@ fn compression_attributes(general_purpose_bit_flags: u16) -> FileAttributes {
 }
 
 impl Decompress {
-    /// `ZIP_SOURCE_GET_FILE_ATTRIBUTES`: no general purpose bits, as
-    /// decompressing sets none.
+    /// `ZIP_SOURCE_GET_FILE_ATTRIBUTES`: the algorithm's general purpose
+    /// bits, which no decompressing algorithm sets.
     pub(crate) fn file_attributes(&self) -> FileAttributes {
-        compression_attributes(0)
+        compression_attributes(
+            self.algorithm.version_needed(),
+            self.algorithm.general_purpose_bit_flags(),
+        )
     }
 
     /// Port of `context_new` for decompressing; `None` if `method` has no
@@ -248,7 +347,7 @@ pub(crate) struct Compress {
     size: u64,
     first_read: i64,
     buffer: Box<[u8; BUFSIZE]>,
-    algorithm: DeflateCompress,
+    algorithm: CompressAlgorithm,
 }
 
 impl Compress {
@@ -256,9 +355,10 @@ impl Compress {
     /// with `method` at `compression_flags`: fails with
     /// `ZIP_ER_COMPNOTSUPP` if `method` has no algorithm.
     pub(crate) fn new(method: i32, compression_flags: u32) -> Result<Compress> {
-        if cm_actual(method) != cm::DEFLATE {
+        let Some(algorithm) = get_compressing_algorithm(cm_actual(method), compression_flags)
+        else {
             return Err(Error::new(ErrorCode::CompNotSupp, 0));
-        }
+        };
         Ok(Compress {
             error: Error::OK,
             end_of_input: false,
@@ -269,7 +369,7 @@ impl Compress {
             size: 0,
             first_read: -1,
             buffer: Box::new([0; BUFSIZE]),
-            algorithm: DeflateCompress::new(compression_flags),
+            algorithm,
         })
     }
 
@@ -316,11 +416,14 @@ impl Compress {
     /// `ZIP_SOURCE_GET_FILE_ATTRIBUTES`: the general purpose bits of the
     /// level, none if the data was stored.
     pub(crate) fn file_attributes(&self) -> FileAttributes {
-        compression_attributes(if self.is_stored {
-            0
-        } else {
-            self.algorithm.general_purpose_bit_flags()
-        })
+        compression_attributes(
+            self.algorithm.version_needed(),
+            if self.is_stored {
+                0
+            } else {
+                self.algorithm.general_purpose_bit_flags()
+            },
+        )
     }
 
     /// `ZIP_SOURCE_READ`: port of `compress_read`, reading the data to

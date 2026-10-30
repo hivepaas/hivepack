@@ -32,6 +32,7 @@ A library may depend on a crate that has `unsafe` code only where there is no ot
 | Dependency | In | For | Why | Replaced by |
 |---|---|---|---|---|
 | `cap-std`, `cap-fs-ext` (Bytecode Alliance; with `rustix` on Unix, `windows-sys` and `winx` on Windows) | `hivepack-extract` | Opening each directory under the destination from its parent's handle without following a symbolic link, and creating files there: `openat2` with `RESOLVE_BENEATH` on Linux, `openat` with `O_NOFOLLOW` a component at a time elsewhere on Unix, handles relative to a directory's on Windows | The standard library's directory handles (`std::fs::Dir`, tracking issue rust-lang/rust#120426) are not stable. Without them, a path is checked and then opened again, and a link put in between is followed | `std::fs::Dir`, once stable |
+| `rustix` (Bytecode Alliance), on macOS only, already there for `cap-std` | `hivepack-extract` | Reading and setting macOS's quarantine attribute (`com.apple.quarantine`) by file descriptor: `fgetxattr` and `fsetxattr`, so that files extracted from a downloaded archive keep its mark | The standard library has no extended attributes, and calling `fsetxattr` is `unsafe` | an extended attributes API in the standard library |
 
 The rest of the repository, the codecs, the cryptography and the ZIP container among them, depends on nothing with `unsafe` code.
 

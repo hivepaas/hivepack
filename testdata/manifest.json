@@ -321,7 +321,7 @@
     {
       "name": "7z-oracle",
       "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/oracle.c"] },
-      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
+      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder and PPMd var.I from 7-Zip 26.05",
       "license": "MIT (the program), public domain (the LZMA SDK's files)",
       "kind": "tool"
     },
@@ -403,6 +403,13 @@
       "kind": "archives"
     },
     {
+      "name": "libarchive-zip-ppmd",
+      "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/test_read_format_zip*ppmd*.uu" },
+      "source": "libarchive 3.8.10's ZIP test archives with PPMd entries (libarchive/test/test_read_format_zip*ppmd*.uu), decoded",
+      "license": "BSD-2-Clause",
+      "kind": "archives"
+    },
+    {
       "name": "iso-oracle",
       "generate": { "group": "generated", "from": "libarchive-3.8.10-source", "with": ["zlib-1.3.2-source"], "tool": "oracle", "sources": ["tools/iso-oracle/oracle.c", "tools/iso-oracle/config.h"] },
       "source": "tools/iso-oracle/oracle.c, built with the libarchive 3.8.10 and zlib 1.3.2 sources",
@@ -415,6 +422,20 @@
       "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING (as LICENSE)",
       "license": "BSD-2-Clause",
       "kind": "vectors"
+    },
+    {
+      "name": "libarchive-cpio",
+      "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": ["libarchive-3.8.10/libarchive/test/*cpio*.uu", "libarchive-3.8.10/libarchive/test/*rpm*.uu"] },
+      "source": "libarchive 3.8.10's cpio and RPM test archives (libarchive/test/*cpio*.uu and *rpm*.uu), decoded",
+      "license": "BSD-2-Clause",
+      "kind": "archives"
+    },
+    {
+      "name": "cpio-oracle",
+      "generate": { "group": "generated", "from": "libarchive-3.8.10-source", "tool": "oracle", "sources": ["tools/cpio-oracle/oracle.c", "tools/cpio-oracle/config.h"] },
+      "source": "tools/cpio-oracle/oracle.c, built with the libarchive 3.8.10 sources",
+      "license": "MIT (the program) and BSD-2-Clause (libarchive)",
+      "kind": "tool"
     },
     {
       "name": "decodecorpus",

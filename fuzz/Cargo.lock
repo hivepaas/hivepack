@@ -194,6 +194,7 @@ dependencies = [
  "cap-std",
  "hivepack-iso",
  "hivepack-tar",
+ "hivepack-udf",
  "hivepack-zip",
  "rustix",
 ]

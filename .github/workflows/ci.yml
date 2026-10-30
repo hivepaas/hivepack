@@ -450,6 +450,11 @@ jobs:
       - name: Seed the UDF corpus with the descriptors of the test images
         run: python3 tools/udf-images/seed.py fuzz/corpus/udf
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu udf -- -max_total_time=60 -rss_limit_mb=4096 -max_len=400000
+      - name: Seed the UDF extraction corpus with the same images behind a byte of options
+        run: |
+          mkdir -p fuzz/corpus/extract_udf
+          for f in fuzz/corpus/udf/*; do { printf '\x22'; cat "$f"; } > "fuzz/corpus/extract_udf/$(basename "$f")"; done
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_udf -- -max_total_time=60 -rss_limit_mb=4096 -max_len=400000
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

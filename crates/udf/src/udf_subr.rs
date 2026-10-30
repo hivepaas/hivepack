@@ -1728,3 +1728,44 @@ pub(crate) fn udf_read<R: Read + Seek>(
     }
     Ok(())
 }
+
+/// Not in NetBSD: whether all of a regular file's data reads, as
+/// `udf_read` would read it, without reading it: each block translated to
+/// a sector of the device, or zeros, or data in the node, within it.
+pub(crate) fn udf_check_read<R: Read + Seek>(
+    dev: &Device<R>,
+    ump: &UdfMount,
+    node: &UdfNode,
+) -> Result<()> {
+    if node.v_type == VType::VDIR {
+        return Err(err(Errno::EISDIR, "a directory"));
+    }
+    if node.v_type != VType::VREG {
+        return Err(err(Errno::EINVAL, "not a regular file"));
+    }
+    let file_size = node.file_size();
+    if file_size == 0 {
+        return Ok(());
+    }
+    let lb_size = u64::from(ump.lb_size());
+    let per_read = u64::from((MAXPHYS / ump.lb_size()).clamp(1, UDF_MAX_MAPPINGS));
+    let blocks = file_size.div_ceil(lb_size);
+    let sectors = dev.sectors();
+    let mut mapping = Vec::new();
+    let mut from = 0;
+    while from < blocks {
+        let n = (blocks - from).min(per_read);
+        let from32 = u32::try_from(from).map_err(|_| err(Errno::EINVAL, "offset too large"))?;
+        udf_translate_file_extent(ump, node, from32, n as u32, &mut mapping)?;
+        if mapping.first() == Some(&UDF_TRANS_INTERN) {
+            return udf_read_internal(ump, node).map(|_| ());
+        }
+        for &sector in &mapping {
+            if sector != UDF_TRANS_ZERO && sector >= sectors {
+                return Err(err(Errno::EIO, "read past the end of the device"));
+            }
+        }
+        from += n;
+    }
+    Ok(())
+}

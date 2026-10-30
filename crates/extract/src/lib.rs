@@ -53,7 +53,8 @@
 //!
 //! [`extract_tar`] extracts tar archives with the same rules, reading them
 //! twice: once to check, once to write; [`extract_iso`] ISO 9660 images, the
-//! same way.
+//! same way; [`extract_udf`] UDF volumes, walked and checked first, as ZIP
+//! archives are.
 //!
 //! The design, and what comes next (RAR), are in the repository's
 //! `docs/extract.md`.
@@ -66,6 +67,7 @@ mod origin;
 mod plan;
 mod progress;
 mod tar;
+mod udf;
 mod unicode;
 mod zip;
 
@@ -76,6 +78,7 @@ pub use origin::Origin;
 pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};
 pub use progress::{Cancel, Progress, ProgressFn};
 pub use tar::extract_tar;
+pub use udf::extract_udf;
 /// The version of Unicode names are compared with: major, minor, update.
 pub use unicode::VERSION as UNICODE_VERSION;
 pub use zip::{Summary, extract_zip};

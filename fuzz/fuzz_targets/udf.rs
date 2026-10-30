@@ -15,71 +15,19 @@
 
 #![no_main]
 
-use std::collections::BTreeMap;
-use std::io::{self, Read, Seek, SeekFrom};
+#[path = "udf_image.rs"]
+mod udf_image;
+
+use std::io::Read;
 
 use hivepack_udf::{Node, Options, Udf, VType};
 use libfuzzer_sys::fuzz_target;
+use udf_image::Sparse;
 
 const MAX_DATA: usize = 1 << 20;
 const MAX_NODES: usize = 4096;
 /// The entries of a directory looked up: each reads the whole directory.
 const MAX_LOOKUPS: usize = 16;
-
-/// The image the input describes.
-struct Sparse<'a> {
-    sector_size: u64,
-    len: u64,
-    sectors: BTreeMap<u64, &'a [u8]>,
-    pos: u64,
-}
-
-impl<'a> Sparse<'a> {
-    fn new(data: &'a [u8]) -> Option<Sparse<'a>> {
-        let (&head, rest) = data.split_first()?;
-        let sector_size = 512u64 << (head & 3);
-        let count = u64::from(*rest.first()?) | u64::from(*rest.get(1)?) << 8 | u64::from(*rest.get(2)?) << 16;
-        let count = count.min(1 << 16);
-        let mut sectors = BTreeMap::new();
-        let mut rest = &rest[3..];
-        while rest.len() >= 6 {
-            let n = u64::from(u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]));
-            let len = usize::from(u16::from_le_bytes([rest[4], rest[5]])).min(sector_size as usize);
-            let take = rest.len().min(6 + len);
-            sectors.insert(n, &rest[6..take]);
-            rest = &rest[take..];
-        }
-        Some(Sparse { sector_size, len: count * sector_size, sectors, pos: 0 })
-    }
-}
-
-impl Read for Sparse<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.len {
-            return Ok(0);
-        }
-        let sector = self.pos / self.sector_size;
-        let at = (self.pos % self.sector_size) as usize;
-        let n = buf.len().min((self.sector_size as usize) - at).min((self.len - self.pos) as usize);
-        let data = self.sectors.get(&sector).copied().unwrap_or(&[]);
-        let have = data.len().saturating_sub(at).min(n);
-        buf[..have].copy_from_slice(&data[at..at + have]);
-        buf[have..n].fill(0);
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
-
-impl Seek for Sparse<'_> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = match pos {
-            SeekFrom::Start(p) => p,
-            SeekFrom::End(d) => self.len.saturating_add_signed(d),
-            SeekFrom::Current(d) => self.pos.saturating_add_signed(d),
-        };
-        Ok(self.pos)
-    }
-}
 
 /// The volume, walked: one line per thing seen.
 fn walk(data: &[u8]) -> Vec<String> {

@@ -161,6 +161,32 @@ fn an_iso_image_under_layers_reads() {
     );
 }
 
+/// UDF volumes, as `testdata/udf` has them (xz-compressed): UDF alone,
+/// on a VAT, and beside ISO 9660, found under their layer and alone, and
+/// mounted by hivepack-udf from what comes out.
+#[test]
+fn udf_volumes_under_layers_open() {
+    for name in [
+        "mkudffs-hd-0201",
+        "mkudffs-hd-0201-bs4096",
+        "mkudffs-cdr-0201",
+        "genisoimage",
+    ] {
+        let path = support::repository().join(format!("testdata/udf/{name}.udf.xz"));
+        let file = std::fs::read(path).unwrap();
+        let (layers, container, image) = open(&file).unwrap();
+        assert_eq!(
+            (layers, container),
+            (vec![Layer::Xz], Container::Udf),
+            "{name}"
+        );
+        assert_eq!(open(&zstd(&image)).unwrap().1, Container::Udf, "{name}");
+        assert_eq!(open(&image).unwrap().1, Container::Udf, "{name}");
+        let udf = hivepack_udf::Udf::open(Cursor::new(image)).unwrap();
+        assert!(!udf.volume().name.is_empty(), "{name}");
+    }
+}
+
 /// Data looked into for an ISO 9660 image, cut short in what is looked
 /// at: it opens, and the error comes after the data before it, as without
 /// the look.

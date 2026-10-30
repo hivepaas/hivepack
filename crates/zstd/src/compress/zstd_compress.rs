@@ -4373,6 +4373,90 @@ impl CCtx {
         self.compress_end(dst, bufs, WindowBuffer::Input, 0, src.len())
     }
 
+    /// `ZSTD_compressBegin_usingCDict_deprecated`, then
+    /// `ZSTD_compressBlock_deprecated` of `src`: the context reset for a
+    /// frame of unknown size with `cdict` (attached, unless it is empty),
+    /// without frame parameters, and `src` compressed into `dst` as one
+    /// block in block mode (`ZSTD_compressContinue_internal` with `frame`
+    /// 0): no frame header, no block header, never an RLE block. Returns
+    /// the size of the block's content, 0 when it does not compress; its
+    /// sequences and literals stay in the store ([`CCtx::seq_store`]), as
+    /// `ZDICT_countEStats` reads them. Fails with `SrcSizeWrong` for more
+    /// than a block (`ZSTD_getBlockSize_deprecated`).
+    ///
+    /// For the dictionary builder's statistics only: the port has no
+    /// public block API (see `docs/porting.md`).
+    pub(crate) fn compress_block_using_cdict(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        cdict: &CDict,
+    ) -> Result<usize> {
+        // The window's dictionary is the CDict's content, for this call only.
+        self.frame_dict = FrameDict::None;
+        let f_params = FrameParameters {
+            content_size_flag: false,
+            checksum_flag: false,
+            no_dict_id_flag: false,
+        };
+        self.compress_begin_using_cdict_internal(cdict, f_params, ZSTD_CONTENTSIZE_UNKNOWN)?;
+
+        // ZSTD_compressBlock_deprecated
+        let block_size_max = self
+            .applied_params
+            .max_block_size
+            .min(1usize << self.applied_params.c_params.window_log);
+        if src.len() > block_size_max {
+            // Larger than a block.
+            return error!(SrcSizeWrong);
+        }
+
+        // ZSTD_compressContinue_internal, in block mode: no frame header,
+        // and the indices lowered here rather than in the frame's chunks.
+        let mut bufs = Buffers::new(src, &[]);
+        bufs.dict = &cdict.content;
+        bufs.cdict = Some(cdict);
+        if self.stage == CompressionStage::Created {
+            return error!(StageWrong);
+        }
+        if src.is_empty() {
+            return Ok(0);
+        }
+        let ms = &mut self.match_state;
+        if !ms
+            .window
+            .update(WindowBuffer::Input, 0, src.len(), ms.force_non_contiguous)
+        {
+            ms.force_non_contiguous = false;
+            ms.next_to_update = ms.window.dict_limit;
+        }
+        if !zstd_window_in_buffers(&ms.window, &bufs) {
+            return error!(SrcBufferWrong);
+        }
+        if self.applied_params.ldm_enable == ParamSwitch::Enable {
+            let window = &mut self.ldm_state.window;
+            window.update(WindowBuffer::Input, 0, src.len(), false);
+            if !zstd_window_in_buffers(window, &bufs) {
+                return error!(SrcBufferWrong);
+            }
+        }
+        zstd_overflow_correct_if_needed(&mut self.match_state, &self.applied_params, 0, src.len());
+        // In block mode the first block stays the first
+        // (ZSTD_compress_frameChunk alone clears `isFirstBlock`), which
+        // keeps ZSTD_compressBlock_internal from making it an RLE block, as
+        // libzstd's `frame` 0 does.
+        debug_assert!(self.is_first_block);
+        let c_size = self.compress_block_internal(dst, bufs, 0, src.len())?;
+        self.consumed_src_size += src.len() as u64;
+        self.produced_csize += c_size as u64;
+        Ok(c_size)
+    }
+
+    /// `ZSTD_getSeqStore`: the sequences and literals of the last block.
+    pub(crate) fn seq_store(&mut self) -> &mut SeqStore {
+        &mut self.seq_store
+    }
+
     /// `ZSTD_compressBegin_usingCDict_internal`: the context reset for a
     /// frame of `pledged_src_size` bytes with `cdict`, without buffers.
     fn compress_begin_using_cdict_internal(

@@ -190,6 +190,7 @@
 mod common;
 mod compress;
 mod decompress;
+mod dict_builder;
 
 #[cfg(test)]
 mod oracle;
@@ -197,6 +198,8 @@ mod oracle;
 mod oracle_compress;
 #[cfg(test)]
 mod oracle_sequences;
+#[cfg(test)]
+mod oracle_zdict;
 
 pub use common::error_private::{Error, ErrorCode, Result};
 pub use compress::zstd_cdict::CDict;
@@ -217,6 +220,16 @@ pub use decompress::zstd_decompress::{
 };
 pub use decompress::zstd_decompress_internal::{
     CONTENTSIZE_UNKNOWN, DCtx, Format, FrameHeader, FrameType,
+};
+pub use dict_builder::cover::{
+    CoverParams, optimize_train_from_buffer_cover, train_from_buffer_cover,
+};
+pub use dict_builder::fastcover::{
+    FastCoverParams, optimize_train_from_buffer_fast_cover, train_from_buffer_fast_cover,
+};
+pub use dict_builder::zdict::{
+    DictParams, add_entropy_tables_from_buffer, finalize_dictionary, get_dict_header_size,
+    get_dict_id, train_from_buffer,
 };
 
 /// The libzstd release this crate follows, as libzstd's

@@ -219,6 +219,7 @@ version = "0.0.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "hivepack-cpio",
  "hivepack-crypto",
  "hivepack-deflate",
  "hivepack-iso",
@@ -253,6 +254,7 @@ dependencies = [
  "flate2",
  "hivepack-age",
  "hivepack-bzip2",
+ "hivepack-cpio",
  "hivepack-deflate",
  "hivepack-extract",
  "hivepack-iso",

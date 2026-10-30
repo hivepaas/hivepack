@@ -1,7 +1,8 @@
 //! The decompressors as `io::Read`: zstd, xz (and lzip and .lzma), gzip,
 //! bzip2 and pbzx (xz streams, a block at a time), each over hivepack's
-//! port of its library, through one adapter; and LZ4, whose port has its
-//! own reader of `.lz4` files.
+//! port of its library, through one adapter; LZ4, whose port has its own
+//! reader of `.lz4` files; and RPM packages, whose lead and headers
+//! hivepack-cpio's port of libarchive's filter takes off.
 //!
 //! A file can hold several streams one after the other, as their tools
 //! make and read them: zstd frames (skippable ones too), gzip members,
@@ -613,6 +614,33 @@ impl<R: Read> Read for Lz4Layer<R> {
     }
 }
 
+/// An RPM package's payload: hivepack-cpio's port of libarchive's RPM
+/// filter, its errors given as the other layers' are, and the errors of
+/// the reader under it as they are.
+struct RpmLayer<R> {
+    reader: hivepack_cpio::rpm::Reader<R>,
+}
+
+impl<R: Read> Read for RpmLayer<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf).map_err(|e| {
+            let Some(error) = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<hivepack_cpio::Error>())
+            else {
+                return e;
+            };
+            // libarchive says nothing of a package that ends before its
+            // payload.
+            let message = match error.message() {
+                Some(text) => String::from_utf8_lossy(&text).into_owned(),
+                None => "the stream is cut short".into(),
+            };
+            decode_error(Layer::Rpm, message)
+        })
+    }
+}
+
 /// The limits of the decoders.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodeLimits {
@@ -668,6 +696,9 @@ pub(crate) fn decoder<'a, R: Read + Send + 'a>(
             PbzxCodec::new(limits.xz_memlimit),
             layer,
         )),
+        Layer::Rpm => Box::new(RpmLayer {
+            reader: hivepack_cpio::rpm::Reader::new(inner),
+        }),
         Layer::Lz4 => Box::new(Lz4Layer {
             decoder: hivepack_lz4::Decoder::new(Tagged(inner)),
             failed: None,

@@ -12,8 +12,8 @@ use std::io::{self, Cursor, Read};
 
 use hivepack_open::{Container, DecodeError, Error, Layer, Limits, Opener};
 use support::{
-    Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, pbzx, pbzx_chunk, pbzx_of, sample_tar, xz,
-    xz_no_check, xz_preset, zstd,
+    Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, newc, pbzx, pbzx_chunk, pbzx_of, rpm,
+    sample_tar, xz, xz_no_check, xz_preset, zstd,
 };
 
 /// A reference library's compressor.
@@ -285,6 +285,173 @@ fn pbzx_refuses_what_apple_s_tools_refuse() {
     }
     // Zeros after the last chunk are chunks of nothing.
     assert_eq!(open(&then(&[0; 32])).unwrap().2, text);
+}
+
+/// A cpio archive under each layer, and an RPM package's payload under
+/// each compressor rpm uses, LZMA's without magic among them: told as
+/// libarchive tells them, then read by hivepack-cpio.
+#[test]
+fn cpio_archives_and_rpm_packages_open() {
+    let tar = sample_tar();
+    let cpio = newc(&[
+        ("usr/", b""),
+        ("usr/share/doc/README", b"Read me.\n"),
+        ("usr/lib/big.bin", &tar),
+    ]);
+    assert_eq!(
+        open(&cpio).unwrap(),
+        (vec![], Container::Cpio, cpio.clone())
+    );
+    let cases: [(Layer, Compress); 5] = [
+        (Layer::Gzip, gzip),
+        (Layer::Bzip2, bzip2),
+        (Layer::Xz, xz),
+        (Layer::Zstd, zstd),
+        (Layer::Pbzx, pbzx_64k),
+    ];
+    for (layer, compress) in cases {
+        let (layers, container, data) = open(&compress(&cpio)).unwrap();
+        assert_eq!((layers, container), (vec![layer], Container::Cpio));
+        assert!(data == cpio, "{layer:?}");
+        // rpm's payload compressors, but pbzx.
+        if layer == Layer::Pbzx {
+            continue;
+        }
+        let (layers, container, data) = open(&rpm(&compress(&cpio))).unwrap();
+        assert_eq!(
+            (layers, container),
+            (vec![Layer::Rpm, layer], Container::Cpio)
+        );
+        assert!(data == cpio, "{layer:?}");
+    }
+    // LZMA, which RPM packages had before xz, has no magic, and the
+    // payload no name: its header tells it, as libarchive tells it.
+    let (layers, container, data) = open(&rpm(&lzma(&cpio))).unwrap();
+    assert_eq!(
+        (layers, container),
+        (vec![Layer::Rpm, Layer::Lzma], Container::Cpio)
+    );
+    assert!(data == cpio);
+    assert_eq!(open(&lzma(&cpio)).unwrap().1, Container::Data);
+    // A payload left uncompressed.
+    assert_eq!(
+        open(&rpm(&cpio)).unwrap(),
+        (vec![Layer::Rpm], Container::Cpio, cpio.clone())
+    );
+    // What hivepack-cpio reads through the layers.
+    let mut opener = Opener::new(|| Ok(Cursor::new(rpm(&xz(&cpio)))));
+    let mut reader = hivepack_cpio::Reader::new(opener.open().unwrap());
+    let mut entries = Vec::new();
+    while let Some(h) = reader.next().unwrap() {
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).unwrap();
+        entries.push((h.path, data.len()));
+    }
+    assert_eq!(
+        entries,
+        [
+            (b"usr".to_vec(), 0),
+            (b"usr/share/doc/README".to_vec(), 9),
+            (b"usr/lib/big.bin".to_vec(), tar.len()),
+        ]
+    );
+}
+
+/// An RPM package extracts through the opener: its payload's files, the
+/// package's lead, headers and compression taken off.
+#[test]
+fn an_rpm_package_extracts_through_the_opener() {
+    let cpio = newc(&[
+        ("usr/", b""),
+        ("usr/bin/", b""),
+        ("usr/bin/hello", b"#!/bin/sh\necho hello\n"),
+    ]);
+    let package = rpm(&xz(&cpio));
+    let scratch = Scratch::new();
+    let out = scratch.path().join("out");
+    let mut opener = Opener::new(|| Ok(Cursor::new(&package[..])));
+    let summary = hivepack_extract::extract_cpio(
+        || Ok(opener.open()?),
+        &out,
+        &hivepack_extract::Options::default(),
+    )
+    .unwrap();
+    assert_eq!((summary.files, summary.directories), (1, 2));
+    assert_eq!(
+        std::fs::read(out.join("usr/bin/hello")).unwrap(),
+        b"#!/bin/sh\necho hello\n"
+    );
+}
+
+/// RPM packages that end before their payload, or have no header, fail
+/// with libarchive's messages.
+#[test]
+fn rpm_packages_without_a_payload_fail() {
+    let package = rpm(&gzip(&newc(&[("a", b"a")])));
+    let header_end = 96 + 16 + 16 + 7 + 1 + 16;
+    for (file, message) in [
+        (
+            package[..50].to_vec(),
+            "Truncated input file (needed 96 bytes, only 50 available)",
+        ),
+        (package[..96].to_vec(), "the stream is cut short"),
+        (
+            package[..header_end - 4].to_vec(),
+            "the stream is cut short",
+        ),
+        (
+            [&package[..96], &gzip(b"no headers")[..]].concat(),
+            "Unrecognized rpm header",
+        ),
+    ] {
+        assert_eq!(failure(open(&file)), (Layer::Rpm, message.to_string()));
+    }
+    // An outer layer's error comes through the package as it is.
+    let mut outer = gzip(&package);
+    outer.truncate(outer.len() - 4);
+    assert_eq!(failed_layer(open(&outer)), Layer::Gzip);
+}
+
+/// libarchive's own cpio archives and RPM packages, when the core sets are
+/// there (`scripts/testdata.py fetch`): every format of cpio, and packages
+/// with gzip and bzip2 payloads, told and their first entry read.
+#[test]
+fn libarchive_s_cpio_archives_and_packages_open() {
+    let folder = support::testdata().join("libarchive-cpio");
+    if !folder.join(".complete").exists() {
+        eprintln!("skipping: the libarchive-cpio set is not fetched");
+        return;
+    }
+    let cases: [(&str, &[Layer]); 8] = [
+        ("cpio_bin_be.cpio", &[]),
+        ("cpio_bin_le.cpio", &[]),
+        // Its test's two parts make one archive.
+        ("cpio_afio_header.part*.cpio", &[]),
+        ("cpio_filename_utf8_jp.cpio", &[]),
+        ("test_compat_cpio_1.cpio", &[]),
+        ("test_write_disk_appledouble.cpio.gz", &[Layer::Gzip]),
+        ("cpio_svr4_gzip_rpm.rpm", &[Layer::Rpm, Layer::Gzip]),
+        ("cpio_svr4_bzip2_rpm.rpm", &[Layer::Rpm, Layer::Bzip2]),
+    ];
+    for (name, layers) in cases {
+        let file = match name.split_once('*') {
+            Some((stem, end)) => ["1", "2"]
+                .iter()
+                .flat_map(|part| std::fs::read(folder.join(format!("{stem}{part}{end}"))).unwrap())
+                .collect(),
+            None => std::fs::read(folder.join(name)).unwrap(),
+        };
+        let mut opener = Opener::new(|| Ok(Cursor::new(file.clone())));
+        let opened = opener.open().unwrap();
+        assert_eq!(
+            (opened.layers(), opened.container()),
+            (layers, Container::Cpio),
+            "{name}"
+        );
+        // The first entry: afio's test is that header alone.
+        let mut reader = hivepack_cpio::Reader::new(opened);
+        assert!(reader.next().unwrap().is_some(), "{name}");
+    }
 }
 
 #[test]

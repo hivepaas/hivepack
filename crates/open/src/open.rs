@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Read};
 use hivepack_age::{BoxedIdentity, FileKey, FileKeyIdentity, Identity};
 
 use crate::decode::{DecodeLimits, decoder};
-use crate::detect::{Container, Detected, HEAD_LEN, Layer, UDF_HEAD_LEN, detect};
+use crate::detect::{Container, Detected, HEAD_LEN, Layer, UDF_HEAD_LEN, detect, is_lzma_alone};
 use crate::error::Error;
 
 /// How far an [`Opener`] goes.
@@ -161,6 +161,13 @@ where
             let mut head = Vec::with_capacity(HEAD_LEN);
             (&mut reader).take(HEAD_LEN as u64).read_to_end(&mut head)?;
             let mut detected = detect(&head, name);
+            // An RPM package's payload has no name to tell `.lzma` by.
+            if detected == Detected::Container(Container::Data)
+                && layers.last() == Some(&Layer::Rpm)
+                && is_lzma_alone(&head)
+            {
+                detected = Detected::Layer(Layer::Lzma);
+            }
             let mut deferred = None;
             if detected == Detected::Container(Container::Data) && head.len() == HEAD_LEN {
                 // An ISO 9660 image or a UDF volume tells further in. An

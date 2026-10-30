@@ -1,8 +1,9 @@
 //! Opening what hivepack reads, through the layers around it: age
-//! encryption and zstd, xz, lzip, .lzma, LZ4, gzip, bzip2 or pbzx
-//! compression, found by their first bytes and taken off one after the
-//! other, as many as there are, until what is under them is a tar or ZIP
-//! archive, or plain data.
+//! encryption, zstd, xz, lzip, .lzma, LZ4, gzip, bzip2 or pbzx
+//! compression, and RPM packages' lead and headers, found by their first
+//! bytes and taken off one after the other, as many as there are, until
+//! what is under them is a container (a tar, ZIP or cpio archive, an ISO
+//! 9660 image, a UDF volume), or plain data.
 //!
 //! ```no_run
 //! use std::sync::Arc;

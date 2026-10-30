@@ -221,6 +221,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "extract_cpio"
+path = "fuzz_targets/extract_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

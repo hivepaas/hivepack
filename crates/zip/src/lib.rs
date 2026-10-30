@@ -66,6 +66,7 @@
 mod add_entry;
 mod algorithm_bzip2;
 mod algorithm_deflate;
+mod algorithm_ppmd;
 mod algorithm_xz;
 mod algorithm_zstd;
 mod buffer;
@@ -102,6 +103,9 @@ mod io_util;
 mod name_locate;
 mod open;
 mod pkware;
+mod ppmd8;
+#[cfg(test)]
+mod ppmd8_oracle;
 mod random;
 mod set_archive_comment;
 mod set_archive_flag;

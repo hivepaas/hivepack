@@ -3,7 +3,7 @@
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd,
 hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with
 liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip,
-hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open, hivepack-7z and hivepack-udf any input. They need
+hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-cpio, hivepack-open, hivepack-7z and hivepack-udf any input. They need
 nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 (`NIGHTLY` in `.github/workflows/ci.yml`), chosen for the shell with
 `export RUSTUP_TOOLCHAIN=<that nightly>`, and
@@ -20,6 +20,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
 | `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |
 | `zip_open` | Opening the input as a ZIP archive, leniently and with `ZIP_CHECKCONS`, asking the reading API about every entry, and reading every entry's data, decompressed, raw, and decrypted with the password "foo": no panic (`crates/zip/tests/oracle.rs` compares the answers with libzip) |
+| `zip_ppmd` | Reading the input as the data of a PPMd entry (ZIP's method 98) in an archive of that one entry, leniently and with `ZIP_CHECKCONS`, in pieces of one byte and of growing sizes: the same bytes and error both ways (libzip has no PPMd: `crates/zip/src/ppmd8_oracle.rs` compares the model with 7-Zip's `Ppmd8.c`) |
 | `zip_split` | Cutting the input into volumes its first bytes pick and opening them as a split archive (`Volumes`), leniently and with `ZIP_CHECKCONS`, reading every entry, decompressed and raw: no panic, and written again as an archive of one disk, the same entries (libzip reads no split archives: `crates/zip/tests/split.rs` compares them with 7-Zip) |
 | `extract` | Extracting the input as a ZIP archive with hivepack-extract, with options its first byte picks, cancelled after some progress if it says so: nothing written beside the destination, every link created staying inside it, the summary counting what is there, and no file left cut off |
 | `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick (encrypting among them) and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data, read with the passwords the edits set (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
@@ -36,6 +37,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `rar_test` | Going through the input as UnRAR tests an archive, twice: the same data both times, no more of any entry than its header's pack and unpacked sizes |
 | `extract_tar` | Extracting the input as a tar archive with hivepack-extract, as `extract` does a ZIP archive: options from its first byte, cancelled after some progress if it says so; nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
 | `iso` | Reading the input as an ISO 9660 image, as an input that cannot seek and as one that can, every entry and up to 4 MiB of each one's data, twice each, in pieces of different sizes its first eight bytes pick: the same headers, data, warnings and end both times, and no panic (`crates/iso/tests/oracle.rs` compares the answers with libarchive) |
+| `cpio` | Reading the input as a cpio archive, with the `pwb` option or without as its first eight bytes pick, every entry and all of its data, twice, from pieces of the input and in pieces of different sizes they pick: the same headers, data and end both times; with some entries' data left for `next` to skip, the same headers; and when the RPM filter's bid takes the input for a package, its payload twice the same, read as a cpio archive too; no panic (`crates/cpio/tests/oracle.rs` compares the answers with libarchive) |
 | `extract_iso` | Extracting the input as an ISO 9660 image with hivepack-extract, as `extract_tar` does a tar archive: options from its first byte, cancelled after some progress if it says so; nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
 | `open` | Opening the input through its layers with hivepack-open (the age key of `crates/open/tests/age.rs`'s files; a name ending in `.lzma` if its first byte is odd; small limits), three times with one opener, the later opens with the file keys kept, and reading up to 4 MiB in pieces of different sizes: the same layers, container and end each time, the same data, or after an error data of which one starts the other (libzstd gives out less before an error when its output buffer is larger), and no panic |
 | `udf` | Mounting the image the input describes (its first byte the sector size, its next three the number of sectors, then sectors by number, length and bytes) and walking it twice: every directory listed, every node's attributes, every link's target, up to 1 MiB of every file, the first 16 names of each directory looked up: the same both times, every name found when its directory reads whole, and no panic (`crates/udf/tests` compares the answers with Linux) |
@@ -94,6 +96,9 @@ CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and
 those libzip encrypted in `testdata/oracle/zip-decrypt.txt` (some with
 "foo"), and `zip_edit` with the same archives behind two edits (encrypting, for
 the encrypted ones).
+
+CI seeds `zip_ppmd` with the streams of `testdata/oracle/ppmd8.txt` made
+with a whole number of MiB, behind ZIP's two bytes of parameters.
 
 CI seeds `zip_split` with the split archives of `testdata/zip-split`, behind
 their number of volumes and where each ends.

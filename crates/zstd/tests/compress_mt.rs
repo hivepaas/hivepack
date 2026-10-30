@@ -1535,7 +1535,13 @@ fn contexts_are_send() {
 fn contexts_share_a_thread_pool() {
     let mut rng = Rng(0x4D54_0700);
     let len = scaled(2_000_000);
-    let levels = [1, 3, 7, 19];
+    // On big-endian machines, levels up to 3 only: from `greedy` up,
+    // libzstd's block splitter hashes in the machine's byte order there.
+    let levels = if cfg!(target_endian = "big") {
+        [1, 3, 2, -1]
+    } else {
+        [1, 3, 7, 19]
+    };
     let inputs: Vec<Vec<u8>> = levels.iter().map(|_| data(&mut rng, len)).collect();
     let steps: Vec<Vec<Step>> = levels.iter().map(|_| steps(&mut rng, len)).collect();
     // libzstd's frames, with threads of its own: in each of two rounds, one

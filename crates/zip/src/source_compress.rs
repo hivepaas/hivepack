@@ -1,8 +1,10 @@
 //! The decompressing and compressing layers: port of
-//! `zip_source_compress.c`, with deflate, bzip2, LZMA, XZ and Zstandard for algorithms.
+//! `zip_source_compress.c`, with deflate, bzip2, LZMA, XZ and Zstandard for algorithms,
+//! and PPMd and Deflate64 to decompress, which libzip does not read.
 
 use crate::algorithm_bzip2::{self, Bzip2};
 use crate::algorithm_deflate::{self, CompressionStatus, DeflateCompress, DeflateDecompress};
+use crate::algorithm_ppmd::Ppmd;
 use crate::algorithm_xz::{self, Xz};
 use crate::algorithm_zstd::{self, Zstd};
 use crate::dirent::{CM_DEFAULT, cm_actual};
@@ -32,6 +34,8 @@ pub(crate) enum DecompressAlgorithm {
     Bzip2(Bzip2),
     Xz(Xz),
     Zstd(Zstd),
+    /// Not in libzip.
+    Ppmd(Ppmd),
 }
 
 /// A compressing algorithm, the same for compressing.
@@ -42,9 +46,10 @@ pub(crate) enum CompressAlgorithm {
     Zstd(Zstd),
 }
 
-/// The algorithms' functions, the same for both directions.
+/// The algorithms' functions, the same for both directions, with the
+/// variants of one direction only after the name.
 macro_rules! algorithm_functions {
-    ($name:ident) => {
+    ($name:ident $(, $only:ident)*) => {
         impl $name {
             fn version_needed(&self) -> u8 {
                 match self {
@@ -52,6 +57,7 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(_) => algorithm_bzip2::VERSION_NEEDED,
                     Self::Xz(_) => algorithm_xz::VERSION_NEEDED,
                     Self::Zstd(_) => algorithm_zstd::VERSION_NEEDED,
+                    $(Self::$only(a) => a.version_needed(),)*
                 }
             }
 
@@ -61,6 +67,7 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(a) => a.general_purpose_bit_flags(),
                     Self::Xz(a) => a.general_purpose_bit_flags(),
                     Self::Zstd(a) => a.general_purpose_bit_flags(),
+                    $(Self::$only(a) => a.general_purpose_bit_flags(),)*
                 }
             }
 
@@ -70,6 +77,7 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(a) => a.start(),
                     Self::Xz(a) => a.start(st, attributes),
                     Self::Zstd(a) => a.start(),
+                    $(Self::$only(a) => a.start(),)*
                 }
             }
 
@@ -79,6 +87,7 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(a) => a.end(),
                     Self::Xz(a) => a.end(),
                     Self::Zstd(a) => a.end(),
+                    $(Self::$only(a) => a.end(),)*
                 }
             }
 
@@ -88,6 +97,7 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(a) => a.input(length),
                     Self::Xz(a) => a.input(buffer, length),
                     Self::Zstd(a) => a.input(length),
+                    $(Self::$only(a) => a.input(buffer, length),)*
                 }
             }
 
@@ -97,6 +107,7 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(a) => a.end_of_input(),
                     Self::Xz(a) => a.end_of_input(),
                     Self::Zstd(a) => a.end_of_input(),
+                    $(Self::$only(a) => a.end_of_input(),)*
                 }
             }
 
@@ -106,17 +117,32 @@ macro_rules! algorithm_functions {
                     Self::Bzip2(a) => a.process(buffer, data),
                     Self::Xz(a) => a.process(buffer, data),
                     Self::Zstd(a) => a.process(buffer, data),
+                    $(Self::$only(a) => a.process(buffer, data),)*
                 }
             }
         }
     };
 }
-algorithm_functions!(DecompressAlgorithm);
+algorithm_functions!(DecompressAlgorithm, Ppmd);
 algorithm_functions!(CompressAlgorithm);
+
+impl DecompressAlgorithm {
+    /// Not in libzip: whether input the stream did not read is left, once
+    /// both have ended. libzip's algorithms end without waiting for the end
+    /// of their input, and are asked what they hold back of it then
+    /// (`end_of_input`); PPMd decodes only with 1 KiB of input ahead or the
+    /// input's end, so that its input has ended first.
+    fn input_left(&self) -> bool {
+        match self {
+            Self::Ppmd(a) => a.input_left(),
+            _ => false,
+        }
+    }
+}
 
 /// The decompressing algorithm for `method`, if libzip has one: port of
 /// `_zip_get_compression_algorithm`, for decompressing. Differs from
-/// libzip, which has no Deflate64, read here.
+/// libzip, which has no Deflate64 and no PPMd, read here.
 pub(crate) fn get_compression_algorithm(method: u16) -> Option<DecompressAlgorithm> {
     match method {
         cm::DEFLATE => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(false))),
@@ -124,6 +150,7 @@ pub(crate) fn get_compression_algorithm(method: u16) -> Option<DecompressAlgorit
         cm::BZIP2 => Some(DecompressAlgorithm::Bzip2(Bzip2::decompressor())),
         cm::LZMA | cm::XZ => Some(DecompressAlgorithm::Xz(Xz::decompressor(method))),
         cm::ZSTD => Some(DecompressAlgorithm::Zstd(Zstd::decompressor())),
+        cm::PPMD => Some(DecompressAlgorithm::Ppmd(Ppmd::decompressor())),
         _ => None,
     }
 }
@@ -296,6 +323,11 @@ impl Decompress {
                             self.error = Error::incons(Detail::CompressedDataTrailingGarbage);
                             break;
                         }
+                    } else if self.check_consistency && self.algorithm.input_left() {
+                        // Not in libzip, whose algorithms do not wait for
+                        // the end of their input (see input_left).
+                        self.error = Error::incons(Detail::CompressedDataTrailingGarbage);
+                        break;
                     }
 
                     if self.first_read < 0 {

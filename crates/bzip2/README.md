@@ -32,6 +32,18 @@ The goals:
 
 How the port follows libbzip2, how it is checked, and what is left are in [docs/bzip2.md](../../docs/bzip2.md).
 
+## Speed
+
+Against libbzip2 1.0.8, with `tools/bzip2-bench`, on the 12 Silesia files. Above 1× the port is faster.
+
+| | Mean | Range |
+|---|---|---|
+| Compression, block sizes 1 and 9 | 1.05× | 0.97–1.18× |
+| Decompression, block size 9 | 1.01× | 0.98–1.05× |
+| Decompression, small mode | 1.03× | 0.99–1.04× |
+
+**Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of three rounds taken in turn. More is in [docs/bzip2.md](../../docs/bzip2.md#the-speed-target).
+
 ## License
 
 libbzip2's BSD-style license (`bzip2-1.0.6`), the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (C) 1996-2019 Julian R Seward, and (c) 2026 HivePaaS.

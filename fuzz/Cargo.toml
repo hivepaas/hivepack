@@ -190,6 +190,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "rar_test"
+path = "fuzz_targets/rar_test.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

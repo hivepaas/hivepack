@@ -101,6 +101,8 @@ pub enum Error {
     /// The headers are encrypted, and no password was given: UnRAR's
     /// library stops there, with the exit code so far.
     MissingPassword { exit_code: ExitCode },
+    /// What hivepack-rar cannot read yet, which UnRAR can.
+    NotYet(&'static str),
     /// The archive could not be read.
     Io(io::Error),
 }
@@ -118,6 +120,7 @@ impl fmt::Display for Error {
             Error::MissingPassword { .. } => {
                 f.write_str("the headers are encrypted, and no password was given")
             }
+            Error::NotYet(what) => write!(f, "{what}: not read yet"),
             Error::Io(e) => write!(f, "{e}"),
         }
     }

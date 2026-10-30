@@ -275,6 +275,55 @@ pub(crate) fn convert_file_header(name: &mut WideString, format: Format, hs_type
     truncate_at_zero(name);
 }
 
+/// `ConvertPath`, on Linux: what is left of a name once any `..` in it, and
+/// whatever leads up to its first real part, is taken away. Names of nothing
+/// but those, like `/` and `../`, are left with nothing.
+pub fn convert_path(s: &[u32]) -> &[u32] {
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+    let is_div = |c: u32| c == u32::from(b'/');
+    let dot = u32::from(b'.');
+    let mut dest = 0;
+    // No "/../" in any part, and no "/.." at the end.
+    for i in 0..s.len() {
+        if is_div(at(i))
+            && at(i + 1) == dot
+            && at(i + 2) == dot
+            && (is_div(at(i + 3)) || at(i + 3) == 0)
+        {
+            dest = if at(i + 3) == 0 { i + 3 } else { i + 4 };
+        }
+    }
+    // No "//server/share/", nor any run of "." and "/", at the start.
+    while dest < s.len() {
+        let mut i = dest;
+        if is_div(at(i)) && is_div(at(i + 1)) {
+            let mut slashes = 0;
+            for j in i + 2..s.len() {
+                if is_div(at(j)) {
+                    slashes += 1;
+                    if slashes == 2 {
+                        i = j + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        let start = i;
+        for j in start..s.len() {
+            if is_div(at(j)) {
+                i = j + 1;
+            } else if at(j) != dot {
+                break;
+            }
+        }
+        if i == dest {
+            break;
+        }
+        dest = i;
+    }
+    &s[dest.min(s.len())..]
+}
+
 /// A name as text: its characters, U+FFFD for what is not one.
 pub fn to_string_lossy(name: &[u32]) -> String {
     name.iter()
@@ -306,6 +355,29 @@ mod tests {
         assert_eq!(utf_to_wide("aé€😀".as_bytes()), wide("aé€😀"));
         assert_eq!(utf_to_wide(b"ab\xffcd"), wide("ab"));
         assert_eq!(utf_to_wide(b"ab\0cd"), wide("ab"));
+    }
+
+    #[test]
+    fn convert_path_leaves_what_unrar_leaves() {
+        for (name, left) in [
+            ("a/b", "a/b"),
+            ("/a", "a"),
+            ("./a", "a"),
+            ("../../a", "a"),
+            ("a/../b", "b"),
+            ("a/b/..", ""),
+            ("/", ""),
+            ("../", ""),
+            ("//server/share/a", "a"),
+            ("..", ".."),
+            ("...", "..."),
+            ("a..", "a.."),
+            ("a/..b", "a/..b"),
+        ] {
+            let wide: Vec<u32> = name.bytes().map(u32::from).collect();
+            let want: Vec<u32> = left.bytes().map(u32::from).collect();
+            assert_eq!(convert_path(&wide), want, "{name}");
+        }
     }
 
     #[test]

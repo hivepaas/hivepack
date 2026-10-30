@@ -2,7 +2,7 @@
 
 Reading RAR archives in safe Rust: a port of [UnRAR](https://www.rarlab.com/rar_add.htm) 7.3.2, RARLAB's source, under UnRAR's license. It reads RAR and never writes it.
 
-> **Status:** reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, broken ones included, compared with UnRAR on libarchive's RAR archives and a quarter of a million damaged copies. The data of entries, decompression and decryption come next. This crate is not on crates.io.
+> **Status:** reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, broken ones included, compared with UnRAR on libarchive's RAR archives and a quarter of a million damaged copies, and reads stored entries as UnRAR tests them, checked against CRC-32, BLAKE2sp or RAR 1.4's checksum. Decompression and decryption come next. This crate is not on crates.io.
 
 ```rust
 use hivepack_rar::{Archive, HEAD_FILE, name};
@@ -15,6 +15,8 @@ while archive.read_header()? != 0 {
     archive.seek_to_next();
 }
 ```
+
+An `Extract` goes through the entries, giving out each one's data and checking its hash; see the crate's documentation.
 
 The plan, the license and how the port is checked are in [docs/rar.md](../../docs/rar.md).
 

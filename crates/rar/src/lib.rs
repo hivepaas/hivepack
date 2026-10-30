@@ -36,11 +36,40 @@
 //! # }
 //! ```
 //!
-//! Reading entries' data, decompressing and decrypting them come next; the
-//! plan is the repository's `docs/rar.md`.
+//! An [`Extract`] goes through the entries as UnRAR does when testing an
+//! archive, giving out each one's data and checking its hash:
+//!
+//! ```no_run
+//! use hivepack_rar::{Archive, Error, Extract};
+//!
+//! # fn main() -> Result<(), Error> {
+//! let file = std::fs::File::open("archive.rar")?;
+//! let mut archive = Archive::open(file, true)?;
+//! let mut extract = Extract::new();
+//! loop {
+//!     let size = archive.read_header()?;
+//!     let mut bytes = 0;
+//!     let go_on = extract.current_file(&mut archive, size, &mut |data| {
+//!         bytes += data.len();
+//!         Ok(())
+//!     })?;
+//!     if !go_on {
+//!         break;
+//!     }
+//! }
+//! println!("{:?}", archive.exit_code());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! So far entries that are stored, not encrypted and whole in one volume are
+//! read; decompressing and decrypting come next. The plan is the repository's
+//! `docs/rar.md`.
 
 mod archive;
 mod error;
+mod extract;
+mod hash;
 mod headers;
 pub mod name;
 mod raw;
@@ -49,6 +78,8 @@ mod time;
 
 pub use archive::Archive;
 pub use error::{Error, ExitCode};
+pub use extract::{Extract, Output};
+pub use hash::DataHash;
 pub use headers::*;
 pub use source::ReadAt;
 pub use time::RarTime;

@@ -11,15 +11,20 @@
 // in source code comments of resulting package.
 
 //! Comparison with UnRAR 7.3.2 through `tools/rar-oracle`: every header of
-//! an archive, as UnRAR reads it.
+//! an archive, as UnRAR reads it, and every entry, as UnRAR tests it.
 //!
 //! The oracle is a small C++ program built with UnRAR's sources by
 //! `scripts/testdata.py`. It answers `list <enable_broken> <hex>` by
 //! opening the archive with UnRAR's `Archive`, reading every header, and
 //! printing what UnRAR keeps of each: its fields, the archive's state and
-//! the exit code. [`answer`] answers the same request with the port, and
-//! the two are compared as text, on libarchive's RAR test archives and on
-//! damaged copies of them.
+//! the exit code. It answers `test <hex>` by going through the archive with
+//! UnRAR's `CmdExtract`, printing what became of each header: how much data
+//! came out, its hash, the position and the exit code. It answers
+//! `hash <type> <chunk> <hex>` with UnRAR's `DataHash`, as no
+//! archive at hand stores data under BLAKE2sp or RAR 1.4's checksum.
+//! [`answer`] answers the same requests with the port, and the two are
+//! compared as text, on libarchive's RAR test archives and on damaged copies
+//! of them.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // Off Linux only the recorded answers are replayed, without the oracle.
@@ -288,9 +293,124 @@ impl Out {
     }
 }
 
+/// Whether UnRAR 7.3.2's mask `*` refuses a name, which the oracle passes
+/// over as the port does here: a last part that starts with `*` and goes on,
+/// as `match` takes that `*` for a plain character.
+fn mask_refuses(name: &[u32]) -> bool {
+    let last = name
+        .rsplit(|&c| c == u32::from(b'/'))
+        .next()
+        .unwrap_or_default();
+    last.len() >= 2 && last[0] == u32::from(b'*')
+}
+
+/// The port's answer to a `test` request, in the oracle's words.
+fn answer_test(archive: &[u8], limit: Option<u64>) -> String {
+    let mut out = Out("test".to_string());
+    let exit = match Archive::open(archive, true) {
+        Err(Error::NotRar { exit_code }) => {
+            out.0 += " notarchive";
+            exit_code
+        }
+        Err(Error::MissingPassword { exit_code }) => {
+            out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+            exit_code
+        }
+        Err(e) => panic!("{e}"),
+        Ok(mut arc) => {
+            out.0 += " archive";
+            let mut extract = Extract::new();
+            if let Some(limit) = limit {
+                extract.win_size_limit = limit;
+            }
+            loop {
+                let size = match arc.read_header() {
+                    Ok(size) => size,
+                    Err(Error::MissingPassword { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                        break exit_code;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                out.0 += " |";
+                out.put("read", size as u64);
+                out.put("headertype", u64::from(arc.cur_header_type));
+                out.put("cur", arc.cur_block_pos as u64);
+                out.put("next", arc.next_block_pos as u64);
+                if size != 0
+                    && arc.cur_header_type == HEAD_FILE
+                    && mask_refuses(&arc.file_head.file_name)
+                {
+                    out.0 += " later";
+                    arc.seek_to_next();
+                    continue;
+                }
+                let (mut bytes, mut fnv) = (0u64, 0xcbf2_9ce4_8422_2325u64);
+                let result = extract.current_file(&mut arc, size, &mut |data| {
+                    bytes += data.len() as u64;
+                    for &byte in data {
+                        fnv = (fnv ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+                    }
+                    Ok(())
+                });
+                match result {
+                    Ok(go) => {
+                        out.put("data", bytes);
+                        out.put("fnv", fnv);
+                        out.bool("baddata", extract.broken_file);
+                        out.put("pos", arc.position());
+                        out.bool("broken", arc.broken_header);
+                        out.put("code", u64::from(arc.exit_code().number()));
+                        if !go {
+                            break arc.exit_code();
+                        }
+                    }
+                    Err(Error::NotYet(_)) => {
+                        out.0 += " later";
+                        arc.seek_to_next();
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+    };
+    out.put("exit", u64::from(exit.number()));
+    out.0
+}
+
+/// The port's answer to a `hash` request, in the oracle's words.
+fn answer_hash(words: &[&str]) -> String {
+    let kind = match words[1] {
+        "1" => HashType::Rar14,
+        "2" => HashType::Crc32,
+        "3" => HashType::Blake2,
+        other => panic!("hash type {other}"),
+    };
+    let chunk: usize = words[2].parse().expect("a chunk size");
+    let mut hash = DataHash::new(kind);
+    for piece in unhex(words[3]).chunks(chunk) {
+        hash.update(piece);
+    }
+    let value = hash.result();
+    let mut out = Out("hash".to_string());
+    if kind == HashType::Blake2 {
+        out.bytes("digest", &value.digest);
+    } else {
+        out.put("crc32", u64::from(value.crc32));
+    }
+    out.0
+}
+
 /// The port's answer to a request, in the oracle's words.
 fn answer(request: &str) -> String {
     let words: Vec<&str> = request.split(' ').collect();
+    if words[0] == "test" {
+        let limit = words.get(2).map(|n| n.parse().expect("a limit"));
+        return answer_test(&unhex(words.get(1).copied().unwrap_or("-")), limit);
+    }
+    if words[0] == "hash" {
+        return answer_hash(&words);
+    }
     assert_eq!(words[0], "list", "{request:.80}");
     let enable_broken = words[1] == "1";
     let data = unhex(words.get(2).copied().unwrap_or("-"));
@@ -434,8 +554,174 @@ fn damaged_archives_list_like_unrar() {
     eprintln!("{compared} damaged archives compared");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn libarchive_archives_test_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let archives = libarchive_archives();
+    let (mut with_data, mut later) = (0, 0);
+    for (name, data) in &archives {
+        let request = format!("test {}", hex(data));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, name);
+        with_data += want
+            .split(' ')
+            .filter(|w| w.starts_with("data=") && *w != "data=0")
+            .count();
+        later += want.split(' ').filter(|w| *w == "later").count();
+    }
+    eprintln!(
+        "{} archives tested: {with_data} entries with data, {later} left for later",
+        archives.len()
+    );
+    // That the comparison compares something.
+    assert!(
+        archives.is_empty() || with_data >= 30,
+        "only {with_data} entries with data"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn damaged_archives_test_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0003);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    let (mut compared, mut failed_hash) = (0, 0);
+    for (name, data) in &libarchive_archives() {
+        if data.len() > 64 << 10 {
+            continue;
+        }
+        for i in 0..count {
+            let damaged = if i % 2 == 0 {
+                let head = data.len().min(1024);
+                let mut d = damage(&mut rng, &data[..head]);
+                d.extend_from_slice(&data[head..]);
+                d
+            } else {
+                damage(&mut rng, data)
+            };
+            let request = format!("test {}", hex(&damaged));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, damaged {i}"));
+            compared += 1;
+            failed_hash += usize::from(want.contains(" code=3"));
+        }
+    }
+    eprintln!("{compared} damaged archives tested, {failed_hash} with a bad hash or header");
+}
+
+// A dictionary too large for the limit, on archives that hold what they say:
+// random damage rarely gets to a size past the default 4 GiB.
+#[cfg(target_os = "linux")]
+#[test]
+fn dictionary_limits_are_unrars() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut stopped = 0;
+    for (name, data) in &libarchive_archives() {
+        if data.len() > 64 << 10 {
+            continue;
+        }
+        for limit in [0x1000, 0x1_ffff, 0x2_0000, 0x40_0000] {
+            let request = format!("test {} {limit}", hex(data));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, limit {limit:#x}"));
+            stopped += usize::from(want.contains(" code=2 ") || want.contains(" exit=2"));
+        }
+    }
+    let archives = libarchive_archives();
+    assert!(
+        archives.is_empty() || stopped > 10,
+        "only {stopped} stopped"
+    );
+}
+
+/// Bytes that are the same run to run.
+fn hash_input(rng: &mut Rng, size: usize) -> Vec<u8> {
+    (0..size).map(|_| rng.next() as u8).collect()
+}
+
+/// A `hash` request of each kind, for sizes around the block sizes.
+fn hash_requests(rng: &mut Rng, sizes: &[usize]) -> Vec<String> {
+    let mut requests = Vec::new();
+    for &size in sizes {
+        let data = hash_input(rng, size);
+        for kind in [1, 2, 3] {
+            let chunk = rng.pick(&[1, 7, 64, 512, 4096, 1 << 20]);
+            requests.push(format!("hash {kind} {chunk} {}", hex(&data)));
+        }
+    }
+    requests
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hashes_are_unrars() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x4152_0005);
+    let sizes = [
+        0,
+        1,
+        2,
+        63,
+        64,
+        65,
+        511,
+        512,
+        513,
+        4096,
+        0x8000,
+        0x8001,
+        200_000,
+        1 << 20,
+    ];
+    for request in hash_requests(&mut rng, &sizes) {
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("{:.20}", request));
+    }
+}
+
 fn recorded_path() -> std::path::PathBuf {
     support::repository().join("testdata/oracle/rar-list.txt")
+}
+
+fn recorded_test_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-test.txt")
+}
+
+/// The archives whose testing is recorded: those of 64 KB or less as they
+/// are, for the stored ones with something to hash, and the same requests
+/// as `recorded_requests`' for the damaged ones.
+fn recorded_test_requests() -> Vec<String> {
+    let mut rng = Rng(0x4152_0004);
+    let mut requests = Vec::new();
+    for (name, data) in libarchive_archives() {
+        if data.len() <= 2048 || name.contains("stored") || name.contains("blake2") {
+            requests.push(format!("test {}", hex(&data)));
+        }
+        if data.len() <= 2048 {
+            for _ in 0..3 {
+                requests.push(format!("test {}", hex(&damage(&mut rng, &data))));
+            }
+        }
+    }
+    requests.extend(hash_requests(&mut rng, &[0, 1, 63, 64, 65, 512, 513, 4096]));
+    requests
 }
 
 /// The requests whose answers are recorded: libarchive's archives of 2 KB
@@ -479,6 +765,41 @@ fn port_lists_as_recorded() {
     assert!(checked > 500, "only {checked} recorded answers");
 }
 
+#[test]
+fn port_tests_as_recorded() {
+    let text = std::fs::read_to_string(recorded_test_path()).expect("testdata/oracle/rar-test.txt");
+    let mut checked = 0;
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        assert_eq!(
+            support::recorded_form(&answer(request)),
+            want,
+            "{request:.300}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 200, "only {checked} recorded answers");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-test.txt from the oracle"]
+fn record_test_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle), replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_test_answers -- --ignored\n",
+    );
+    for request in recorded_test_requests() {
+        let reply = oracle.ask(&request);
+        let _ = writeln!(text, "{request}\t{}", support::recorded_form(&reply));
+    }
+    std::fs::write(recorded_test_path(), text).expect("written");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "rewrites testdata/oracle/rar-list.txt from the oracle"]
@@ -512,9 +833,13 @@ fn corpus_lists_like_unrar() {
         let Some((&choice, archive)) = data.split_first() else {
             continue;
         };
-        let request = format!("list {} {}", choice & 1, hex(archive));
-        let want = oracle.ask(&request);
-        assert_same(&request, &want, &path.display().to_string());
+        for request in [
+            format!("list {} {}", choice & 1, hex(archive)),
+            format!("test {}", hex(archive)),
+        ] {
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &path.display().to_string());
+        }
         compared += 1;
     }
     eprintln!("{compared} inputs compared");

@@ -49,7 +49,7 @@ Where UnRAR depends on the system (a name in a RAR 4 archive without Unicode, wh
 | `archive.cpp`, `arcread.cpp`, `headers.hpp`, `headers5.hpp`, `headers.cpp`, `rawread.cpp` | `archive`, `headers`, `raw` | step 1 |
 | `encname.cpp`, the parts of `unicode.cpp`, `strfn.cpp` and `timefn.cpp` that names and times need | `name`, `time` | step 1 |
 | `crc.cpp`, `hash.cpp`, `blake2s.cpp`, `blake2sp.cpp` | `hash`; CRC-32 from `hivepack-deflate`; BLAKE2s and BLAKE2sp in `hivepack-crypto`, ported from the reference code (CC0) | step 1 |
-| `rdwrfn.cpp` (`ComprDataIO`), the data path of `extract.cpp` | `read` | steps 1 and 2 |
+| `rdwrfn.cpp` (`ComprDataIO`), the data path of `extract.cpp` | `extract` | steps 1 and 2 |
 | `unpack.cpp`, `unpack15.cpp`, `unpack20.cpp`, `unpack30.cpp`, `unpack50.cpp`, `unpack50frag.cpp`, `unpackinline.cpp`, `getbits.cpp` | `unpack` | step 2 (2.9/3.x, 5.0, 7.0), step 3 (1.5, 2.x) |
 | `model.cpp`, `suballoc.cpp` (PPMd variant H) | `ppm` | step 2 |
 | `rarvm.cpp` (RAR 3's standard filters) | `filters` | step 2 |
@@ -82,6 +82,22 @@ The oracle prints all of that, field by field, after every header, and `crates/r
 - `CRC32` and the BLAKE2sp digest are one union: only the one the hash type names means anything.
 
 The comparison runs on Linux: UnRAR's macOS build decodes names with `UtfToWide`, where Linux's uses `mbsrtowcs`, and the port reads them as Linux's does. `testdata/oracle/rar-list.txt` holds the oracle's answers for libarchive's archives of 2 KB or less and damaged copies, 576 of them, replayed everywhere. The `rar_headers` fuzz target reads every header of its input twice: 7.4 million inputs over four minutes found nothing before the first commit.
+
+**Step 1, stored data.** `Extract::current_file` is `CmdExtract::ExtractCurrentFile` as UnRAR tests an archive: it takes the header `read_header` read, reads a stored entry's data as `UnstoreFile`, `UnpRead` and `UnpWrite` do, gives it to a callback, and checks it against CRC-32, BLAKE2sp or RAR 1.4's checksum. An entry that is compressed, encrypted or split across volumes is `Error::NotYet` for now, and the oracle passes over the same entries.
+
+The oracle's `test` request drives UnRAR's own `CmdExtract` the same way, with the options UnRAR's library sets, and prints after each header how much data came out, its FNV-1a hash, whether its hash failed, the position and the exit code. They agree on libarchive's 131 archives, with and without a smaller dictionary limit, and on 625,000 damaged copies by hand and 2,500 in each run. What they had to agree on, which is not in the format's description:
+
+- What follows a directory's header is read as the next header, whatever the directory's pack size says: UnRAR does not seek past it.
+- Up to the pack size is read, and up to the unpacked size given out and hashed. A file cut short hashes what there is, and fails.
+- A name that `ConvertPath` leaves empty, like `/` or `../`, is not read in a plain archive and is read without a hash in a solid one, where it would be needed for what follows.
+- A record of an encryption version UnRAR does not know is a fatal error for that entry, stored or not, even when nothing else says the entry is encrypted; a solid archive stops there.
+- A dictionary over 4 GiB stops everything with a fatal error, even for a stored entry, which needs none.
+- Links have no data when testing. RAR 5's are checked against the hash of no data, and RAR 4's not at all, as their target is their data.
+- A next volume that cannot be opened is `RARX_OPEN`, which the warning that follows does not replace.
+
+No archive at hand stores data under BLAKE2sp or RAR 1.4's checksum, and hivepack does not make archives, so the `hash` request compares those with UnRAR's `DataHash` directly, in chunks of several sizes, and unit tests check the comparison. Going through a whole archive with BLAKE2sp comes with `rar5_blake2.rar` in step 2; none of the archives at hand is RAR 1.4. Two things are left out on purpose, as they concern choosing files and not reading archives, and the port has no masks. With `*` as the only mask and no recursing, UnRAR stops after a first file named `*`, taking it for all that was asked for, so the oracle recurses. And the mask `*` does not match a name whose last part starts with `*` and goes on, like `*root.txt`, as `match` (rewritten on 2026-09-23) compares that `*` as a plain character before it treats it as a wildcard: UnRAR 7.3.2 silently leaves such a file out. The oracle passes over those entries, and so does the comparison.
+
+`testdata/oracle/rar-test.txt` holds the oracle's answers for libarchive's stored archives and those of 2 KB or less with damaged copies, and for hashes, replayed everywhere. The `rar_test` fuzz target goes through its input twice: 7.1 million inputs over four minutes found nothing before the first commit.
 
 ## The order of work
 

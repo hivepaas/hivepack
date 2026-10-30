@@ -2,11 +2,11 @@
 
 `hivepack-open` takes off the layers around what hivepack reads: `backup.tar.zst.age` is a tar archive, compressed with zstd, then encrypted with age, and opens as the tar archive. Each layer is found by its first bytes, as `file` and the tools themselves find them, not by the file's name, which is often wrong or missing; and each is read with hivepack's port of its library: `hivepack-age`, `hivepack-zstd`, `hivepack-xz` (xz, lzip and .lzma), `hivepack-lz4`, `hivepack-deflate` (gzip) and `hivepack-bzip2`.
 
-> **Status:** age, zstd, xz, lzip, .lzma, LZ4, gzip and bzip2, stacked in any order up to a limit, under which a tar archive, a ZIP archive or plain data; each read as its tools read it, checked with files the reference libraries and age make, and fuzzed. A tar archive under them extracts with `hivepack-extract`. Next: packwing's prompts for passphrases and keys.
+> **Status:** age, zstd, xz, lzip, .lzma, LZ4, gzip and bzip2, stacked in any order up to a limit, under which a tar archive, a ZIP archive, an ISO 9660 image or plain data; each read as its tools read it, checked with files the reference libraries and age make, and fuzzed. A tar archive or an ISO 9660 image under them extracts with `hivepack-extract`. Next: packwing's prompts for passphrases and keys.
 
 ## Finding the layers
 
-`detect` looks at the first 1,570 bytes of a stream (`HEAD_LEN`: a tar header block, or an armored age file's 1 KiB of white space and its first line), in this order:
+`detect` looks at the first 1,570 bytes of a stream (`HEAD_LEN`: a tar header block, or an armored age file's 1 KiB of white space and its first line), in this order, and at 34 KiB (`ISO_HEAD_LEN`) for an ISO 9660 image, whose first bytes are anything:
 
 | What | How it is told |
 |---|---|
@@ -19,9 +19,10 @@
 | bzip2 | `BZh` and a block size, `1` to `9` |
 | ZIP | `PK 03 04`, `PK 05 06` (an empty archive), `PK 07 08` (a split archive's marker) |
 | tar | `ustar` at 257 (USTAR and GNU), or else a checksum that adds up, signed or not, with a name: V7 has no magic |
+| ISO 9660 | after its 32 KiB system area (zeros, a boot sector, or a partition table for a USB stick), a volume descriptor: a type (0 to 3, or 255), `CD001` and version 1, as `file` and libarchive look for. Windows' images and most DVDs have UDF beside it, and are found; an image of UDF alone is data |
 | .lzma | no magic: by the file's name, `.lzma` at its end, once the layers around it are taken off with their extensions (`backup.tar.lzma.age`) |
 
-Anything else is data: one file, compressed or encrypted (`notes.txt.zst`), or, with no layer at all, something hivepack does not read. A layer is taken off, and the stream under it looked at again, until a container or data is found, or `Limits::max_layers` (8) are taken off.
+Anything else is data: one file, compressed or encrypted (`notes.txt.zst`), or, with no layer at all, something hivepack does not read. Only a stream whose first 1,570 bytes are data is read further, to 34 KiB, for an ISO 9660 image: an error of its layer there is given when the data before it has been read, as it would have been without that look. A layer is taken off, and the stream under it looked at again, until a container or data is found, or `Limits::max_layers` (8) are taken off.
 
 ## Reading each layer
 
@@ -51,6 +52,7 @@ A compressor checks its data at the end of its stream (gzip's and bzip2's CRC-32
 ## What is left to the caller
 
 - **A ZIP archive under layers** (`archive.zip.age`) is read by random access, from its end: it must be written to a file first, then opened with `hivepack-zip`. A ZIP archive with no layer is opened as it is.
+- **An ISO 9660 image** is read in order by `hivepack-iso`, under layers too (`.iso.xz`, `.iso.gz`), as libarchive reads one without seeking; `hivepack_extract::extract_iso` extracts it as it does tar. With no layer, opening the file itself lets the reader go back for the rare file whose data is before its directory (`hivepack_iso::Reader::seekable`).
 - **Data** under layers is one file, whose name is the file's without the layers' extensions; writing it is the application's.
 
 ## Bounded resources
@@ -61,7 +63,8 @@ The layers are limited (8 by default), and so is what each decoder may allocate:
 
 - **`tests/open.rs`**: tar archives compressed by the reference libraries (libzstd, liblzma, liblz4, zlib, libbzip2; LZ4's legacy format from liblz4's blocks; lzip members made with liblzma's raw LZMA1 encoder and lzip's header and trailer, as liblzma has no lzip encoder), each layer alone and four stacked, LZ4 twice among them; several streams one after the other, a skippable frame first and between, zstd's and LZ4's, zeros and xz's padding after; other data after them; each cut short at three places; damaged data, and an outer layer's error coming through LZ4's reader as it is; reads of a byte, into nothing, and from an input that gives a byte at a time and is interrupted between; the limits on layers, zstd's window and liblzma's memory; an error that stays; a file that changes between opens; `.lzma` by its name; and a tar archive under two layers extracted through the opener. A gzip file whose stored data has a byte changed fails `extract_tar` before anything is written: only its CRC-32 tells.
 - **`tests/age.rs`**: files age v1.3.2 encrypts, through `tools/age-oracle` ([age.md](age.md)): tar archives under zstd, gzip and xz, a tar archive alone and plain data, to a passphrase or an X25519 key, armored or not, and age inside zstd inside age. Each opens to what opening the plaintext gives, three times, with one prompt for each layer that needs a passphrase; one extracts with one prompt; a wrong passphrase, no matching key (the stanza types say `scrypt`), a prompt refused and a file encrypted again between opens fail with their reasons. Where the oracle is built the files are encrypted afresh; `testdata/oracle/open.txt` holds files age encrypted for everywhere else.
-- **Unit tests** for `detect`: each magic and near misses, skippable frames before zstd's and LZ4's and past the head, armor after white space and after too much, ZIP's three signatures, USTAR, GNU and V7 tar with signed and unsigned checksums, and `.lzma` by its name.
+- **An ISO 9660 image** of libarchive's tests, kept xz-compressed, opens as one under its layer, and again under gzip and zstd, and alone; `hivepack-iso` reads the same entries and data through the layer as from the image; another, with Rock Ridge and Joliet, extracts through its layer with `extract_iso`, its hard link and symbolic link as files. Data under gzip cut short past the first 1,570 bytes opens, and gives what comes before the error.
+- **Unit tests** for `detect`: each magic and near misses, an ISO 9660 image's volume descriptor of each type after a boot sector, and another type, version or identifier, or too short, skippable frames before zstd's and LZ4's and past the head, armor after white space and after too much, ZIP's three signatures, USTAR, GNU and V7 tar with signed and unsigned checksums, and `.lzma` by its name.
 - **Fuzzing**: the `open` target opens any input three times with one opener, with the age key of the recorded files and small limits, reading it in pieces of different sizes: each must find the same layers and end the same way, the data the same, or after an error the start of the other's. Its first five minutes found the adapter dropping what liblzma had decoded before an error in the same call, so that what was read depended on the size of the reads; the adapter keeps it now, which `tests/open.rs` checks. The next eight minutes, 865,000 inputs, found nothing, and three more with LZ4, 340,000 inputs.
 
 ## Next

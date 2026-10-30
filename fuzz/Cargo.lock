@@ -192,6 +192,7 @@ version = "0.0.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "hivepack-iso",
  "hivepack-tar",
  "hivepack-zip",
  "rustix",

@@ -58,6 +58,7 @@ jobs:
           v=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
+      - run: cargo check -p hivepack-age --lib --locked
       - run: cargo check -p hivepack-bzip2 --lib --locked
       - run: cargo check -p hivepack-xz --lib --locked
       - run: cargo check -p hivepack-crypto --lib --locked
@@ -292,6 +293,35 @@ jobs:
               pathlib.Path(f"fuzz/corpus/bzip2/r{i}").write_bytes(mode + bytes(8) + data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu bzip2 -- -max_total_time=90
+      - name: Seed the age corpus with the recorded files
+        run: |
+          mkdir -p fuzz/corpus/age
+          python3 - <<'PY'
+          import pathlib
+          # Files age encrypted, damaged or not, many to the identity and
+          # passphrase the target tries.
+          lines = pathlib.Path("testdata/oracle/age.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("decrypt")):
+              data = line.split("\t")[0].split(" ")[2]
+              pathlib.Path(f"fuzz/corpus/age/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu age -- -max_total_time=60
+      - name: Seed the identity file corpus with the recorded ones
+        run: |
+          mkdir -p fuzz/corpus/age_keys
+          python3 - <<'PY'
+          import pathlib
+          # SSH keys, files of keys and encrypted ones, damaged or not.
+          lines = pathlib.Path("testdata/oracle/age.txt").read_text().splitlines()
+          n = 0
+          for line in (l for l in lines if l.startswith("decrypt")):
+              for spec in line.split("\t")[0].split(" ")[1].split(","):
+                  if spec.startswith("f:"):
+                      data = spec.split(":")[1]
+                      pathlib.Path(f"fuzz/corpus/age_keys/r{n}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
+                      n += 1
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu age_keys -- -max_total_time=30
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

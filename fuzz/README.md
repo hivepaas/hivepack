@@ -2,7 +2,8 @@
 
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd,
 hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, and hivepack-xz with
-liblzma. They need
+liblzma, and that feed hivepack-zip, hivepack-extract and hivepack-age any
+input. They need
 nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 (`NIGHTLY` in `.github/workflows/ci.yml`), chosen for the shell with
 `export RUSTUP_TOOLCHAIN=<that nightly>`, and
@@ -21,6 +22,8 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
 | `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). Where the port refuses a Block's filters and liblzma, which has the delta and BCJ filters, goes on, the comparison stops; and the automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
+| `age` | Decrypting the input as an age file, armored or not, with CCTV's usual X25519 key and the passphrase `password` (work factors up to 2^4), twice, in pieces of different sizes its first eight bytes pick: the same plaintext and the same end both times, and no panic (`crates/age/tests/oracle.rs` compares the outcomes with age) |
+| `age_keys` | Reading the input as an identity file, as `age -i` does (a file of keys, an SSH key, a file of keys encrypted with age): no panic. Only the parsing, as decrypting an encrypted key file could ask scrypt for 4 GiB |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:

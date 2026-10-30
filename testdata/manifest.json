@@ -222,9 +222,9 @@
     },
     {
       "name": "age-oracle",
-      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
-      "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: golang.org/x/crypto v0.55.0, the release age v1.3.2 requires",
-      "license": "MIT (the program) and BSD-3-Clause (golang.org/x/crypto)",
+      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/identities.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
+      "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0, the release age requires",
+      "license": "MIT (the program) and BSD-3-Clause (age, golang.org/x/crypto)",
       "kind": "tool"
     },
     {
@@ -275,6 +275,13 @@
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",
       "license": "public domain",
       "kind": "archives"
+    },
+    {
+      "name": "cctv-age",
+      "fetch": { "group": "core", "files": [{ "url": "https://proxy.golang.org/c2sp.org/%21c%21c%21t%21v/age/@v/v0.0.0-20260829155415-4448f2097b2d.zip", "sha256": "6720e26a39fdea14c0f94fe1aa4d1a112b19d284996cdd0a419bd71ca7895fb1", "unpack": "zip" }] },
+      "source": "https://github.com/C2SP/CCTV/tree/4448f2097b2d/age (the Go module c2sp.org/CCTV/age, which age v1.3.2 tests with), from Go's module proxy",
+      "license": "0BSD OR CC0-1.0 OR Unlicense (the vectors)",
+      "kind": "vectors"
     },
     {
       "name": "decodecorpus",

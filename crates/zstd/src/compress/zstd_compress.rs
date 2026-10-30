@@ -70,7 +70,16 @@ use crate::compress::zstdmt_compress::{
 use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
 use crate::decompress::zstd_decompress_internal::Format;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+// Compression from sequences the caller gives, or a sequence producer of
+// the caller's, and the sequences a frame would have.
+mod sequences;
+pub use sequences::{
+    SEQUENCE_PRODUCER_ERROR, Sequence, SequenceFormat, SequenceProducer, merge_block_delimiters,
+    sequence_bound,
+};
+use sequences::{SeqCollector, copy_block_sequences, zstd_resolve_external_repcode_search};
 
 /// `ZSTD_seqToCodes`: the codes of the sequences' lengths and offsets, into
 /// the store (or the chunk of it). Returns `longOffsets`, which is only
@@ -1732,6 +1741,25 @@ pub(crate) struct CCtxParams {
     pub(crate) deterministic_ref_prefix: bool,
     /// `prefetchCDictTables` (`ZSTD_c_prefetchCDictTables`).
     pub(crate) prefetch_cdict_tables: ParamSwitch,
+    /// `blockDelimiters`: whether the sequences given to
+    /// `ZSTD_compressSequences` mark the ends of blocks
+    /// (`ZSTD_c_blockDelimiters`).
+    pub(crate) block_delimiters: SequenceFormat,
+    /// `validateSequences`: whether the sequences given are checked
+    /// (`ZSTD_c_validateSequences`).
+    pub(crate) validate_sequences: bool,
+    /// `enableMatchFinderFallback`: whether a block the sequence producer
+    /// fails on is compressed with the context's own match finder
+    /// (`ZSTD_c_enableSeqProducerFallback`).
+    pub(crate) enable_match_finder_fallback: bool,
+    /// `searchForExternalRepcodes`: whether the offsets of the sequences
+    /// given are written as repeat codes where they can be
+    /// (`ZSTD_c_repcodeResolution`); `Auto` until a frame resolves it from
+    /// the level.
+    pub(crate) search_for_external_repcodes: ParamSwitch,
+    /// `ZSTD_hasExtSeqProd`: whether a sequence producer is registered
+    /// (`extSeqProdFunc`), which the context holds itself.
+    pub(crate) ext_seq_prod: bool,
 }
 
 impl CCtxParams {
@@ -1765,6 +1793,14 @@ impl CCtxParams {
             force_window: false,
             deterministic_ref_prefix: false,
             prefetch_cdict_tables: ParamSwitch::Auto,
+            block_delimiters: SequenceFormat::NoBlockDelimiters,
+            validate_sequences: false,
+            enable_match_finder_fallback: false,
+            search_for_external_repcodes: zstd_resolve_external_repcode_search(
+                ParamSwitch::Auto,
+                compression_level,
+            ),
+            ext_seq_prod: false,
         }
     }
 
@@ -1782,6 +1818,7 @@ impl CCtxParams {
         params.use_row_match_finder = ParamSwitch::Auto;
         params.post_block_splitter = ParamSwitch::Auto;
         params.ldm_enable = ParamSwitch::Auto;
+        params.search_for_external_repcodes = ParamSwitch::Auto;
         (params, CParamOverrides::default())
     }
 }
@@ -1826,9 +1863,15 @@ fn zstd_resolve_max_block_size(max_block_size: usize) -> usize {
     }
 }
 
-/// `ZSTD_maxNbSeq`: the most sequences a block can have.
-fn zstd_max_nb_seq(block_size: usize, min_match: u32) -> usize {
-    let divider = if min_match == 3 { 3 } else { 4 };
+/// `ZSTD_maxNbSeq`: the most sequences a block can have; with a sequence
+/// producer, whose matches may be of 3 bytes, as with a shortest match of
+/// 3.
+fn zstd_max_nb_seq(block_size: usize, min_match: u32, use_sequence_producer: bool) -> usize {
+    let divider = if min_match == 3 || use_sequence_producer {
+        3
+    } else {
+        4
+    };
     block_size / divider
 }
 
@@ -2290,6 +2333,33 @@ pub enum CParameter {
     /// Differs from libzstd: the port takes the parameter, but does not
     /// prefetch the tables. It changes no frame.
     PrefetchCDictTables(ParamSwitch),
+    /// Whether the sequences given to [`CCtx::compress_sequences`] mark
+    /// where the blocks end, with a delimiter after each block's sequences
+    /// that holds its last literals (`ZSTD_c_blockDelimiters`). Without
+    /// delimiters, the default, the context cuts the frame into blocks
+    /// itself, splitting sequences where it must;
+    /// [`CCtx::compress_sequences_and_literals`] takes them only with.
+    BlockDelimiters(SequenceFormat),
+    /// Whether [`CCtx::compress_sequences`] checks the sequences given
+    /// (`ZSTD_c_validateSequences`): their offsets within the window and
+    /// the dictionary, their matches of 4 bytes or more (3 with a shortest
+    /// match of 3, or a sequence producer). Off by default: the sequences
+    /// are trusted, and wrong ones can make a frame that does not decode to
+    /// the input. A sequence producer's are checked too.
+    ValidateSequences(bool),
+    /// With a sequence producer registered
+    /// ([`CCtx::register_sequence_producer`]), whether a block it fails on
+    /// is compressed with the context's own match finder, as the other
+    /// parameters say, rather than failing the frame
+    /// (`ZSTD_c_enableSeqProducerFallback`). Off by default.
+    EnableSeqProducerFallback(bool),
+    /// Whether the offsets of the sequences given, by the caller with
+    /// explicit block delimiters or by a sequence producer, are written as
+    /// repeat codes where they repeat one of the last three
+    /// (`ZSTD_c_repcodeResolution`): better compression, at some cost in
+    /// speed. `Auto`, the default, does from level 10 on. The sequences'
+    /// [`Sequence::rep`] is not read.
+    RepcodeResolution(ParamSwitch),
 }
 
 /// A `ZSTD_cParameter`, for [`CCtx::get_parameter`].
@@ -2329,6 +2399,10 @@ pub enum CParameterKind {
     ForceMaxWindow,
     DeterministicRefPrefix,
     PrefetchCDictTables,
+    BlockDelimiters,
+    ValidateSequences,
+    EnableSeqProducerFallback,
+    RepcodeResolution,
 }
 
 impl CParameter {
@@ -2369,6 +2443,10 @@ impl CParameter {
             CParameter::ForceMaxWindow(_) => CParameterKind::ForceMaxWindow,
             CParameter::DeterministicRefPrefix(_) => CParameterKind::DeterministicRefPrefix,
             CParameter::PrefetchCDictTables(_) => CParameterKind::PrefetchCDictTables,
+            CParameter::BlockDelimiters(_) => CParameterKind::BlockDelimiters,
+            CParameter::ValidateSequences(_) => CParameterKind::ValidateSequences,
+            CParameter::EnableSeqProducerFallback(_) => CParameterKind::EnableSeqProducerFallback,
+            CParameter::RepcodeResolution(_) => CParameterKind::RepcodeResolution,
         }
     }
 }
@@ -2542,6 +2620,13 @@ pub(crate) fn set_cctx_parameter(
             params.deterministic_ref_prefix = deterministic;
         }
         CParameter::PrefetchCDictTables(prefetch) => params.prefetch_cdict_tables = prefetch,
+        // Their types hold only the values libzstd's bounds allow.
+        CParameter::BlockDelimiters(format) => params.block_delimiters = format,
+        CParameter::ValidateSequences(validate) => params.validate_sequences = validate,
+        CParameter::EnableSeqProducerFallback(enable) => {
+            params.enable_match_finder_fallback = enable;
+        }
+        CParameter::RepcodeResolution(mode) => params.search_for_external_repcodes = mode,
     }
     Ok(())
 }
@@ -2606,6 +2691,14 @@ struct LocalDict {
 /// (`dictMatchState`), for small inputs and inputs of unknown size, and
 /// copied in or its content loaded again otherwise, as libzstd decides;
 /// [`CParameter::ForceAttachDict`] can force one way.
+///
+/// The sequences of a frame can come from outside its match finder: from
+/// the caller, found beforehand ([`CCtx::compress_sequences`], or
+/// [`CCtx::compress_sequences_and_literals`] with the literals apart), or
+/// from a match finder of the caller's that the context asks for each
+/// block's ([`CCtx::register_sequence_producer`]). And the context gives
+/// the sequences it finds ([`CCtx::generate_sequences`]), as libzstd does
+/// for debugging.
 pub struct CCtx {
     stage: CompressionStage,
     /// The parameters set for the next frames (`requestedParams`); the
@@ -2681,6 +2774,23 @@ pub struct CCtx {
     /// sequences long distance matching found for the job, which its
     /// blocks take in turn.
     extern_seq_store: RawSeqStore,
+
+    // Sequences given by the caller.
+    /// The sequence producer registered (`extSeqProdFunc` and
+    /// `extSeqProdState`), which `ext_seq_prod` of the parameters says
+    /// there is. In a mutex only for the context to be `Sync`: it is only
+    /// reached through `&mut self`, never locked.
+    seq_producer: Option<Mutex<Box<dyn SequenceProducer>>>,
+    /// One registered while a frame is streamed (or `Some(None)` for none):
+    /// that frame goes on with the one it started with, as libzstd's
+    /// applied parameters keep theirs, and the next frame takes it.
+    pending_seq_producer: Option<Option<Mutex<Box<dyn SequenceProducer>>>>,
+    /// `extSeqBuf`: the producer's sequences for a block, room for
+    /// `ZSTD_sequenceBound` of the largest block (`extSeqBufCapacity`).
+    ext_seq_buf: Vec<Sequence>,
+    /// `seqCollector`: with [`CCtx::generate_sequences`], the sequences of
+    /// each block, gathered instead of compressing it.
+    seq_collector: Option<SeqCollector>,
 }
 
 impl CCtx {
@@ -2725,6 +2835,10 @@ impl CCtx {
             mtctx: None,
             c_params_changed: false,
             extern_seq_store: RawSeqStore::default(),
+            seq_producer: None,
+            pending_seq_producer: None,
+            ext_seq_buf: Vec::new(),
+            seq_collector: None,
         }
     }
 
@@ -2774,7 +2888,7 @@ impl CCtx {
 
         let window_size = (1u64 << c_params.window_log).min(pledged_src_size).max(1) as usize;
         let block_size = params.max_block_size.min(window_size);
-        let max_nb_seq = zstd_max_nb_seq(block_size, c_params.min_match);
+        let max_nb_seq = zstd_max_nb_seq(block_size, c_params.min_match, params.ext_seq_prod);
         let max_nb_ldm_seq = zstd_ldm_get_max_nb_seq(params.ldm_enable, &params.ldm, block_size);
         let buff_out_size = if buffered && params.out_buffer_mode == BufferMode::Buffered {
             zstd_compress_bound(block_size)? + 1
@@ -2844,6 +2958,15 @@ impl CCtx {
         // 0)).
         self.extern_seq_store.reset();
         self.extern_seq_store.capacity = 0;
+
+        // The sequence producer's room, for the largest block; and the one
+        // registered while the last frame was streamed, if any.
+        self.commit_pending_seq_producer();
+        if params.ext_seq_prod {
+            let max_nb_external_seq = sequence_bound(block_size);
+            self.ext_seq_buf
+                .resize(max_nb_external_seq, Sequence::default());
+        }
 
         // The buffers. What they hold is not used again: the window starts
         // over.
@@ -3124,15 +3247,33 @@ impl CCtx {
         }
         self.seq_store.reset();
 
-        let ms = &mut self.match_state;
         // A limited update after a very long match.
         {
+            let ms = &mut self.match_state;
             let curr = ms.window.index(istart);
             if curr > ms.next_to_update + 384 {
                 ms.next_to_update = curr - 192.min(curr - ms.next_to_update - 384);
             }
         }
+        self.next_cblock.rep = self.prev_cblock.rep;
 
+        if self.applied_params.ext_seq_prod {
+            // External sequences with long distance matching are not
+            // implemented in libzstd, from either source.
+            if self.extern_seq_store.pos < self.extern_seq_store.size()
+                || self.applied_params.ldm_enable == ParamSwitch::Enable
+            {
+                return error!(ParameterCombinationUnsupported);
+            }
+            // The sequence producer's, or the block compressor's below
+            // when it fails and falling back is allowed.
+            let src = bufs.get(self.match_state.window.buffer);
+            if self.build_seq_store_with_producer(&src[istart..iend])? {
+                return Ok(true);
+            }
+        }
+
+        let ms = &mut self.match_state;
         // Find and store the sequences, with the window's older segment if
         // it has one, or else the attached CDict's match state if the
         // frame has one (ZSTD_matchState_dictMode).
@@ -3146,7 +3287,6 @@ impl CCtx {
         } else {
             bufs.dict_match_state(ms)
         };
-        self.next_cblock.rep = self.prev_cblock.rep;
         let rep = &mut self.next_cblock.rep;
         let seq_store = &mut self.seq_store;
         let params = &self.applied_params;
@@ -3231,7 +3371,26 @@ impl CCtx {
         const RLE_MAX_LENGTH: usize = 25;
         let block = &bufs.get(self.match_state.window.buffer)[istart..iend];
         let mut c_size = 0;
-        if self.build_seq_store(bufs, istart, iend)? {
+        let compress = self.build_seq_store(bufs, istart, iend)?;
+        if let Some(collector) = &mut self.seq_collector {
+            // Gathering the sequences: the block is not compressed, and
+            // one too small to have sequences fails.
+            if !compress {
+                return error!(SequenceProducerFailed);
+            }
+            let seq_store = &self.seq_store;
+            copy_block_sequences(
+                collector,
+                &seq_store.sequences,
+                seq_store.literals().len(),
+                seq_store.long_length_type,
+                seq_store.long_length_pos,
+                &self.prev_cblock.rep,
+            )?;
+            self.confirm_repcodes_and_entropy_tables();
+            return Ok(0);
+        }
+        if compress {
             // Encode the sequences and the literals.
             let params = &self.applied_params;
             let disable = zstd_literals_compression_is_disabled(
@@ -3362,6 +3521,21 @@ impl CCtx {
             c_seqs_size = 1;
         }
 
+        if let Some(collector) = &mut self.seq_collector {
+            // Gathering the sequences: the chunk's, as the decoder's
+            // repeat offsets left them.
+            copy_block_sequences(
+                collector,
+                &self.seq_store.sequences[chunk.seq_start..chunk.seq_end],
+                chunk.lit_end - chunk.lit_start,
+                chunk.long_length_type,
+                chunk.long_length_pos,
+                &d_rep_original,
+            )?;
+            self.confirm_repcodes_and_entropy_tables();
+            return Ok(0);
+        }
+
         let c_size = match c_seqs_size {
             0 => {
                 let c_size = zstd_no_compress_block(dst, src, last_block)?;
@@ -3464,7 +3638,7 @@ impl CCtx {
         nb_seq: u32,
     ) -> Result<usize> {
         let block_size = src.len();
-        let mut ip = 0;
+        let mut ip = 0usize;
         let mut op = 0;
         let mut src_bytes_total = 0;
         let mut partitions = Vec::new();
@@ -3504,16 +3678,24 @@ impl CCtx {
             src_bytes_total += src_bytes;
             if last_partition {
                 // The last partition: with the block's last literals.
-                src_bytes += block_size - src_bytes_total;
+                src_bytes = src_bytes.wrapping_add(block_size.wrapping_sub(src_bytes_total));
                 last_block_entire_src = last_block;
             }
+            // Differs from libzstd: a sequence producer's sequences that do
+            // not add up to the block (match lengths under 3, without
+            // ZSTD_c_validateSequences) make partitions that reach past it,
+            // which libzstd reads; the port fails. Sequences that add up,
+            // as every match finder's, never do.
+            let Some(chunk_src) = ip.checked_add(src_bytes).and_then(|end| src.get(ip..end)) else {
+                return error!(ExternalSequencesInvalid);
+            };
 
             let c_size_chunk = self.compress_seq_store_single_block(
                 &chunk,
                 &mut d_rep,
                 &mut c_rep,
                 &mut dst[op..],
-                &src[ip..ip + src_bytes],
+                chunk_src,
                 last_block_entire_src,
                 true,
             )?;
@@ -3546,6 +3728,10 @@ impl CCtx {
             // Too small to compress.
             if self.prev_cblock.entropy.fse.offcode_repeat_mode == FseRepeat::Valid {
                 self.prev_cblock.entropy.fse.offcode_repeat_mode = FseRepeat::Check;
+            }
+            if self.seq_collector.is_some() {
+                // Gathering the sequences: a block without any fails.
+                return error!(SequenceProducerFailed);
             }
             return zstd_no_compress_block(dst, src, last_block);
         }
@@ -3646,7 +3832,8 @@ impl CCtx {
                     ip + block_size,
                     last_block,
                 )?;
-                debug_assert!(c_size > 0);
+                // Nothing written when gathering the sequences.
+                debug_assert!(c_size > 0 || self.seq_collector.is_some());
                 c_size
             } else {
                 let c_size = self.compress_block_internal(
@@ -4165,6 +4352,12 @@ impl CCtx {
             CParameterKind::ForceMaxWindow => i32::from(params.force_window),
             CParameterKind::DeterministicRefPrefix => i32::from(params.deterministic_ref_prefix),
             CParameterKind::PrefetchCDictTables => params.prefetch_cdict_tables as i32,
+            CParameterKind::BlockDelimiters => params.block_delimiters as i32,
+            CParameterKind::ValidateSequences => i32::from(params.validate_sequences),
+            CParameterKind::EnableSeqProducerFallback => {
+                i32::from(params.enable_match_finder_fallback)
+            }
+            CParameterKind::RepcodeResolution => params.search_for_external_repcodes as i32,
         }
     }
 
@@ -4204,6 +4397,9 @@ impl CCtx {
             }
             self.clear_all_dicts();
             (self.requested_params, self.requested_c_params) = CCtxParams::requested_default();
+            // No sequence producer either.
+            self.seq_producer = None;
+            self.pending_seq_producer = None;
         }
         Ok(())
     }
@@ -4633,6 +4829,8 @@ impl CCtx {
     /// `ZSTD_CCtx_init_compressStream2`: starts a frame, with the parameters
     /// set. With [`EndDirective::End`], `in_size` is its size.
     fn init_compress_stream2(&mut self, end_op: EndDirective, in_size: usize) -> Result<()> {
+        // A sequence producer registered while the last frame was streamed.
+        self.commit_pending_seq_producer();
         let mut params = self.requested_params;
         // The dictionary loaded, made a CDict if not yet.
         self.init_local_dict()?;
@@ -4673,7 +4871,19 @@ impl CCtx {
         params.ldm_enable = zstd_resolve_enable_ldm(params.ldm_enable, &params.c_params);
         params.use_row_match_finder =
             zstd_resolve_row_match_finder_mode(params.use_row_match_finder, &params.c_params);
+        // (ZSTD_resolveExternalSequenceValidation leaves validateSequences
+        // as it is.)
         params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
+        params.search_for_external_repcodes = zstd_resolve_external_repcode_search(
+            params.search_for_external_repcodes,
+            params.compression_level,
+        );
+
+        // A sequence producer is not for worker threads: refused before the
+        // size is looked at, whatever it is.
+        if params.ext_seq_prod && params.nb_workers >= 1 {
+            return error!(ParameterCombinationUnsupported);
+        }
 
         // A frame of a known size of ZSTDMT_JOBSIZE_MIN or less is
         // compressed without workers.

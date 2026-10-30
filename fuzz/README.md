@@ -12,6 +12,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `decompress` | Decoding the input in one call: the same output as libzstd, or the same error |
 | `compress` | Compressing the input in one call, at a level its first byte picks, with the blocks split after their sequences when a bit of it is set, and with worker threads when another is (then also streamed with its size unknown, which takes them): the same frame as libzstd, which decodes back |
 | `compress_stream` | Streaming the input, with parameters (long distance matching among them), pieces, directives and room for output its first 8 bytes pick: every call the same as libzstd's, and a frame that decodes back. A quarter of the time with worker threads, a different number on each side, where each side goes through the same steps on its own: the same frame |
+| `sequences` | The sequence API, which zstd-safe does not offer (the oracle's tests compare it with libzstd): with the input's first byte, its sequences generated at a level and compressed back with `compress_sequences`, with their block delimiters and merged without, and with `compress_sequences_and_literals`, every frame decoding back to it; or sequences of any values read from its start, compressed over the rest as given and as a sequence producer's for every block: a frame or an error, never a panic |
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
 | `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |
 | `zip_open` | Opening the input as a ZIP archive, leniently and with `ZIP_CHECKCONS`, asking the reading API about every entry, and reading every entry's data, decompressed, raw, and decrypted with the password "foo": no panic (`crates/zip/tests/oracle.rs` compares the answers with libzip) |
@@ -28,6 +29,8 @@ mkdir -p fuzz/corpus/decompress
 find testdata -name '*.zst' -exec cp {} fuzz/corpus/decompress/ \;
 cargo fuzz run --features unsafe-fast decompress -- -max_total_time=3600
 ```
+
+CI seeds `sequences` with the same files as `compress`.
 
 `compress` and `compress_stream` take the feature too: with it, the row
 match finder gathers its candidates and prefetches them, as libzstd does,

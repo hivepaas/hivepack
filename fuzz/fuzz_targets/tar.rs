@@ -2,14 +2,15 @@
 //! data read, twice, in pieces of different sizes the first eight bytes'
 //! hash picks. Both reads must give the same headers, data and end, and a
 //! panic is a bug (`crates/tar/tests/oracle.rs` compares the answers with
-//! Go's archive/tar).
+//! Go's archive/tar). Going through the entries without their data gives the
+//! same whether the reader seeks past it or not.
 //!
 //! Data is read up to 4 MiB an entry: sparse files can be terabytes of
 //! holes.
 
 #![no_main]
 
-use std::io::Read;
+use std::io::{Cursor, Read};
 
 use hivepack_tar::{Header, Reader};
 use libfuzzer_sys::fuzz_target;
@@ -44,7 +45,20 @@ fn read(data: &[u8], mut seed: u64) -> (Vec<(Header, Vec<u8>, String)>, String) 
     }
 }
 
+/// Every entry, its data skipped, and how the archive ended.
+fn list<R: Read>(mut tr: Reader<R>) -> (Vec<Header>, String) {
+    let mut entries = Vec::new();
+    loop {
+        match tr.next() {
+            Ok(Some(h)) => entries.push(h),
+            Ok(None) => return (entries, "end".into()),
+            Err(e) => return (entries, e.to_string()),
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let seed = data.iter().take(8).fold(0u64, |h, &b| h.rotate_left(8) ^ u64::from(b));
     assert_eq!(read(data, seed), read(data, !seed));
+    assert_eq!(list(Reader::new(data)), list(Reader::seekable(Cursor::new(data))));
 });

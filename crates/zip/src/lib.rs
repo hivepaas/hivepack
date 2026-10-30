@@ -7,11 +7,11 @@
 //! records, Info-ZIP's count of entries modulo 65,536, file names in UTF-8
 //! or CP437 and the Info-ZIP Unicode extra fields, WinZip AES headers,
 //! torrentzip, and, with [`OpenFlags::CHECKCONS`], the comparison of every
-//! local header with the central directory. It reads stored and deflated
-//! entries, decrypts ZipCrypto and WinZip AES ones with a password, and
-//! checks the CRC-32 and length of an entry read to its end, as libzip
-//! does. It edits archives as libzip does too: entries are
-//! added from a [`DataSource`], replaced, deleted, renamed, given comments,
+//! local header with the central directory. It reads stored, deflated,
+//! bzip2, LZMA, XZ and Deflate64 entries, decrypts ZipCrypto and WinZip AES
+//! ones with a password, and checks the CRC-32 and length of an entry read
+//! to its end, as libzip does. It edits archives as libzip does too: entries
+//! are added from a [`DataSource`], replaced, deleted, renamed, given comments,
 //! times, attributes, compression methods and encryption (ZipCrypto or
 //! WinZip AES, with [`Archive::file_set_encryption`]), the archive a
 //! comment, and [`Archive::close_to`] writes the archive with its changes,
@@ -63,6 +63,7 @@
 mod add_entry;
 mod algorithm_bzip2;
 mod algorithm_deflate;
+mod algorithm_xz;
 mod buffer;
 mod close;
 mod delete;

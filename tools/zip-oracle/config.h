@@ -2,7 +2,8 @@
  * config.h for building libzip 1.12.1 into the oracle on 64-bit Linux and
  * macOS, in place of the one libzip's CMake build writes from
  * config.h.in: what those systems have, with libbzip2 (bzip2 1.0.8's
- * sources) but not the other optional libraries. The crypto backend is
+ * sources) and liblzma (XZ Utils 5.8.4's, built apart with
+ * tools/xz-oracle/config.h) but not the other optional libraries. The crypto backend is
  * GnuTLS's, on nettle's sources and the part of GnuTLS in gnutls/. oracle.c gives zip_random_uint32 (temporary file
  * names) apart from the random bytes, so that encrypting draws the same
  * bytes from gnutls_rnd whatever file is written.
@@ -32,6 +33,8 @@
 #define HAVE_GNUTLS
 #define HAVE_RANDOM_UINT32
 #define HAVE_LIBBZ2
+#define HAVE_LIBLZMA
+#define LZMA_WINDOW_LIMIT UINT64_MAX
 #define SIZEOF_OFF_T 8
 #define SIZEOF_SIZE_T 8
 #define PACKAGE "libzip"

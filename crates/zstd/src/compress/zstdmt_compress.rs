@@ -58,13 +58,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::common::bits::highbit32;
+#[cfg(doc)]
+use crate::common::error_private::ErrorCode;
 use crate::common::error_private::{Result, error};
 use crate::common::pool::{BusyTicket, Pool};
 use crate::common::xxhash::Xxh64State;
 use crate::common::zstd_internal::{BlockType, ZSTD_BLOCKSIZE_MAX, ZSTD_BLOCKSIZELOG_MAX};
 use crate::compress::zstd_cdict::CDict;
 use crate::compress::zstd_compress::{
-    CCtx, CCtxParams, EndDirective, zstd_compress_bound, zstd_cycle_log,
+    CCtx, CCtxParams, EndDirective, FrameProgression, zstd_compress_bound, zstd_cycle_log,
 };
 use crate::compress::zstd_compress_internal::{
     Buffers, CompressionParameters, LdmEntry, LdmParams, LdmState, ParamSwitch, RawSeqStore,
@@ -224,6 +226,44 @@ impl BufferPool {
     fn expand(&self, max_nb_buffers: usize) {
         let mut state = lock(&self.state);
         state.total_buffers = state.total_buffers.max(max_nb_buffers);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thread pools shared between contexts
+
+/// `ZSTD_threadPool`: worker threads that contexts compressing with
+/// workers ([`CParameter::NbWorkers`](crate::CParameter::NbWorkers)) can
+/// share ([`CCtx::ref_thread_pool`]), rather than each starting threads of
+/// its own. A clone is the same pool. Its threads end once the pool and
+/// the contexts that use it are dropped (`ZSTD_freeThreadPool`), and their
+/// jobs are done.
+///
+/// The frames do not depend on it. Each job waits for a thread free in the
+/// pool, whichever context's jobs the others run. As in libzstd, a context
+/// whose number of workers changes between its frames resizes the pool to
+/// that number, for every context that shares it.
+#[derive(Clone)]
+pub struct ThreadPool(Arc<Pool<JobDescription>>);
+
+impl ThreadPool {
+    /// `ZSTD_createThreadPool`: a pool of `num_threads` threads, started
+    /// at once. Fails with [`ErrorCode::MemoryAllocation`] for no threads,
+    /// or when a thread cannot be started, where libzstd returns `NULL`.
+    pub fn new(num_threads: usize) -> Result<ThreadPool> {
+        if num_threads == 0 {
+            return error!(MemoryAllocation);
+        }
+        Ok(ThreadPool(Arc::new(Pool::new(
+            num_threads,
+            zstdmt_compression_job,
+        )?)))
+    }
+}
+
+impl std::fmt::Debug for ThreadPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadPool").finish_non_exhaustive()
     }
 }
 
@@ -798,8 +838,9 @@ struct SyncPoint {
 /// `ZSTDMT_CCtx`: the worker threads, the jobs of the frame, and the input
 /// taken for the next.
 pub(crate) struct MtCCtx {
-    /// `factory`: the threads.
-    factory: Pool<JobDescription>,
+    /// `factory`: the threads, the context's own or a pool shared with
+    /// other contexts (`providedFactory`).
+    factory: Arc<Pool<JobDescription>>,
     /// The jobs handed over and not all written out yet, from `doneJobID`
     /// to `nextJobID`, oldest first.
     jobs: VecDeque<JobSlot>,
@@ -821,6 +862,10 @@ pub(crate) struct MtCCtx {
     rsync: RsyncState,
     /// `nextJobID`: the number of the next job.
     next_job_id: u32,
+    /// `consumed`, `produced`: the input and the output of the frame's
+    /// jobs done and all written out.
+    consumed: u64,
+    produced: u64,
     /// `frameEnded`: the last job is made.
     frame_ended: bool,
     /// `frameContentSize`: the frame's size, pledged, or unknown.
@@ -895,14 +940,19 @@ fn zstdmt_compute_overlap_size(params: &CCtxParams) -> usize {
 
 impl MtCCtx {
     /// `ZSTDMT_createCCtx_advanced`: the threads, and the pools, for
-    /// `nb_workers` (at least one).
-    pub(crate) fn new(nb_workers: u32) -> Result<MtCCtx> {
+    /// `nb_workers` (at least one); with `pool`, its threads rather than
+    /// threads of its own, the pool's size left as it is.
+    pub(crate) fn new(nb_workers: u32, pool: Option<&ThreadPool>) -> Result<MtCCtx> {
         let nb_workers = nb_workers.clamp(1, ZSTDMT_NBWORKERS_MAX);
         let workers = nb_workers as usize;
         let (mut params, _) = CCtxParams::requested_default();
         params.nb_workers = nb_workers;
+        let factory = match pool {
+            Some(pool) => pool.0.clone(),
+            None => Arc::new(Pool::new(workers, zstdmt_compression_job)?),
+        };
         Ok(MtCCtx {
-            factory: Pool::new(workers, zstdmt_compression_job)?,
+            factory,
             jobs: VecDeque::new(),
             job_table_size: zstdmt_jobs_table_size(workers),
             shared: Arc::new(Shared {
@@ -925,6 +975,8 @@ impl MtCCtx {
             in_prefix_size: 0,
             rsync: RsyncState::default(),
             next_job_id: 0,
+            consumed: 0,
+            produced: 0,
             frame_ended: false,
             frame_content_size: 0,
             cdict: None,
@@ -934,7 +986,8 @@ impl MtCCtx {
     }
 
     /// `ZSTDMT_resize`: `nb_workers` threads, and the pools and the job
-    /// table grown for them.
+    /// table grown for them. A pool shared with other contexts is resized
+    /// too, for all of them, as in libzstd.
     fn resize(&mut self, nb_workers: u32) -> Result<()> {
         let workers = nb_workers as usize;
         self.factory.resize(workers)?;
@@ -994,6 +1047,50 @@ impl MtCCtx {
         c_params.window_log = self.params.c_params.window_log;
         self.params.compression_level = compression_level;
         self.params.c_params = c_params;
+    }
+
+    /// `ZSTDMT_getFrameProgression`: the frame's input taken, compressed,
+    /// and its output produced and written out, by the jobs done and
+    /// written out, those not yet, and the input taken for the next; the
+    /// jobs that are compressing, or waiting for a thread.
+    pub(crate) fn frame_progression(&self) -> FrameProgression {
+        let filled = self.filled() as u64;
+        let mut fps = FrameProgression {
+            ingested: self.consumed + filled,
+            consumed: self.consumed,
+            produced: self.produced,
+            flushed: self.produced,
+            current_job_id: self.next_job_id,
+            nb_active_workers: 0,
+        };
+        let ready = self.job_ready.as_ref().map(|(slot, _)| slot);
+        for job in self.jobs.iter().chain(ready) {
+            let state = lock(&job.progress.state);
+            let (produced, flushed) = match state.c_size {
+                Ok(c_size) => (c_size, job.dst_flushed),
+                Err(_) => (0, 0),
+            };
+            debug_assert!(flushed <= produced);
+            fps.ingested += job.src_size as u64;
+            fps.consumed += state.consumed as u64;
+            fps.produced += produced as u64;
+            fps.flushed += flushed as u64;
+            fps.nb_active_workers += u32::from(state.consumed < job.src_size);
+        }
+        fps
+    }
+
+    /// `ZSTDMT_toFlushNow`: what the oldest job handed over has produced
+    /// and not written out yet; 0 without one.
+    pub(crate) fn to_flush_now(&self) -> usize {
+        let Some(job) = self.jobs.front() else {
+            return 0;
+        };
+        let state = lock(&job.progress.state);
+        match state.c_size {
+            Ok(c_size) => c_size - job.dst_flushed,
+            Err(_) => 0,
+        }
     }
 
     /// `ZSTDMT_nextInputSizeHint`: the input that completes the next job.
@@ -1063,6 +1160,8 @@ impl MtCCtx {
         self.in_prefix_size = 0;
         self.next_job_id = 0;
         self.frame_ended = false;
+        self.consumed = 0;
+        self.produced = 0;
 
         // The dictionary: a prefix of raw content for the first job, other
         // content made a CDict (referencing it in libzstd, copied here).
@@ -1262,6 +1361,8 @@ impl MtCCtx {
                     let dst = std::mem::take(&mut state.dst);
                     drop(state);
                     self.jobs.pop_front();
+                    self.consumed += src_size as u64;
+                    self.produced += c_size as u64;
                     self.shared.out_pool.release_buffer(dst);
                 }
             }

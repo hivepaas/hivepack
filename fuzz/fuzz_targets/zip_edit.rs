@@ -349,8 +349,15 @@ fuzz_target!(|data: &[u8]| {
             }
             _ => za.set_file_compression(
                 i,
-                [i32::from(cm::STORE), i32::from(cm::DEFLATE), cm::DEFAULT, i32::from(cm::BZIP2)]
-                    [usize::from(arg % 4)],
+                [
+                    i32::from(cm::STORE),
+                    i32::from(cm::DEFLATE),
+                    cm::DEFAULT,
+                    i32::from(cm::BZIP2),
+                    i32::from(cm::LZMA),
+                    i32::from(cm::XZ),
+                ]
+                    [usize::from(arg % 6)],
                 u32::from(kind >> 4),
             ),
         };

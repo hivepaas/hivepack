@@ -194,6 +194,7 @@ dependencies = [
  "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
+ "hivepack-tar",
  "hivepack-xz",
  "hivepack-zip",
  "hivepack-zstd",
@@ -203,6 +204,10 @@ dependencies = [
  "libz-sys",
  "zstd",
 ]
+
+[[package]]
+name = "hivepack-tar"
+version = "0.0.0"
 
 [[package]]
 name = "hivepack-xz"

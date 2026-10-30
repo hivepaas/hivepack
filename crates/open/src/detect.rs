@@ -1,5 +1,5 @@
 //! What a stream is, from its first bytes: a layer to take off (age, or a
-//! compressor), a container (tar, ZIP), or plain data.
+//! compressor), a container (tar, ZIP, an ISO 9660 image), or plain data.
 
 /// A layer over the data: encryption or compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,6 +32,9 @@ pub enum Container {
     /// A ZIP archive, which is read by random access: in a layer, it must
     /// be taken out to a file first.
     Zip,
+    /// An ISO 9660 image (`.iso`), which `hivepack-iso` reads in order, in
+    /// a layer too (`.iso.xz`).
+    Iso,
     /// Data: one file, compressed or encrypted (`notes.txt.zst`).
     Data,
 }
@@ -46,6 +49,16 @@ pub enum Detected {
 /// How much of a stream [`detect`] looks at: a tar header block, or an
 /// armored age file's 1 KiB of white space and its first line.
 pub const HEAD_LEN: usize = 1024 + 34 + 512;
+
+/// How much of a stream [`detect`] looks at to tell an ISO 9660 image, when
+/// its first [`HEAD_LEN`] bytes are data: its system area and its first
+/// volume descriptor.
+pub const ISO_HEAD_LEN: usize = ISO_DESCRIPTORS + 2048;
+
+/// Where an ISO 9660 image's volume descriptors start, after its 32 KiB
+/// system area (which a bootable image fills with a boot sector, or a
+/// partition table to be written to a USB stick).
+const ISO_DESCRIPTORS: usize = 16 * 2048;
 
 const AGE_INTRO: &[u8] = b"age-encryption.org/";
 const AGE_ARMOR: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
@@ -108,8 +121,19 @@ fn is_tar(head: &[u8]) -> bool {
     value != 0 && (value == unsigned || value == signed) && block[..100].iter().any(|&c| c != 0)
 }
 
+/// Whether `head` has an ISO 9660 volume descriptor where the first one
+/// is: a type (0 to 3, or 255 for the set's end), "CD001" and version 1,
+/// as `file` and libarchive look for. An image with UDF beside ISO 9660
+/// (Windows' and most DVDs') has it too; one with UDF alone does not.
+fn is_iso(head: &[u8]) -> bool {
+    let Some(vd) = head.get(ISO_DESCRIPTORS..ISO_DESCRIPTORS + 7) else {
+        return false;
+    };
+    matches!(vd[0], 0..=3 | 255) && &vd[1..6] == b"CD001" && vd[6] == 1
+}
+
 /// What `head`, the first [`HEAD_LEN`] bytes of a stream (fewer if it is
-/// shorter), is. `name`, the file's name if the stream is the file's, tells
+/// shorter), or [`ISO_HEAD_LEN`] to tell an ISO 9660 image, is. `name`, the file's name if the stream is the file's, tells
 /// `.lzma`, which has no magic.
 pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     let starts = |magic: &[u8]| head.starts_with(magic);
@@ -156,6 +180,10 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     }
     if is_tar(head) {
         return Detected::Container(Container::Tar);
+    }
+    // After what starts the stream: an image's system area is anything.
+    if is_iso(head) {
+        return Detected::Container(Container::Iso);
     }
     if name.is_some_and(|n| n.to_ascii_lowercase().ends_with(".lzma")) {
         return Detected::Layer(Layer::Lzma);
@@ -293,6 +321,36 @@ mod tests {
         let unnamed = tar_block(b"", b"", None);
         for head in [&wrong[..], &unnamed, &[0; 512], &v7[..511], b""] {
             assert_eq!(layer(head), Detected::Container(Container::Data));
+        }
+    }
+
+    #[test]
+    fn iso_by_its_first_volume_descriptor() {
+        let mut image = vec![0u8; ISO_HEAD_LEN];
+        image[ISO_DESCRIPTORS..ISO_DESCRIPTORS + 7].copy_from_slice(b"\x01CD001\x01");
+        assert_eq!(layer(&image), Detected::Container(Container::Iso));
+        // A boot record first, or the set's end; a boot sector or a
+        // partition table in the system area.
+        for kind in [0, 2, 3, 255] {
+            image[ISO_DESCRIPTORS] = kind;
+            assert_eq!(layer(&image), Detected::Container(Container::Iso));
+        }
+        image[..2].copy_from_slice(&[0x33, 0xed]);
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        assert_eq!(layer(&image), Detected::Container(Container::Iso));
+        // What starts the stream comes first.
+        image[..3].copy_from_slice(&[0x1F, 0x8B, 0x08]);
+        assert_eq!(layer(&image), Detected::Layer(Layer::Gzip));
+        image[..3].fill(0);
+        // Another type, version or identifier (UDF alone has BEA01), or too
+        // short (the first HEAD_LEN bytes alone): data.
+        for (at, byte) in [(0, 4), (0, 254), (6, 2), (1, b'B')] {
+            let mut other = image.clone();
+            other[ISO_DESCRIPTORS + at] = byte;
+            assert_eq!(layer(&other), Detected::Container(Container::Data));
+        }
+        for len in [ISO_DESCRIPTORS + 6, HEAD_LEN] {
+            assert_eq!(layer(&image[..len]), Detected::Container(Container::Data));
         }
     }
 

@@ -1,0 +1,4 @@
+# Linux does not mount it:
+# UDF-fs: Scanning with blocksize 1024 failed
+# UDF-fs: error (device loop0): udf_read_tagged: read failed, block=131591, location=0
+# UDF-fs: warning (device loop0): udf_fill_super: No fileset found

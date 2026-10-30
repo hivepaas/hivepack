@@ -192,6 +192,7 @@ version = "0.0.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "hivepack-iso",
  "hivepack-tar",
  "hivepack-zip",
  "rustix",
@@ -213,6 +214,7 @@ dependencies = [
  "hivepack-open",
  "hivepack-rar",
  "hivepack-tar",
+ "hivepack-udf",
  "hivepack-xz",
  "hivepack-zip",
  "hivepack-zstd",
@@ -258,6 +260,10 @@ dependencies = [
 
 [[package]]
 name = "hivepack-tar"
+version = "0.0.0"
+
+[[package]]
+name = "hivepack-udf"
 version = "0.0.0"
 
 [[package]]

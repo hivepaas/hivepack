@@ -10,8 +10,22 @@
 // opens the archive (its bytes in hex), with QuickOpen off, as IsArchive
 // opens it, then reads every header as Archive::ReadHeader reads them,
 // printing what UnRAR keeps of each: the header's fields, the archive's
-// state, and the exit code at the end. hivepack-rar answers the same requests
-// in crates/rar/tests/oracle.rs, and the answers are compared as text.
+// state, and the exit code at the end.
+//
+//   test <hex> [<dictionary limit>]
+//
+// goes through the archive as UnRAR tests one, with CmdExtract's own
+// ExtractCurrentFile, printing after each header how much data it gave out,
+// its FNV-1a hash, whether its hash failed, where the archive is and the exit
+// code.
+//
+// hivepack-rar answers the same requests in crates/rar/tests/oracle.rs, and
+// the answers are compared as text.
+//
+//   hash <type> <chunk> <hex>
+//
+// hashes the bytes in chunks of that size with UnRAR's DataHash, HASH_RAR14,
+// HASH_CRC32 or HASH_BLAKE2 by number, and prints the hash.
 //
 // UnRAR's license, whose source this program is built with:
 //
@@ -285,24 +299,38 @@ static std::vector<byte> unhex(const char *hex) {
   return data;
 }
 
-static void do_list(int enable_broken, const char *hex) {
+// The archive, in memory and not in /tmp: how far a damaged header can seek
+// depends on the file system. ext4 refuses to seek past 16 TiB, which UnRAR
+// takes for a fatal error, and tmpfs and this file do not. Only Linux's answers
+// are compared, so elsewhere a file will do. -1 if it failed.
+static int archive_file(const char *hex, char *path, size_t path_size) {
   std::vector<byte> data = unhex(hex);
-  // In memory, not in /tmp: how far a damaged header can seek depends on the
-  // file system. ext4 refuses to seek past 16 TiB, which UnRAR takes for a
-  // fatal error, and tmpfs and this file do not. Only Linux's answers are
-  // compared, so elsewhere a file will do.
-  char path[64];
 #ifdef __linux__
   int fd = memfd_create("rar-oracle", 0);
-  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+  snprintf(path, path_size, "/proc/self/fd/%d", fd);
 #else
-  snprintf(path, sizeof(path), "/tmp/rar-oracle-XXXXXX");
+  snprintf(path, path_size, "/tmp/rar-oracle-XXXXXX");
   int fd = mkstemp(path);
 #endif
   if (fd < 0 || (data.size() && write(fd, data.data(), data.size()) != (ssize_t)data.size())) {
     printf("error writing\n");
-    return;
+    return -1;
   }
+  return fd;
+}
+
+static void close_archive_file(int fd, const char *path) {
+  close(fd);
+#ifndef __linux__
+  unlink(path);
+#endif
+}
+
+static void do_list(int enable_broken, const char *hex) {
+  char path[64];
+  int fd = archive_file(hex, path, sizeof(path));
+  if (fd < 0)
+    return;
 
   out = "list";
   ErrHandler.Clean();
@@ -338,10 +366,124 @@ static void do_list(int enable_broken, const char *hex) {
     out += " badalloc";
   }
   put("exit", ErrHandler.GetErrorCode());
-  close(fd);
-#ifndef __linux__
-  unlink(path);
-#endif
+  close_archive_file(fd, path);
+  printf("%s\n", out.c_str());
+}
+
+static unsigned long long data_size, data_fnv;
+
+// All an entry's data comes here, and nobody allows anything: no password, no
+// next volume, no larger dictionary.
+static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
+  if (msg != UCM_PROCESSDATA)
+    return -1;
+  const byte *data = (const byte *)p1;
+  for (size_t i = 0; i < (size_t)p2; i++) {
+    data_fnv ^= data[i];
+    data_fnv *= 0x100000001b3ULL;
+  }
+  data_size += (size_t)p2;
+  return 1;
+}
+
+static void do_test(const char *hex, unsigned long long limit) {
+  char path[64];
+  int fd = archive_file(hex, path, sizeof(path));
+  if (fd < 0)
+    return;
+
+  out = "test";
+  ErrHandler.Clean();
+  // What RAROpenArchiveEx and ProcessFile set for testing, with QuickOpen off.
+  // Recursing is the one difference: with "*" as the only mask and no recursing,
+  // UnRAR stops after a first file whose name is that very "*", taking it for
+  // all that was asked for, which says nothing of reading the archive.
+  CommandData Cmd;
+  Cmd.QOpenMode = QOPEN_NONE;
+  Cmd.FileArgs.AddString(L"*");
+  Cmd.Overwrite = OVERWRITE_ALL;
+  Cmd.VersionControl = 1;
+  Cmd.Recurse = RECURSE_ALWAYS;
+  Cmd.DllOpMode = RAR_TEST;
+  Cmd.Command = L"T";
+  Cmd.Test = true;
+  if (limit != 0)
+    Cmd.WinSizeLimit = Cmd.WinSize = limit;
+  try {
+    Archive Arc(&Cmd);
+    CmdExtract Extract(&Cmd);
+    std::string narrow(path);
+    std::wstring wide(narrow.begin(), narrow.end());
+    if (!Arc.Open(wide)) {
+      out += " notopened";
+    } else if (!Arc.IsArchive(true)) {
+      out += " notarchive";
+    } else {
+      out += " archive";
+      // Only now: IsArchive reads on past an encrypted main header if there is
+      // a callback that could give a password. Passwords are for later.
+      Cmd.Callback = test_callback;
+      Extract.ExtractArchiveInit(Arc);
+      while (true) {
+        size_t size = Arc.ReadHeader();
+        out += " |";
+        put("read", size);
+        put("headertype", (unsigned)Arc.GetHeaderType());
+        put("cur", (unsigned long long)Arc.CurBlockPos);
+        put("next", (unsigned long long)Arc.NextBlockPos);
+        // What hivepack-rar cannot read yet is passed over on both sides, and
+        // so is what UnRAR's mask refuses: "*" does not match a name that
+        // starts with "*" and goes on, as match() takes that "*" for a plain
+        // character. That is choosing files, and hivepack-rar has no masks.
+        if (size != 0 && Arc.GetHeaderType() == HEAD_FILE) {
+          FileHeader &h = Arc.FileHead;
+          if (h.Method != 0 || h.Encrypted || h.SplitBefore || h.SplitAfter ||
+              !Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
+            out += " later";
+            Arc.SeekToNext();
+            continue;
+          }
+        }
+        data_size = 0;
+        data_fnv = 0xcbf29ce484222325ULL;
+        bool repeat = false;
+        // As ProcessFile does: what this entry alone did, which the exit code
+        // does not say once it has a worse one.
+        Cmd.DllError = 0;
+        bool go = Extract.ExtractCurrentFile(Arc, size, repeat);
+        put("data", data_size);
+        put("fnv", data_fnv);
+        put("baddata", Cmd.DllError == ERAR_BAD_DATA);
+        put("pos", (unsigned long long)Arc.Tell());
+        put("broken", Arc.BrokenHeader);
+        put("code", ErrHandler.GetErrorCode());
+        if (!go)
+          break;
+      }
+    }
+  } catch (RAR_EXIT code) {
+    put("thrown", code);
+  } catch (std::bad_alloc &) {
+    out += " badalloc";
+  }
+  put("exit", ErrHandler.GetErrorCode());
+  close_archive_file(fd, path);
+  printf("%s\n", out.c_str());
+}
+
+static void do_hash(int type, size_t chunk, const char *hex) {
+  std::vector<byte> data = unhex(hex);
+  DataHash hash;
+  hash.Init((HASH_TYPE)type, 1);
+  for (size_t at = 0; at < data.size(); at += chunk)
+    hash.Update(data.data() + at, Min(chunk, data.size() - at));
+  HashValue value;
+  hash.Result(&value);
+  out = "hash";
+  if (type == HASH_BLAKE2)
+    put_bytes("digest", value.Digest, sizeof(value.Digest));
+  else
+    put("crc32", value.CRC32);
   printf("%s\n", out.c_str());
 }
 
@@ -366,6 +508,14 @@ int main() {
       do_list(atoi(words[1]), words[2]);
     else if (count == 2 && strcmp(words[0], "list") == 0)
       do_list(atoi(words[1]), "");
+    else if (count == 3 && strcmp(words[0], "test") == 0)
+      do_test(words[1], strtoull(words[2], NULL, 10));
+    else if (count == 2 && strcmp(words[0], "test") == 0)
+      do_test(words[1], 0);
+    else if (count == 1 && strcmp(words[0], "test") == 0)
+      do_test("", 0);
+    else if (count == 4 && strcmp(words[0], "hash") == 0)
+      do_hash(atoi(words[1]), strtoul(words[2], NULL, 10), words[3]);
     else
       printf("unknown request\n");
     fflush(stdout);

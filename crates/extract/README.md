@@ -2,7 +2,7 @@
 
 Extracting archives to disk, safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs.
 
-> **Status:** extracts ZIP archives that `hivepack-zip` opened, refusing unportable names, the same path twice (ignoring case and how accents are written), links and overlapping data, writing by handle, and counting what is written against its limits, with named options to relax each rule, a time limit, cancelling and progress, and carrying the archive's mark of origin (Windows' Mark of the Web, macOS's quarantine) to every file. tar and RAR come later. This crate is not on crates.io.
+> **Status:** extracts ZIP archives that `hivepack-zip` opened, refusing unportable names, the same path twice (ignoring case and how accents are written), links and overlapping data, writing by handle, and counting what is written against its limits, with named options to relax each rule, a time limit, cancelling and progress, and carrying the archive's mark of origin (Windows' Mark of the Web, macOS's quarantine) to every file. tar archives (`extract_tar`) and ISO 9660 images (`extract_iso`) are read twice, to check everything before writing. RAR comes later. This crate is not on crates.io.
 
 ```rust
 use hivepack_extract::{Options, Origin, extract_zip};

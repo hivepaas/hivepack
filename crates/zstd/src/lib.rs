@@ -2,8 +2,10 @@
 //! official library, [libzstd](https://github.com/facebook/zstd).
 //!
 //! Work in progress: decompression works, of whole frames in one call
-//! ([`decompress`], [`DCtx::decompress`]) or streaming
-//! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`].
+//! ([`decompress`], [`DCtx::decompress`]), streaming
+//! ([`DCtx::decompress_stream`]) or a piece at a time into the caller's
+//! buffers ([`DCtx::decompress_continue`]), with dictionaries through
+//! [`DDict`].
 //! Compression works at every level, with every strategy, the block
 //! splitter after the sequences, long distance matching and a target size
 //! for compressed blocks ([`CParameter::TargetCBlockSize`]), in one call
@@ -263,7 +265,7 @@ pub use decompress::zstd_decompress::{
     is_frame, is_skippable_frame, read_skippable_frame,
 };
 pub use decompress::zstd_decompress_internal::{
-    CONTENTSIZE_UNKNOWN, DCtx, Format, FrameHeader, FrameType,
+    CONTENTSIZE_UNKNOWN, DCtx, Format, FrameHeader, FrameType, NextInputType,
 };
 pub use dict_builder::cover::{
     CoverParams, optimize_train_from_buffer_cover, train_from_buffer_cover,

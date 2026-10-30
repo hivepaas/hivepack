@@ -166,9 +166,10 @@ pub(crate) enum Kind {
     File,
     Dir,
     Link,
-    /// A tar hard link: a second name for a file extracted before it.
+    /// A hard link (tar, ISO 9660): a second name for a file extracted
+    /// before it.
     HardLink,
-    /// A tar device or FIFO, which is never created.
+    /// A device or FIFO (tar, ISO 9660), which is never created.
     Special,
 }
 

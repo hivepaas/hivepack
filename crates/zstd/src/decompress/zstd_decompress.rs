@@ -31,13 +31,19 @@ use crate::decompress::zstd_decompress_block::{
 };
 use crate::decompress::zstd_decompress_internal::{
     CONTENTSIZE_UNKNOWN, DCtx, DDictHashSet, DStage, DStreamStage, DictUses, EntropyDTables,
-    ExtDict, Format, FrameHeader, FrameType, LL_BASE, ML_BASE, OF_BASE, OF_BITS, OutBufferId,
-    Segment, TableRef, WILDCOPY_OVERLENGTH, ZSTD_MAXWINDOWSIZE_DEFAULT,
+    ExtDict, Format, FrameHeader, FrameType, LL_BASE, ML_BASE, NextInputType, OF_BASE, OF_BITS,
+    OutBufferId, Segment, TableRef, WILDCOPY_OVERLENGTH, ZSTD_MAXWINDOWSIZE_DEFAULT,
     ZSTD_WINDOWLOG_LIMIT_DEFAULT,
 };
 
 /// `ZSTD_SKIPPABLEHEADERSIZE`
 pub const SKIPPABLE_HEADER_SIZE: usize = 8;
+
+/// How often [`DCtx::decompress_continue`] dropped the oldest part of its
+/// copy of the window, so that the tests can check they reach it.
+#[cfg(test)]
+pub(crate) static BUFFERLESS_TRIMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// `ZSTD_WINDOWLOG_MAX` for a 64-bit machine. libzstd lowers it to 30 on
 /// 32-bit machines; the port keeps 31 everywhere.
 pub const WINDOWLOG_MAX: u32 = 31;
@@ -744,7 +750,7 @@ impl FrameDict<'_> {
 
 impl DCtx {
     /// `ZSTD_decompressBegin`: gets ready for a new frame.
-    pub(crate) fn decompress_begin(&mut self) {
+    fn decompress_begin_internal(&mut self) {
         self.expected = starting_input_length(self.format);
         self.stage = DStage::GetFrameHeaderSize;
         self.processed_c_size = 0;
@@ -758,6 +764,10 @@ impl DCtx {
         self.dict_id = 0;
         self.b_type = BlockType::Reserved;
         self.is_frame_decompression = true;
+        // The bufferless window, kept allocated.
+        self.bufferless.begun = false;
+        self.bufferless.end = 0;
+        self.bufferless.caller_end = 0;
     }
 
     /// `ZSTD_refDictContent`, for the pointer bookkeeping: the window will
@@ -791,8 +801,8 @@ impl DCtx {
     }
 
     /// `ZSTD_decompressBegin_usingDict`
-    fn decompress_begin_using_dict<'d>(&mut self, dict: Option<&'d [u8]>) -> Result<FrameDict<'d>> {
-        self.decompress_begin();
+    fn frame_begin_using_dict<'d>(&mut self, dict: Option<&'d [u8]>) -> Result<FrameDict<'d>> {
+        self.decompress_begin_internal();
         let Some(dict) = dict.filter(|d| !d.is_empty()) else {
             return Ok(FrameDict::NONE);
         };
@@ -806,13 +816,13 @@ impl DCtx {
     }
 
     /// `ZSTD_decompressBegin_usingDDict`
-    fn decompress_begin_using_ddict<'d>(&mut self, ddict: Option<&'d DDict>) -> FrameDict<'d> {
+    fn frame_begin_using_ddict<'d>(&mut self, ddict: Option<&'d DDict>) -> FrameDict<'d> {
         if let Some(ddict) = ddict {
             // A dictionary other than the one just used is presumably not in
             // the processor's cache: the first block then prefetches.
             self.ddict_is_cold = self.dict_end != address(&ddict.content, ddict.content.len());
         }
-        self.decompress_begin();
+        self.decompress_begin_internal();
         match ddict {
             // A missing DDict means no dictionary.
             None => FrameDict::NONE,
@@ -1055,10 +1065,10 @@ impl DCtx {
             }
 
             let frame_dict = if ddict.is_some() {
-                self.decompress_begin_using_ddict(ddict)
+                self.frame_begin_using_ddict(ddict)
             } else {
                 // With no dictionary too.
-                self.decompress_begin_using_dict(dict)?
+                self.frame_begin_using_dict(dict)?
             };
             self.check_continuity(dst, op, dst.len() - op);
 
@@ -1474,7 +1484,7 @@ impl DCtx {
     /// `src_size` is the size of `src`, except for the content of a
     /// skippable frame, which libzstd counts without reading it: the
     /// streaming decoder does not keep it, and passes no bytes.
-    fn decompress_continue(
+    fn decompress_continue_internal(
         &mut self,
         out: &mut [u8],
         dst: usize,
@@ -1668,6 +1678,245 @@ impl DCtx {
         }
     }
 
+    /// `ZSTD_decompressBegin`: starts a frame for
+    /// [`DCtx::decompress_continue`], without a dictionary.
+    pub fn decompress_begin(&mut self) {
+        self.decompress_begin_internal();
+        self.bufferless.begun = true;
+    }
+
+    /// `ZSTD_decompressBegin_usingDict`: starts a frame for
+    /// [`DCtx::decompress_continue`] with `dict`: a zstd dictionary, or raw
+    /// content (one without the dictionary magic number, or under 8
+    /// bytes). An empty one means none. Fails with
+    /// [`ErrorCode::DictionaryCorrupted`] for a zstd dictionary whose
+    /// tables cannot be read.
+    ///
+    /// libzstd references the dictionary; the port copies it. Where it lies
+    /// still counts: output that starts right where `dict` ends in memory
+    /// continues its content, as in libzstd.
+    pub fn decompress_begin_using_dict(&mut self, dict: &[u8]) -> Result<()> {
+        self.decompress_begin();
+        if dict.is_empty() {
+            return Ok(());
+        }
+        // The tables into the context's own, as libzstd loads them; the
+        // content after them, which is all the window has of it, copied.
+        let Ok(content) = self.insert_dictionary(dict) else {
+            return error!(DictionaryCorrupted);
+        };
+        let content = DDict::with_content_type(content, DictContentType::RawContent)?;
+        self.frame_ddict = Some(Arc::new(content));
+        // prefixStart and virtualStart at the content's start.
+        self.stream_prefix = Segment::Dict;
+        self.stream_ext = Segment::None;
+        self.bufferless.caller_end = address(dict, dict.len());
+        Ok(())
+    }
+
+    /// `ZSTD_decompressBegin_usingDDict`: starts a frame for
+    /// [`DCtx::decompress_continue`] with `ddict`.
+    pub fn decompress_begin_using_ddict(&mut self, ddict: Arc<DDict>) {
+        // As in ZSTD_decompressBegin_usingDDict: a dictionary other than the
+        // one just used is presumably not in the processor's cache.
+        let content_end = address(&ddict.content, ddict.content.len());
+        self.ddict_is_cold = self.dict_end != content_end;
+        self.decompress_begin();
+        self.copy_ddict_parameters(&ddict);
+        self.frame_ddict = Some(ddict);
+        self.bufferless.caller_end = content_end;
+    }
+
+    /// `ZSTD_nextSrcSizeToDecompress`: how many bytes the next call of
+    /// [`DCtx::decompress_continue`] takes: exactly that many, or, in a
+    /// stored block, from 1 byte up to that many. 0 once the frame is
+    /// decoded.
+    pub fn next_src_size_to_decompress(&self) -> usize {
+        self.expected
+    }
+
+    /// `ZSTD_nextInputType`: what the next call of
+    /// [`DCtx::decompress_continue`] reads.
+    pub fn next_input_type(&self) -> NextInputType {
+        match self.stage {
+            DStage::GetFrameHeaderSize | DStage::DecodeFrameHeader => NextInputType::FrameHeader,
+            DStage::DecodeBlockHeader => NextInputType::BlockHeader,
+            DStage::DecompressBlock => NextInputType::Block,
+            DStage::DecompressLastBlock => NextInputType::LastBlock,
+            DStage::CheckChecksum => NextInputType::Checksum,
+            DStage::DecodeSkippableHeader | DStage::SkipFrame => NextInputType::SkippableFrame,
+        }
+    }
+
+    /// `ZSTD_decompressContinue`: decodes `src`, the next piece of the frame
+    /// begun with [`DCtx::decompress_begin`] (or its variants), of the size
+    /// [`DCtx::next_src_size_to_decompress`] gives, into `dst`. Returns how
+    /// much it wrote there: 0 for a header or a checksum, and for each
+    /// piece of a skippable frame, whose content it skips. The frame is
+    /// decoded when [`DCtx::next_src_size_to_decompress`] gives 0; begin
+    /// again for the next.
+    ///
+    /// Wrong sizes fail with [`ErrorCode::SrcSizeWrong`], room too small
+    /// for a block with [`ErrorCode::DstSizeTooSmall`], and a context that
+    /// was not begun so, or that was used since for other decompression,
+    /// with [`ErrorCode::StageWrong`] (where libzstd reads whatever state
+    /// it holds). After an error, begin again.
+    ///
+    /// The window, as in libzstd, is the output since the last call whose
+    /// `dst` did not start where the previous one's output ended in memory,
+    /// and the one segment before it: output decoded each time into a new
+    /// buffer has only the last call's before it, where a frame's matches
+    /// may reach further back and fail with
+    /// [`ErrorCode::CorruptionDetected`]. A round buffer of
+    /// [`decoding_buffer_size_min`] bytes, written from its start again
+    /// when what is left of it is less than a block, keeps the window.
+    ///
+    /// Differs from libzstd: libzstd reads the window in the caller's
+    /// memory; the port keeps a copy of it, of at least the frame's window
+    /// size and a block, and decodes each block there before copying it to
+    /// `dst`. A damaged frame whose matches reach further back than its
+    /// window, or into output the caller has written over since, decodes
+    /// differently, or fails with [`ErrorCode::CorruptionDetected`] where
+    /// libzstd reads that memory. A damaged compressed block that decodes
+    /// to more than the frame's block size fails with
+    /// [`ErrorCode::CorruptionDetected`]; libzstd, given more room than
+    /// that, may decode on to the end of `dst` first and fail with
+    /// [`ErrorCode::DstSizeTooSmall`].
+    pub fn decompress_continue(&mut self, dst: &mut [u8], src: &[u8]) -> Result<usize> {
+        if !self.bufferless.begun {
+            return error!(StageWrong);
+        }
+        if src.len() != self.next_src_size_to_decompress_with_input_size(src.len()) {
+            return error!(SrcSizeWrong);
+        }
+        // ZSTD_checkContinuity, on the caller's addresses.
+        let at = address(dst, 0);
+        if !dst.is_empty() {
+            if at != self.bufferless.caller_end {
+                self.bufferless_new_segment();
+                self.bufferless.caller_end = at;
+            } else if self.stream_prefix == Segment::Dict
+                && let Some(ddict) = &self.frame_ddict
+            {
+                // The output follows the dictionary's content in memory:
+                // one segment.
+                let content = &ddict.content;
+                let window = &mut self.bufferless.window;
+                if window.len() < content.len() {
+                    window.resize(content.len(), 0);
+                }
+                window[..content.len()].copy_from_slice(content);
+                self.bufferless.end = content.len();
+                self.stream_prefix = Segment::Out {
+                    start: 0,
+                    end: content.len(),
+                };
+                self.stream_ext = Segment::None;
+            }
+        }
+
+        // The room the piece can write, in the copy of the window: a block
+        // at most, or what a stored or RLE block says.
+        let in_block = matches!(
+            self.stage,
+            DStage::DecompressBlock | DStage::DecompressLastBlock
+        );
+        let compressed = in_block && self.b_type == BlockType::Compressed;
+        let room = if !in_block {
+            0
+        } else {
+            match self.b_type {
+                BlockType::Compressed => self.f_params.block_size_max as usize,
+                BlockType::Rle => self.rle_size as usize,
+                BlockType::Raw | BlockType::Reserved => src.len(),
+            }
+            .min(dst.len())
+        };
+        let end = self.bufferless.end;
+        let mut window = std::mem::take(&mut self.bufferless.window);
+        if window.len() < end + room {
+            window.resize(end + room, 0);
+        }
+        let result =
+            self.decompress_continue_internal(&mut window[..end + room], end, room, src, src.len());
+        let result = match result {
+            Ok(size) => {
+                dst[..size].copy_from_slice(&window[end..end + size]);
+                if in_block {
+                    self.bufferless.end = end + size;
+                    self.bufferless.caller_end = at.wrapping_add(size);
+                }
+                Ok(size)
+            }
+            // libzstd decodes on into the larger room; past the block size,
+            // the block is damaged.
+            Err(error)
+                if compressed && error.code() == ErrorCode::DstSizeTooSmall && dst.len() > room =>
+            {
+                error!(CorruptionDetected)
+            }
+            Err(error) => Err(error),
+        };
+        self.bufferless.window = window;
+        if in_block {
+            self.bufferless_trim();
+        }
+        result
+    }
+
+    /// `ZSTD_checkContinuity`, for [`DCtx::decompress_continue`]: output
+    /// elsewhere than where the last ended starts a new segment of the
+    /// window, and the current one becomes the older one.
+    fn bufferless_new_segment(&mut self) {
+        match self.stream_prefix {
+            Segment::Out { start, end } => {
+                // The older segment before it is gone.
+                self.bufferless.window.copy_within(start..end, 0);
+                let len = end - start;
+                self.stream_ext = Segment::Out { start: 0, end: len };
+                self.stream_prefix = Segment::Out {
+                    start: len,
+                    end: len,
+                };
+                self.bufferless.end = len;
+            }
+            older => {
+                // The dictionary's content, or nothing.
+                self.stream_ext = older;
+                self.stream_prefix = Segment::Out { start: 0, end: 0 };
+                self.bufferless.end = 0;
+            }
+        }
+    }
+
+    /// Drops the oldest part of the copy of the window, beyond the frame's
+    /// window size and a block, once it holds twice that (and at least
+    /// 1 MB).
+    fn bufferless_trim(&mut self) {
+        let keep = usize::try_from(self.f_params.window_size)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.f_params.block_size_max as usize);
+        let end = self.bufferless.end;
+        if end <= keep.saturating_mul(2).max(1 << 20) {
+            return;
+        }
+        let drop = end - keep;
+        #[cfg(test)]
+        BUFFERLESS_TRIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bufferless.window.copy_within(drop..end, 0);
+        self.bufferless.end = keep;
+        let shift = |segment: Segment| match segment {
+            Segment::Out { end, .. } if end <= drop => Segment::None,
+            Segment::Out { start, end } => Segment::Out {
+                start: start.saturating_sub(drop),
+                end: end - drop,
+            },
+            other => other,
+        };
+        self.stream_ext = shift(self.stream_ext);
+        self.stream_prefix = shift(self.stream_prefix);
+    }
+
     /// `ZSTD_DCtx_updateOversizedDuration`: counts the frames in a row for
     /// which the buffers are much larger than needed.
     fn update_oversized_duration(
@@ -1722,8 +1971,13 @@ impl DCtx {
                 self.out_buff.len() - self.out_start
             };
             let mut out_buff = std::mem::take(&mut self.out_buff);
-            let decoded_size =
-                self.decompress_continue(&mut out_buff, self.out_start, dst_size, src, src_size);
+            let decoded_size = self.decompress_continue_internal(
+                &mut out_buff,
+                self.out_start,
+                dst_size,
+                src,
+                src_size,
+            );
             self.out_buff = out_buff;
             let decoded_size = decoded_size?;
             if decoded_size == 0 && !is_skip_frame {
@@ -1735,7 +1989,8 @@ impl DCtx {
         } else {
             // Straight into the output buffer.
             let dst_size = if is_skip_frame { 0 } else { oend - *op };
-            let decoded_size = self.decompress_continue(dst, *op, dst_size, src, src_size)?;
+            let decoded_size =
+                self.decompress_continue_internal(dst, *op, dst_size, src, src_size)?;
             *op += decoded_size;
             // Nothing to flush.
             self.stream_stage = DStreamStage::Read;
@@ -1896,7 +2151,7 @@ impl DCtx {
 
                     // Take in the header (see DStage::DecodeFrameHeader).
                     let ddict = self.get_ddict();
-                    self.decompress_begin_using_ddict(ddict.as_deref());
+                    self.frame_begin_using_ddict(ddict.as_deref());
                     self.frame_ddict = ddict;
 
                     if self.format == Format::Zstd1
@@ -2197,5 +2452,59 @@ pub fn decompress(dst: &mut [u8], src: &[u8]) -> Result<usize> {
 impl From<Error> for std::io::Error {
     fn from(error: Error) -> Self {
         std::io::Error::other(error)
+    }
+}
+
+#[cfg(test)]
+mod bufferless_tests {
+    //! [`DCtx::decompress_continue`] into one buffer, for a frame longer
+    //! than twice its window and 1 MB: its copy of the window drops the
+    //! oldest part, and stays bounded. The oracle's buffer is too small for
+    //! this; with libzstd's own buffers, nothing there depends on it.
+
+    use super::*;
+    use crate::{CCtx, CParameter};
+
+    #[test]
+    fn the_copy_of_the_window_stays_bounded() {
+        let mut rng = crate::oracle::Rng::new(0xB0FF);
+        let data = rng.lz_data(1_300_000);
+        let mut cctx = CCtx::new();
+        for parameter in [
+            CParameter::CompressionLevel(3),
+            CParameter::WindowLog(15),
+            CParameter::ChecksumFlag(true),
+        ] {
+            cctx.set_parameter(parameter).expect("a parameter");
+        }
+        let mut frame = vec![0u8; crate::compress_bound(data.len()).expect("a bound")];
+        let size = cctx.compress2(&mut frame, &data).expect("compressed");
+        frame.truncate(size);
+
+        let trims = BUFFERLESS_TRIMS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut dctx = DCtx::new();
+        dctx.decompress_begin();
+        let mut out = vec![0u8; data.len()];
+        let (mut ip, mut op) = (0, 0);
+        let mut largest = 0;
+        loop {
+            let next = dctx.next_src_size_to_decompress();
+            if next == 0 {
+                break;
+            }
+            op += dctx
+                .decompress_continue(&mut out[op..], &frame[ip..ip + next])
+                .expect("decoded");
+            ip += next;
+            largest = largest.max(dctx.bufferless.window.len());
+        }
+        assert_eq!((ip, op), (frame.len(), data.len()));
+        assert!(out == data, "the output differs");
+        assert!(BUFFERLESS_TRIMS.load(std::sync::atomic::Ordering::Relaxed) > trims);
+        // 1 MB, and the room for a block of 32 KB.
+        assert!(
+            largest <= (1 << 20) + (1 << 15),
+            "a copy of {largest} bytes"
+        );
     }
 }

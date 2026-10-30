@@ -277,8 +277,30 @@ pub(crate) enum Segment {
     /// The content of the dictionary the frame uses.
     Dict,
     /// `start..end` in the output buffer: the context's own (`outBuff`), or
-    /// the caller's with [`DParameter::StableOutBuffer`](crate::DParameter::StableOutBuffer).
+    /// the caller's with [`DParameter::StableOutBuffer`](crate::DParameter::StableOutBuffer);
+    /// for [`DCtx::decompress_continue`](crate::DCtx::decompress_continue),
+    /// the copy of the window in [`Bufferless`].
     Out { start: usize, end: usize },
+}
+
+/// The window of a frame decoded with
+/// [`DCtx::decompress_continue`](crate::DCtx::decompress_continue).
+/// libzstd's is the caller's earlier output, where it lies, which the
+/// caller must keep; safe Rust cannot read it there at the next call, so
+/// the port keeps a copy: the older segment, then the current one, from
+/// the start of `window` (the stream's [`Segment::Out`] positions), and
+/// the last call's address, to tell where segments end as libzstd does.
+#[derive(Default)]
+pub(crate) struct Bufferless {
+    /// The frame was begun with `ZSTD_decompressBegin` or its variants.
+    pub(crate) begun: bool,
+    /// The copy of the window, its first `end` bytes; room after them for
+    /// the next block.
+    pub(crate) window: Vec<u8>,
+    pub(crate) end: usize,
+    /// `previousDstEnd`, in the caller's memory: where its output ended,
+    /// or the dictionary's content; 0 for libzstd's NULL.
+    pub(crate) caller_end: usize,
 }
 
 /// `ZSTD_dStage`: what [`DCtx::decompress_stream`](crate::DCtx::decompress_stream)
@@ -293,6 +315,24 @@ pub(crate) enum DStage {
     CheckChecksum,
     DecodeSkippableHeader,
     SkipFrame,
+}
+
+/// `ZSTD_nextInputType_e`: what [`DCtx::decompress_continue`](crate::DCtx::decompress_continue)
+/// reads next ([`DCtx::next_input_type`](crate::DCtx::next_input_type)).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NextInputType {
+    /// The frame header, or the start of a skippable frame's.
+    FrameHeader,
+    /// A block header.
+    BlockHeader,
+    /// A block's content, which is not the last block.
+    Block,
+    /// The last block's content.
+    LastBlock,
+    /// The frame's checksum.
+    Checksum,
+    /// The rest of a skippable frame's header, or its content.
+    SkippableFrame,
 }
 
 /// `ZSTD_dStreamStage`: where [`DCtx::decompress_stream`](crate::DCtx::decompress_stream)
@@ -465,6 +505,8 @@ pub struct DCtx {
     /// The dictionary the frame being streamed uses: libzstd points into
     /// it, so the port keeps it alive until the next frame.
     pub(crate) frame_ddict: Option<Arc<DDict>>,
+    /// The window of a frame decoded without the streaming buffers.
+    pub(crate) bufferless: Bufferless,
 
     // Streaming: the buffers (ZSTD_decompressStream).
     pub(crate) stream_stage: DStreamStage,
@@ -539,6 +581,7 @@ impl DCtx {
             stream_prefix: Segment::None,
             stream_ext: Segment::None,
             frame_ddict: None,
+            bufferless: Bufferless::default(),
             stream_stage: DStreamStage::Init,
             in_buff: Vec::new(),
             in_pos: 0,

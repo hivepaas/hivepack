@@ -112,6 +112,9 @@ pub(crate) struct Ppmd7 {
     ns2indx: [u8; 256],
     see: [See; DUMMY_SEE + 1],
     bin_summ: [[u16; 64]; 128],
+    /// `charMask`, a local of the SDK's `Ppmd7z_DecodeSymbol`: which symbols
+    /// an escape has left. Set only by an escape, which most symbols are not.
+    char_mask: [u8; 256],
     mem: Vec<u8>,
 }
 
@@ -193,6 +196,7 @@ impl Ppmd7 {
             ns2bs_indx,
             ns2indx,
             see: [See::default(); DUMMY_SEE + 1],
+            char_mask: [0xFF; 256],
             bin_summ: [[0; 64]; 128],
             mem: vec![0; total],
         }))
@@ -211,7 +215,9 @@ impl Ppmd7 {
     #[inline(always)]
     fn get16(&self, at: u32) -> u32 {
         let at = at as usize;
-        u32::from(u16::from_le_bytes([self.mem[at], self.mem[at + 1]]))
+        // One bounds check.
+        let m = &self.mem[at..at + 2];
+        u32::from(u16::from_le_bytes([m[0], m[1]]))
     }
 
     #[inline(always)]
@@ -223,12 +229,9 @@ impl Ppmd7 {
     #[inline(always)]
     fn get32(&self, at: u32) -> u32 {
         let at = at as usize;
-        u32::from_le_bytes([
-            self.mem[at],
-            self.mem[at + 1],
-            self.mem[at + 2],
-            self.mem[at + 3],
-        ])
+        // One bounds check.
+        let m = &self.mem[at..at + 4];
+        u32::from_le_bytes([m[0], m[1], m[2], m[3]])
     }
 
     #[inline(always)]
@@ -1057,7 +1060,6 @@ impl Ppmd7 {
 
     /// `Ppmd7z_DecodeSymbol`: a byte, or `SYM_END` or `SYM_ERROR`.
     pub(crate) fn decode_symbol(&mut self, input: &mut impl ByteIn) -> i32 {
-        let mut char_mask = [0xFFu8; 256];
         let mc = self.min_context;
 
         if self.num_stats(mc) != 1 {
@@ -1105,16 +1107,16 @@ impl Ppmd7 {
             self.rc_decode(hi_cnt, summ_freq.wrapping_sub(hi_cnt));
 
             self.hi_bits_flag = hi_bits_flag_3(self.symbol(self.found_state));
-            // PPMD_SetAllBitsIn256Bytes was done above; the states' symbols
-            // masked.
+            // PPMD_SetAllBitsIn256Bytes, and the states' symbols masked.
+            self.char_mask.fill(0xFF);
             let mut s2 = self.stats(mc);
-            char_mask[self.symbol(s) as usize] = 0;
+            self.char_mask[self.symbol(s) as usize] = 0;
             loop {
                 let sym0 = self.symbol(s2) as usize;
                 let sym1 = self.symbol(s2 + STATE_SIZE) as usize;
                 s2 += 2 * STATE_SIZE;
-                char_mask[sym0] = 0;
-                char_mask[sym1] = 0;
+                self.char_mask[sym0] = 0;
+                self.char_mask[sym1] = 0;
                 if s2 >= s {
                     break;
                 }
@@ -1163,7 +1165,8 @@ impl Ppmd7 {
             self.code -= size0;
             self.range -= size0;
 
-            char_mask[sym as usize] = 0;
+            self.char_mask.fill(0xFF);
+            self.char_mask[sym as usize] = 0;
             self.prev_success = 0;
         }
 
@@ -1187,7 +1190,7 @@ impl Ppmd7 {
             let num = self.num_stats(mc);
             let num2 = num / 2;
             let num = num & 1;
-            let mut hi_cnt = (self.freq(s) & u32::from(char_mask[self.symbol(s) as usize]))
+            let mut hi_cnt = (self.freq(s) & u32::from(self.char_mask[self.symbol(s) as usize]))
                 & 0u32.wrapping_sub(num);
             s += num * STATE_SIZE;
             self.min_context = mc;
@@ -1195,8 +1198,8 @@ impl Ppmd7 {
             for _ in 0..num2 {
                 let sym0 = self.symbol(s) as usize;
                 let sym1 = self.symbol(s + STATE_SIZE) as usize;
-                hi_cnt += self.freq(s) & u32::from(char_mask[sym0]);
-                hi_cnt += self.freq(s + STATE_SIZE) & u32::from(char_mask[sym1]);
+                hi_cnt += self.freq(s) & u32::from(self.char_mask[sym0]);
+                hi_cnt += self.freq(s + STATE_SIZE) & u32::from(self.char_mask[sym1]);
                 s += 2 * STATE_SIZE;
             }
 
@@ -1208,8 +1211,9 @@ impl Ppmd7 {
                 let mut s = self.stats(self.min_context);
                 let threshold = count;
                 loop {
-                    count = count
-                        .wrapping_sub(self.freq(s) & u32::from(char_mask[self.symbol(s) as usize]));
+                    count = count.wrapping_sub(
+                        self.freq(s) & u32::from(self.char_mask[self.symbol(s) as usize]),
+                    );
                     s += STATE_SIZE;
                     if (count as i32) < 0 {
                         break;
@@ -1250,7 +1254,7 @@ impl Ppmd7 {
             let mut s = self.stats(self.min_context);
             let end = s + self.num_stats(self.min_context) * STATE_SIZE;
             loop {
-                char_mask[self.symbol(s) as usize] = 0;
+                self.char_mask[self.symbol(s) as usize] = 0;
                 s += STATE_SIZE;
                 if s == end {
                     break;

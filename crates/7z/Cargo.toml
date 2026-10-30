@@ -20,5 +20,5 @@ workspace = true
 [dependencies]
 # CRC-32, which 7z checks its headers and files with.
 hivepack-deflate.workspace = true
-# LZMA, LZMA2, and the branch filters.
+# LZMA and LZMA2.
 hivepack-xz.workspace = true

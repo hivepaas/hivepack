@@ -63,12 +63,20 @@ pub struct Options {
     /// headers decoded, in bytes: past it, the archive fails to open with
     /// [`Error::Mem`]. 1 GiB by default.
     pub memory_limit: u64,
+    /// The most a folder's dictionaries and models may take, in bytes, and
+    /// [`Archive::decode_folder`] and [`Archive::extract`] the folder they
+    /// keep in memory: past it, they fail with [`Error::Mem`], as does
+    /// reading the folder with [`Archive::files`]. An archive says how much
+    /// it needs, and the SDK has no such limit. 4 GiB by default, the most
+    /// LZMA's dictionary and PPMd's model can be.
+    pub decoder_memory_limit: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             memory_limit: 1 << 30,
+            decoder_memory_limit: 1 << 32,
         }
     }
 }
@@ -106,6 +114,7 @@ pub struct Entry {
 pub struct Archive<R> {
     reader: R,
     db: ArEx,
+    decoder_limit: u64,
     /// `SzArEx_Extract`'s cache: the folder last decoded, and its data.
     cache: Option<(usize, Vec<u8>)>,
 }
@@ -119,10 +128,15 @@ impl<R: Read + Seek> Archive<R> {
 
     /// `SzArEx_Open`, with `options`.
     pub fn open_with(mut reader: R, options: &Options) -> Result<Self> {
-        let db = arc_in::open(&mut reader, options.memory_limit)?;
+        let db = arc_in::open(
+            &mut reader,
+            options.memory_limit,
+            options.decoder_memory_limit,
+        )?;
         Ok(Archive {
             reader,
             db,
+            decoder_limit: options.decoder_memory_limit,
             cache: None,
         })
     }
@@ -191,18 +205,22 @@ impl<R: Read + Seek> Archive<R> {
             return Err(Error::Param);
         }
         let size = self.folder_size(folder);
-        if size > usize::MAX as u64 {
+        if size > usize::MAX as u64 || size > self.decoder_limit {
             return Err(Error::Mem);
         }
-        let mut out = Vec::new();
-        out.try_reserve_exact(size as usize)
+        // That it can be had, before the allocation that cannot fail softly.
+        let mut probe = Vec::<u8>::new();
+        probe
+            .try_reserve_exact(size as usize)
             .map_err(|_| Error::Mem)?;
-        out.resize(size as usize, 0);
+        drop(probe);
+        let mut out = vec![0; size as usize];
         dec::decode_folder(
             &self.db.db,
             folder,
             &mut self.reader,
             self.db.data_pos,
+            self.decoder_limit,
             &mut out,
         )?;
         Ok(out)
@@ -296,7 +314,8 @@ impl<R: Read + Seek> Files<'_, R> {
             if self.folder.as_ref().is_none_or(|(f, _)| *f != fo) {
                 self.end_folder()?;
                 let db = &self.archive.db;
-                self.folder = Some((fo, FolderDecoder::new(&db.db, fo, db.data_pos)?));
+                let limit = self.archive.decoder_limit;
+                self.folder = Some((fo, FolderDecoder::new(&db.db, fo, db.data_pos, limit)?));
             }
             // Skip what is between: the folder's data no file holds.
             let db = &self.archive.db;

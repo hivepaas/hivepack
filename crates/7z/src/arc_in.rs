@@ -64,11 +64,16 @@ const SIZE_T_BYTES: u32 = usize::BITS / 8;
 /// What the vectors of an archive's description may take, in bytes.
 pub(crate) struct Budget {
     left: u64,
+    /// `Options::decoder_memory_limit`, for an encoded header's folder.
+    decoder_limit: u64,
 }
 
 impl Budget {
-    pub(crate) fn new(limit: u64) -> Self {
-        Budget { left: limit }
+    pub(crate) fn new(limit: u64, decoder_limit: u64) -> Self {
+        Budget {
+            left: limit,
+            decoder_limit,
+        }
     }
 
     /// `MY_ALLOC`: `n` items, `T::default()` each.
@@ -908,7 +913,7 @@ fn read_and_decode_packed_streams<R: Read + Seek>(
     }
     for (fo, buf) in bufs.iter_mut().enumerate() {
         seek_to(in_stream, data_start_pos)?;
-        dec::decode_folder(p, fo, in_stream, data_start_pos, buf)?;
+        dec::decode_folder(p, fo, in_stream, data_start_pos, budget.decoder_limit, buf)?;
     }
     Ok(bufs)
 }
@@ -1500,9 +1505,13 @@ pub(crate) fn read_exact<R: Read>(in_stream: &mut R, buf: &mut [u8], eof: Error)
 }
 
 /// `SzArEx_Open`.
-pub(crate) fn open<R: Read + Seek>(in_stream: &mut R, memory_limit: u64) -> Result<ArEx> {
+pub(crate) fn open<R: Read + Seek>(
+    in_stream: &mut R,
+    memory_limit: u64,
+    decoder_limit: u64,
+) -> Result<ArEx> {
     let mut p = ArEx::default();
-    let mut budget = Budget::new(memory_limit);
+    let mut budget = Budget::new(memory_limit, decoder_limit);
     p.open2(in_stream, &mut budget)?;
     Ok(p)
 }

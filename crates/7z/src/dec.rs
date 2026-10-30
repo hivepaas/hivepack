@@ -246,8 +246,15 @@ impl<R> PackBytes<'_, R> {
     }
 }
 
+/// `n` bytes of a coder's dictionary or model, out of what the folder may
+/// use (`Options::decoder_memory_limit`).
+fn charge(limit: &mut u64, n: u64) -> Result<()> {
+    *limit = limit.checked_sub(n).ok_or(Error::Mem)?;
+    Ok(())
+}
+
 /// `SzDecodePpmd`'s checks of its properties, and the decoder for them.
-fn ppmd_decoder(props: &[u8]) -> Result<Box<Ppmd7>> {
+fn ppmd_decoder(props: &[u8], limit: &mut u64) -> Result<Box<Ppmd7>> {
     if props.len() != 5 {
         return Err(Error::Unsupported);
     }
@@ -258,6 +265,7 @@ fn ppmd_decoder(props: &[u8]) -> Result<Box<Ppmd7>> {
     {
         return Err(Error::Unsupported);
     }
+    charge(limit, u64::from(mem_size))?;
     let mut ppmd = Ppmd7::new(mem_size)?;
     ppmd.init(order);
     Ok(ppmd)
@@ -289,7 +297,7 @@ fn lzma_props(props: &[u8]) -> Result<(u32, u32, u32, u32)> {
 
 /// The decoder for LZMA or LZMA2 properties, which are checked. The
 /// dictionary needs to be no larger than the output.
-fn lzma_decoder(props: &[u8], out_size: u64, lzma2: bool) -> Result<Stream> {
+fn lzma_decoder(props: &[u8], out_size: u64, lzma2: bool, limit: &mut u64) -> Result<Stream> {
     let dict_cap = out_size.clamp(4096, u64::from(u32::MAX)) as u32;
     let filter = if lzma2 {
         // SzDecodeLzma2, Lzma2Dec_AllocateProbs.
@@ -305,15 +313,19 @@ fn lzma_decoder(props: &[u8], out_size: u64, lzma2: bool) -> Result<Stream> {
         } else {
             (2 | (prop & 1)) << (prop / 2 + 11)
         };
+        let dict_size = dict_size.min(dict_cap).max(4096);
+        charge(limit, u64::from(dict_size))?;
         let options = LzmaOptions {
-            dict_size: dict_size.min(dict_cap).max(4096),
+            dict_size,
             ..LzmaOptions::preset(0).ok_or(Error::Fail)?
         };
         Filter::lzma2(options)
     } else {
         let (lc, lp, pb, dict_size) = lzma_props(props)?;
+        let dict_size = dict_size.min(dict_cap).max(4096);
+        charge(limit, u64::from(dict_size))?;
         let options = LzmaOptions {
-            dict_size: dict_size.min(dict_cap).max(4096),
+            dict_size,
             lc,
             lp,
             pb,
@@ -334,7 +346,14 @@ fn lzma_decoder(props: &[u8], out_size: u64, lzma2: bool) -> Result<Stream> {
 }
 
 impl MainCoder {
-    fn new(method_id: u32, props: &[u8], pos: u64, in_size: u64, out_size: u64) -> Result<Self> {
+    fn new(
+        method_id: u32,
+        props: &[u8],
+        pos: u64,
+        in_size: u64,
+        out_size: u64,
+        limit: &mut u64,
+    ) -> Result<Self> {
         let method = match method_id {
             K_COPY => {
                 // Check it.
@@ -345,12 +364,13 @@ impl MainCoder {
             }
             K_LZMA => match lzma_props(props)? {
                 (lc, lp, pb, dict_size) if lc + lp > 4 => {
+                    charge(limit, u64::from(dict_size).min(out_size))?;
                     Main::LzmaDec(Box::new(LzmaDec::new(lc, lp, pb, dict_size, out_size)?))
                 }
-                _ => Main::Lzma(Box::new(lzma_decoder(props, out_size, false)?)),
+                _ => Main::Lzma(Box::new(lzma_decoder(props, out_size, false, limit)?)),
             },
-            K_LZMA2 => Main::Lzma(Box::new(lzma_decoder(props, out_size, true)?)),
-            K_PPMD => Main::Ppmd(ppmd_decoder(props)?, false),
+            K_LZMA2 => Main::Lzma(Box::new(lzma_decoder(props, out_size, true, limit)?)),
+            K_PPMD => Main::Ppmd(ppmd_decoder(props, limit)?, false),
             _ => return Err(Error::Unsupported),
         };
         Ok(MainCoder {
@@ -820,8 +840,9 @@ pub(crate) struct FolderDecoder {
 
 impl FolderDecoder {
     /// The decoder of folder `fo` of `p`, whose packed streams start at
-    /// `start_pos` in the archive.
-    pub(crate) fn new(p: &Ar, fo: usize, start_pos: u64) -> Result<Self> {
+    /// `start_pos` in the archive. Its coders' dictionaries and models take
+    /// no more than `limit` bytes.
+    pub(crate) fn new(p: &Ar, fo: usize, start_pos: u64, mut limit: u64) -> Result<Self> {
         let start = p.fo_coders_offsets[fo];
         let data = &p.coders_data[start..p.fo_coders_offsets[fo + 1]];
         let mut sd = Sd::new(data);
@@ -866,6 +887,7 @@ impl FolderDecoder {
                     pos,
                     in_size,
                     unpack_size,
+                    &mut limit,
                 )?);
             }
             let (jump_size, call_size, main_size) =
@@ -895,8 +917,14 @@ impl FolderDecoder {
             }))
         } else {
             let (pos, in_size) = pack(0);
-            let main =
-                MainCoder::new(folder.coders[0].method_id, props(0), pos, in_size, out_size)?;
+            let main = MainCoder::new(
+                folder.coders[0].method_id,
+                props(0),
+                pos,
+                in_size,
+                out_size,
+                &mut limit,
+            )?;
             if folder.num_coders == 2 {
                 Root::Filter(
                     Box::new(FilterCoder::new(folder.coders[1].method_id, props(1))?),
@@ -980,9 +1008,10 @@ pub(crate) fn decode_folder<R: Read + Seek>(
     fo: usize,
     in_stream: &mut R,
     start_pos: u64,
+    limit: u64,
     out: &mut [u8],
 ) -> Result<()> {
-    let mut folder = FolderDecoder::new(p, fo, start_pos)?;
+    let mut folder = FolderDecoder::new(p, fo, start_pos, limit)?;
     if out.len() as u64 != folder.size() {
         return Err(Error::Fail);
     }

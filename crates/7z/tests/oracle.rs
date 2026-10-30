@@ -23,11 +23,20 @@ use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use hivepack_7z::{Archive, Error};
+use hivepack_7z::{Archive, Error, Options};
 use support::{Oracle, Rng, fnv64, hex, make_archive, scratch, seven_zip, unhex, write_files};
 
 fn recorded_path() -> PathBuf {
     support::repository().join("testdata/oracle/7z.txt")
+}
+
+/// The archive opened with no limit but the SDK's, the machine's.
+fn open(archive: &[u8]) -> Result<Archive<Cursor<&[u8]>>, Error> {
+    let options = Options {
+        memory_limit: u64::MAX,
+        decoder_memory_limit: u64::MAX,
+    };
+    Archive::open_with(Cursor::new(archive), &options)
 }
 
 fn number(res: Result<(), Error>) -> i32 {
@@ -36,7 +45,7 @@ fn number(res: Result<(), Error>) -> i32 {
 
 /// The port's answer for an archive, in the oracle's format.
 fn answer(archive: &[u8]) -> String {
-    let mut a = match Archive::open(Cursor::new(archive)) {
+    let mut a = match open(archive) {
         Ok(a) => a,
         Err(e) => return e.number().to_string(),
     };
@@ -104,7 +113,7 @@ fn answer(archive: &[u8]) -> String {
 /// The files read one after another give what `extract` gives; where it
 /// fails, reading fails too, by the end of the folder at the latest.
 fn check_files(archive: &[u8]) {
-    let Ok(mut a) = Archive::open(Cursor::new(archive)) else {
+    let Ok(mut a) = open(archive) else {
         return;
     };
     let extracted: Vec<_> = (0..a.len()).map(|i| a.extract(i)).collect();
@@ -358,4 +367,38 @@ fn numbers_are_the_sdk_s() {
     assert_eq!(number(Err(Error::Archive)), 16);
     assert_eq!(number(Err(Error::NoArchive)), 17);
     assert_eq!(number(Ok(())), 0);
+}
+
+#[test]
+fn the_decoder_memory_limit_holds() {
+    let Some(tool) = seven_zip() else {
+        return;
+    };
+    let dir = scratch("limit");
+    let mut rng = Rng(0x5eed_7a03);
+    write_files(&mut rng, &dir, 3, 200_000);
+    let archive = make_archive(&tool, &dir, "files", "-m0=PPMd:mem=1m -mhc=off");
+    let _ = std::fs::remove_dir_all(&dir);
+    let open = |decoder_memory_limit| {
+        let options = Options {
+            decoder_memory_limit,
+            ..Options::default()
+        };
+        Archive::open_with(Cursor::new(&archive), &options).expect("it opens")
+    };
+    let first_failure = |a: &mut Archive<Cursor<&Vec<u8>>>| {
+        let mut files = a.files();
+        loop {
+            match files.next() {
+                Ok(Some(_)) => {}
+                Ok(None) => return None,
+                Err(e) => return Some(e),
+            }
+        }
+    };
+    // PPMd's model is exactly 1 MiB.
+    assert_eq!(first_failure(&mut open(1 << 20)), None);
+    let mut a = open((1 << 20) - 1);
+    assert_eq!(first_failure(&mut a), Some(Error::Mem));
+    assert_eq!(a.decode_folder(0).err(), Some(Error::Mem));
 }

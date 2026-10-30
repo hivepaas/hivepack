@@ -20,7 +20,7 @@
 mod support;
 
 use std::fmt::Write as _;
-use std::io::Read;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use hivepack_crypto::Sha256;
@@ -77,6 +77,11 @@ fn error_name(e: &Error) -> &'static str {
 /// is read in pieces of random sizes.
 fn answer(archive: &[u8], rng: &mut Rng) -> String {
     let mut tr = Reader::new(archive);
+    answer_of(&mut tr, rng)
+}
+
+/// [`answer`], with any reader.
+fn answer_of<R: Read>(tr: &mut Reader<R>, rng: &mut Rng) -> String {
     let mut out = Vec::new();
     loop {
         let h = match tr.next() {
@@ -664,6 +669,141 @@ fn port_matches_go() {
     for what in ["eof", "header", "unexpected-eof", "miss-data", "unref-data"] {
         assert!(ends.contains_key(what), "no {what} in {ends:?}");
     }
+}
+
+/// Each entry and how the reader stops, with only some of each entry's data read,
+/// so that the rest is skipped, by seeking or not.
+fn skim<R: Read>(tr: &mut Reader<R>, rng: &mut Rng) -> String {
+    let mut out = String::new();
+    loop {
+        match tr.next() {
+            Ok(Some(h)) => {
+                let _ = write!(out, "{}:{} ", hex(&h.name), h.size);
+            }
+            Ok(None) => return out + "eof",
+            Err(e) => return out + error_name(&e),
+        }
+        let mut buf = vec![0; rng.below(3) as usize * 700];
+        match tr.read(&mut buf) {
+            Ok(n) => {
+                let _ = write!(out, "{} ", digest(&buf[..n]));
+            }
+            Err(e) => return out + error_name(&Error::from(e)),
+        }
+    }
+}
+
+/// An input that says it seeks and cannot.
+struct NoSeek<'a>(&'a [u8]);
+
+impl Read for NoSeek<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Seek for NoSeek<'_> {
+    fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::other("no seeking here"))
+    }
+}
+
+/// Seeking changes nothing but the time: what is read, and how the reader stops,
+/// on damaged archives and archives cut short too. The plain reader is the one
+/// compared with Go.
+#[test]
+fn seeking_changes_nothing() {
+    let mut rng = Rng(0x7a2_c005);
+    let mut compared = 0;
+    for (name, bytes) in go_archives() {
+        for i in 0..=COPIES {
+            let archive = if i == 0 {
+                bytes.clone()
+            } else {
+                go_damaged(&name, &bytes, i)
+            };
+            let seed = rng.next();
+            let plain = skim(&mut Reader::new(archive.as_slice()), &mut Rng(seed));
+            let seeking = skim(&mut Reader::seekable(Cursor::new(&archive)), &mut Rng(seed));
+            assert_eq!(seeking, plain, "{name}, #{i}");
+            let refused = skim(&mut Reader::seekable(NoSeek(&archive)), &mut Rng(seed));
+            assert_eq!(refused, plain, "{name}, #{i}, an input that cannot seek");
+            let whole = answer_of(&mut Reader::seekable(Cursor::new(&archive)), &mut Rng(seed));
+            assert_eq!(whole, answer(&archive, &mut Rng(seed)), "{name}, #{i}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 100, "only {compared} archives");
+}
+
+/// An archive of two entries of a MiB, cut short in the data of the first or the
+/// second, or at their ends.
+#[test]
+fn seeking_finds_an_archive_cut_short() {
+    let mut archive = Vec::new();
+    for name in [&b"first"[..], b"second"] {
+        archive.extend_from_slice(&header_block(name, b'0', 1 << 20, false));
+        archive.extend(std::iter::repeat_n(7u8, 1 << 20));
+    }
+    archive.extend_from_slice(&[0; 1024]);
+    let mut rng = Rng(1);
+    for cut in [
+        512,
+        513,
+        1 << 19,
+        512 + (1 << 20) - 1,
+        512 + (1 << 20),
+        1024 + (1 << 20),
+        1024 + (2 << 20) - 1,
+        1024 + (2 << 20),
+        archive.len(),
+    ] {
+        let part = &archive[..cut];
+        let seed = rng.next();
+        let plain = skim(&mut Reader::new(part), &mut Rng(seed));
+        let seeking = skim(&mut Reader::seekable(Cursor::new(part)), &mut Rng(seed));
+        assert_eq!(seeking, plain, "cut at {cut}");
+    }
+}
+
+/// What `seekable` is for: the data of entries not read is not read.
+#[test]
+fn seeking_skips_the_data() {
+    struct Counting<'a>(Cursor<&'a [u8]>, u64);
+
+    impl Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1 += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Counting<'_> {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
+        }
+    }
+
+    let mut archive = Vec::new();
+    for i in 0..50 {
+        archive.extend_from_slice(&header_block(
+            format!("file{i}").as_bytes(),
+            b'0',
+            1 << 20,
+            false,
+        ));
+        archive.extend(std::iter::repeat_n(7u8, 1 << 20));
+    }
+    archive.extend_from_slice(&[0; 1024]);
+    let mut tr = Reader::seekable(Counting(Cursor::new(&archive), 0));
+    let mut count = 0;
+    while tr.next().unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 50);
+    let read = tr.into_inner().1;
+    assert!(read < 1 << 16, "{read} bytes read of {}", archive.len());
 }
 
 #[test]

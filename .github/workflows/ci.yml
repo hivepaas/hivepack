@@ -61,6 +61,7 @@ jobs:
       - run: cargo check -p hivepack-7z --lib --locked
       - run: cargo check -p hivepack-age --lib --locked
       - run: cargo check -p hivepack-bzip2 --lib --locked
+      - run: cargo check -p hivepack-cpio --lib --locked
       - run: cargo check -p hivepack-xz --lib --locked
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
@@ -469,6 +470,20 @@ jobs:
               pathlib.Path(f"fuzz/corpus/extract_iso/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_iso -- -max_total_time=60 -rss_limit_mb=4096
+      - name: Seed the cpio corpus with the recorded archives
+        run: |
+          mkdir -p fuzz/corpus/cpio
+          python3 - <<'PY'
+          import pathlib
+          # libarchive's small test archives, damaged copies of them,
+          # archives its writers made and RPM packages, as the recorded
+          # requests hold them.
+          lines = pathlib.Path("testdata/oracle/cpio.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith(("read ", "rpm "))):
+              data = line.split("\t")[0].split(" ")[-1]
+              pathlib.Path(f"fuzz/corpus/cpio/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu cpio -- -max_total_time=60
       - name: Seed the layers corpus with the recorded age files and what they hold
         run: |
           mkdir -p fuzz/corpus/open

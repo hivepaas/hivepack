@@ -2659,3 +2659,102 @@ impl StreamHc {
         &self.history
     }
 }
+
+impl HcState {
+    /// `dictLimit - lowLimit`: the size of the external dictionary, 0 when
+    /// there is no prefix (the next block starts a new one).
+    pub(crate) fn ext_size(&self) -> usize {
+        if self.prefix_null {
+            return 0;
+        }
+        self.dict_limit.wrapping_sub(self.low_limit) as usize
+    }
+}
+
+/// What `continue_located` did to the history, for a caller that keeps
+/// track of where it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Moved {
+    /// Nothing: the external dictionary is where it was.
+    Nothing,
+    /// The prefix became the external dictionary (`LZ4HC_setExternalDict`),
+    /// and the block starts a new prefix.
+    PrefixToExt,
+    /// The attached dictionary's context was copied into the state
+    /// (`LZ4HC_compress_generic_dictCtx`, a first block of more than 4 KB):
+    /// the external dictionary is the attached dictionary's content.
+    DictCtxToExt,
+}
+
+/// `LZ4_compressHC_continue_generic`, for a caller that knows where its
+/// history is: the source at `source` in `buf`; `follows` whether it starts
+/// where the prefix ends (`src == ctx->end`), the prefix then being the
+/// state's `prefix_size` bytes before it in `buf`; else the prefix ends at
+/// `prefix_end` in `prefix`. `ext` is the external dictionary.
+///
+/// Differs from liblz4: the case of a source that overlaps the external
+/// dictionary is not taken.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn continue_located(
+    st: &mut HcState,
+    dict_ctx: &mut Option<DictCtx>,
+    buf: &[u8],
+    source: usize,
+    follows: bool,
+    prefix: &[u8],
+    prefix_end: usize,
+    ext: &[u8],
+    dst: &mut [u8],
+    src_size: &mut usize,
+    limit: Limit,
+) -> (usize, Moved) {
+    let mut moved = Moved::Nothing;
+    let mut follows = follows;
+    // Auto-init if forgotten.
+    if st.prefix_null {
+        st.init_internal();
+        follows = true;
+    }
+
+    // Check for overflow: the last 64 KB of the prefix, where they are,
+    // loaded as a dictionary.
+    if st.prefix_size + st.dict_limit as usize > 2 * GB {
+        let dict_size = st.prefix_size.min(64 * KB);
+        let (seg, end) = if follows {
+            (buf, source)
+        } else {
+            (prefix, prefix_end)
+        };
+        st.load_dict(&seg[end - dict_size..end]);
+    }
+
+    // Check if the blocks follow each other.
+    let view = if follows {
+        View {
+            buf,
+            pstart: source - st.prefix_size,
+            dict: ext,
+        }
+    } else {
+        let pstart = prefix_end - st.prefix_size;
+        set_external_dict(st, prefix, pstart);
+        *dict_ctx = None;
+        moved = Moved::PrefixToExt;
+        View {
+            buf,
+            pstart: source,
+            dict: &prefix[pstart..prefix_end],
+        }
+    };
+    let had_dict_ctx = dict_ctx.is_some();
+    let position = st.prefix_size + st.ext_size();
+    let capacity = dst.len();
+    let c_level = st.compression_level;
+    let result = compress_generic(
+        st, view, dict_ctx, source, dst, src_size, capacity, c_level, limit,
+    );
+    if had_dict_ctx && dict_ctx.is_none() && position == 0 {
+        moved = Moved::DictCtxToExt;
+    }
+    (result, moved)
+}

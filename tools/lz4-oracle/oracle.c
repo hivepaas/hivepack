@@ -512,6 +512,155 @@ static void do_hcstream(const char *dict_hex, const char *how, int level, int ca
     free(safe);
 }
 
+/* Preferences: "-" for none, else
+ * level:blockSizeID:blockMode:contentChecksum:blockChecksum:contentSize:dictID:autoFlush:favorDecSpeed. */
+static int parse_prefs(const char *text, LZ4F_preferences_t *prefs) {
+    unsigned long long content_size;
+    int level, bsid, mode, cchk, bchk, autoflush, favor;
+    unsigned dict_id;
+    memset(prefs, 0, sizeof(*prefs));
+    if (strcmp(text, "-") == 0)
+        return 0;
+    sscanf(text, "%d:%d:%d:%d:%d:%llu:%u:%d:%d", &level, &bsid, &mode, &cchk, &bchk,
+           &content_size, &dict_id, &autoflush, &favor);
+    prefs->compressionLevel = level;
+    prefs->frameInfo.blockSizeID = (LZ4F_blockSizeID_t)bsid;
+    prefs->frameInfo.blockMode = (LZ4F_blockMode_t)mode;
+    prefs->frameInfo.contentChecksumFlag = (LZ4F_contentChecksum_t)cchk;
+    prefs->frameInfo.blockChecksumFlag = (LZ4F_blockChecksum_t)bchk;
+    prefs->frameInfo.contentSize = content_size;
+    prefs->frameInfo.dictID = dict_id;
+    prefs->autoFlush = (unsigned)autoflush;
+    prefs->favorDecSpeed = favor;
+    return 1;
+}
+
+/* Frames compressed call by call: `steps`, comma-separated, are b<i> (begin
+ * with preferences i, and the dictionary: `u` for _usingDict, `c` for
+ * _usingCDict), u<n> (compressUpdate of the next n bytes), x<n>
+ * (uncompressedUpdate), f (flush), e (end), F<i>.<n> (compressFrame) and
+ * G<i>.<n> (compressFrame_usingCDict, with the same context), each with an
+ * optional /<capacity> (else the bound). Prints what each returns, then the
+ * size and hash of all the output. */
+static void do_fcompress(char *prefs_list, const char *dict_kind, const char *dict_hex,
+                         const char *steps, const char *data_hex) {
+    size_t len, dict_len, consumed = 0, written = 0, room = 1 << 20;
+    unsigned char *data = unhex(data_hex, &len);
+    unsigned char *dict = unhex(dict_hex, &dict_len);
+    unsigned char *out = malloc(room);
+    LZ4F_preferences_t prefs[8];
+    int has_prefs[8];
+    int n_prefs = 0, current = -1;
+    LZ4F_cctx *cctx;
+    LZ4F_CDict *cdict = NULL;
+    const char *p = steps;
+    char *item, *save;
+    for (item = strtok_r(prefs_list, ";", &save); item && n_prefs < 8;
+         item = strtok_r(NULL, ";", &save)) {
+        has_prefs[n_prefs] = parse_prefs(item, &prefs[n_prefs]);
+        n_prefs++;
+    }
+    if (dict_kind[0] == 'c')
+        cdict = LZ4F_createCDict(dict, dict_len);
+    if (LZ4F_isError(LZ4F_createCompressionContext(&cctx, LZ4F_VERSION))) {
+        printf("bad\n");
+        return;
+    }
+    printf("ok");
+    while (*p) {
+        char kind = *p++;
+        char *end;
+        unsigned long arg = 0, n = 0;
+        size_t take, capacity, ret;
+        const LZ4F_preferences_t *pp = current >= 0 && has_prefs[current] ? &prefs[current] : NULL;
+        unsigned char *dst;
+        if (kind == 'b' || kind == 'u' || kind == 'x' || kind == 'F' || kind == 'G') {
+            arg = strtoul(p, &end, 10);
+            p = end;
+        }
+        if ((kind == 'F' || kind == 'G') && *p == '.') {
+            n = strtoul(p + 1, &end, 10);
+            p = end;
+        }
+        take = kind == 'u' || kind == 'x' ? arg : n;
+        if (take > len - consumed)
+            take = len - consumed;
+        switch (kind) {
+        case 'b':
+            capacity = LZ4F_HEADER_SIZE_MAX;
+            break;
+        case 'u':
+        case 'x':
+            capacity = LZ4F_compressBound(take, pp);
+            break;
+        case 'F':
+        case 'G':
+            capacity = LZ4F_compressFrameBound(take, has_prefs[arg] ? &prefs[arg] : NULL);
+            break;
+        default:
+            capacity = LZ4F_compressBound(0, pp);
+        }
+        if (*p == '/') {
+            capacity = strtoul(p + 1, &end, 10);
+            p = end;
+        }
+        dst = malloc(capacity + 1);
+        switch (kind) {
+        case 'b':
+            current = (int)arg;
+            pp = has_prefs[arg] ? &prefs[arg] : NULL;
+            if (dict_kind[0] == 'u')
+                ret = LZ4F_compressBegin_usingDict(cctx, dst, capacity, dict, dict_len, pp);
+            else if (dict_kind[0] == 'c')
+                ret = LZ4F_compressBegin_usingCDict(cctx, dst, capacity, cdict, pp);
+            else
+                ret = LZ4F_compressBegin(cctx, dst, capacity, pp);
+            break;
+        case 'u':
+            ret = LZ4F_compressUpdate(cctx, dst, capacity, data + consumed, take, NULL);
+            break;
+        case 'x':
+            ret = LZ4F_uncompressedUpdate(cctx, dst, capacity, data + consumed, take, NULL);
+            break;
+        case 'f':
+            ret = LZ4F_flush(cctx, dst, capacity, NULL);
+            break;
+        case 'e':
+            ret = LZ4F_compressEnd(cctx, dst, capacity, NULL);
+            break;
+        case 'F':
+            ret = LZ4F_compressFrame(dst, capacity, data + consumed, take,
+                                     has_prefs[arg] ? &prefs[arg] : NULL);
+            break;
+        default:
+            ret = LZ4F_compressFrame_usingCDict(cctx, dst, capacity, data + consumed, take, cdict,
+                                                has_prefs[arg] ? &prefs[arg] : NULL);
+        }
+        consumed += take;
+        printf(" ");
+        print_result(ret);
+        if (!LZ4F_isError(ret)) {
+            while (written + ret > room) {
+                room *= 2;
+                out = realloc(out, room);
+            }
+            memcpy(out + written, dst, ret);
+            written += ret;
+        }
+        free(dst);
+        if (LZ4F_isError(ret))
+            break;
+        if (*p == ',')
+            p++;
+    }
+    printf(" %zu/%016llx\n", written, fnv64(out, written));
+    LZ4F_freeCompressionContext(cctx);
+    LZ4F_freeCDict(cdict);
+    free(data);
+    free(dict);
+    free(out);
+}
+
 static void do_header(const char *data_hex) {
     size_t len;
     unsigned char *data = unhex(data_hex, &len);
@@ -567,6 +716,8 @@ int main(void) {
             do_hcdest(atoi(words[1]), atoi(words[2]), words[3]);
         else if (n == 6 && strcmp(words[0], "hcstream") == 0)
             do_hcstream(words[1], words[2], atoi(words[3]), atoi(words[4]), words[5]);
+        else if (n == 6 && strcmp(words[0], "fcompress") == 0)
+            do_fcompress(words[1], words[2], words[3], words[4], words[5]);
         else if (n == 2 && strcmp(words[0], "header") == 0)
             do_header(words[1]);
         else if (n == 4 && strcmp(words[0], "xxh32") == 0)

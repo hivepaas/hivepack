@@ -2,7 +2,10 @@
 //! for blocks, what each decoding function returns, the error position
 //! included, and everything it writes in the output, past what it decoded
 //! too; for frames, what each `LZ4F_decompress` and `LZ4F_getFrameInfo`
-//! call returns, reads and writes, and a hash of the output; and XXH32.
+//! call returns, reads and writes, and a hash of the output; for the
+//! compressors, what each call returns and writes, blocks alone, in
+//! streams and with dictionaries, fast and high compression, and frames
+//! call by call; and XXH32.
 //!
 //! The oracle is a small C program built with liblz4's sources by
 //! `scripts/testdata.py`. It answers requests such as
@@ -16,7 +19,12 @@
 //!   pieces, some damaged, cut short or followed by more; blocks made up
 //!   here, valid or not, with every offset (0 included) and length; frames
 //!   put together here with every flag, skippable frames and uncompressed
-//!   blocks.
+//!   blocks; and the same inputs compressed at every level and
+//!   acceleration, into outputs of every size, frames with every
+//!   preference, in pieces, flushed, stored, and one context for several.
+//!   `LZ4_ORACLE_SEED=<n>` makes other requests, and
+//!   `LZ4_ORACLE_DUMP=<file>` keeps the last one asked, to replay one that
+//!   fails.
 //! - Everywhere, including where the oracle cannot be built (Windows, and
 //!   the emulated i686 and s390x jobs), `testdata/oracle/lz4.txt` replays
 //!   answers liblz4 gave earlier. `cargo test -p hivepack-lz4 --test oracle
@@ -32,8 +40,11 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hivepack_lz4::block::{self, DecodeError, StreamDecode};
+use std::sync::Arc;
+
 use hivepack_lz4::frame::{
-    DecompressOptions, DecompressionContext, FrameInfo, InBuffer, OutBuffer,
+    self, BlockMode, BlockSizeId, CDict, CompressionContext, DecompressOptions,
+    DecompressionContext, FrameInfo, InBuffer, OutBuffer, Preferences,
 };
 use hivepack_lz4::{Xxh32, xxh32};
 use support::{
@@ -292,6 +303,9 @@ fn answer(request: &str) -> String {
             }
             text
         }
+        ["fcompress", prefs, dict_kind, dict, steps, data] => {
+            fcompress(prefs, dict_kind, &unhex(dict), steps, &unhex(data))
+        }
         ["header", data] => match hivepack_lz4::frame::header_size(&unhex(data)) {
             Ok(size) => size.to_string(),
             Err(e) => e.name().to_string(),
@@ -313,6 +327,121 @@ fn answer(request: &str) -> String {
         }
         _ => panic!("unknown request {request:.100}"),
     }
+}
+
+/// Preferences as the oracle takes them: `-` for none, else
+/// `level:blockSizeID:blockMode:contentChecksum:blockChecksum:contentSize:dictID:autoFlush:favorDecSpeed`.
+fn parse_prefs(text: &str) -> Option<Preferences> {
+    if text == "-" {
+        return None;
+    }
+    let v: Vec<&str> = text.split(':').collect();
+    let flag = |i: usize| v[i] == "1";
+    Some(Preferences {
+        frame_info: FrameInfo {
+            block_size_id: match v[1] {
+                "4" => BlockSizeId::Max64Kb,
+                "5" => BlockSizeId::Max256Kb,
+                "6" => BlockSizeId::Max1Mb,
+                "7" => BlockSizeId::Max4Mb,
+                _ => BlockSizeId::Default,
+            },
+            block_mode: if flag(2) {
+                BlockMode::Independent
+            } else {
+                BlockMode::Linked
+            },
+            content_checksum: flag(3),
+            block_checksum: flag(4),
+            content_size: v[5].parse().unwrap(),
+            dict_id: v[6].parse().unwrap(),
+            ..FrameInfo::default()
+        },
+        compression_level: v[0].parse().unwrap(),
+        auto_flush: flag(7),
+        favor_dec_speed: flag(8),
+    })
+}
+
+fn prefs_text(prefs: Option<&Preferences>) -> String {
+    let Some(p) = prefs else {
+        return "-".to_string();
+    };
+    let fi = &p.frame_info;
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        p.compression_level,
+        fi.block_size_id as u32,
+        fi.block_mode as u32,
+        u32::from(fi.content_checksum),
+        u32::from(fi.block_checksum),
+        fi.content_size,
+        fi.dict_id,
+        u32::from(p.auto_flush),
+        u32::from(p.favor_dec_speed)
+    )
+}
+
+/// The port's answer to `fcompress`: frames compressed call by call (see
+/// `do_fcompress` in the oracle).
+fn fcompress(prefs: &str, dict_kind: &str, dict: &[u8], steps: &str, data: &[u8]) -> String {
+    let prefs: Vec<Option<Preferences>> = prefs.split(';').map(parse_prefs).collect();
+    let cdict = (dict_kind == "c").then(|| Arc::new(CDict::new(dict)));
+    let mut cctx = CompressionContext::new();
+    let mut current: Option<usize> = None;
+    let (mut consumed, mut out) = (0, Vec::new());
+    let mut text = String::from("ok");
+    for step in steps.split(',').filter(|s| !s.is_empty()) {
+        let (head, capacity) = match step.split_once('/') {
+            Some((head, capacity)) => (head, Some(capacity.parse::<usize>().unwrap())),
+            None => (step, None),
+        };
+        let kind = head.as_bytes()[0];
+        let rest = &head[1..];
+        let (arg, n) = match rest.split_once('.') {
+            Some((arg, n)) => (arg.parse::<usize>().unwrap(), n.parse::<usize>().unwrap()),
+            None if rest.is_empty() => (0, 0),
+            None => (rest.parse::<usize>().unwrap(), 0),
+        };
+        let take = if matches!(kind, b'u' | b'x') { arg } else { n }.min(data.len() - consumed);
+        let src = &data[consumed..consumed + take];
+        let pp = current.and_then(|i| prefs[i].as_ref());
+        let capacity = capacity.unwrap_or(match kind {
+            b'b' => frame::HEADER_SIZE_MAX,
+            b'u' | b'x' => frame::compress_bound(take, pp),
+            b'F' | b'G' => frame::compress_frame_bound(take, prefs[arg].as_ref()),
+            _ => frame::compress_bound(0, pp),
+        });
+        let mut dst = vec![0; capacity];
+        let ret = match kind {
+            b'b' => {
+                current = Some(arg);
+                let pp = prefs[arg].as_ref();
+                match dict_kind {
+                    "u" => cctx.compress_begin_using_dict(&mut dst, dict, pp),
+                    "c" => cctx.compress_begin_using_cdict(&mut dst, cdict.as_ref().unwrap(), pp),
+                    _ => cctx.compress_begin(&mut dst, pp),
+                }
+            }
+            b'u' => cctx.compress_update(&mut dst, src),
+            b'x' => cctx.uncompressed_update(&mut dst, src),
+            b'f' => cctx.flush(&mut dst),
+            b'e' => cctx.compress_end(&mut dst),
+            b'F' => frame::compress_frame(&mut dst, src, prefs[arg].as_ref()),
+            _ => {
+                cctx.compress_frame_using_cdict(&mut dst, src, cdict.as_ref(), prefs[arg].as_ref())
+            }
+        };
+        consumed += take;
+        text.push(' ');
+        text.push_str(&frame_ret(ret));
+        match ret {
+            Ok(size) => out.extend_from_slice(&dst[..size]),
+            Err(_) => break,
+        }
+    }
+    let _ = write!(text, " {}/{:016x}", out.len(), fnv64(&out));
+    text
 }
 
 /*-************************************
@@ -490,7 +619,7 @@ fn length(rng: &mut Rng, max: usize) -> usize {
     match rng.below(10) {
         0 => rng.below(20) as usize,
         1..=3 => rng.below(1000) as usize,
-        4..=6 => rng.below(20_000) as usize,
+        4..=6 => rng.below(20_000.min(max as u64 + 1)) as usize,
         _ => rng.below(max as u64 + 1) as usize,
     }
 }
@@ -554,6 +683,175 @@ fn frame_steps(rng: &mut Rng, len: usize, out_len: usize, with_info: bool) -> St
     }
     steps.push(format!("d{}/{}", len + 10, out_len + 70_000));
     steps.join(",")
+}
+
+/// Random preferences for a frame of `total` bytes, or none.
+fn random_prefs(rng: &mut Rng, total: usize) -> Option<Preferences> {
+    if rng.below(8) == 0 {
+        return None;
+    }
+    let compression_level = match rng.below(9) {
+        0 => -(1 + rng.below(70) as i32),
+        1 | 2 => 0,
+        3 => 1,
+        4 => 2,
+        5 => 3 + rng.below(7) as i32,
+        6 => 10 + rng.below(3) as i32,
+        7 => rng.pick(&[9, 13, 100, -100_000]),
+        _ => rng.pick(&[0, 9]),
+    };
+    let content_size = match rng.below(12) {
+        0 | 1 => total as u64,
+        2 => total as u64 + 1,
+        _ => 0,
+    };
+    Some(Preferences {
+        frame_info: FrameInfo {
+            block_size_id: rng.pick(&[
+                BlockSizeId::Default,
+                BlockSizeId::Max64Kb,
+                BlockSizeId::Max64Kb,
+                BlockSizeId::Max256Kb,
+                BlockSizeId::Max1Mb,
+                BlockSizeId::Max4Mb,
+            ]),
+            block_mode: if rng.below(3) == 0 {
+                BlockMode::Independent
+            } else {
+                BlockMode::Linked
+            },
+            content_checksum: rng.below(2) == 0,
+            block_checksum: rng.below(3) == 0,
+            content_size,
+            dict_id: if rng.below(4) == 0 {
+                rng.next() as u32
+            } else {
+                0
+            },
+            ..FrameInfo::default()
+        },
+        compression_level,
+        auto_flush: rng.below(3) == 0,
+        favor_dec_speed: rng.below(4) == 0,
+    })
+}
+
+/// A request for frames compressed call by call: one to three frames, from
+/// one context, begun with a dictionary or not, their input in pieces of
+/// every size, now and then flushed, stored, or given too little room; or
+/// made in one call.
+fn fcompress_request(rng: &mut Rng, max: usize) -> String {
+    let dict_kind = rng.pick(&["n", "n", "u", "c"]);
+    let dict_len = match rng.below(4) {
+        0 => rng.below(10) as usize,
+        1 => 70_000.min(max + 1000),
+        _ => rng.below(max.min(70_000) as u64) as usize,
+    };
+    let dict = if dict_kind == "n" {
+        Vec::new()
+    } else {
+        input(rng, dict_len)
+    };
+    let mut prefs = Vec::new();
+    let mut steps = Vec::new();
+    let mut total = 0;
+    if rng.below(20) == 0 {
+        // Before any frame begins.
+        steps.push("u10".to_string());
+    }
+    let frames = 1 + rng.pick(&[0, 0, 0, 1, 2]);
+    // Now and then, one call is given too little room.
+    let mut short_of_room = rng.below(6) == 0;
+    for _ in 0..frames {
+        let index = prefs.len();
+        let len = length(rng, max / frames).min(max);
+        let one_call = rng.below(8);
+        if one_call < 2 {
+            prefs.push(random_prefs(rng, len));
+            let kind = if one_call == 0 { 'F' } else { 'G' };
+            steps.push(format!("{kind}{index}.{len}"));
+            total += len;
+            continue;
+        }
+        let frame_prefs = random_prefs(rng, len);
+        let independent =
+            frame_prefs.is_some_and(|p| p.frame_info.block_mode == BlockMode::Independent);
+        let auto_flush = frame_prefs.is_some_and(|p| p.auto_flush);
+        let block_size = frame_prefs.map_or(64 << 10, |p| {
+            frame::get_block_size(p.frame_info.block_size_id)
+        });
+        let mut frame_steps = vec![format!("b{index}")];
+        let style = rng.below(4);
+        let mut given = 0;
+        let mut last_op = 'u';
+        while given < len {
+            let piece = match style {
+                _ if frame_steps.len() > 200 => len,
+                0 => len,
+                1 => 1 + rng.below(100) as usize,
+                2 => 1 + rng.below(70_000) as usize,
+                _ => rng.pick(&[
+                    0, 1, 4, 100, 4096, 65535, 65536, 65537, 70_000, 262_144, len,
+                ]),
+            }
+            .min(len - given);
+            // Stored blocks are for independent ones (liblz4 1.10.0 makes
+            // frames that do not decompress otherwise).
+            let op = if independent && rng.below(12) == 0 {
+                'x'
+            } else {
+                'u'
+            };
+            let room = if short_of_room && rng.below(20) == 0 {
+                short_of_room = false;
+                format!("/{}", rng.pick(&[10, piece / 2]))
+            } else if op != last_op && !auto_flush {
+                // liblz4 1.10.0 writes past the bound when it first flushes
+                // a block kept from the other kind of call: room for it.
+                format!(
+                    "/{}",
+                    frame::compress_bound(piece, frame_prefs.as_ref()) + block_size + 8
+                )
+            } else {
+                String::new()
+            };
+            last_op = op;
+            frame_steps.push(format!("{op}{piece}{room}"));
+            given += piece;
+            if rng.below(8) == 0 {
+                frame_steps.push("f".to_string());
+            }
+        }
+        match rng.below(12) {
+            // Left unfinished: the next frame begins over it.
+            0 => {}
+            1 if short_of_room => {
+                short_of_room = false;
+                frame_steps.push("e/3".to_string());
+            }
+            _ => frame_steps.push("e".to_string()),
+        }
+        prefs.push(frame_prefs);
+        steps.extend(frame_steps);
+        total += len;
+    }
+    // Inputs like the dictionary, to find matches in it.
+    let mut data = input(rng, total);
+    if !dict.is_empty() && rng.below(2) == 0 {
+        for chunk in data.chunks_mut(97) {
+            let at = rng.below(dict.len() as u64) as usize;
+            let take = chunk.len().min(dict.len() - at);
+            chunk[..take].copy_from_slice(&dict[at..at + take]);
+        }
+    }
+    let prefs: Vec<String> = prefs.iter().map(|p| prefs_text(p.as_ref())).collect();
+    format!(
+        "fcompress {} {dict_kind} {} {} {}",
+        prefs.join(";"),
+        hex(&dict),
+        steps.join(","),
+        hex(&data)
+    )
 }
 
 /// Generated requests: about `count` of each kind, with inputs up to `max`
@@ -898,7 +1196,7 @@ fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
             .map(|_| {
                 let len = match rng.below(6) {
                     0 => rng.below(20) as usize,
-                    1 => 65536 + rng.below(30) as usize - 15,
+                    1 if max >= 65536 => 65536 + rng.below(30) as usize - 15,
                     _ => length(rng, max),
                 };
                 lens.push(len);
@@ -1055,6 +1353,11 @@ fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
         ));
     }
 
+    // Frames compressed call by call.
+    for _ in 0..count {
+        requests.push(fcompress_request(rng, max));
+    }
+
     // Header sizes.
     for _ in 0..count / 2 {
         let frame = match rng.below(3) {
@@ -1074,18 +1377,21 @@ fn port_matches_liblz4() {
     let Some(mut oracle) = Oracle::spawn() else {
         return;
     };
-    let mut rng = Rng(0x5eed_1204);
+    // LZ4_ORACLE_SEED=<n> for other requests than CI's.
+    let seed = std::env::var("LZ4_ORACLE_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x5eed_1204);
+    let mut rng = Rng(seed);
     let requests = requests(&mut rng, 150, 200_000);
     let mut checked = 0;
     for request in &requests {
-        let want = oracle.ask(request);
-        let got = answer(request);
-        if got != want
-            && let Some(path) = std::env::var_os("LZ4_ORACLE_DUMP")
-        {
-            // The whole request, to replay by hand.
+        if let Some(path) = std::env::var_os("LZ4_ORACLE_DUMP") {
+            // The whole request, to replay by hand if it fails.
             let _ = std::fs::write(path, request);
         }
+        let want = oracle.ask(request);
+        let got = answer(request);
         assert_eq!(got, want, "{request:.400}");
         checked += 1;
     }

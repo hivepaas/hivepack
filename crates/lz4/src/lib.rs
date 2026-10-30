@@ -1,23 +1,44 @@
 //! LZ4 compression and decompression in safe Rust, ported from the
 //! official library, [liblz4](https://github.com/lz4/lz4) 1.10.0.
 //!
-//! Two formats, as in liblz4:
+//! Two formats, as in liblz4, and its file functions:
 //!
-//! - **Blocks** ([`block`], `lz4.h`): compressed data alone, which the
-//!   caller must know the size of to decode. [`block::decompress_safe`]
-//!   gives liblz4's result, the error position included, and what it
-//!   writes.
+//! - **Blocks** ([`block`], `lz4.h`, and [`hc`], `lz4hc.h`): compressed
+//!   data alone, which the caller must know the size of to decode.
+//!   [`block::compress_fast`] and [`hc::compress_hc`] make liblz4's
+//!   blocks, byte for byte, at every acceleration and level, and
+//!   [`block::decompress_safe`] gives liblz4's result, the error position
+//!   included, and what it writes. Streams of blocks, each referring to
+//!   the ones before or to a dictionary: [`block::Stream`],
+//!   [`hc::StreamHc`] and [`block::StreamDecode`].
 //! - **Frames** ([`frame`], `lz4frame.h`): the `.lz4` file format, with
 //!   its header, blocks, checksums and skippable frames.
-//!   [`frame::DecompressionContext`] decodes them in as many calls as the
-//!   input and output come in, each reading, writing and returning what
-//!   `LZ4F_decompress` does.
-//! - **`.lz4` files** ([`Decoder`]): what `lz4 -d` decodes, as an
-//!   [`std::io::Read`]: frames one after another, skippable frames, and the
-//!   legacy format.
+//!   [`frame::CompressionContext`] and [`frame::DecompressionContext`]
+//!   compress and decode them in as many calls as the input and output
+//!   come in, each reading, writing and returning what liblz4's
+//!   `LZ4F_compressUpdate` and `LZ4F_decompress` do.
+//! - **`.lz4` files** ([`Encoder`] and [`Decoder`]): one frame written as
+//!   an [`std::io::Write`], as liblz4's `LZ4F_write` writes it; and what
+//!   `lz4 -d` decodes, as an [`std::io::Read`]: frames one after another,
+//!   skippable frames, and the legacy format.
 //!
 //! The rules the port follows, and how it is checked, are in the
 //! repository: `docs/lz4.md` and `docs/safety.md`.
+//!
+//! ```
+//! use std::io::{Read, Write};
+//!
+//! let text = b"hello, hello, hello\n".repeat(100);
+//! let mut encoder = hivepack_lz4::Encoder::new(Vec::new(), None)?;
+//! encoder.write_all(&text)?;
+//! let lz4 = encoder.finish()?;
+//! assert!(lz4.len() < 60);
+//!
+//! let mut back = Vec::new();
+//! hivepack_lz4::Decoder::new(&lz4[..]).read_to_end(&mut back)?;
+//! assert_eq!(back, text);
+//! # Ok::<(), std::io::Error>(())
+//! ```
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_lz4::frame::Error> {
@@ -54,13 +75,16 @@
 #![allow(clippy::needless_range_loop)]
 
 mod decoder;
+mod encoder;
 mod lz4;
 mod lz4_compress;
 mod lz4frame;
+mod lz4frame_compress;
 mod lz4hc;
 mod xxhash;
 
 pub use decoder::{Decoder, LEGACY_BLOCKSIZE, LEGACY_MAGICNUMBER};
+pub use encoder::Encoder;
 
 /// The block format: `lz4.h`.
 pub mod block {
@@ -91,6 +115,10 @@ pub mod frame {
         HEADER_SIZE_MIN, InBuffer, MAGIC_SKIPPABLE_START, MAGICNUMBER,
         MIN_SIZE_TO_KNOW_HEADER_LENGTH, OutBuffer, Result, VERSION, get_block_size, get_version,
         header_size,
+    };
+    pub use crate::lz4frame_compress::{
+        CDict, CompressionContext, Preferences, compress_bound, compress_frame,
+        compress_frame_bound, compression_level_max,
     };
 }
 

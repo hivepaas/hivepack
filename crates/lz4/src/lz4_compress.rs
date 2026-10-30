@@ -231,10 +231,11 @@ impl StreamState {
     #[inline(always)]
     fn put_index_on_hash(&mut self, idx: u32, h: u32, table_type: TableType) {
         match table_type {
-            TableType::ByU16 => {
-                debug_assert!(idx < 65536);
-                self.hash_table16[h as usize] = idx as u16;
-            }
+            // The index is truncated as in liblz4: it can pass 65535 after
+            // a dictionary of less than HASH_UNIT bytes was loaded (the
+            // offset moved by 64 KB, the table still cleared), and then
+            // every match is refused (dictSmall).
+            TableType::ByU16 => self.hash_table16[h as usize] = idx as u16,
             _ => self.hash_table[h as usize] = idx,
         }
     }
@@ -1332,7 +1333,7 @@ impl StreamState {
             }
             // External dictionary mode.
             History::Ext(dict) => {
-                let result = if let Some(ctx) = dict_ctx.take() {
+                let result = if let Some(ctx) = dict_ctx.clone() {
                     // dictCtx'es (from LZ4_loadDict) guarantee that their
                     // tables contain no references to offsets between
                     // dictCtx->currentOffset - 64 KB and
@@ -1344,6 +1345,7 @@ impl StreamState {
                         // dictionary's tables into the active context, so
                         // that the loop looks into one table.
                         *self = ctx.0.clone();
+                        *dict_ctx = None;
                         let with_dict = Input {
                             buf: input.buf,
                             src: input.src,
@@ -1364,6 +1366,13 @@ impl StreamState {
                             None,
                         )
                     } else {
+                        // Subsequent linked blocks can't use the
+                        // dictionary: they use this block. Unless it is
+                        // empty, or too large, which compress_generic
+                        // returns from before.
+                        if (1..=MAX_INPUT_SIZE).contains(&input.len) {
+                            *dict_ctx = None;
+                        }
                         compress_generic(
                             self,
                             input,

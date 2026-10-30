@@ -7,8 +7,8 @@ testdata/manifest.json lists every set:
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
   by the oracles in tools/, built from the pinned zstd, zlib, bzip2, lz4,
-  XZ Utils, libzip and nettle releases, or with Go from the modules their
-  go.sum pins.
+  XZ Utils, libzip, nettle and libarchive releases, or with Go from the
+  modules their go.sum pins.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -23,6 +23,7 @@ import binascii
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -96,8 +97,8 @@ def unpack(archive: Path, kind: str, into: Path) -> None:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, dest.open("wb") as out:
                     shutil.copyfileobj(src, out)
-    elif kind == "tar.gz":
-        with tarfile.open(archive, "r:gz") as t:
+    elif kind in ("tar.gz", "tar.xz"):
+        with tarfile.open(archive, "r:gz" if kind == "tar.gz" else "r:xz") as t:
             for member in t.getmembers():
                 rel = safe_member(member.name)
                 if not rel.parts:
@@ -172,6 +173,25 @@ def build_tool(source: Path, tool: str) -> Path:
     return binary
 
 
+def build_7zz(source: Path, folder: Path) -> None:
+    """7-Zip's console program from the release's sources, with its own
+    makefile: what makes the archives the tests read. The makefile for GCC
+    leaves out assembly; the one for arm64 macs has it."""
+    bundle = source / "CPP" / "7zip" / "Bundles" / "Alone2"
+    print(f"  building 7zz from {source.name}")
+    makefile = "cmpl_gcc.mak"
+    if sys.platform == "darwin":
+        makefile = "cmpl_mac_arm64.mak" if platform.machine() == "arm64" else "cmpl_mac_x64.mak"
+    jobs = str(os.cpu_count() or 2)
+    build = subprocess.run(["make", "-f", f"../../{makefile}", "-j", jobs], cwd=bundle,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if build.returncode != 0:
+        # The end of what it said: it warns a lot before an error.
+        print(build.stderr[-4000:], file=sys.stderr)
+        raise SystemExit(f"building 7zz failed with {build.returncode}")
+    shutil.copy2(next(bundle.glob("b/*/7zz")), folder / "7zz")
+
+
 def libzip_sources(lib: Path) -> list:
     """The library's C files, as lib/CMakeLists.txt lists them in ZIP_SOURCES,
     with the Unix ones it adds; zip_err_str.c is generated apart."""
@@ -187,6 +207,16 @@ BZIP2_SOURCES = [
     "blocksort.c", "huffman.c", "crctable.c", "randtable.c", "compress.c", "decompress.c",
     "bzlib.c",
 ]
+
+
+# The LZMA SDK's 7z decoder: the files C/Util/7z/makefile.gcc builds 7zdec
+# with, without its LZMA assembly loop and with PPMd, as it builds it.
+SEVENZ_SOURCES = [
+    "Bcj2.c", "Bra.c", "Bra86.c", "BraIA64.c", "CpuArch.c", "Delta.c", "Lzma2Dec.c", "LzmaDec.c",
+    "Ppmd7.c", "Ppmd7Dec.c", "7zCrc.c", "7zCrcOpt.c", "7zAlloc.c", "7zArcIn.c", "7zBuf.c",
+    "7zBuf2.c", "7zDec.c", "7zFile.c", "7zStream.c",
+]
+SEVENZ_FLAGS = ["-DZ7_PPMD_SUPPORT", "-DZ7_EXTRACT_ONLY"]
 
 
 # liblz4: the library's files (lib/), as lz4's lib/Makefile builds them,
@@ -244,6 +274,46 @@ LIBZIP_CRYPTO_SOURCES = [
     "zip_source_winzip_aes_encode.c",
 ]
 LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
+LIBZIP_XZ_SOURCES = ["zip_algorithm_xz.c"]
+
+
+# libarchive: the reader and writer of ISO 9660 images, what they call, and
+# the memory and callback inputs and outputs the oracle uses.
+LIBARCHIVE_SOURCES = [
+    "archive_acl.c", "archive_check_magic.c", "archive_entry.c", "archive_entry_sparse.c",
+    "archive_entry_xattr.c", "archive_options.c", "archive_random.c", "archive_rb.c",
+    "archive_read.c", "archive_read_open_memory.c", "archive_read_set_options.c",
+    "archive_read_support_format_iso9660.c", "archive_string_sprintf.c", "archive_util.c",
+    "archive_virtual.c", "archive_write.c", "archive_write_add_filter_none.c",
+    "archive_write_set_format_iso9660.c", "archive_write_set_options.c",
+]
+
+
+# archive_string.c without the Unicode normalization of names converted from
+# UTF-16 or UTF-8 (NFC, or NFD on macOS), which hivepack-iso leaves out: Joliet
+# names come out as the image has them.
+LIBARCHIVE_NORMALIZATION = """\
+	if ((flag & SCONV_FROM_CHARSET) &&
+	    (flag & (SCONV_FROM_UTF16 | SCONV_FROM_UTF8))) {
+#if defined(__APPLE__)
+		if (flag & SCONV_TO_UTF8)
+			flag |= SCONV_NORMALIZATION_D;
+		else
+#endif
+			flag |= SCONV_NORMALIZATION_C;
+	}
+"""
+
+
+def libarchive_string(lib: Path, folder: Path) -> Path:
+    """archive_string.c, with LIBARCHIVE_NORMALIZATION taken out."""
+    text = (lib / "archive_string.c").read_text()
+    if text.count(LIBARCHIVE_NORMALIZATION) != 1:
+        sys.exit("archive_string.c: the normalization to take out is not there")
+    patched = folder / "patched"
+    patched.mkdir()
+    (patched / "archive_string.c").write_text(text.replace(LIBARCHIVE_NORMALIZATION, ""))
+    return patched / "archive_string.c"
 
 
 def zip_err_str(lib: Path) -> str:
@@ -317,13 +387,22 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/lz4-oracle with liblz4's LZ4_SOURCES, and tools/xz-oracle with
     liblzma's, from LIBLZMA_DIRS, and its own config.h.
     tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
+    tools/iso-oracle is built with libarchive's LIBARCHIVE_SOURCES, its
+    archive_string.c without the Unicode normalization (libarchive_string),
+    its own config.h, and zlib's (the `extra` set).
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, the part of
-    GnuTLS that backend uses in gnutls/, and zlib's, nettle's and
-    libbzip2's (the `extra` sets)."""
+    GnuTLS that backend uses in gnutls/, and zlib's, nettle's, libbzip2's
+    and liblzma's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
+    if (source / "C" / "7zArcIn.c").exists():
+        sdk = source / "C"
+        files += [str(sdk / name) for name in SEVENZ_SOURCES]
+        subprocess.run([compiler, "-O2", "-w", *SEVENZ_FLAGS, f"-I{sdk}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
     unrar = source / "unrar"
     if unrar.is_dir():
         files = [str(ROOT / s) for s in sources if s.endswith(".cpp")]
@@ -337,20 +416,43 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         zlib = next(extra[0].glob("zlib-*"))
         nettle = next(extra[1].glob("nettle-*"))
         bzip2 = next(extra[2].glob("bzip2-*"))
+        xz = next(extra[3].glob("xz-*/src/liblzma"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
         files += [str(lib / name) for name in
-                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES]
+                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES
+                  + LIBZIP_XZ_SOURCES]
         files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(nettle / name) for name in NETTLE_SOURCES]
         files += [str(bzip2 / name) for name in BZIP2_SOURCES]
         include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
-        subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
-                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", *files, "-o", str(folder / "oracle")],
+        # liblzma has a config.h of its own, so it is compiled apart.
+        objects = folder / "liblzma"
+        objects.mkdir()
+        dirs = [xz / d for d in LIBLZMA_DIRS]
+        xz_files = sorted(str(f) for d in dirs for f in d.glob("*.c")
+                          if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
+        xz_includes = [f"-I{d}" for d in [ROOT / "tools/xz-oracle", xz / "api", *dirs, xz.parent / "common"]]
+        subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *xz_includes, "-c", *xz_files],
+                       check=True, cwd=objects)
+        files += sorted(str(f) for f in objects.glob("*.o"))
+        subprocess.run([compiler, "-O2", "-w", "-pthread", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
+                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", f"-I{xz / 'api'}", *files,
+                        "-o", str(folder / "oracle")],
                        check=True)
+        return
+    libarchive = next(source.glob("libarchive-*/libarchive"), None)
+    if libarchive is not None:
+        zlib = next(extra[0].glob("zlib-*"))
+        files += [str(libarchive / name) for name in LIBARCHIVE_SOURCES]
+        files += [str(libarchive_string(libarchive, folder))]
+        files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+        config = ROOT / Path(sources[0]).parent
+        subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", f"-I{config}", f"-I{libarchive}",
+                        f"-I{zlib}", *files, "-o", str(folder / "oracle")], check=True)
         return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:
@@ -436,7 +538,9 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
-    if generate["tool"] == "uudecode":
+    if generate["tool"] == "7zz":
+        build_7zz(cache / origin["name"], folder)
+    elif generate["tool"] == "uudecode":
         # Each file the glob finds, decoded, named without its `.uu` and
         # libarchive's `test_read_format_`.
         for uu in sorted((cache / origin["name"]).glob(generate["glob"])):

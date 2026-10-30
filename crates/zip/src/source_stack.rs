@@ -299,12 +299,17 @@ impl<R: ReadAt + ?Sized> Stack<'_, R> {
             layer.opened();
         }
 
-        if let Some(decompress) = self.decompress.as_mut() {
-            if let Err(e) = decompress.ctx.open() {
-                decompress.error = e;
-                return Err(e);
+        if self.decompress.is_some() {
+            let st = stat_below_decompress(&self.decrypt, &self.window, &self.lower);
+            let mut attributes = self.window.ctx.file_attributes();
+            attributes.merge_lower(&self.lower.file_attributes()?);
+            if let Some(decompress) = self.decompress.as_mut() {
+                if let Err(e) = decompress.ctx.open(&st, &attributes) {
+                    decompress.error = e;
+                    return Err(e);
+                }
+                decompress.opened();
             }
-            decompress.opened();
         }
 
         if let Some(crc) = self.crc.as_mut() {
@@ -609,12 +614,19 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
             }
             layer.opened();
         }
-        if let Some(decompress) = self.decompress.as_mut() {
-            if let Err(e) = decompress.ctx.open() {
-                decompress.error = e;
-                return Err(e);
+        if self.decompress.is_some() {
+            let mut st = self.base.stat()?;
+            if let Some(decrypt) = &self.decrypt {
+                decrypt.ctx.stat(&mut st)?;
             }
-            decompress.opened();
+            let attributes = self.base.file_attributes()?;
+            if let Some(decompress) = self.decompress.as_mut() {
+                if let Err(e) = decompress.ctx.open(&st, &attributes) {
+                    decompress.error = e;
+                    return Err(e);
+                }
+                decompress.opened();
+            }
         }
         if let Some(crc) = self.crc.as_mut() {
             crc.ctx.open();
@@ -623,15 +635,15 @@ impl<R: ReadAt + ?Sized> WriteStack<'_, R> {
         if self.compress.is_some() {
             // The compressing layer asks for the stat and attributes of the
             // source below it when it opens.
-            stat_below_compress(&self.base, &self.decrypt, &self.decompress, &self.crc)?;
-            attributes_below_compress(&self.base, &self.decompress)?;
-        }
-        if let Some(compress) = self.compress.as_mut() {
-            if let Err(e) = compress.ctx.open() {
-                compress.error = e;
-                return Err(e);
+            let st = stat_below_compress(&self.base, &self.decrypt, &self.decompress, &self.crc)?;
+            let attributes = attributes_below_compress(&self.base, &self.decompress)?;
+            if let Some(compress) = self.compress.as_mut() {
+                if let Err(e) = compress.ctx.open(&st, &attributes) {
+                    compress.error = e;
+                    return Err(e);
+                }
+                compress.opened();
             }
-            compress.opened();
         }
         if let Some(encrypt) = self.encrypt.as_mut() {
             if let Err(e) = encrypt.ctx.open() {

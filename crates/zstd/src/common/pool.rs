@@ -5,13 +5,14 @@
 //! Only what `zstdmt_compress.c` uses: a pool made for a number of
 //! threads (`POOL_create_advanced`, with a queue of size 0), resized
 //! (`POOL_resize`), given a job only when a thread is free to take it
-//! (`POOL_tryAdd`), and freed once its jobs are done (`POOL_free`).
+//! (`POOL_tryAdd`), and freed once its jobs are done (`POOL_free`). Shared
+//! between contexts, it is `ZSTD_threadPool`
+//! ([`ThreadPool`](crate::ThreadPool)).
 //!
 //! Differs from libzstd: libzstd's queue of size 0 is a ring of one slot;
 //! here a queue that holds at most one job for the same reason. A job is a
 //! value the pool's function runs, as libzstd's is the argument of its
-//! function pointer, and a job refused comes back to the caller. No pools
-//! shared between contexts (`ZSTD_threadPool`).
+//! function pointer, and a job refused comes back to the caller.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -85,8 +86,9 @@ impl<J> Drop for BusyTicket<J> {
 /// `POOL_ctx`: worker threads, and the job waiting for one.
 pub(crate) struct Pool<J: Send + 'static> {
     shared: Arc<PoolShared<J>>,
-    /// `threads`: every thread made, `threadCapacity` of them.
-    threads: Vec<JoinHandle<()>>,
+    /// `threads`: every thread made, `threadCapacity` of them; behind a
+    /// mutex of its own, for a pool that contexts share and resize.
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// `POOL_thread`: takes the jobs added, one at a time, while the pool
@@ -128,7 +130,7 @@ impl<J: Send + 'static> Pool<J> {
     /// Fails with `MemoryAllocation` when a thread cannot be started, as
     /// libzstd fails to make the pool.
     pub(crate) fn new(num_threads: usize, function: fn(J, BusyTicket<J>)) -> Result<Pool<J>> {
-        let mut pool = Pool {
+        let pool = Pool {
             shared: Arc::new(PoolShared {
                 state: Mutex::new(PoolState {
                     queue: VecDeque::new(),
@@ -139,7 +141,7 @@ impl<J: Send + 'static> Pool<J> {
                 pop_cond: Condvar::new(),
                 function,
             }),
-            threads: Vec::new(),
+            threads: Mutex::new(Vec::new()),
         };
         pool.resize(num_threads)?;
         Ok(pool)
@@ -147,15 +149,16 @@ impl<J: Send + 'static> Pool<J> {
 
     /// `POOL_resize`: `num_threads` threads allowed to run jobs; more made
     /// if the pool has fewer, none stopped if it has more.
-    pub(crate) fn resize(&mut self, num_threads: usize) -> Result<()> {
+    pub(crate) fn resize(&self, num_threads: usize) -> Result<()> {
         let num_threads = num_threads.max(1);
-        while self.threads.len() < num_threads {
+        let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+        while threads.len() < num_threads {
             let shared = self.shared.clone();
             let thread = std::thread::Builder::new()
                 .name("hivepack-zstd".into())
                 .spawn(move || pool_thread(&shared));
             match thread {
-                Ok(thread) => self.threads.push(thread),
+                Ok(thread) => threads.push(thread),
                 Err(_) => return error!(MemoryAllocation),
             }
         }
@@ -189,7 +192,11 @@ impl<J: Send + 'static> Drop for Pool<J> {
             state.shutdown = true;
         }
         self.shared.pop_cond.notify_all();
-        for thread in self.threads.drain(..) {
+        let threads = self
+            .threads
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for thread in threads.drain(..) {
             // A thread that panicked has nothing more to clean up.
             let _ = thread.join();
         }

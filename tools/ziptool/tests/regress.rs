@@ -165,9 +165,9 @@ fn parse(text: &str) -> Test {
                 let after = parts.get(2).map(|p| content(p));
                 test.files.push((parts[0].into(), before, after));
             }
-            // WinZip AES, which needs a crypto library in libzip, and
-            // bzip2.
-            "features" if rest == "HAVE_CRYPTO" || rest == "HAVE_LIBBZ2" => {}
+            // WinZip AES, which needs a crypto library in libzip, bzip2,
+            // and LZMA and XZ.
+            "features" if matches!(rest, "HAVE_CRYPTO" | "HAVE_LIBBZ2" | "HAVE_LIBLZMA") => {}
             "stdin" if rest.is_empty() => test.stdin = inline(&mut lines),
             "stdout" if rest.is_empty() => test.stdout = inline(&mut lines),
             "stderr" if rest.is_empty() => test.stderr = inline(&mut lines),

@@ -1,6 +1,6 @@
 # Porting liblzma
 
-`hivepack-xz` is a port of liblzma, the library of [XZ Utils](https://tukaani.org/xz/), to safe Rust. It encodes `.xz` and `.lzma` files and raw LZMA1 and LZMA2 streams, with the delta and BCJ filters before LZMA where the format has them, and decodes those and `.lz` files (liblzma has no `.lz` encoder); tar files will use it for `.tar.xz`, and ZIP archives for their methods 14 (LZMA) and 95 (XZ). The goal is the one [porting.md](porting.md) sets for zstd: the same results as liblzma, at the same speed.
+`hivepack-xz` is a port of liblzma, the library of [XZ Utils](https://tukaani.org/xz/), to safe Rust. It encodes `.xz` and `.lzma` files and raw LZMA1 and LZMA2 streams, with the delta and BCJ filters before LZMA where the format has them, and decodes those and `.lz` files (liblzma has no `.lz` encoder); tar files use it for `.tar.xz`, and ZIP archives for their methods 14 (LZMA) and 95 (XZ). The goal is the one [porting.md](porting.md) sets for zstd: the same results as liblzma, at the same speed.
 
 The decoders came first, then the encoders, then the delta and BCJ filters, then the multithreaded encoder and decoder. What is left is in [Not ported, for now](#not-ported-for-now).
 

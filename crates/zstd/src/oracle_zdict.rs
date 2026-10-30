@@ -791,7 +791,21 @@ fn port_matches_libzstd_dict_builder() {
     } else {
         (60, 60_000)
     };
-    let requests = requests(&mut rng, &files, count, budget);
+    let mut requests = requests(&mut rng, &files, count, budget);
+    // The statistics at every level, of many samples each: their context
+    // goes on from sample to sample with its tables (see
+    // CCtx::compress_block_using_cdict), whose entries from the samples
+    // before every match finder must leave alone.
+    for level in (-7..=22).filter(|&level| level != 0) {
+        let (samples, sizes) = sample_set(&mut rng, &files, budget);
+        let content = content(&mut rng, &samples, (budget / 4).max(1000));
+        requests.push(format!(
+            "zdentropy 248 {level} {} {} {}",
+            crate::oracle::hex(&content),
+            list(&sizes),
+            crate::oracle::hex(&samples)
+        ));
+    }
     let mut problems = Vec::new();
     let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
     for request in &requests {

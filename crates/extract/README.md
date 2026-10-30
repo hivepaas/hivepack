@@ -2,18 +2,21 @@
 
 Extracting archives to disk, safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs.
 
-> **Status:** extracts ZIP archives that `hivepack-zip` opened, refusing unportable names, the same path twice (ignoring case and how accents are written), links and overlapping data, writing by handle, and counting what is written against its limits, with named options to relax each rule, a time limit, cancelling and progress. tar and RAR come later. This crate is not on crates.io.
+> **Status:** extracts ZIP archives that `hivepack-zip` opened, refusing unportable names, the same path twice (ignoring case and how accents are written), links and overlapping data, writing by handle, and counting what is written against its limits, with named options to relax each rule, a time limit, cancelling and progress, and carrying the archive's mark of origin (Windows' Mark of the Web, macOS's quarantine) to every file. tar and RAR come later. This crate is not on crates.io.
 
 ```rust
-use hivepack_extract::{Options, extract_zip};
+use hivepack_extract::{Options, Origin, extract_zip};
 use hivepack_zip::{Archive, OpenFlags};
 
-let archive = Archive::open(std::fs::File::open("archive.zip")?, OpenFlags::CHECKCONS)?;
-let summary = extract_zip(&archive, "out".as_ref(), &Options::default())?;
+let path = std::path::Path::new("archive.zip");
+let archive = Archive::open(std::fs::File::open(path)?, OpenFlags::CHECKCONS)?;
+let mut options = Options::default();
+options.origin = Origin::of(path)?;
+let summary = extract_zip(&archive, "out".as_ref(), &options)?;
 println!("{} files, {} bytes", summary.files, summary.bytes);
 ```
 
-The rules, and why each is there, are in [docs/extract.md](../../docs/extract.md). Writing by handle takes cap-std, the one dependency with `unsafe` code in hivepack's libraries, until the standard library's directory handles are stable (see [docs/safety.md](../../docs/safety.md)).
+The rules, and why each is there, are in [docs/extract.md](../../docs/extract.md). Writing by handle takes cap-std, a dependency with `unsafe` code, until the standard library's directory handles are stable, and macOS's quarantine attribute takes rustix, which cap-std already uses (see [docs/safety.md](../../docs/safety.md)).
 
 ## License
 

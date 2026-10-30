@@ -4,7 +4,7 @@
 
 Extractors no longer break on memory, which safe Rust settles, but on logic, and memory-safe code gets that wrong as often as C: writing through a link (the `zip` crate's CVE-2025-29787, adm-zip's CVE-2026-76845), keeping setuid bits or chmod through a link (RUSTSEC-2026-0367 and 0369), links that point outside (RUSTSEC-2026-0368), alternate data streams on Windows (WinRAR's CVE-2025-8088, exploited), and Python's tarfile filter, which took five CVEs in June 2025 for checking strings and `realpath`. The rules below answer those, and come from the research behind this repository's ZIP plan.
 
-> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, the options that relax them, a time limit, cancelling and progress, and names compared as file systems compare them: done, for ZIP, checked on libzip's test archives, Fifield's bombs and Unicode's own tests, and fuzzed. Next: marks of origin, tar and RAR (see [What comes next](#what-comes-next)).
+> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, the options that relax them, a time limit, cancelling and progress, names compared as file systems compare them, and marks of origin: done, for ZIP, checked on libzip's test archives, Fifield's bombs and Unicode's own tests, and fuzzed. Next: tar and RAR (see [What comes next](#what-comes-next)).
 
 ## Refuse, do not repair
 
@@ -42,7 +42,7 @@ A device, FIFO or socket in a ZIP archive is only a mode with data: Info-ZIP's `
 
 Checking a path and then writing to it lets a link put in between be followed. Every write goes through handles instead: the destination is opened once, each directory under it is opened from its parent's handle without following a link, and each file is created new (`O_CREAT|O_EXCL`, `O_NOFOLLOW`; `CREATE_NEW` on Windows). So a link already in the destination, or one put there while extracting, is not followed: a directory on the way that is a link stops the extraction (`NotADirectory`), and so does a file that is there (`Exists`). Nothing is overwritten.
 
-The standard library cannot do this yet: its directory handles (`std::fs::Dir`) are not stable. cap-std does it, with `openat2` and `RESOLVE_BENEATH` on Linux 5.6 and later, `openat` with `O_NOFOLLOW` a component at a time elsewhere on Unix, and handles relative to a directory's on Windows; it is the one dependency with `unsafe` code in the libraries (see [safety.md](safety.md#dependencies-with-unsafe-code)), and `std::fs::Dir` replaces it once stable.
+The standard library cannot do this yet: its directory handles (`std::fs::Dir`) are not stable. cap-std does it, with `openat2` and `RESOLVE_BENEATH` on Linux 5.6 and later, `openat` with `O_NOFOLLOW` a component at a time elsewhere on Unix, and handles relative to a directory's on Windows; it is a dependency with `unsafe` code, in this crate only (see [safety.md](safety.md#dependencies-with-unsafe-code)), and `std::fs::Dir` replaces it once stable.
 
 The destination itself is the caller's: it is created if it is not there, and its path is followed as given.
 
@@ -69,6 +69,14 @@ Every entry's data is checked at its end, its CRC-32, or for WinZip AES its auth
 
 On Unix, a file gets the permission bits its entry has, masked as Python's `data` filter masks them: no setuid, setgid or sticky bit, nothing writable by group or others, and readable and writable by its owner. Owners, ACLs and extended attributes are not restored. Directories get the system's default permissions. Files and directories get the time their entry has, the directories once nothing more is written in them, the deepest first, without following a link.
 
+## Marks of origin
+
+A downloaded archive carries a mark of where it came from, which the system checks before a file is opened or run: Windows' Mark of the Web, a `Zone.Identifier` stream with the zone (`ZoneId=3` for the internet) and the address, and macOS's quarantine, the `com.apple.quarantine` attribute that Gatekeeper reads. A file extracted without it escapes the check: 7-Zip's CVE-2025-0411, exploited, was nested archives losing it.
+
+`Origin::of` reads the mark an archive's file has, and `Options::origin` carries it, as it is, to every file written: on Windows the stream is opened from the file's own handle (`:Zone.Identifier` relative to it, so no path is resolved again, and a file named `a` is not taken for drive A); on macOS the attribute is set on the file's descriptor, and on every directory created too, as Gatekeeper checks an app, which is a directory. The mark is written before the file's time, which writing a stream changes. A mark that cannot be written stops the extraction (`ErrorKind::Origin`), and so does one this system cannot carry, before anything is written: an extraction that drops the mark would hide where its files came from. It is not the default only because the archive's path is the caller's: `extract_zip` reads an `Archive`, not a file.
+
+Linux and the other systems have no mark (`Origin::of` gives `None`). macOS's attribute takes `rustix`, a dependency with `unsafe` code, already there for `cap-std`, since the standard library has no extended attributes (see [safety.md](safety.md#dependencies-with-unsafe-code)).
+
 ## Time, cancelling and progress
 
 The limits bound what an archive writes, not how long it takes: a disk that is slow, or many small entries, take their time within them. `Options::time_limit` (none by default) stops an extraction once past it, from when it starts (`ErrorKind::TimeLimit`), and `Cancel`, a token whose clones share one flag, stops it from another thread (`ErrorKind::Cancelled`). Both are checked between entries and before each read of data, which gives at most 64 KiB; a read of compressed data that gives nothing, such as empty Deflate blocks, runs to the end of that entry's data, which the archive's size bounds. A file cut off is removed, as one whose data fails; what was written before stays.
@@ -91,6 +99,7 @@ Each rule that is not about writing outside the destination can be relaxed, by n
 | `permissions` | `Permissions::Masked` | `Preserve`: the entry's bits but setuid, setgid and sticky. `Ignore`: the system's |
 | `limits` | see [Limits](#limits) | each raised or lowered |
 | `password` | none | the password encrypted entries are read with |
+| `origin` | none | the archive's mark of origin (`Origin::of`), carried to every file (see [Marks of origin](#marks-of-origin)) |
 | `time_limit` | none | how long the extraction may take (see [Time, cancelling and progress](#time-cancelling-and-progress)) |
 | `cancel` | none | a `Cancel` token that stops it |
 | `progress` | none | a function told how far it is |
@@ -113,6 +122,5 @@ The `extract` fuzz target (see [fuzz/README.md](../fuzz/README.md)) extracts its
 
 ## What comes next
 
-- **Marks of origin**: the archive's `Zone.Identifier` on Windows and `com.apple.quarantine` on macOS, carried to every file written, a failure to write one being a failure to extract. The macOS one takes a system call the standard library does not wrap.
 - **tar and RAR**, through the same checks and writing.
 - **Corpora**: the archives behind recent CVEs.

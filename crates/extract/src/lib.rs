@@ -32,26 +32,32 @@
 //! - **Time**: an extraction can be given a time limit
 //!   ([`Options::time_limit`]), stopped from another thread ([`Cancel`]),
 //!   and followed ([`Options::progress`]).
+//! - **Marks of origin**: the archive's Mark of the Web on Windows, or its
+//!   quarantine on macOS ([`Origin`]), is carried to every file written.
 //!
 //! ```no_run
-//! use hivepack_extract::{Options, extract_zip};
+//! use hivepack_extract::{Options, Origin, extract_zip};
 //! use hivepack_zip::{Archive, OpenFlags};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let file = std::fs::File::open("archive.zip")?;
-//! let archive = Archive::open(file, OpenFlags::CHECKCONS)?;
-//! let summary = extract_zip(&archive, "out".as_ref(), &Options::default())?;
+//! let path = std::path::Path::new("archive.zip");
+//! let archive = Archive::open(std::fs::File::open(path)?, OpenFlags::CHECKCONS)?;
+//! let mut options = Options::default();
+//! // Downloaded files are marked; what is extracted from them must be too.
+//! options.origin = Origin::of(path)?;
+//! let summary = extract_zip(&archive, "out".as_ref(), &options)?;
 //! println!("{} files, {} bytes", summary.files, summary.bytes);
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The design, and what comes next (marks of origin, tar and RAR), are in
-//! the repository's `docs/extract.md`.
+//! The design, and what comes next (tar and RAR), are in the repository's
+//! `docs/extract.md`.
 
 mod destination;
 mod error;
 mod name;
+mod origin;
 mod plan;
 mod progress;
 mod unicode;
@@ -59,6 +65,7 @@ mod zip;
 
 pub use error::{Error, ErrorKind};
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};
+pub use origin::Origin;
 pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};
 pub use progress::{Cancel, Progress, ProgressFn};
 /// The version of Unicode names are compared with: major, minor, update.

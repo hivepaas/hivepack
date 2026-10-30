@@ -21,3 +21,6 @@ workspace = true
 hivepack-zip.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix.workspace = true

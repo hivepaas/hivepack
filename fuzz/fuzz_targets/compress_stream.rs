@@ -4,7 +4,8 @@
 //! call returns the same, moves as far and writes the same, and that the
 //! port decodes the frame back. A third of the time with a dictionary
 //! from the start of the input, loaded, a prefix or a `CDict`, attached,
-//! copied in or loaded again.
+//! copied in or loaded again. A quarter of the time with a target size
+//! for compressed blocks (`ZSTD_c_targetCBlockSize`).
 //!
 //! A quarter of the time with worker threads (`ZSTD_c_nbWorkers`), a
 //! different number on each side, and their job size, overlap and
@@ -179,6 +180,12 @@ fuzz_target!(|input: &[u8]| {
     if rng.next() % 4 == 0 {
         // The optimal parser's 3-byte hash table.
         parameters.push((P::MinMatch(3), C::MinMatch(3)));
+    }
+    if rng.next() % 4 == 0 {
+        // A target size for compressed blocks: below the smallest, raised
+        // to it, the smallest, small ones and the largest.
+        let target = [1, 1340, 2000, 4096, 20_000, 131_072][(rng.next() % 6) as usize];
+        parameters.push((P::TargetCBlockSize(target), C::TargetCBlockSize(target)));
     }
     let switches = [
         (ParamSwitch::Auto, zstd_safe::ParamSwitch::Auto),

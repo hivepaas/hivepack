@@ -251,6 +251,9 @@ jobs:
       - name: Seed the streaming compressor's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/compress_stream
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=120 -rss_limit_mb=4096
+      - name: Seed the sequence API's corpus with the same files
+        run: cp -r fuzz/corpus/compress fuzz/corpus/sequences
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu sequences -- -max_total_time=60 -rss_limit_mb=4096
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=120
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=120
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90

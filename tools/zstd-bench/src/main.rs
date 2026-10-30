@@ -2,8 +2,13 @@
 //! and decompression of what libzstd wrote.
 //!
 //! ```text
-//! cargo run --release -p zstd-bench -- [--levels 1,3,19] [--rounds 3] [--seconds 0.5] [--stream] [--workers 1,2,4,8] PATH...
+//! cargo run --release -p zstd-bench -- [--levels 1,3,19] [--rounds 3] [--seconds 0.5] [--stream] [--workers 1,2,4,8] [--target-cblock-size N] PATH...
 //! ```
+//!
+//! With `--target-cblock-size`, compression cuts blocks to about that size
+//! compressed (`ZSTD_c_targetCBlockSize`), on both sides; in one call, it
+//! then goes through `ZSTD_compress2`, as `ZSTD_compressCCtx` leaves the
+//! parameter out.
 //!
 //! With `--workers`, only compression, through `ZSTD_compress2` with
 //! `ZSTD_c_nbWorkers` at each count given: a row per count, and the ratio of
@@ -56,6 +61,8 @@ trait Codec {
 /// `zstd -b` does.
 struct Libzstd {
     compressor: CCtx<'static>,
+    /// `ZSTD_c_targetCBlockSize`, 0 for none.
+    target_cblock_size: u32,
     decompressor: DCtx<'static>,
     /// A piece of streamed output, decompressed and compressed.
     piece: Vec<u8>,
@@ -81,6 +88,22 @@ impl Codec for Libzstd {
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
         output.clear();
         output.reserve(zstd_safe::compress_bound(input.len()));
+        if self.target_cblock_size != 0 {
+            // ZSTD_compressCCtx would leave the target out.
+            for parameter in [
+                zstd_safe::CParameter::CompressionLevel(level),
+                zstd_safe::CParameter::TargetCBlockSize(self.target_cblock_size),
+            ] {
+                self.compressor
+                    .set_parameter(parameter)
+                    .map_err(error_name)?;
+            }
+            return self
+                .compressor
+                .compress2(output, input)
+                .map(drop)
+                .map_err(error_name);
+        }
         self.compressor
             .compress(output, input, level)
             .map(drop)
@@ -93,9 +116,14 @@ impl Codec for Libzstd {
         self.compressor
             .reset(zstd_safe::ResetDirective::SessionOnly)
             .map_err(error_name)?;
-        self.compressor
-            .set_parameter(zstd_safe::CParameter::CompressionLevel(level))
-            .map_err(error_name)?;
+        for parameter in [
+            zstd_safe::CParameter::CompressionLevel(level),
+            zstd_safe::CParameter::TargetCBlockSize(self.target_cblock_size),
+        ] {
+            self.compressor
+                .set_parameter(parameter)
+                .map_err(error_name)?;
+        }
         let mut in_pos = 0;
         loop {
             let in_end = input.len().min(in_pos + CCtx::in_size());
@@ -135,6 +163,7 @@ impl Codec for Libzstd {
         for parameter in [
             CParameter::CompressionLevel(level),
             CParameter::NbWorkers(workers),
+            CParameter::TargetCBlockSize(self.target_cblock_size),
         ] {
             self.compressor
                 .set_parameter(parameter)
@@ -186,6 +215,8 @@ impl Codec for Libzstd {
 /// The port.
 struct Hivepack {
     cctx: hivepack_zstd::CCtx,
+    /// `ZSTD_c_targetCBlockSize`, 0 for none.
+    target_cblock_size: u32,
     dctx: hivepack_zstd::DCtx,
     /// A piece of streamed output, decompressed and compressed.
     piece: Vec<u8>,
@@ -202,11 +233,23 @@ impl Codec for Hivepack {
     }
 
     fn compress(&mut self, level: i32, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        use hivepack_zstd::CParameter;
         output.resize(hivepack_zstd::compress_bound(input.len()).unwrap_or(0), 0);
-        let size = self
-            .cctx
-            .compress(output, input, level)
-            .map_err(|e| e.to_string())?;
+        let size = if self.target_cblock_size != 0 {
+            // As libzstd, through compress2.
+            for parameter in [
+                CParameter::CompressionLevel(level),
+                CParameter::TargetCBlockSize(self.target_cblock_size),
+            ] {
+                self.cctx
+                    .set_parameter(parameter)
+                    .map_err(|e| e.to_string())?;
+            }
+            self.cctx.compress2(output, input)
+        } else {
+            self.cctx.compress(output, input, level)
+        }
+        .map_err(|e| e.to_string())?;
         output.truncate(size);
         Ok(())
     }
@@ -218,9 +261,12 @@ impl Codec for Hivepack {
         self.cctx
             .reset(ResetDirective::SessionOnly)
             .map_err(error)?;
-        self.cctx
-            .set_parameter(CParameter::CompressionLevel(level))
-            .map_err(error)?;
+        for parameter in [
+            CParameter::CompressionLevel(level),
+            CParameter::TargetCBlockSize(self.target_cblock_size),
+        ] {
+            self.cctx.set_parameter(parameter).map_err(error)?;
+        }
         let mut in_pos = 0;
         loop {
             let in_end = input.len().min(in_pos + hivepack_zstd::cstream_in_size());
@@ -259,6 +305,7 @@ impl Codec for Hivepack {
         for parameter in [
             CParameter::CompressionLevel(level),
             CParameter::NbWorkers(workers),
+            CParameter::TargetCBlockSize(self.target_cblock_size),
         ] {
             self.cctx
                 .set_parameter(parameter)
@@ -313,6 +360,8 @@ struct Options {
     stream: bool,
     /// With `--workers`: compression only, with these numbers of threads.
     workers: Vec<u32>,
+    /// `--target-cblock-size`: `ZSTD_c_targetCBlockSize`, 0 for none.
+    target_cblock_size: u32,
     levels: Vec<i32>,
     rounds: usize,
     budget: Duration,
@@ -323,6 +372,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
     let mut options = Options {
         stream: false,
         workers: Vec::new(),
+        target_cblock_size: 0,
         levels: vec![1, 3, 9, 19],
         rounds: 3,
         budget: Duration::from_millis(500),
@@ -345,6 +395,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
                     .map(|w| w.parse().map_err(|_| format!("bad worker count {w:?}")))
                     .collect::<Result<_>>()?;
             }
+            "--target-cblock-size" => {
+                options.target_cblock_size =
+                    value()?.parse().map_err(|_| "bad --target-cblock-size")?;
+            }
             "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
             "--seconds" => {
                 let seconds: f64 = value()?.parse().map_err(|_| "bad --seconds")?;
@@ -353,7 +407,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: zstd-bench [--levels 1,3,19] [--rounds N] [--seconds S] [--stream] [--workers 1,2,4,8] PATH..."
+                    "usage: zstd-bench [--levels 1,3,19] [--rounds N] [--seconds S] [--stream] [--workers 1,2,4,8] [--target-cblock-size N] PATH..."
                         .into(),
                 );
             }
@@ -418,10 +472,13 @@ impl Range {
 
 impl std::fmt::Display for Range {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0.round() == self.1.round() {
-            write!(f, "{:.0}", self.0)
+        // A decimal for the slow levels, which run at a few MB/s.
+        let digits = if self.1 < 10.0 { 1 } else { 0 };
+        let scale = if digits == 1 { 10.0 } else { 1.0 };
+        if (self.0 * scale).round() == (self.1 * scale).round() {
+            write!(f, "{:.*}", digits, self.0)
         } else {
-            write!(f, "{:.0}–{:.0}", self.0, self.1)
+            write!(f, "{:.*}–{:.*}", digits, self.0, digits, self.1)
         }
     }
 }
@@ -542,12 +599,14 @@ fn run() -> Result<()> {
     let mut codecs: Vec<Box<dyn Codec>> = vec![
         Box::new(Libzstd {
             compressor: CCtx::create(),
+            target_cblock_size: options.target_cblock_size,
             decompressor: DCtx::create(),
             piece: vec![0; DCtx::out_size()],
             compressed_piece: vec![0; CCtx::out_size()],
         }),
         Box::new(Hivepack {
             cctx: hivepack_zstd::CCtx::new(),
+            target_cblock_size: options.target_cblock_size,
             dctx: hivepack_zstd::DCtx::new(),
             piece: vec![0; hivepack_zstd::dstream_out_size()],
             compressed_piece: vec![0; hivepack_zstd::cstream_out_size()],

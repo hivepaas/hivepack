@@ -15,6 +15,7 @@ pub(crate) mod zstd_compress;
 pub(crate) mod zstd_compress_internal;
 pub(crate) mod zstd_compress_literals;
 pub(crate) mod zstd_compress_sequences;
+pub(crate) mod zstd_compress_superblock;
 pub(crate) mod zstd_double_fast;
 pub(crate) mod zstd_fast;
 pub(crate) mod zstd_lazy;

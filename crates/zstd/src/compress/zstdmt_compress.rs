@@ -690,9 +690,12 @@ fn zstdmt_compress_job(
         // The prefix of a job after the first is part of its window, not a
         // dictionary reached whole (ZSTD_c_forceMaxWindow); in the input's
         // segment, ZSTD_checkDictValidity would drop it as one at the first
-        // block anyway. deterministicRefPrefix, which the jobs after the
-        // first turn off, is off already: the port does not offer it.
+        // block anyway. Their prefix and input, one buffer, are one
+        // segment too: they turn deterministicRefPrefix off.
         job_params.force_window = !job.first_job;
+        if !job.first_job {
+            job_params.deterministic_ref_prefix = false;
+        }
         if job.first_job {
             // Its prefix is the frame's prefix of raw content, if any,
             // apart from the input: the window's older segment.

@@ -278,6 +278,7 @@ dependencies = [
  "hivepack-crypto",
  "hivepack-deflate",
  "hivepack-xz",
+ "hivepack-zstd",
 ]
 
 [[package]]

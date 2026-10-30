@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/lz4", "crates/open", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/iso", "crates/lz4", "crates/open", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,7 @@ hivepack-bzip2 = { path = "crates/bzip2" }
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-extract = { path = "crates/extract" }
+hivepack-iso = { path = "crates/iso" }
 hivepack-lz4 = { path = "crates/lz4" }
 hivepack-open = { path = "crates/open" }
 hivepack-tar = { path = "crates/tar" }
@@ -98,6 +99,11 @@ opt-level = 3
 # zip64_creation adds 4 GiB): optimized, as the C libraries are, though
 # with the checks of a dev build.
 [profile.dev.package.hivepack-deflate]
+opt-level = 3
+
+# hivepack-iso's tests compare thousands of images with libarchive, some of
+# them 25 MiB, passed to the oracle in hexadecimal.
+[profile.dev.package.hivepack-iso]
 opt-level = 3
 
 [profile.release]

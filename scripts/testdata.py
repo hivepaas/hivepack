@@ -7,8 +7,8 @@ testdata/manifest.json lists every set:
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
   by the oracles in tools/, built from the pinned zstd, zlib, bzip2, lz4,
-  XZ Utils, libzip and nettle releases, or with Go from the modules their
-  go.sum pins.
+  XZ Utils, libzip, nettle and libarchive releases, or with Go from the
+  modules their go.sum pins.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -245,6 +245,45 @@ LIBZIP_CRYPTO_SOURCES = [
 LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
 
 
+# libarchive: the reader and writer of ISO 9660 images, what they call, and
+# the memory and callback inputs and outputs the oracle uses.
+LIBARCHIVE_SOURCES = [
+    "archive_acl.c", "archive_check_magic.c", "archive_entry.c", "archive_entry_sparse.c",
+    "archive_entry_xattr.c", "archive_options.c", "archive_random.c", "archive_rb.c",
+    "archive_read.c", "archive_read_open_memory.c", "archive_read_set_options.c",
+    "archive_read_support_format_iso9660.c", "archive_string_sprintf.c", "archive_util.c",
+    "archive_virtual.c", "archive_write.c", "archive_write_add_filter_none.c",
+    "archive_write_set_format_iso9660.c", "archive_write_set_options.c",
+]
+
+
+# archive_string.c without the Unicode normalization of names converted from
+# UTF-16 or UTF-8 (NFC, or NFD on macOS), which hivepack-iso leaves out: Joliet
+# names come out as the image has them.
+LIBARCHIVE_NORMALIZATION = """\
+	if ((flag & SCONV_FROM_CHARSET) &&
+	    (flag & (SCONV_FROM_UTF16 | SCONV_FROM_UTF8))) {
+#if defined(__APPLE__)
+		if (flag & SCONV_TO_UTF8)
+			flag |= SCONV_NORMALIZATION_D;
+		else
+#endif
+			flag |= SCONV_NORMALIZATION_C;
+	}
+"""
+
+
+def libarchive_string(lib: Path, folder: Path) -> Path:
+    """archive_string.c, with LIBARCHIVE_NORMALIZATION taken out."""
+    text = (lib / "archive_string.c").read_text()
+    if text.count(LIBARCHIVE_NORMALIZATION) != 1:
+        sys.exit("archive_string.c: the normalization to take out is not there")
+    patched = folder / "patched"
+    patched.mkdir()
+    (patched / "archive_string.c").write_text(text.replace(LIBARCHIVE_NORMALIZATION, ""))
+    return patched / "archive_string.c"
+
+
 def zip_err_str(lib: Path) -> str:
     """zip_err_str.c, as libzip's cmake/GenerateZipErrorStrings.cmake writes
     it from the comments in zip.h and zipint.h."""
@@ -280,6 +319,9 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/lz4-oracle with liblz4's LZ4_SOURCES, and tools/xz-oracle with
     liblzma's, from LIBLZMA_DIRS, and its own config.h.
     tools/nettle-oracle is built with nettle's NETTLE_SOURCES.
+    tools/iso-oracle is built with libarchive's LIBARCHIVE_SOURCES, its
+    archive_string.c without the Unicode normalization (libarchive_string),
+    its own config.h, and zlib's (the `extra` set).
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, the part of
@@ -307,6 +349,16 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
                         f"-I{include}", f"-I{nettle}", f"-I{bzip2}", *files, "-o", str(folder / "oracle")],
                        check=True)
+        return
+    libarchive = next(source.glob("libarchive-*/libarchive"), None)
+    if libarchive is not None:
+        zlib = next(extra[0].glob("zlib-*"))
+        files += [str(libarchive / name) for name in LIBARCHIVE_SOURCES]
+        files += [str(libarchive_string(libarchive, folder))]
+        files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+        config = ROOT / Path(sources[0]).parent
+        subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", f"-I{config}", f"-I{libarchive}",
+                        f"-I{zlib}", *files, "-o", str(folder / "oracle")], check=True)
         return
     zlib = next(source.glob("zlib-*"), None)
     if zlib is not None:

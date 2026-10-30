@@ -249,6 +249,20 @@
       "kind": "tool"
     },
     {
+      "name": "libarchive-3.8.10-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/libarchive/libarchive/releases/download/v3.8.10/libarchive-3.8.10.tar.gz", "sha256": "a1bffbe5152cfe869751179e7b16648c87c461cb8c46eee75062efbe164cc57c", "unpack": "tar.gz" }] },
+      "source": "https://github.com/libarchive/libarchive/releases/tag/v3.8.10",
+      "license": "BSD-2-Clause",
+      "kind": "source"
+    },
+    {
+      "name": "iso-oracle",
+      "generate": { "group": "generated", "from": "libarchive-3.8.10-source", "with": ["zlib-1.3.2-source"], "tool": "oracle", "sources": ["tools/iso-oracle/oracle.c", "tools/iso-oracle/config.h"] },
+      "source": "tools/iso-oracle/oracle.c, built with the libarchive 3.8.10 and zlib 1.3.2 sources",
+      "license": "MIT (the program), BSD-2-Clause (libarchive) and Zlib (zlib)",
+      "kind": "tool"
+    },
+    {
       "name": "bzip2-1.0.8-source",
       "fetch": { "group": "generated", "files": [{ "url": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz", "sha256": "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269", "unpack": "tar.gz" }] },
       "source": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz, signed by Mark Wielaard (key EC3CFE88F6CA0788774F5C1D1AA44BE649DE760A)",
@@ -309,6 +323,13 @@
       "path": "go-tar",
       "source": "https://github.com/golang/go/tree/go1.27.2/src/archive/tar/testdata (Go 1.27.2's archive/tar tests), with Go's LICENSE",
       "license": "BSD-3-Clause",
+      "kind": "vectors"
+    },
+    {
+      "name": "libarchive-iso",
+      "path": "libarchive-iso",
+      "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING",
+      "license": "BSD-2-Clause",
       "kind": "vectors"
     },
     {

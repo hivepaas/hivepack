@@ -251,10 +251,11 @@ def zip_err_str(lib: Path) -> str:
 def build_oracle(source: Path, sources: list, included: list, folder: Path, extra: list) -> None:
     """An oracle program, compiled with the library's own sources.
 
-    tools/zstd-oracle is built with libzstd's (without the assembly loop,
-    which the port does not have either, and with its threads); the
-    `included` files are left out, as the oracle includes them itself to
-    reach their static functions.
+    tools/zstd-oracle is built with libzstd's, its dictionary builder
+    (lib/dictBuilder) among them (without the assembly loop, which the port
+    does not have either, and with its threads, which cover.c's pool needs
+    for its trials to run on several); the `included` files are left out,
+    as the oracle includes them itself to reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
     Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES.
@@ -304,7 +305,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                         "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))
-    for part in ("common", "compress", "decompress"):
+    for part in ("common", "compress", "decompress", "dictBuilder"):
         files += sorted(str(f) for f in (lib / part).glob("*.c")
                         if f"{part}/{f.name}" not in included)
     subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", "-DZSTD_MULTITHREAD", "-pthread",

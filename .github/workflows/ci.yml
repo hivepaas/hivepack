@@ -229,6 +229,21 @@ jobs:
       - name: Seed the sequence API's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/sequences
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu sequences -- -max_total_time=60 -rss_limit_mb=4096
+      # Units cut at their newlines (a third byte of 1), into rooms of 1 KB
+      # and 4 KB.
+      - name: Seed the dictionary builder's corpus with the systemd units
+        run: |
+          mkdir -p fuzz/corpus/zdict
+          i=0
+          for unit in testdata/ruzstd/dict/files/*; do
+            case "$unit" in *.zst) continue ;; esac
+            i=$((i + 1))
+            {
+              if [ $((i % 2)) -eq 0 ]; then printf '\000\004\001'; else printf '\000\020\001'; fi
+              cat "$unit"
+            } > "fuzz/corpus/zdict/u$i"
+          done
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zdict -- -max_total_time=90 -rss_limit_mb=4096
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=150
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=150
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90

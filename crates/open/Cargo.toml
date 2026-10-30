@@ -1,0 +1,34 @@
+[package]
+name = "hivepack-open"
+version = "0.0.0"
+description = "Opening what hivepack reads: age, zstd, xz, gzip and bzip2 layers found and stacked, then the container told"
+license = "MIT"
+readme = "README.md"
+keywords = ["archive", "decompression", "age", "tar", "zstd"]
+categories = ["compression"]
+# Nothing to publish yet.
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hivepack-age.workspace = true
+hivepack-bzip2.workspace = true
+hivepack-deflate.workspace = true
+hivepack-xz.workspace = true
+hivepack-zstd.workspace = true
+
+[dev-dependencies]
+# The reference libraries, to compress what the tests open.
+zstd.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+liblzma.workspace = true
+hivepack-tar.workspace = true
+hivepack-extract.workspace = true

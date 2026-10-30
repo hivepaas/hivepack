@@ -52,7 +52,7 @@ It was 0.35–0.55× before the speed work. What made the difference, the larges
 - **32-byte pieces for matches 32 bytes back or more**, the same bytes with half the bounds checks.
 - **Indices that cannot overflow.** Masking an index to `isize::MAX`, which changes no valid index, lets the compiler drop one of the two comparisons of each bounds check.
 
-Tried, and not worth it: prefetching each match as libzstd does on arm64 (the numbers are in [safety.md](safety.md)), and copying long matches with `copy_within` or in 64-byte pieces. x86-64 is not measured yet.
+Tried, and not worth it: prefetching each match as libzstd does on arm64 (the numbers are in [safety.md](safety.md)), and copying long matches with `copy_within` or in 64-byte pieces. On x86-64 and arm64 Linux, see [below](#on-linux-x86-64-and-arm64).
 
 What is left is bounds checks: libzstd's fast-path condition keeps the sequence loop's copies in bounds, but the compiler cannot see it. The `unsafe-fast` feature, off by default, makes those copies without them (see [unsafe.md](unsafe.md)):
 
@@ -125,6 +125,29 @@ These loops are fragile: the register allocator moves them by several instructio
 What is left: the one-segment finders' candidates keep a check each, since nothing tells the compiler that a table entry is before the current position; and at level 3 the one-segment search loop still reloads three values each turn and rebuilds its 64-bit prime. Measured on a scratch copy before these loops were reshaped, with the finders' reads and table accesses unchecked, compression gained +4% to +40%, `sao` at level −1 reaching 0.71×; the safe loops gained more, and it runs at 0.76× now.
 
 With a target size for compressed blocks (`ZSTD_c_targetCBlockSize`, 1340 bytes), through `ZSTD_compress2`, on five of the files (`dickens`, `ooffice`, `sao`, `x-ray`, `xml`), best of two rounds taken in turn (`zstd-bench --target-cblock-size 1340`), October 2026, on a loaded machine: the port runs at 0.81–0.90× libzstd at level 1, 0.86–0.93× at level 3, 0.62–0.81× at level 9, and 0.92× at level 19 (`xml`), the same ratios as without the target in the same run. The target costs both sides alike, about 12% at level 1 (`dickens`: libzstd from 329 to 285 MB/s, the port from 283 to 249): the superblocks keep up, and what is left is the match finders' gap above.
+
+### On Linux, x86-64 and arm64
+
+On GitHub's hosted runners (October 2026), with `.github/workflows/bench.yml`: the 12 files of the Silesia corpus at levels 1, 3, 5, 7, 9, 12, 15, 16 and 19, in one call, best of three rounds taken in turn (`zstd-bench`). x86-64 is an AMD EPYC 7763 (`ubuntu-latest`), where libzstd decodes Huffman with its assembly loop; arm64 is a Neoverse-N2 (`ubuntu-24.04-arm`). Both are shared machines with 4 threads, so the ratios are steadier than the speeds. The port's speed as a share of libzstd's, mean and range over the files:
+
+| | x86-64 | with `unsafe-fast` | arm64 | with `unsafe-fast` |
+|---|---|---|---|---|
+| Decompression, every level | 0.72× (0.69–0.80) | 0.78× (0.76–0.86) | 0.91× (0.80–1.01) | 0.96× (0.86–1.07) |
+| Compression, level 1 (`fast`) | 0.83× (0.77–0.86) | 0.83× (0.77–0.87) | 0.84× (0.79–0.88) | 0.84× (0.79–0.88) |
+| 3 (`dfast`) | 0.89× (0.83–0.93) | 0.88× (0.83–0.93) | 0.84× (0.78–0.92) | 0.84× (0.77–0.93) |
+| 5 (`greedy`) | 0.60× (0.51–0.71) | 0.82× (0.73–0.92) | 0.61× (0.49–0.75) | 0.81× (0.76–0.85) |
+| 7 (`lazy`) | 0.58× (0.51–0.68) | 0.79× (0.72–0.85) | 0.56× (0.44–0.70) | 0.81× (0.75–0.88) |
+| 9 (`lazy2`) | 0.54× (0.44–0.66) | 0.77× (0.69–0.90) | 0.50× (0.37–0.65) | 0.80× (0.75–0.88) |
+| 12 (`lazy2`) | 0.49× (0.39–0.63) | 0.69× (0.59–0.78) | 0.53× (0.31–0.69) | 0.82× (0.76–0.86) |
+| 15 (`btlazy2`) | 0.94× (0.88–1.03) | 0.94× (0.90–1.00) | 0.96× (0.92–1.00) | 0.97× (0.90–1.04) |
+| 16 (`btopt`) | 0.89× (0.86–0.93) | 0.89× (0.83–0.95) | 0.90× (0.86–0.95) | 0.90× (0.82–0.97) |
+| 19 (`btultra2`) | 0.84× (0.76–0.89) | 0.85× (0.76–0.97) | 0.91× (0.86–1.00) | 0.93× (0.85–1.00) |
+
+Against the M1 above:
+
+- **Decoding on x86-64** is the furthest from the target: 0.72×, and 0.78× with the feature, where arm64 and the M1 are at 0.91–0.92× and 0.95–0.96×. libzstd's assembly loop is not what makes the difference: against libzstd built without it (`--features zstd/no_asm`), on another runner (an AMD EPYC 9V74), decoding at levels 1 and 19 ran at 0.73×, and 0.79× with the feature.
+- **The row match finder without prefetches** (levels 5 to 12) falls further behind here: 0.49–0.61× on both, where the M1 is at 0.68–0.84×. With the feature's prefetches, x86-64 reaches 0.69–0.82× and arm64 0.80–0.82×, near the M1's 0.83–0.87×.
+- **Levels 1 and 3** run at 0.83–0.89×, against 0.88× on the M1. **From level 15 on** it is 0.84–0.97×; the feature changes nothing there.
 
 ### Compression with workers
 

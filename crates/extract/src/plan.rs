@@ -166,6 +166,10 @@ pub(crate) enum Kind {
     File,
     Dir,
     Link,
+    /// A tar hard link: a second name for a file extracted before it.
+    HardLink,
+    /// A tar device or FIFO, which is never created.
+    Special,
 }
 
 /// An entry to extract.
@@ -213,6 +217,7 @@ fn refused(item: &Item, options: &Options) -> Option<ErrorKind> {
     match (&item.name, item.kind) {
         (Err(e), _) => Some(ErrorKind::Name(*e)),
         (Ok(_), Kind::Link) if options.links == Links::Refuse => Some(ErrorKind::Link),
+        (Ok(_), Kind::Special) => Some(ErrorKind::Special),
         (Ok(_), _) => None,
     }
 }

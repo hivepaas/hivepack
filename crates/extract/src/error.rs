@@ -24,9 +24,13 @@ pub enum ErrorKind {
     /// Another entry, `first`, names the same path, ignoring case, or
     /// names a file where this one has a directory, or the other way.
     Duplicate { first: u64 },
-    /// A symbolic or hard link, which is not created (see
+    /// A symbolic link, which is not created (see
     /// [`Links`](crate::Links)).
     Link,
+    /// A tar hard link whose target is not a file extracted before it.
+    HardLinkTarget,
+    /// A tar device or FIFO: nothing is created as one.
+    Special,
     /// A link whose target is refused, as a name is
     /// ([`NameError::Dot`] for one that climbs out of the destination).
     LinkTarget(NameError),
@@ -60,6 +64,10 @@ pub enum ErrorKind {
     Origin(std::io::Error),
     /// The archive could not be read.
     Archive(hivepack_zip::Error),
+    /// The tar archive could not be read.
+    Tar(hivepack_tar::Error),
+    /// The tar archive read again, to write it, is not the one checked.
+    Changed,
     /// The destination could not be written.
     Io(std::io::Error),
 }
@@ -88,6 +96,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Name(e) => write!(f, "name refused: {e}"),
             ErrorKind::Duplicate { first } => write!(f, "same path as entry {first}"),
             ErrorKind::Link => f.write_str("link"),
+            ErrorKind::HardLinkTarget => f.write_str("hard link to no file extracted before it"),
+            ErrorKind::Special => f.write_str("device or FIFO"),
             ErrorKind::LinkTarget(e) => write!(f, "link target refused: {e}"),
             ErrorKind::LinkChain { other } => write!(f, "link through link {other}"),
             ErrorKind::Overlap { other } => write!(f, "data overlaps entry {other}"),
@@ -102,6 +112,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Cancelled => f.write_str("cancelled"),
             ErrorKind::Origin(e) => write!(f, "mark of origin not written: {e}"),
             ErrorKind::Archive(e) => write!(f, "archive: {e}"),
+            ErrorKind::Tar(e) => write!(f, "archive: {e}"),
+            ErrorKind::Changed => f.write_str("the archive changed between its two readings"),
             ErrorKind::Io(e) => write!(f, "{e}"),
         }
     }
@@ -125,6 +137,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
             ErrorKind::Archive(e) => Some(e),
+            ErrorKind::Tar(e) => Some(e),
             ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }

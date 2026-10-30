@@ -118,6 +118,30 @@ impl<'a> Destination<'a> {
         })
     }
 
+    /// Creates `name` in `dir`, a hard link to the file `src` in `src_dir`,
+    /// which is not followed if it is a symbolic link.
+    pub(crate) fn hard_link(
+        src_dir: &Dir,
+        src: &str,
+        dir: &Dir,
+        name: &str,
+    ) -> Result<(), ErrorKind> {
+        src_dir
+            .hard_link(src, dir, name)
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => ErrorKind::Exists,
+                _ => ErrorKind::Io(e),
+            })
+    }
+
+    /// Opens the file `name` in `dir` to read it, without following a link.
+    pub(crate) fn open_file(dir: &Dir, name: &str) -> Result<File, ErrorKind> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        dir.open_with(name, &options).map_err(ErrorKind::Io)
+    }
+
     /// Sets the time of `name` in `dir`, without following a link.
     pub(crate) fn set_time(dir: &Dir, name: &str, mtime: SystemTime) -> Result<(), ErrorKind> {
         let mtime = SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(mtime));

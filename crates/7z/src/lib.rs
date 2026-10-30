@@ -4,9 +4,11 @@
 //! [`Archive::open`] reads an archive's headers (`SzArEx_Open`), encoded
 //! ones included, and lists its files: their names, sizes, attributes,
 //! times and CRCs. A file's data comes from its folder, a stream that may
-//! hold several files (a solid block), compressed with Copy, LZMA, LZMA2 or
-//! PPMd, after a branch converter (x86 BCJ, ARM, ARM-Thumb, ARM64, PowerPC,
-//! SPARC, IA-64, RISC-V), the delta filter or BCJ2:
+//! hold several files (a solid block), compressed with Copy, LZMA, LZMA2,
+//! PPMd, Deflate, Deflate64, BZip2 or Zstandard, after a branch converter
+//! (x86 BCJ, ARM, ARM-Thumb, ARM64, PowerPC, SPARC, IA-64, RISC-V), the delta
+//! or swap filters or BCJ2, in any graph of coders. What the SDK decodes gets
+//! its answers; the rest goes as far as 7-Zip's program does:
 //!
 //! - [`Archive::extract`] decodes a file's whole folder, as
 //!   `SzArEx_Extract` does, and keeps it for the folder's next file;

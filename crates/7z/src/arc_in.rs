@@ -42,12 +42,14 @@ const ID_MTIME: u64 = 20;
 const ID_WIN_ATTRIB: u64 = 21;
 const ID_ENCODED_HEADER: u64 = 23;
 
-/// `SZ_NUM_CODERS_IN_FOLDER_MAX`.
-pub(crate) const NUM_CODERS_IN_FOLDER_MAX: usize = 4;
+/// `SZ_NUM_CODERS_IN_FOLDER_MAX`. Differs from the SDK, which stops at 4: its
+/// fixed shapes need no more, and 7-Zip's graphs do (BCJ2 with AES takes 8).
+/// The decoder's own checks still tell the SDK's shapes.
+pub(crate) const NUM_CODERS_IN_FOLDER_MAX: usize = 16;
 /// `SZ_NUM_BONDS_IN_FOLDER_MAX`.
-pub(crate) const NUM_BONDS_IN_FOLDER_MAX: usize = 3;
+pub(crate) const NUM_BONDS_IN_FOLDER_MAX: usize = NUM_CODERS_IN_FOLDER_MAX - 1;
 /// `SZ_NUM_PACK_STREAMS_IN_FOLDER_MAX`.
-pub(crate) const NUM_PACK_STREAMS_IN_FOLDER_MAX: usize = 4;
+pub(crate) const NUM_PACK_STREAMS_IN_FOLDER_MAX: usize = NUM_CODERS_IN_FOLDER_MAX;
 /// `k_NumCodersStreams_in_Folder_MAX`.
 const NUM_CODERS_STREAMS_IN_FOLDER_MAX: usize =
     NUM_BONDS_IN_FOLDER_MAX + NUM_PACK_STREAMS_IN_FOLDER_MAX;

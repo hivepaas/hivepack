@@ -24,7 +24,9 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use hivepack_7z::{Archive, Error, Options};
-use support::{Oracle, Rng, fnv64, hex, make_archive, scratch, seven_zip, unhex, write_files};
+use support::{
+    Oracle, Rng, damaged, fnv64, hex, make_archive, scratch, seven_zip, unhex, write_files,
+};
 
 fn recorded_path() -> PathBuf {
     support::repository().join("testdata/oracle/7z.txt")
@@ -108,6 +110,25 @@ fn answer(archive: &[u8]) -> String {
         }
     }
     text
+}
+
+/// The port's answer against the SDK's. Where the SDK answers
+/// `SZ_ERROR_UNSUPPORTED` (4), the port may do more: it reads what 7-Zip's
+/// program reads, which `tests/methods.rs` checks.
+fn assert_same(got: &str, want: &str, context: &str) {
+    if want == "4" {
+        return;
+    }
+    let (g, w): (Vec<&str>, Vec<&str>) = (got.split(' ').collect(), want.split(' ').collect());
+    assert_eq!(g.len(), w.len(), "{context}: {got} against {want}");
+    for (g, w) in g.iter().zip(&w) {
+        let mut parts = w.split(':');
+        let kind = parts.next();
+        if matches!(kind, Some("d" | "x")) && parts.nth(1) == Some("4") {
+            continue;
+        }
+        assert_eq!(g, w, "{context}");
+    }
 }
 
 /// The files read one after another give what `extract` gives; where it
@@ -207,62 +228,6 @@ const OPTIONS: &[&str] = &[
     "-mtm=off -mtc=off -mta=off -mhc=off",
 ];
 
-/// `archive` with bytes changed: in its data, in the header with its
-/// checksums made right again, or cut short.
-fn damaged(rng: &mut Rng, archive: &[u8]) -> Vec<u8> {
-    let mut bad = archive.to_vec();
-    if bad.len() < 32 {
-        return bad;
-    }
-    let le64 = |b: &[u8], at: usize| {
-        let mut word = [0; 8];
-        word.copy_from_slice(&b[at..at + 8]);
-        u64::from_le_bytes(word)
-    };
-    let next_offset = le64(&bad, 12) as usize;
-    let next_size = le64(&bad, 20) as usize;
-    let header = 32 + next_offset;
-    let valid = header <= bad.len() && header + next_size == bad.len();
-    match rng.below(if valid && next_size > 0 { 7 } else { 3 }) {
-        0 => {
-            // Anywhere, the checksums then finding it, most of the time.
-            let at = rng.below(bad.len() as u64) as usize;
-            bad[at] ^= 1 << rng.below(8);
-        }
-        1 => {
-            bad.truncate(rng.below(bad.len() as u64) as usize);
-        }
-        2 => {
-            // More after the end, which the header does not count.
-            bad.push(rng.next() as u8);
-        }
-        3 | 4 => {
-            // In the packed data.
-            if next_offset > 0 {
-                let at = 32 + rng.below(next_offset as u64) as usize;
-                bad[at] = rng.next() as u8;
-            }
-        }
-        _ => {
-            // In the header: its checksums made right, so that the parsing
-            // sees it.
-            for _ in 0..1 + rng.below(3) {
-                let at = header + rng.below(next_size as u64) as usize;
-                match rng.below(3) {
-                    0 => bad[at] ^= 1 << rng.below(8),
-                    1 => bad[at] = rng.pick(&[0, 1, 0x7F, 0x80, 0xFF]),
-                    _ => bad[at] = rng.next() as u8,
-                }
-            }
-            let crc = hivepack_deflate::crc32(0, &bad[header..header + next_size]);
-            bad[28..32].copy_from_slice(&crc.to_le_bytes());
-            let crc = hivepack_deflate::crc32(0, &bad[12..32]);
-            bad[8..12].copy_from_slice(&crc.to_le_bytes());
-        }
-    }
-    bad
-}
-
 fn ask(oracle: &mut Oracle, dir: &Path, archive: &[u8]) -> String {
     let path = dir.join("asked.7z");
     std::fs::write(&path, archive).expect("the archive written");
@@ -295,7 +260,7 @@ fn port_matches_the_sdk() {
             }
             let want = ask(&mut oracle, &dir, &bytes);
             let got = answer(&bytes);
-            assert_eq!(got, want, "{options}, round {round}");
+            assert_same(&got, &want, &format!("{options}, round {round}"));
             if round == 0 {
                 // Each folder and file: x:INDEX:RESULT:... and d:FOLDER:RESULT:...
                 let failed = want.split(' ').any(|field| {
@@ -319,11 +284,10 @@ fn port_matches_recorded_answers() {
     for line in text.lines().filter(|line| !line.starts_with('#')) {
         let (archive, want) = line.split_once('\t').expect("archive and answer");
         let archive = unhex(archive);
-        assert_eq!(
-            answer(&archive),
+        assert_same(
+            &answer(&archive),
             want,
-            "{}",
-            hex(&archive[..archive.len().min(64)])
+            &hex(&archive[..archive.len().min(64)]),
         );
         check_files(&archive);
         checked += 1;

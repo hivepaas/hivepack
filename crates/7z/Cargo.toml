@@ -18,7 +18,12 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-# CRC-32, which 7z checks its headers and files with.
+# BZip2.
+hivepack-bzip2.workspace = true
+# CRC-32, which 7z checks its headers and files with, and Deflate and
+# Deflate64.
 hivepack-deflate.workspace = true
 # LZMA and LZMA2.
 hivepack-xz.workspace = true
+# Zstandard.
+hivepack-zstd.workspace = true

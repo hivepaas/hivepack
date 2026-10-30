@@ -75,6 +75,7 @@ pub mod name;
 mod raw;
 mod source;
 mod time;
+mod unpack;
 
 pub use archive::Archive;
 pub use error::{Error, ExitCode};

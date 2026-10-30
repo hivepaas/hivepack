@@ -2,7 +2,7 @@
 
 `hivepack-rar` will read RAR archives: list them, check them and give their entries' data, from RAR 1.4 to RAR 7. It is a port of UnRAR, RARLAB's own source, to safe Rust, under UnRAR's license, and it is checked against a program built from the same source. It does not write RAR, and never will: UnRAR's license forbids it, and so does this plan.
 
-> **Status:** planned. Nothing is written yet; step 1, the headers, comes first (see [The order of work](#the-order-of-work)).
+> **Status:** step 1 half done: `hivepack-rar` reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, compared with UnRAR on libarchive's 131 RAR archives and 250,000 damaged copies of them (see [Progress](#progress)). The data of stored entries and their hashes come next.
 
 ## Why UnRAR
 
@@ -69,6 +69,19 @@ The cryptography stays in `hivepack-crypto`, under its own license, where it is 
 - **Archives others made.** libarchive's 131 RAR test archives (BSD-2-Clause), from RAR 2.9 to RAR 5: solid, multivolume, filters, PPMd, symbolic and hard links, Unicode names, encrypted headers and data, and damaged ones; then more from other open projects, each with its license.
 - **Damaged copies** of those, bytes changed, cut or moved by a seeded generator, through the oracle: no archive is written, since nothing here writes RAR.
 - **Fuzzing**: a target per step, from libarchive's archives, that nothing panics and that the port agrees with what it read before.
+
+## Progress
+
+**Step 1, the headers.** `Archive::open` finds the signature, at the start or after a self-extracting module in the first 4 MB, and reads up to the main header as `IsArchive` does; `read_header` reads each header as `ReadHeader` does, RAR 1.4's, RAR 1.5 to 4.x's and RAR 5's with their extra records, and `seek_to_next` moves past its data. What UnRAR keeps of each header is kept the same, its fields left as they were where UnRAR leaves them (`FileHeader::Reset` clears some fields only), and so are the archive's state, the positions, the broken header flag and the exit code UnRAR's `ErrHandler` would give. Headers that need a password stop the reading, as UnRAR's library stops without a callback; decryption is step 3. QuickOpen records, whose copies of the headers UnRAR reads in place of the headers when an archive has one, are read in step 3; the oracle runs with them off.
+
+The oracle prints all of that, field by field, after every header, and `crates/rar/tests/oracle.rs` prints the same from the port. They agree on libarchive's 131 RAR archives, both with and without reading past a broken main header, on 2,500 damaged copies of the 125 under 64 KB in every run (`HIVEPACK_RAR_DAMAGED` and `HIVEPACK_RAR_SEED` make more: 250,000 agreed in a run by hand), and on the 2,000 inputs four minutes of fuzzing collected (`HIVEPACK_RAR_CORPUS`). Where UnRAR leaves a field unset, so that it holds what an earlier header or the heap left, neither side prints it. What the comparison found:
+
+- UnRAR keeps a header type in its enum, an `int`: a RAR 5 type is cut to 32 bits, kept if that is negative, and made 0xff if it is over 0xff.
+- A size that is not known is `INT64NDF`, 0x7fffffff7fffffff, not the largest `int64`.
+- Names not in the code page are decoded as glibc decodes UTF-8, which takes four-byte sequences up to U+1FFFFF; what glibc refuses UnRAR maps to U+E080–U+E0FF behind a U+FFFE mark.
+- `CRC32` and the BLAKE2sp digest are one union: only the one the hash type names means anything.
+
+The comparison runs on Linux: UnRAR's macOS build decodes names with `UtfToWide`, where Linux's uses `mbsrtowcs`, and the port reads them as Linux's does. `testdata/oracle/rar-list.txt` holds the oracle's answers for libarchive's archives of 2 KB or less and damaged copies, 576 of them, replayed everywhere. The `rar_headers` fuzz target reads every header of its input twice: 7.4 million inputs over four minutes found nothing before the first commit.
 
 ## The order of work
 

@@ -2,7 +2,8 @@
 //! parameters, in the same pieces, with the same directives and the same
 //! room for output, all picked by its first 8 bytes, and checks that every
 //! call returns the same, moves as far and writes the same, and that the
-//! port decodes the frame back. A third of the time with a dictionary
+//! port decodes the frame back, and that `ZSTD_getFrameProgression` says
+//! the same after every call. A third of the time with a dictionary
 //! from the start of the input, loaded, a prefix or a `CDict`, attached,
 //! copied in or loaded again. A quarter of the time with a target size
 //! for compressed blocks (`ZSTD_c_targetCBlockSize`).
@@ -12,7 +13,9 @@
 //! synchronization points: how much each call takes and writes then
 //! depends on the threads, but not the frame. Then each side goes through
 //! the same steps on its own, each step's calls repeated until it is done,
-//! and the frames must be the same. A panic or a difference is a bug.
+//! and the frames must be the same; the port's frame progression and what
+//! it has to flush now are asked after every call. A panic or a difference
+//! is a bug.
 
 #![no_main]
 
@@ -353,6 +356,12 @@ fuzz_target!(|input: &[u8]| {
             let mut output = hivepack_zstd::OutBuffer { dst, pos: out_pos };
             let mut input = hivepack_zstd::InBuffer::new(piece);
             let result = p.compress_stream2(&mut output, &mut input, directive);
+            let fp = p.get_frame_progression();
+            assert!(
+                fp.consumed <= fp.ingested && fp.flushed <= fp.produced,
+                "with workers: frame progression {fp:?}"
+            );
+            assert!(p.to_flush_now() as u64 <= fp.produced - fp.flushed);
             (
                 result.map_err(|error| error.code().message().to_string()),
                 input.pos,
@@ -433,6 +442,14 @@ fuzz_target!(|input: &[u8]| {
         assert!(
             c_dst[out_pos..co] == p_dst[out_pos..po],
             "call {call}: the output differs"
+        );
+        let (c_fp, p_fp) = (c.get_frame_progression(), p.get_frame_progression());
+        assert!(
+            (c_fp.ingested, c_fp.consumed, c_fp.produced, c_fp.flushed)
+                == (p_fp.ingested, p_fp.consumed, p_fp.produced, p_fp.flushed)
+                && (c_fp.currentJobID, c_fp.nbActiveWorkers)
+                    == (p_fp.current_job_id, p_fp.nb_active_workers),
+            "call {call}: frame progression: libzstd {c_fp:?}, port {p_fp:?}"
         );
         frame.extend_from_slice(&c_dst[out_pos..co]);
         if stable_out {

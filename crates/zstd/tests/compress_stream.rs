@@ -5,7 +5,7 @@
 //! what it writes. Contexts are used for several frames, with parameters
 //! changed between them (and tried while streaming), and dictionaries
 //! loaded, referenced as `CDict`s or prefixes, changed between them too.
-//! Then `compress2`.
+//! Then `compress2`. After each call, `ZSTD_getFrameProgression` too.
 //!
 //! The data has repeats near and far, and the windows are small: the input
 //! buffer wraps around, and matches reach into the window's older segment.
@@ -20,8 +20,8 @@ mod support;
 use std::sync::Arc;
 
 use hivepack_zstd::{
-    CCtx, CDict, CParameter as P, DCtx, DictAttachPref, EndDirective, Format, ParamSwitch,
-    ResetDirective, Strategy,
+    CCtx, CDict, CParameter as P, DCtx, DictAttachPref, EndDirective, Format, FrameProgression,
+    ParamSwitch, ResetDirective, Strategy,
 };
 use support::{Problems, Rng};
 use zstd::zstd_safe::{self, CParameter as C, FrameFormat, zstd_sys::ZSTD_EndDirective};
@@ -278,6 +278,28 @@ enum Ended {
     Refused,
 }
 
+/// `ZSTD_getFrameProgression` on both: without workers, the same at every
+/// step.
+fn same_progression(c: &zstd_safe::CCtx<'_>, p: &CCtx) -> Result<(), String> {
+    let fp = c.get_frame_progression();
+    let want = FrameProgression {
+        ingested: fp.ingested,
+        consumed: fp.consumed,
+        produced: fp.produced,
+        flushed: fp.flushed,
+        current_job_id: fp.currentJobID,
+        nb_active_workers: fp.nbActiveWorkers,
+    };
+    let got = p.get_frame_progression();
+    if want != got {
+        return Err(format!("frame progression: libzstd {want:?}, port {got:?}"));
+    }
+    if p.to_flush_now() != 0 {
+        return Err(format!("{} to flush now without workers", p.to_flush_now()));
+    }
+    Ok(())
+}
+
 /// One frame of `data` through both contexts, in the same calls.
 #[allow(clippy::too_many_lines)]
 fn stream_frame(
@@ -402,6 +424,8 @@ fn stream_frame(
                 "call {call} ({directive:?}): the output differs at byte {at}"
             ));
         }
+        same_progression(c, p)
+            .map_err(|problem| format!("call {call} ({directive:?}): {problem}"))?;
         frame.extend_from_slice(&c_dst[out_pos..co]);
         if stable_out {
             stable_pos = co;
@@ -667,6 +691,10 @@ fn compare_contexts(
                 c.reset(zstd_safe::ResetDirective::SessionOnly)
                     .expect("libzstd resets");
                 p.reset(ResetDirective::SessionOnly).expect("port resets");
+                if let (Ended::Failed, Err(problem)) = (ended, same_progression(&c, &p)) {
+                    problems.add(format!("{tag}: after the reset, {problem}"));
+                    return frames;
+                }
             }
             Ok(Ended::Frame(frame)) => {
                 frames += 1;
@@ -822,6 +850,10 @@ fn compress2_compresses_as_libzstd_does() {
                 problems.add(format!(
                     "seed {seed}, {len} bytes into {room}: libzstd {want:?}, port {got:?}"
                 ));
+                break;
+            }
+            if let Err(problem) = same_progression(&c, &p) {
+                problems.add(format!("seed {seed}, {len} bytes, compress2: {problem}"));
                 break;
             }
             if let Ok(size) = want {

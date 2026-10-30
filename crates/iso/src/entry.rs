@@ -44,7 +44,10 @@ pub struct Header {
     /// The number of links: for a directory, 2 and its subdirectories.
     pub nlink: u32,
     /// The size of the data; `None` for a hard link to the entry before,
-    /// whose data that entry has.
+    /// whose data that entry has. A zisofs file's data can end before it:
+    /// libarchive leaves out the blocks of zeros at its end (zisofs stores
+    /// them as nothing), which an extractor writes as zeros, as
+    /// libarchive's does.
     pub size: Option<u64>,
     /// When the file was made, in seconds since 1970: Rock Ridge's.
     pub birth_time: Option<i64>,

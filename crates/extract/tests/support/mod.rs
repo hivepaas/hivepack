@@ -180,3 +180,28 @@ pub fn required(group: &str) -> bool {
     let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
     required.split(',').any(|g| g == "all" || g == group)
 }
+
+/// The repository's root.
+pub fn repository() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// An .xz file's content.
+pub fn xz_decode(data: &[u8]) -> Vec<u8> {
+    use hivepack_xz::{Action, InBuffer, OutBuffer, Status, Stream};
+    let mut stream = Stream::stream_decoder(u64::MAX, 0).unwrap();
+    let mut out = Vec::new();
+    let mut input = InBuffer::new(data);
+    let mut piece = vec![0; 1 << 16];
+    loop {
+        let mut output = OutBuffer::new(&mut piece);
+        let status = stream
+            .code(&mut output, &mut input, Action::Finish)
+            .unwrap();
+        let written = output.pos;
+        out.extend_from_slice(&piece[..written]);
+        if status == Status::StreamEnd {
+            return out;
+        }
+    }
+}

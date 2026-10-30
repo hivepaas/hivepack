@@ -529,6 +529,30 @@ fn a_tar_archive_under_layers_extracts() {
     );
 }
 
+/// libarchive's Rock Ridge and Joliet image, xz-compressed in
+/// `testdata`, extracted through its layer.
+#[test]
+fn an_iso_image_under_layers_extracts() {
+    let path = support::repository()
+        .join("testdata/libarchive-iso/test_read_format_iso_joliet_rockridge.iso.xz");
+    let mut opener = Opener::new(|| std::fs::File::open(&path)).name("disc.iso.xz");
+    assert_eq!(opener.open().unwrap().container(), Container::Iso);
+    let scratch = Scratch::new();
+    let out = scratch.path().join("out");
+    let mut options = hivepack_extract::Options::default();
+    options.links = hivepack_extract::Links::AsFile;
+    let summary = hivepack_extract::extract_iso(|| Ok(opener.open()?), &out, &options).unwrap();
+    assert_eq!((summary.files, summary.directories), (3, 1));
+    // The hard link's file and its copy hold the same data, and the
+    // symbolic link its target.
+    let file = std::fs::read(out.join("long-joliet-file-name.textfile")).unwrap();
+    assert_eq!(std::fs::read(out.join("hardlink")).unwrap(), file);
+    assert_eq!(
+        std::fs::read(out.join("symlink")).unwrap(),
+        b"long-joliet-file-name.textfile"
+    );
+}
+
 #[test]
 fn a_damaged_stream_stops_before_anything_is_written() {
     // gzip's stored blocks hold the data as it is: only the CRC-32 at the

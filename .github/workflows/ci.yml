@@ -396,6 +396,15 @@ jobs:
           mkdir -p fuzz/corpus/iso
           for f in testdata/libarchive-iso/*.iso.xz; do xz -dc "$f" > "fuzz/corpus/iso/$(basename "$f" .xz)"; done
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu iso -- -max_total_time=60 -rss_limit_mb=4096
+      - name: Seed the ISO 9660 extraction corpus with the same images, behind a choice of options
+        run: |
+          mkdir -p fuzz/corpus/extract_iso
+          python3 - <<'PY'
+          import pathlib
+          for i, path in enumerate(sorted(pathlib.Path("fuzz/corpus/iso").glob("*.iso"))):
+              pathlib.Path(f"fuzz/corpus/extract_iso/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_iso -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the layers corpus with the recorded age files and what they hold
         run: |
           mkdir -p fuzz/corpus/open

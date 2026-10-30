@@ -75,6 +75,12 @@ pub enum ErrorKind {
     /// directory, a name not in UTF-16, a part of a file's data out of
     /// place.
     IsoEntry(hivepack_iso::Warning),
+    /// The UDF volume could not be read: an entry's node, data or link
+    /// target, or a directory with a broken entry.
+    Udf(hivepack_udf::Error),
+    /// A directory of the UDF volume met again: under two names, or its
+    /// own ancestor, which UDF does not allow.
+    DirectoryAgain,
     /// The tar archive or ISO 9660 image read again, to write it, is not
     /// the one checked.
     Changed,
@@ -125,6 +131,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Tar(e) => write!(f, "archive: {e}"),
             ErrorKind::Iso(e) => write!(f, "image: {e}"),
             ErrorKind::IsoEntry(w) => write!(f, "entry with something missing: {w}"),
+            ErrorKind::Udf(e) => write!(f, "volume: {e}"),
+            ErrorKind::DirectoryAgain => f.write_str("a directory met again"),
             ErrorKind::Changed => f.write_str("the archive changed between its two readings"),
             ErrorKind::Io(e) => write!(f, "{e}"),
         }
@@ -151,6 +159,7 @@ impl std::error::Error for Error {
             ErrorKind::Archive(e) => Some(e),
             ErrorKind::Tar(e) => Some(e),
             ErrorKind::Iso(e) => Some(e),
+            ErrorKind::Udf(e) => Some(e),
             ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }

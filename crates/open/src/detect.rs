@@ -1,5 +1,6 @@
 //! What a stream is, from its first bytes: a layer to take off (age, or a
-//! compressor), a container (tar, ZIP, an ISO 9660 image), or plain data.
+//! compressor), a container (tar, ZIP, an ISO 9660 image, a UDF volume),
+//! or plain data.
 
 /// A layer over the data: encryption or compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +36,12 @@ pub enum Container {
     /// An ISO 9660 image (`.iso`), which `hivepack-iso` reads in order, in
     /// a layer too (`.iso.xz`).
     Iso,
+    /// A UDF volume (DVD, Blu-ray and Windows' images, `.iso` too), which
+    /// `hivepack-udf` reads by random access: in a layer, it must be taken
+    /// out to a file first. An image with ISO 9660 beside UDF (Windows' and
+    /// most DVDs') is one, as the files are on its UDF side; `hivepack-iso`
+    /// reads its ISO 9660 side.
+    Udf,
     /// Data: one file, compressed or encrypted (`notes.txt.zst`).
     Data,
 }
@@ -54,6 +61,13 @@ pub const HEAD_LEN: usize = 1024 + 34 + 512;
 /// its first [`HEAD_LEN`] bytes are data: its system area and its first
 /// volume descriptor.
 pub const ISO_HEAD_LEN: usize = ISO_DESCRIPTORS + 2048;
+
+/// How much of a stream [`detect`] looks at to tell a UDF volume, when its
+/// first [`HEAD_LEN`] bytes are data or an ISO 9660 image: its system area
+/// and 32 descriptors of the volume recognition sequence, room for ISO
+/// 9660's before UDF's. With fewer bytes, an image with both is found as
+/// ISO 9660.
+pub const UDF_HEAD_LEN: usize = ISO_DESCRIPTORS + 32 * 2048;
 
 /// Where an ISO 9660 image's volume descriptors start, after its 32 KiB
 /// system area (which a bootable image fills with a boot sector, or a
@@ -132,9 +146,34 @@ fn is_iso(head: &[u8]) -> bool {
     matches!(vd[0], 0..=3 | 255) && &vd[1..6] == b"CD001" && vd[6] == 1
 }
 
+/// Whether `head` has a UDF volume recognition sequence (ECMA-167 2/8.3):
+/// from 32 KiB, descriptors of 2048 bytes (or of a block, when blocks are
+/// larger, with nothing between them) of type 0 and version 1, among which
+/// `BEA01`, then `NSR02` or `NSR03` before `TEA01`, as `file` and Linux
+/// look for. ISO 9660's descriptors come first in an image with both.
+fn is_udf(head: &[u8]) -> bool {
+    let mut extended = false;
+    for at in (ISO_DESCRIPTORS..head.len()).step_by(2048) {
+        let Some(vsd) = head.get(at..at + 7) else {
+            break;
+        };
+        if vsd[0] != 0 || vsd[6] != 1 {
+            continue;
+        }
+        match &vsd[1..6] {
+            b"BEA01" => extended = true,
+            b"NSR02" | b"NSR03" if extended => return true,
+            b"TEA01" => extended = false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// What `head`, the first [`HEAD_LEN`] bytes of a stream (fewer if it is
-/// shorter), or [`ISO_HEAD_LEN`] to tell an ISO 9660 image, is. `name`, the file's name if the stream is the file's, tells
-/// `.lzma`, which has no magic.
+/// shorter), or [`ISO_HEAD_LEN`] to tell an ISO 9660 image, or
+/// [`UDF_HEAD_LEN`] to tell a UDF volume, is. `name`, the file's name if
+/// the stream is the file's, tells `.lzma`, which has no magic.
 pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     let starts = |magic: &[u8]| head.starts_with(magic);
     if starts(AGE_INTRO) {
@@ -182,6 +221,9 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
         return Detected::Container(Container::Tar);
     }
     // After what starts the stream: an image's system area is anything.
+    if is_udf(head) {
+        return Detected::Container(Container::Udf);
+    }
     if is_iso(head) {
         return Detected::Container(Container::Iso);
     }
@@ -352,6 +394,63 @@ mod tests {
         for len in [ISO_DESCRIPTORS + 6, HEAD_LEN] {
             assert_eq!(layer(&image[..len]), Detected::Container(Container::Data));
         }
+    }
+
+    /// A UDF volume recognition sequence of `ids` from 32 KiB, a descriptor
+    /// every `step` bytes, in an image of at least [`UDF_HEAD_LEN`].
+    fn vrs(ids: &[&[u8]], step: usize) -> Vec<u8> {
+        let mut image = vec![0u8; UDF_HEAD_LEN.max(ISO_DESCRIPTORS + ids.len() * step)];
+        for (i, id) in ids.iter().enumerate() {
+            let at = ISO_DESCRIPTORS + i * step;
+            // ISO 9660's: a primary volume descriptor, and the set's end.
+            image[at] = match *id {
+                b"CD001" if i == 0 => 1,
+                b"CD001" => 255,
+                _ => 0,
+            };
+            image[at + 1..at + 6].copy_from_slice(id);
+            image[at + 6] = 1;
+        }
+        image
+    }
+
+    #[test]
+    fn udf_by_its_volume_recognition_sequence() {
+        let udf = Detected::Container(Container::Udf);
+        for ids in [
+            &[&b"BEA01"[..], b"NSR02", b"TEA01"][..],
+            &[b"BEA01", b"NSR03", b"TEA01"],
+        ] {
+            assert_eq!(layer(&vrs(ids, 2048)), udf);
+            // Blocks of 4096 bytes.
+            assert_eq!(layer(&vrs(ids, 4096)), udf);
+        }
+        // Beside ISO 9660, after its descriptors: UDF, but in its first
+        // ISO_HEAD_LEN bytes.
+        let bridge = vrs(&[b"CD001", b"CD001", b"BEA01", b"NSR02", b"TEA01"], 2048);
+        assert_eq!(layer(&bridge), udf);
+        assert_eq!(
+            layer(&bridge[..ISO_HEAD_LEN]),
+            Detected::Container(Container::Iso)
+        );
+        // NSR outside an extended area, none at all, or another version:
+        // not UDF.
+        for ids in [
+            &[&b"NSR02"[..], b"BEA01", b"TEA01"][..],
+            &[b"BEA01", b"TEA01", b"NSR03"],
+            &[b"BEA01", b"TEA01"],
+        ] {
+            assert_eq!(layer(&vrs(ids, 2048)), Detected::Container(Container::Data));
+        }
+        let mut other = vrs(&[b"BEA01", b"NSR02"], 2048);
+        other[ISO_DESCRIPTORS + 2048 + 6] = 2;
+        assert_eq!(layer(&other), Detected::Container(Container::Data));
+        // Past what is looked at.
+        let far = vrs(&[b"BEA01", b"NSR02"], 2048 * 32);
+        assert_eq!(
+            layer(&far[..UDF_HEAD_LEN]),
+            Detected::Container(Container::Data)
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Read};
 use hivepack_age::{BoxedIdentity, FileKey, FileKeyIdentity, Identity};
 
 use crate::decode::{DecodeLimits, decoder};
-use crate::detect::{Container, Detected, HEAD_LEN, ISO_HEAD_LEN, Layer, detect};
+use crate::detect::{Container, Detected, HEAD_LEN, Layer, UDF_HEAD_LEN, detect};
 use crate::error::Error;
 
 /// How far an [`Opener`] goes.
@@ -163,9 +163,10 @@ where
             let mut detected = detect(&head, name);
             let mut deferred = None;
             if detected == Detected::Container(Container::Data) && head.len() == HEAD_LEN {
-                // An ISO 9660 image tells further in. An error there comes
-                // when the data is read up to it, as it would have.
-                deferred = read_more(&mut reader, &mut head, ISO_HEAD_LEN);
+                // An ISO 9660 image or a UDF volume tells further in. An
+                // error there comes when the data is read up to it, as it
+                // would have.
+                deferred = read_more(&mut reader, &mut head, UDF_HEAD_LEN);
                 detected = detect(&head, name);
             }
             reader = match deferred {

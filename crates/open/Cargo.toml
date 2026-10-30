@@ -35,3 +35,5 @@ lz4.workspace = true
 hivepack-tar.workspace = true
 hivepack-extract.workspace = true
 hivepack-iso.workspace = true
+# For the UDF volumes it finds.
+hivepack-udf.workspace = true

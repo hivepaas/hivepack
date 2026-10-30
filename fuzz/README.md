@@ -38,6 +38,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `extract_iso` | Extracting the input as an ISO 9660 image with hivepack-extract, as `extract_tar` does a tar archive: options from its first byte, cancelled after some progress if it says so; nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
 | `open` | Opening the input through its layers with hivepack-open (the age key of `crates/open/tests/age.rs`'s files; a name ending in `.lzma` if its first byte is odd; small limits), three times with one opener, the later opens with the file keys kept, and reading up to 4 MiB in pieces of different sizes: the same layers, container and end each time, the same data, or after an error data of which one starts the other (libzstd gives out less before an error when its output buffer is larger), and no panic |
 | `udf` | Mounting the image the input describes (its first byte the sector size, its next three the number of sectors, then sectors by number, length and bytes) and walking it twice: every directory listed, every node's attributes, every link's target, up to 1 MiB of every file, the first 16 names of each directory looked up: the same both times, every name found when its directory reads whole, and no panic (`crates/udf/tests` compares the answers with Linux) |
+| `extract_udf` | Extracting the image the input describes, after a byte of options (as `extract_iso`'s, and whether hidden entries are listed), as the `udf` target reads it, with hivepack-extract: nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
 
 Seed the corpus with the frames in `testdata`, then run, with the
 `unsafe-fast` feature or without:
@@ -105,12 +106,16 @@ cargo fuzz run extract_iso -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `udf` with the descriptors of `testdata/udf`'s images, and
+`extract_udf` with the same images behind a byte of options;
 `tools/udf-images/seed.py` takes the crafted ones too:
 
 ```sh
 UDF_CRAFTED=$PWD/target/udf-crafted cargo test -p hivepack-udf --test crafted write_crafted_images -- --ignored
 python3 tools/udf-images/seed.py fuzz/corpus/udf target/udf-crafted
+mkdir -p fuzz/corpus/extract_udf
+for f in fuzz/corpus/udf/*; do { printf '\x22'; cat "$f"; } > "fuzz/corpus/extract_udf/$(basename "$f")"; done
 cargo fuzz run udf -- -max_total_time=3600 -rss_limit_mb=4096 -max_len=400000
+cargo fuzz run extract_udf -- -max_total_time=3600 -rss_limit_mb=4096 -max_len=400000
 ```
 
 `cargo fuzz` builds with AddressSanitizer, so with the feature an access out

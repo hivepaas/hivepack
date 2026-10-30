@@ -45,10 +45,11 @@ const WORKER_THREAD_SIZE: u64 = 544;
 /// or exit.
 const IN_CHUNK_MAX: usize = 16384;
 
-/// `lzma_mt`: the options of the threaded encoder.
+/// `lzma_mt`: the options of the threaded encoder and decoder.
 #[derive(Clone, Debug)]
 pub struct MtOptions {
-    /// Set this to zero if no flags are wanted. The encoder takes none.
+    /// Set this to zero if no flags are wanted. The encoder takes none; the
+    /// decoder takes those of [`Stream::stream_decoder`](crate::Stream::stream_decoder).
     pub flags: u32,
     /// Number of worker threads to use, from 1 to 16384.
     pub threads: u32,
@@ -65,6 +66,13 @@ pub struct MtOptions {
     pub filters: Option<Vec<Filter>>,
     /// Encoder only: the integrity check of the Blocks.
     pub check: Check,
+    /// Decoder only: the memory usage above which the decoder does not start
+    /// another Block in a thread, and decodes a Block that would need more
+    /// than this alone without threads. It is at most `memlimit_stop`.
+    pub memlimit_threading: u64,
+    /// Decoder only: the memory usage that decoding never goes over; a
+    /// Block that would need more gives [`Error::Memlimit`](crate::Error::Memlimit).
+    pub memlimit_stop: u64,
 }
 
 impl Default for MtOptions {
@@ -77,6 +85,8 @@ impl Default for MtOptions {
             preset: crate::PRESET_DEFAULT,
             filters: None,
             check: Check::CRC64,
+            memlimit_threading: u64::MAX,
+            memlimit_stop: u64::MAX,
         }
     }
 }
@@ -156,11 +166,11 @@ struct Coder {
 
 /// A mutex's data. A thread that panicked while holding it cannot leave it
 /// inconsistent in a way that matters here, as no code panics.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn wait<'a, T>(cond: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+pub(crate) fn wait<'a, T>(cond: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     cond.wait(guard).unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -249,7 +259,7 @@ struct WorkerLocal {
 /// The input the main thread has given, moved to the worker's buffer: by
 /// exchanging the two if the worker's is empty, as it is when a Block comes
 /// in one piece, else by copying.
-fn take_pending(input: &mut Vec<u8>, pending: &mut Vec<u8>) {
+pub(crate) fn take_pending(input: &mut Vec<u8>, pending: &mut Vec<u8>) {
     if input.is_empty() {
         core::mem::swap(input, pending);
     } else {
@@ -263,7 +273,7 @@ fn take_pending(input: &mut Vec<u8>, pending: &mut Vec<u8>) {
 /// allocated at its full size and written as it goes; here it grows as it
 /// is written, and the Block encoder is called again when it has filled
 /// what there was, as with an output buffer of the full size.
-fn ensure_room(buf: &mut Vec<u8>, out_pos: usize, out_size: usize) {
+pub(crate) fn ensure_room(buf: &mut Vec<u8>, out_pos: usize, out_size: usize) {
     if buf.len() <= out_pos && buf.len() < out_size {
         let len = (out_pos + (1 << 16)).max(buf.len() * 2).min(out_size);
         buf.resize(len, 0);
@@ -676,7 +686,7 @@ impl StreamEncoderMt {
         // The output buffer for the Block.
         let outbuf = {
             let mut shared = lock(&self.coder.mutex);
-            let id = shared.outq.get_buf();
+            let id = shared.outq.get_buf(None);
             match shared.outq.buf_mut(id) {
                 Some(buf) => WorkerOutBuf {
                     id,

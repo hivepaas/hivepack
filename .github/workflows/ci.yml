@@ -454,6 +454,12 @@ jobs:
               mode = modes.get(kind, 4 if last.startswith(("1:", "2:")) else 5)
               data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
               pathlib.Path(f"fuzz/corpus/xz/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
+          # Mode 6 is the threaded decoder.
+          lines = pathlib.Path("testdata/oracle/xz-mt.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("mtdec ")):
+              words = line.split("\t")[0].split(" ")
+              data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
+              pathlib.Path(f"fuzz/corpus/xz/m{i}").write_bytes(bytes([6]) + i.to_bytes(8, "little") + data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu xz -- -max_total_time=90 -rss_limit_mb=4096
       - name: Seed the xz_encode corpus

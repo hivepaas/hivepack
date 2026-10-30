@@ -88,6 +88,21 @@
  *       "ok <ret> <total_in>/<total_out> <hash>" with the last call's result,
  *       "fail <ret>" for a call that failed, or "err <code>" for an encoder
  *       refused.
+ *
+ *   mtdec <threads>:<timeout>:<flags>:<memlimit_threading>:<memlimit_stop>:
+ *         <bcj> <steps> <hex>
+ *       lzma_stream_decoder_mt, then the steps as for mtcode: LZMA_RUN once
+ *       (its LZMA_BUF_ERROR, which depends on the threads, passes), LZMA_FINISH
+ *       again until it returns an error or LZMA_STREAM_END. Answered
+ *       "<ret> <tells> <total_out> <hash>" with the last result, the number of
+ *       LZMA_NO_CHECK, LZMA_UNSUPPORTED_CHECK and LZMA_GET_CHECK returned, and
+ *       then, if it is LZMA_STREAM_END, <total_in>, which depends on the
+ *       threads after an error. With <bcj> 1, for a Stream with BCJ filters, an
+ *       error is answered without <total_out> and <hash>: the BCJ coder leaves
+ *       what it has not filtered in the output when the coder after it fails,
+ *       and how much that is depends on the threads. With LZMA_FAIL_FAST an
+ *       error is answered only "fail", as what comes first depends on the
+ *       threads too; a decoder refused "err <code>".
  */
 
 #include <stdio.h>
@@ -407,6 +422,99 @@ static void do_mtcode(const char *args, const char *steps, const char *data_hex)
     free(out);
 }
 
+/* The threaded decoder, driven by the steps. */
+static void do_mtdec(const char *args, const char *steps, const char *data_hex) {
+    lzma_stream strm = LZMA_STREAM_INIT;
+    lzma_mt mt;
+    unsigned char *data, *out = NULL;
+    size_t len, consumed = 0, written = 0, cap = 0;
+    unsigned long threads, timeout, flags, bcj, tells = 0;
+    unsigned long long memlimit_threading, memlimit_stop;
+    lzma_ret ret;
+    const char *p;
+    int done = 0;
+
+    if (sscanf(args, "%lu:%lu:%lu:%llu:%llu:%lu", &threads, &timeout, &flags, &memlimit_threading,
+               &memlimit_stop, &bcj) != 6) {
+        puts("bad");
+        return;
+    }
+    memset(&mt, 0, sizeof(mt));
+    mt.threads = (uint32_t)threads;
+    mt.timeout = (uint32_t)timeout;
+    mt.flags = (uint32_t)flags;
+    mt.memlimit_threading = memlimit_threading;
+    mt.memlimit_stop = memlimit_stop;
+    ret = lzma_stream_decoder_mt(&strm, &mt);
+    if (ret != LZMA_OK) {
+        printf("err %d\n", ret);
+        lzma_end(&strm);
+        return;
+    }
+    data = unhex(data_hex, &len);
+    strm.next_in = data;
+    strm.avail_in = 0;
+    p = steps;
+    while (*p == 'c' && !done) {
+        unsigned long room;
+        int action;
+        const char *q = p + 1;
+        if (*q == '=') {
+            q++;
+        } else {
+            char *end;
+            unsigned long in = strtoul(q, &end, 10);
+            strm.next_in = data + consumed;
+            strm.avail_in = in < len - consumed ? in : len - consumed;
+            q = end;
+        }
+        if (sscanf(q, "/%lu/%d", &room, &action) != 2)
+            break;
+        for (;;) {
+            size_t before_in = strm.avail_in;
+            if (cap < written + room + 1) {
+                cap = (written + room) * 2 + 1;
+                out = realloc(out, cap);
+            }
+            strm.next_out = out + written;
+            strm.avail_out = room;
+            ret = lzma_code(&strm, (lzma_action)action);
+            consumed += before_in - strm.avail_in;
+            written += room - strm.avail_out;
+            if (ret == LZMA_NO_CHECK || ret == LZMA_UNSUPPORTED_CHECK || ret == LZMA_GET_CHECK) {
+                tells++;
+                ret = LZMA_OK;
+            } else if (ret == LZMA_BUF_ERROR && action == LZMA_RUN) {
+                ret = LZMA_OK;
+            }
+            if (ret != LZMA_OK) {
+                done = 1;
+                break;
+            }
+            if (action == LZMA_RUN)
+                break;
+        }
+        p = strchr(p, ',');
+        if (!p)
+            break;
+        p++;
+    }
+    if (ret != LZMA_OK && ret != LZMA_STREAM_END && (flags & LZMA_FAIL_FAST))
+        puts("fail");
+    else if (ret != LZMA_OK && ret != LZMA_STREAM_END && bcj)
+        printf("%d %lu\n", ret, tells);
+    else {
+        printf("%d %lu %llu %016llx", ret, tells, (unsigned long long)strm.total_out,
+               fnv64(out, written));
+        if (ret == LZMA_STREAM_END)
+            printf(" %llu", (unsigned long long)strm.total_in);
+        putchar('\n');
+    }
+    lzma_end(&strm);
+    free(data);
+    free(out);
+}
+
 /* The single-call BCJ functions of liblzma 5.8. */
 static void do_bcj(const char *arch, const char *direction, const char *start_text, const char *data_hex) {
     size_t len, done;
@@ -677,6 +785,8 @@ int main(void) {
                 puts("bad");
         } else if (count == 4 && strcmp(words[0], "mtcode") == 0)
             do_mtcode(words[1], words[2], words[3]);
+        else if (count == 4 && strcmp(words[0], "mtdec") == 0)
+            do_mtdec(words[1], words[2], words[3]);
         else if (count == 5 && strcmp(words[0], "bcj") == 0)
             do_bcj(words[1], words[2], words[3], words[4]);
         else if (count == 2 && strcmp(words[0], "bound") == 0)

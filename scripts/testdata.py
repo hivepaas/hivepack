@@ -231,7 +231,7 @@ LZ4_FLAGS = ["-DXXH_NAMESPACE=LZ4_"]
 # their filters (see tools/xz-oracle/config.h); only their headers, which
 # the filter tables include, are on the include path.
 LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder", "delta", "simple"]
-LIBLZMA_LEFT_OUT = ["stream_decoder_mt", "hardware_",
+LIBLZMA_LEFT_OUT = ["hardware_",
                     "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
 
 

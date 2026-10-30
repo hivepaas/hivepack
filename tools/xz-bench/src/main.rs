@@ -4,13 +4,14 @@
 //! give the input back, and the same Streams.
 //!
 //! ```text
-//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--filter FILTER] [--compress [--threads N]] [--rounds 3] [--seconds 1] PATH...
+//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--filter FILTER] [--threads N] [--compress] [--rounds 3] [--seconds 1] PATH...
 //! ```
 //!
 //! With `--filter`, the Streams have that filter before LZMA2: `x86`,
 //! `powerpc`, `ia64`, `arm`, `armthumb`, `arm64`, `sparc`, `riscv`, or
 //! `delta:<distance>`. With `--threads`, the threaded encoders write them,
-//! in Blocks of the preset's size, and both must write the same Streams.
+//! in Blocks of the preset's size, and both must write the same Streams; and
+//! without `--compress`, the threaded decoders decode those.
 //!
 //! Each run is one call, with all the input and room for all the output,
 //! on a new .xz decoder or encoder.
@@ -60,8 +61,15 @@ impl Filter {
 
 trait Codec {
     fn name(&self) -> String;
-    /// Decodes `input`, whose content is `size` bytes long.
-    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
+    /// Decodes `input`, whose content is `size` bytes long, in `threads`
+    /// threads if any.
+    fn decompress(
+        &mut self,
+        threads: Option<u32>,
+        input: &[u8],
+        size: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<()>;
     /// Encodes `input` as a .xz Stream at `preset`, with `check`, and
     /// `filter` before LZMA2 if any, in `threads` threads if any.
     fn compress(
@@ -202,9 +210,22 @@ impl Codec for Liblzma {
         }
     }
 
-    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
-        let mut stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0)
-            .map_err(|e| format!("liblzma: {e}"))?;
+    fn decompress(
+        &mut self,
+        threads: Option<u32>,
+        input: &[u8],
+        size: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut stream = match threads {
+            Some(threads) => liblzma::stream::MtStreamBuilder::new()
+                .threads(threads)
+                .memlimit_threading(u64::MAX)
+                .memlimit_stop(u64::MAX)
+                .decoder(),
+            None => liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0),
+        }
+        .map_err(|e| format!("liblzma: {e}"))?;
         output.clear();
         output.resize(size, 0);
         match stream.process(input, output, liblzma::stream::Action::Finish) {
@@ -281,9 +302,21 @@ impl Codec for Port {
         }
     }
 
-    fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()> {
-        let mut stream =
-            hivepack_xz::Stream::stream_decoder(u64::MAX, 0).map_err(|e| format!("port: {e}"))?;
+    fn decompress(
+        &mut self,
+        threads: Option<u32>,
+        input: &[u8],
+        size: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut stream = match threads {
+            Some(threads) => hivepack_xz::Stream::stream_decoder_mt(&hivepack_xz::MtOptions {
+                threads,
+                ..hivepack_xz::MtOptions::default()
+            }),
+            None => hivepack_xz::Stream::stream_decoder(u64::MAX, 0),
+        }
+        .map_err(|e| format!("port: {e}"))?;
         output.clear();
         output.resize(size, 0);
         let mut out = hivepack_xz::OutBuffer::new(output);
@@ -356,7 +389,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--filter FILTER] [--compress [--threads N]] [--rounds N] [--seconds S] PATH..."
+                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--filter FILTER] [--threads N] [--compress] [--rounds N] [--seconds S] PATH..."
                         .into(),
                 );
             }
@@ -466,7 +499,7 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
                     seconds
                 } else {
                     let seconds = time(options.budget, || {
-                        codec.decompress(&compressed, data.len(), &mut scratch)
+                        codec.decompress(options.threads, &compressed, data.len(), &mut scratch)
                     })?;
                     if scratch != data {
                         return Err(format!(

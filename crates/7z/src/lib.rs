@@ -4,8 +4,8 @@
 //! [`Archive::open`] reads an archive's headers (`SzArEx_Open`), encoded
 //! ones included, and lists its files: their names, sizes, attributes,
 //! times and CRCs. A file's data comes from its folder, a stream that may
-//! hold several files (a solid block), compressed with Copy, LZMA or
-//! LZMA2, after a branch converter (x86 BCJ, ARM, ARM-Thumb, ARM64, PowerPC,
+//! hold several files (a solid block), compressed with Copy, LZMA, LZMA2 or
+//! PPMd, after a branch converter (x86 BCJ, ARM, ARM-Thumb, ARM64, PowerPC,
 //! SPARC, IA-64, RISC-V), the delta filter or BCJ2:
 //!
 //! - [`Archive::extract`] decodes a file's whole folder, as
@@ -37,6 +37,7 @@ mod bcj2;
 mod bra;
 mod dec;
 mod error;
+mod ppmd7;
 
 use std::io::{self, Read, Seek};
 

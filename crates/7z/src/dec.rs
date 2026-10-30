@@ -22,6 +22,7 @@ use crate::arc_in::{self, Ar, Folder, Sd};
 use crate::bcj2::{self, Bcj2Dec, Delta};
 use crate::bra;
 use crate::error::{Error, Result};
+use crate::ppmd7::{self, ByteIn, Ppmd7};
 
 /// `k_Copy`.
 const K_COPY: u32 = 0;
@@ -50,12 +51,15 @@ const K_ARM: u32 = 0x3030501;
 /// `k_SPARC`.
 const K_SPARC: u32 = 0x3030805;
 
+/// `k_PPMD`.
+const K_PPMD: u32 = 0x30401;
+
 /// How much of a packed stream is read at a time.
 const PACK_BUF_SIZE: usize = 1 << 16;
 
 /// `IS_MAIN_METHOD`.
 fn is_main_method(m: u32) -> bool {
-    matches!(m, K_COPY | K_LZMA | K_LZMA2)
+    matches!(m, K_COPY | K_LZMA | K_LZMA2 | K_PPMD)
 }
 
 /// `IS_SUPPORTED_CODER`.
@@ -192,6 +196,69 @@ enum Main {
     Copy,
     /// `SzDecodeLzma` and `SzDecodeLzma2`.
     Lzma(Box<Stream>),
+    /// `SzDecodePpmd`; the range decoder is started by the first read.
+    Ppmd(Box<Ppmd7>, bool),
+}
+
+/// `CByteInToLook`: the range decoder's bytes, from a packed stream. Past
+/// its end they are 0, and `extra` tells.
+struct PackBytes<'a, R> {
+    input: &'a mut PackReader,
+    reader: &'a mut R,
+    extra: bool,
+    res: Option<Error>,
+}
+
+impl<R: Read + Seek> ByteIn for PackBytes<'_, R> {
+    #[inline(always)]
+    fn read_byte(&mut self) -> u8 {
+        let input = &mut *self.input;
+        if input.start < input.len {
+            let b = input.buf[input.start];
+            input.start += 1;
+            return b;
+        }
+        match input.fill(self.reader, Error::Data) {
+            Ok(buf) if !buf.is_empty() => {
+                let b = buf[0];
+                input.consume(1);
+                b
+            }
+            Ok(_) => {
+                self.extra = true;
+                0
+            }
+            Err(e) => {
+                self.extra = true;
+                self.res = Some(e);
+                0
+            }
+        }
+    }
+}
+
+impl<R> PackBytes<'_, R> {
+    /// What `SzDecodePpmd` returns for a decoding that stopped.
+    fn error(&self) -> Error {
+        self.res.unwrap_or(Error::Data)
+    }
+}
+
+/// `SzDecodePpmd`'s checks of its properties, and the decoder for them.
+fn ppmd_decoder(props: &[u8]) -> Result<Box<Ppmd7>> {
+    if props.len() != 5 {
+        return Err(Error::Unsupported);
+    }
+    let order = u32::from(props[0]);
+    let mem_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+    if !(ppmd7::MIN_ORDER..=ppmd7::MAX_ORDER).contains(&order)
+        || !(ppmd7::MIN_MEM_SIZE..=ppmd7::MAX_MEM_SIZE).contains(&mem_size)
+    {
+        return Err(Error::Unsupported);
+    }
+    let mut ppmd = Ppmd7::new(mem_size)?;
+    ppmd.init(order);
+    Ok(ppmd)
 }
 
 struct MainCoder {
@@ -279,6 +346,7 @@ impl MainCoder {
             }
             K_LZMA => Main::Lzma(Box::new(lzma_decoder(props, out_size, false)?)),
             K_LZMA2 => Main::Lzma(Box::new(lzma_decoder(props, out_size, true)?)),
+            K_PPMD => Main::Ppmd(ppmd_decoder(props)?, false),
             _ => return Err(Error::Unsupported),
         };
         Ok(MainCoder {
@@ -309,6 +377,29 @@ impl MainCoder {
                 self.input.consume(n);
                 self.out_pos += n as u64;
                 Ok(n)
+            }
+            Main::Ppmd(ppmd, started) => {
+                let mut bytes = PackBytes {
+                    input: &mut self.input,
+                    reader: r,
+                    extra: false,
+                    res: None,
+                };
+                if !*started {
+                    *started = true;
+                    if !ppmd.range_dec_init(&mut bytes) || bytes.extra {
+                        return Err(bytes.error());
+                    }
+                }
+                for b in out.iter_mut() {
+                    let sym = ppmd.decode_symbol(&mut bytes);
+                    if bytes.extra || sym < 0 {
+                        return Err(bytes.error());
+                    }
+                    *b = sym as u8;
+                }
+                self.out_pos += want as u64;
+                Ok(want)
             }
             Main::Lzma(stream) => loop {
                 let buf = if self.input.remaining() == 0 {
@@ -352,6 +443,23 @@ impl MainCoder {
     /// The checks at the end of the output: all of the input read, and, for
     /// LZMA, the end of its stream.
     fn finish<R: Read + Seek>(&mut self, r: &mut R) -> Result<()> {
+        if let Main::Ppmd(ppmd, started) = &mut self.method {
+            if !*started {
+                *started = true;
+                let mut bytes = PackBytes {
+                    input: &mut self.input,
+                    reader: r,
+                    extra: false,
+                    res: None,
+                };
+                if !ppmd.range_dec_init(&mut bytes) || bytes.extra {
+                    return Err(bytes.error());
+                }
+            }
+            if !ppmd.range_dec_is_finished_ok() {
+                return Err(Error::Data);
+            }
+        }
         if let Main::Lzma(stream) = &mut self.method
             && !self.ended
         {

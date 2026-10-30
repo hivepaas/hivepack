@@ -269,7 +269,9 @@ def zip_err_str(lib: Path) -> str:
 
 # UnRAR's library build (`make lib`): -DRARDLL, as its makefile defines it,
 # without RAR_SMP, the threads, which give the same output.
-UNRAR_FLAGS = ["-DRARDLL", "-D_FILE_OFFSET_BITS=64", "-D_LARGEFILE_SOURCE"]
+# Signed chars, as on x86-64, whose UnRAR the port follows: `char` is unsigned
+# on Linux on ARM, and names that are not UTF-8 would decode differently.
+UNRAR_FLAGS = ["-DRARDLL", "-D_FILE_OFFSET_BITS=64", "-D_LARGEFILE_SOURCE", "-fsigned-char"]
 
 
 def unrar_sources(unrar: Path) -> list:

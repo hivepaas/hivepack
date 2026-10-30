@@ -30,7 +30,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#ifdef __linux__
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 static std::string out;
@@ -287,14 +289,20 @@ static void do_list(int enable_broken, const char *hex) {
   std::vector<byte> data = unhex(hex);
   // In memory, not in /tmp: how far a damaged header can seek depends on the
   // file system. ext4 refuses to seek past 16 TiB, which UnRAR takes for a
-  // fatal error, and tmpfs and this file do not.
+  // fatal error, and tmpfs and this file do not. Only Linux's answers are
+  // compared, so elsewhere a file will do.
+  char path[64];
+#ifdef __linux__
   int fd = memfd_create("rar-oracle", 0);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+#else
+  snprintf(path, sizeof(path), "/tmp/rar-oracle-XXXXXX");
+  int fd = mkstemp(path);
+#endif
   if (fd < 0 || (data.size() && write(fd, data.data(), data.size()) != (ssize_t)data.size())) {
     printf("error writing\n");
     return;
   }
-  char path[64];
-  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
 
   out = "list";
   ErrHandler.Clean();
@@ -331,6 +339,9 @@ static void do_list(int enable_broken, const char *hex) {
   }
   put("exit", ErrHandler.GetErrorCode());
   close(fd);
+#ifndef __linux__
+  unlink(path);
+#endif
   printf("%s\n", out.c_str());
 }
 

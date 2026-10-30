@@ -134,7 +134,12 @@ impl<R: ReadAt> Archive<R> {
         self.exit_code
     }
 
-    fn cursor(&mut self) -> Cursor<'_> {
+    /// Where the next read starts: `Tell`.
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    pub(crate) fn cursor(&mut self) -> Cursor<'_> {
         Cursor {
             src: &self.src,
             pos: &mut self.pos,
@@ -145,7 +150,7 @@ impl<R: ReadAt> Archive<R> {
         self.cursor().read(buf)
     }
 
-    fn seek(&mut self, pos: u64) {
+    pub(crate) fn seek(&mut self, pos: u64) {
         self.pos = pos;
     }
 
@@ -327,7 +332,7 @@ impl<R: ReadAt> Archive<R> {
         size as u32
     }
 
-    fn set_error_code(&mut self, code: ExitCode) {
+    pub(crate) fn set_error_code(&mut self, code: ExitCode) {
         self.exit_code = self.exit_code.set(code);
     }
 

@@ -213,7 +213,7 @@ BZIP2_SOURCES = [
 # with, without its LZMA assembly loop and with PPMd, as it builds it.
 SEVENZ_SOURCES = [
     "Bcj2.c", "Bra.c", "Bra86.c", "BraIA64.c", "CpuArch.c", "Delta.c", "Lzma2Dec.c", "LzmaDec.c",
-    "Ppmd7.c", "Ppmd7Dec.c", "7zCrc.c", "7zCrcOpt.c", "7zAlloc.c", "7zArcIn.c", "7zBuf.c",
+    "Ppmd7.c", "Ppmd7Dec.c", "Ppmd8.c", "Ppmd8Dec.c", "Ppmd8Enc.c", "7zCrc.c", "7zCrcOpt.c", "7zAlloc.c", "7zArcIn.c", "7zBuf.c",
     "7zBuf2.c", "7zDec.c", "7zFile.c", "7zStream.c",
 ]
 SEVENZ_FLAGS = ["-DZ7_PPMD_SUPPORT", "-DZ7_EXTRACT_ONLY"]

@@ -314,7 +314,7 @@
     {
       "name": "7z-oracle",
       "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/oracle.c"] },
-      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
+      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder and PPMd var.I from 7-Zip 26.05",
       "license": "MIT (the program), public domain (the LZMA SDK's files)",
       "kind": "tool"
     },
@@ -385,6 +385,13 @@
       "name": "libarchive-rar",
       "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/*rar*.uu" },
       "source": "libarchive 3.8.10's RAR test archives (libarchive/test/*rar*.uu), decoded",
+      "license": "BSD-2-Clause",
+      "kind": "archives"
+    },
+    {
+      "name": "libarchive-zip-ppmd",
+      "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/test_read_format_zip*ppmd*.uu" },
+      "source": "libarchive 3.8.10's ZIP test archives with PPMd entries (libarchive/test/test_read_format_zip*ppmd*.uu), decoded",
       "license": "BSD-2-Clause",
       "kind": "archives"
     },

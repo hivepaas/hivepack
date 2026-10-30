@@ -27,9 +27,10 @@ pub enum ErrorKind {
     /// A symbolic link, which is not created (see
     /// [`Links`](crate::Links)).
     Link,
-    /// A tar hard link whose target is not a file extracted before it.
+    /// A hard link (tar, ISO 9660) whose target is not a file extracted
+    /// before it.
     HardLinkTarget,
-    /// A tar device or FIFO: nothing is created as one.
+    /// A device or FIFO (tar, ISO 9660): nothing is created as one.
     Special,
     /// A link whose target is refused, as a name is
     /// ([`NameError::Dot`] for one that climbs out of the destination).
@@ -66,7 +67,16 @@ pub enum ErrorKind {
     Archive(hivepack_zip::Error),
     /// The tar archive could not be read.
     Tar(hivepack_tar::Error),
-    /// The tar archive read again, to write it, is not the one checked.
+    /// The ISO 9660 image could not be read.
+    Iso(hivepack_iso::Error),
+    /// An entry of the ISO 9660 image that libarchive gives with something
+    /// missing ([`hivepack_iso::Warning`]): a directory left out with what
+    /// it holds, a file past the image's end or whose data is before its
+    /// directory, a name not in UTF-16, a part of a file's data out of
+    /// place.
+    IsoEntry(hivepack_iso::Warning),
+    /// The tar archive or ISO 9660 image read again, to write it, is not
+    /// the one checked.
     Changed,
     /// The destination could not be written.
     Io(std::io::Error),
@@ -113,6 +123,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Origin(e) => write!(f, "mark of origin not written: {e}"),
             ErrorKind::Archive(e) => write!(f, "archive: {e}"),
             ErrorKind::Tar(e) => write!(f, "archive: {e}"),
+            ErrorKind::Iso(e) => write!(f, "image: {e}"),
+            ErrorKind::IsoEntry(w) => write!(f, "entry with something missing: {w}"),
             ErrorKind::Changed => f.write_str("the archive changed between its two readings"),
             ErrorKind::Io(e) => write!(f, "{e}"),
         }
@@ -138,6 +150,7 @@ impl std::error::Error for Error {
         match &self.kind {
             ErrorKind::Archive(e) => Some(e),
             ErrorKind::Tar(e) => Some(e),
+            ErrorKind::Iso(e) => Some(e),
             ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }

@@ -51,21 +51,22 @@ impl Seen {
     }
 }
 
-/// An entry of the archive, as the first reading saw it.
-struct Entry {
-    seen: Seen,
+/// An entry of the archive, as the first reading saw it: what the second
+/// reading must see again (`S`), and what it is to become.
+pub(crate) struct Entry<S> {
+    pub(crate) seen: S,
     /// Its place in `items`, if it is to be extracted at all (global PAX
     /// headers, volume labels and `./` are not).
-    item: Option<usize>,
+    pub(crate) item: Option<usize>,
     /// A link's target: a symbolic link's as written, a hard link's as a
     /// name in the archive.
-    target: Vec<u8>,
+    pub(crate) target: Vec<u8>,
 }
 
 /// The name of an entry or of a hard link's target as the options take
 /// it, a leading `./` dropped (`tar -cf x.tar .` writes every name so):
 /// `None` for the archive's root, `./` itself.
-fn name_of(raw: &[u8], options: &Options) -> Option<Result<Name, NameError>> {
+pub(crate) fn name_of(raw: &[u8], options: &Options) -> Option<Result<Name, NameError>> {
     if raw.iter().any(u8::is_ascii_control) {
         return Some(Err(NameError::Control));
     }
@@ -103,7 +104,7 @@ fn read_headers<R: Read>(
     r: R,
     run: &Run<'_>,
     options: &Options,
-) -> Result<(Vec<Entry>, Vec<Item>), Error> {
+) -> Result<(Vec<Entry<Seen>>, Vec<Item>), Error> {
     let mut tr = Reader::new(r);
     let mut entries = Vec::new();
     let mut items = Vec::new();
@@ -189,7 +190,7 @@ fn read_headers<R: Read>(
 /// far past it: what is read is limited to
 /// [`Limits::max_total_size`](crate::Limits::max_total_size), or 1 MiB if
 /// that is less, the largest record tar pads an archive to (`-b 2048`).
-fn read_rest<R: Read>(mut r: R, run: &Run<'_>, options: &Options) -> Result<(), Error> {
+pub(crate) fn read_rest<R: Read>(mut r: R, run: &Run<'_>, options: &Options) -> Result<(), Error> {
     let limit = options.limits.max_total_size.max(1 << 20);
     let mut buf = vec![0u8; 64 << 10];
     let mut total = 0u64;
@@ -210,7 +211,7 @@ fn read_rest<R: Read>(mut r: R, run: &Run<'_>, options: &Options) -> Result<(), 
 }
 
 /// What to do with a link once the entries are checked.
-enum LinkPlan {
+pub(crate) enum LinkPlan {
     /// A symbolic link to create last, with its target, and whether it
     /// leads to a directory.
     Symlink(String, bool),
@@ -224,8 +225,8 @@ enum LinkPlan {
 /// and not pass through another link (with [`Links::Inside`]); a hard
 /// link's must name a file extracted before it. Those refused and skipped
 /// go to `skipped`.
-fn plan_links(
-    entries: &[Entry],
+pub(crate) fn plan_links<S>(
+    entries: &[Entry<S>],
     items: &[Item],
     kept: &[&Item],
     options: &Options,
@@ -479,8 +480,8 @@ pub fn extract_tar<R: Read, F: FnMut() -> io::Result<R>>(
 /// The bytes the second reading is to write: the files' data, and with
 /// [`Links::AsFile`] the targets of symbolic links and the copies of hard
 /// links, which tar's sizes do not count.
-fn bytes_to_write(
-    entries: &[Entry],
+pub(crate) fn bytes_to_write<S>(
+    entries: &[Entry<S>],
     items: &[Item],
     kept: &std::collections::HashSet<u64>,
     plans: &HashMap<u64, LinkPlan>,
@@ -558,7 +559,7 @@ fn write_from(
 
 /// Writes a copy of the file at `target` into `file`, for a hard link
 /// with [`Links::AsFile`]: its bytes count as written.
-fn copy_of(
+pub(crate) fn copy_of(
     destination: &Destination<'_>,
     target: &[String],
     item: &Item,
@@ -584,7 +585,11 @@ fn copy_of(
 
 /// A file's mark of origin, time and permissions, once its data is
 /// written.
-fn finish_file(file: &std::fs::File, item: &Item, options: &Options) -> Result<(), ErrorKind> {
+pub(crate) fn finish_file(
+    file: &std::fs::File,
+    item: &Item,
+    options: &Options,
+) -> Result<(), ErrorKind> {
     // The mark first: writing a stream can change the file's time.
     if let Some(origin) = &options.origin {
         origin.write_file(file).map_err(ErrorKind::Origin)?;

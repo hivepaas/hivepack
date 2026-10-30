@@ -29,6 +29,11 @@ The reader keeps its records in lists linked through pointers inside them, one r
 - **The volume descriptors are looked for in 16 MiB.** With the image in memory, libarchive looks until the Volume Descriptor Set Terminator or the end, holding everything it looked at; the port, which holds it too, stops at 8,192 descriptors. Real images have a handful.
 - **Not ported:** the writer (`archive_write_set_format_iso9660.c`). The reader's options are both here: `set_joliet` and `set_rock_ridge`.
 
+## What libarchive gives that a reader should know
+
+- **A zisofs file's data can end before its size.** zisofs stores a block of zeros as nothing; libarchive gives such a block as zeros when compressed blocks come after it, but stops at the last compressed byte, so the blocks of zeros at a file's end are not given (libarchive's own test image `test_read_format_iso_zisofs` has a file of 12,345,684 bytes whose data, as libarchive reads it, is its first 32 KiB). libarchive's extraction (`archive_write_disk`) makes the file its size with zeros, and so does `hivepack_extract::extract_iso`.
+- **The data of a damaged zisofs file can go past its size**, by the blocks of zeros its block pointers claim: extractors write up to the size.
+
 ## Bounded resources
 
 As in libarchive: a directory is read whole, up to the 4 GiB its size field holds, and the records of the whole image are kept while it is read. Both take memory only as the image has the bytes: a directory larger than the image fails. A zisofs file's block pointers take at most 512 KiB, and its decompressed block at most 128 KiB; its data can be far larger than the image (blocks of zeros cost nothing), so readers bound what they take, as hivepack-extract does.

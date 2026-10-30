@@ -52,13 +52,15 @@
 //! ```
 //!
 //! [`extract_tar`] extracts tar archives with the same rules, reading them
-//! twice: once to check, once to write.
+//! twice: once to check, once to write; [`extract_iso`] ISO 9660 images, the
+//! same way.
 //!
 //! The design, and what comes next (RAR), are in the repository's
 //! `docs/extract.md`.
 
 mod destination;
 mod error;
+mod iso;
 mod name;
 mod origin;
 mod plan;
@@ -68,6 +70,7 @@ mod unicode;
 mod zip;
 
 pub use error::{Error, ErrorKind};
+pub use iso::extract_iso;
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};
 pub use origin::Origin;
 pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};

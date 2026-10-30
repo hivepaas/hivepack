@@ -200,6 +200,13 @@ test = false
 doc = false
 
 [[bin]]
+name = "extract_iso"
+path = "fuzz_targets/extract_iso.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

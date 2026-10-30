@@ -150,24 +150,24 @@ fn decoder_options(threads: u32) -> MtOptions {
 }
 
 /// `xz` decoded by the threaded decoder with LZMA_FINISH and `room` bytes of
-/// output space per call: the data, and the calls that made no progress.
+/// output space per call: the data, and the calls that returned with room
+/// left before the end, which without a timeout they do not.
 fn decode_mt(options: &MtOptions, xz: &[u8], room: usize) -> (Vec<u8>, usize) {
     let mut strm = Stream::stream_decoder_mt(options).unwrap();
     let mut out = Vec::new();
     let mut input = InBuffer::new(xz);
-    let mut idle = 0;
+    let mut early = 0;
     loop {
         let written = out.len();
         out.resize(written + room, 0);
-        let before = input.pos;
         let mut output = OutBuffer::new(&mut out[written..]);
         let status = strm.code(&mut output, &mut input, Action::Finish).unwrap();
         let made = output.pos;
         out.truncate(written + made);
-        idle += usize::from(made == 0 && input.pos == before);
         if status == Status::StreamEnd {
-            return (out, idle);
+            return (out, early);
         }
+        early += usize::from(made < room);
     }
 }
 
@@ -181,10 +181,14 @@ fn the_decoder_with_a_timeout_returns_early_with_the_same_output() {
         timeout: 1,
         ..decoder_options(1)
     };
-    let (out, idle) = decode_mt(&with, &xz, 1 << 24);
+    let (out, early) = decode_mt(&with, &xz, 1 << 24);
     assert!(out == data);
-    // Each Block takes much longer than a millisecond.
-    assert!(idle > 0, "no call timed out");
+    // All of it takes much longer than a millisecond.
+    assert!(early > 0, "no call timed out");
+    // Without a timeout, the call returns when it has filled the output.
+    let (out, early) = decode_mt(&decoder_options(1), &xz, 1 << 16);
+    assert!(out == data);
+    assert_eq!(early, 0);
 }
 
 #[test]
@@ -315,8 +319,10 @@ fn fail_fast_reports_an_error() {
     let mut output = OutBuffer::new(&mut out);
     let ret = strm.code(&mut output, &mut InBuffer::new(&xz), Action::Finish);
     assert!(ret.is_err(), "{ret:?}");
-    let written = output.pos;
-    assert_eq!(out[..written], data[..written]);
+    // Up to the damaged Block, whose damage may have come out before its
+    // check was read. The Blocks are of 64 KiB.
+    let written = output.pos.min(data.len() - (128 << 10));
+    assert!(out[..written] == data[..written]);
     // Without it, all the output before the error comes first.
     let mut strm = Stream::stream_decoder_mt(&decoder_options(4)).unwrap();
     let mut output = OutBuffer::new(&mut out);

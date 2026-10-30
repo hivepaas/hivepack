@@ -70,6 +70,7 @@ jobs:
       - run: cargo check -p hivepack-lz4 --lib --locked --features unsafe-fast
       - run: cargo check -p hivepack-open --lib --locked
       - run: cargo check -p hivepack-tar --lib --locked
+      - run: cargo check -p hivepack-udf --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast
@@ -437,6 +438,9 @@ jobs:
               pathlib.Path(f"fuzz/corpus/open/a{i}").write_bytes(b"\0" + bytes.fromhex(answer.split(" ")[1]))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu open -- -max_total_time=30
+      - name: Seed the UDF corpus with the descriptors of the test images
+        run: python3 tools/udf-images/seed.py fuzz/corpus/udf
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu udf -- -max_total_time=60 -rss_limit_mb=4096 -max_len=400000
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

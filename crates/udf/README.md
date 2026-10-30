@@ -18,7 +18,7 @@ for entry in entries {
 }
 ```
 
-`Udf::open` mounts the volume, trying the usual sector sizes. A directory's entries come as NetBSD lists them (with `..`, without hidden ones unless `Options::unhide`); `node` reads an entry's node, `stat` gives its attributes, `read_link` a link's target, and `read_at` or `file` a file's data. Errors are NetBSD's errno values, with what failed. Extracting to disk, with its checks on names and links, belongs to hivepack-extract.
+`Udf::open` mounts the volume, trying the usual sector sizes. A directory's entries come as NetBSD lists them (with `..`, without hidden ones unless `Options::unhide`); `node` reads an entry's node, `stat` gives its attributes, `read_link` a link's target, and `read_at` or `file` a file's data. Errors are NetBSD's errno values, with what failed. Extracting to disk, with its checks on names and links, belongs to hivepack-extract (`extract_udf`), and telling a UDF volume from what else a file is to hivepack-open.
 
 How the port follows NetBSD, where it does not, and how it is checked, is in [docs/udf.md](../../docs/udf.md).
 

@@ -92,9 +92,18 @@ impl std::error::Error for Error {
     }
 }
 
+/// The image's read error, or the [`Error`] an `io::Error` holds (from
+/// [`File`](crate::File)'s reads).
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {
-        Error::Io(e)
+        match e.get_ref().map(|inner| inner.is::<Error>()) {
+            Some(true) => match e.into_inner().map(|inner| inner.downcast::<Error>()) {
+                Some(Ok(inner)) => *inner,
+                Some(Err(other)) => Error::Io(io::Error::new(io::ErrorKind::InvalidData, other)),
+                None => Error::new(Errno::EIO, "read error"),
+            },
+            _ => Error::Io(e),
+        }
     }
 }
 

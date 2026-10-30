@@ -300,7 +300,7 @@ When streaming, the port follows libzstd's ring buffer exactly: its size, when t
   - custom allocators (`ZSTD_customMem`);
   - static contexts (`ZSTD_initStatic*`);
   - the sizes of C structures (`ZSTD_sizeof_*`, `ZSTD_estimate*Size`);
-  - libzstd's own threads (the port's workers are Rust threads), and its thread pools shared between contexts;
+  - libzstd's own threads (the port's workers, and the pools that contexts share, are Rust threads);
   - `ZSTD_trace`.
 - Deprecated functions that other calls replace: `ZSTD_initDStream_usingDict`, `ZSTD_initDStream_usingDDict` and `ZSTD_resetDStream` are `reset` followed by `load_dictionary` or `ref_ddict`; `ZSTD_initCStream_srcSize`, `ZSTD_initCStream_advanced` and `ZSTD_resetCStream` are `reset` followed by `set_pledged_src_size` and `set_parameter`.
 - The bufferless streaming API (see above), and its compression side (`ZSTD_compressBegin`, `ZSTD_compressContinue`, `ZSTD_compressEnd`, `ZSTD_compressBlock`), which keeps the caller's earlier input buffers as the window between calls. The port has them inside, for `compress_stream2`.

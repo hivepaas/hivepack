@@ -53,6 +53,7 @@
 
 mod decoder;
 mod lz4;
+mod lz4_compress;
 mod lz4frame;
 mod xxhash;
 
@@ -65,6 +66,10 @@ pub mod block {
         decompress_safe_partial, decompress_safe_partial_using_dict,
         decompress_safe_partial_with_prefix, decompress_safe_using_dict,
         decompress_safe_with_prefix, version_number, version_string,
+    };
+    pub use crate::lz4_compress::{
+        ACCELERATION_DEFAULT, ACCELERATION_MAX, State, compress_default, compress_dest_size,
+        compress_fast,
     };
 }
 

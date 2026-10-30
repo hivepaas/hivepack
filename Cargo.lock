@@ -214,6 +214,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-open"
+version = "0.0.0"
+dependencies = [
+ "bzip2",
+ "flate2",
+ "hivepack-age",
+ "hivepack-bzip2",
+ "hivepack-deflate",
+ "hivepack-extract",
+ "hivepack-tar",
+ "hivepack-xz",
+ "hivepack-zstd",
+ "liblzma",
+ "zstd",
+]
+
+[[package]]
 name = "hivepack-tar"
 version = "0.0.0"
 dependencies = [

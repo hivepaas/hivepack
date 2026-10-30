@@ -68,6 +68,18 @@ pub trait Identity {
     }
 }
 
+/// A file key known already, from [`Decryptor::file_key`]:
+/// `NewInjectedFileKeyIdentity`. It unwraps it for any header; the header's
+/// MAC then tells whether it is the file's.
+#[derive(Clone, Debug)]
+pub struct FileKeyIdentity(pub FileKey);
+
+impl Identity for FileKeyIdentity {
+    fn unwrap(&self, _stanzas: &[Stanza]) -> Result<FileKey, UnwrapError> {
+        Ok(self.0.clone())
+    }
+}
+
 /// `ErrIncorrectIdentity`'s message.
 pub(crate) const INCORRECT_IDENTITY: &str = "incorrect identity for recipient block";
 
@@ -160,6 +172,7 @@ pub fn decrypt<R: BufRead>(
     Ok(Decryptor {
         stanza_types: hdr.recipients.iter().map(|s| s.kind.clone()).collect(),
         reader: DecryptReader::new(stream_key(&file_key.0, &nonce), src),
+        file_key,
     })
 }
 
@@ -172,6 +185,7 @@ pub fn decrypt<R: BufRead>(
 #[derive(Debug)]
 pub struct Decryptor<R> {
     stanza_types: Vec<String>,
+    file_key: FileKey,
     reader: DecryptReader<R>,
 }
 
@@ -179,6 +193,13 @@ impl<R> Decryptor<R> {
     /// The types of the header's recipient stanzas, such as `X25519`.
     pub fn stanza_types(&self) -> &[String] {
         &self.stanza_types
+    }
+
+    /// The file key the header's stanza unwrapped, checked against its MAC:
+    /// with [`FileKeyIdentity`], the same file decrypts again without its
+    /// identity, its passphrase asked for or scrypt run again.
+    pub fn file_key(&self) -> &FileKey {
+        &self.file_key
     }
 }
 

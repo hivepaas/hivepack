@@ -231,6 +231,12 @@ pub struct Stream {
     internal: Internal,
 }
 
+// A stream can be moved to another thread.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Stream>();
+};
+
 impl Stream {
     fn new(next: Box<dyn common::NextCoder>) -> Stream {
         Stream {

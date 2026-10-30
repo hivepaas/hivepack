@@ -9,14 +9,24 @@
 //! by the SDK's `LzmaDec.c`: the output is the same, and on damaged data
 //! either may stop at another byte, with the same error. liblzma takes no
 //! LZMA properties with `lc + lp` above 4, though, which `lzma_dec` decodes.
+//!
+//! The folders the SDK decodes take its path, with its checks. Others, which
+//! the SDK answers `SZ_ERROR_UNSUPPORTED`, are decoded as 7-Zip's program
+//! decodes them: any graph of coders, with more methods. Each coder's stream
+//! must end where its output does and its input must be read to its end,
+//! which `7zz t` calls an error too.
 
 use std::io::{Read, Seek};
 
+use hivepack_bzip2::Decompress;
+use hivepack_crypto::AES_BLOCK_LENGTH;
+use hivepack_deflate::{Flush, Inflate, Inflate9};
 use hivepack_xz::{
     Action, FILTER_LZMA1EXT, Filter, FilterOptions, InBuffer, LZMA1EXT_ALLOW_EOPM, LzmaOptions,
     OutBuffer, Status, Stream,
 };
 
+use crate::aes7z::{AesCoder, Decoding, K_AES};
 use crate::arc_in::{self, Ar, Folder, Sd};
 use crate::bcj2::{self, Bcj2Dec, Delta};
 use crate::bra;
@@ -53,6 +63,14 @@ const K_SPARC: u32 = 0x3030805;
 
 /// `k_PPMD`.
 const K_PPMD: u32 = 0x30401;
+
+// What 7-Zip's program decodes and the SDK does not (`DOC/Methods.txt`).
+const K_SWAP2: u32 = 0x20302;
+const K_SWAP4: u32 = 0x20304;
+const K_DEFLATE: u32 = 0x40108;
+const K_DEFLATE64: u32 = 0x40109;
+const K_BZIP2: u32 = 0x40202;
+const K_ZSTD: u32 = 0x4F7_1101;
 
 /// How much of a packed stream is read at a time.
 const PACK_BUF_SIZE: usize = 1 << 16;
@@ -131,14 +149,17 @@ fn check_supported_folder(f: &Folder) -> Result<()> {
     Err(Error::Unsupported)
 }
 
-/// A packed stream: a range of the archive, read through a buffer of its
-/// own, so that several can be read in turns.
+/// A coder's input, read through a buffer of its own, so that several can be
+/// read in turns: a packed stream, a range of the archive, or another coder's
+/// output.
 struct PackReader {
     pos: u64,
     end: u64,
     buf: Vec<u8>,
     start: usize,
     len: usize,
+    /// The coder it comes from, whose bytes count from `pos` 0.
+    source: Option<Box<Node>>,
 }
 
 impl PackReader {
@@ -149,6 +170,15 @@ impl PackReader {
             buf: Vec::new(),
             start: 0,
             len: 0,
+            source: None,
+        }
+    }
+
+    /// The output of `node`, of `size` bytes.
+    fn from_node(node: Node, size: u64) -> Self {
+        PackReader {
+            source: Some(Box::new(node)),
+            ..PackReader::new(0, size)
         }
     }
 
@@ -165,14 +195,18 @@ impl PackReader {
                 self.buf = vec![0; PACK_BUF_SIZE];
             }
             let want = (self.end - self.pos).min(PACK_BUF_SIZE as u64) as usize;
-            arc_in::seek_to(r, self.pos)?;
             let mut got = 0;
-            while got < want {
-                match r.read(&mut self.buf[got..want]) {
-                    Ok(0) => break,
-                    Ok(n) => got += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => return Err(Error::Read),
+            if let Some(node) = &mut self.source {
+                got = node.read(r, &mut self.buf[..want])?;
+            } else {
+                arc_in::seek_to(r, self.pos)?;
+                while got < want {
+                    match r.read(&mut self.buf[got..want]) {
+                        Ok(0) => break,
+                        Ok(n) => got += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => return Err(Error::Read),
+                    }
                 }
             }
             if got == 0 {
@@ -188,6 +222,16 @@ impl PackReader {
     fn consume(&mut self, n: usize) {
         self.start += n;
     }
+
+    /// The checks of the coder it comes from, at the end of its output.
+    fn finish_source<R: Read + Seek>(&mut self, r: &mut R) -> Result<()> {
+        if let Some(node) = &mut self.source
+            && node.read(r, &mut [0u8; 1])? != 0
+        {
+            return Err(Error::Data);
+        }
+        Ok(())
+    }
 }
 
 /// A main method: a packed stream decoded into `out_size` bytes.
@@ -200,6 +244,59 @@ enum Main {
     LzmaDec(Box<LzmaDec>),
     /// `SzDecodePpmd`; the range decoder is started by the first read.
     Ppmd(Box<Ppmd7>, bool),
+    /// Deflate.
+    Inflate(Box<Inflate>),
+    /// Deflate64.
+    Inflate9(Box<Inflate9>),
+    /// BZip2: one stream after another, as 7-Zip reads them.
+    Bzip2(Box<Decompress>),
+    /// `7zAES`.
+    Aes(Box<AesCoder>),
+    /// Zstandard, which 7-Zip's program does not take in 7z, and forks of it
+    /// write: one frame after another.
+    Zstd(Box<hivepack_zstd::DCtx>),
+}
+
+/// What a step of a decoder from other crates did: the bytes it read and
+/// wrote, and whether its stream or frame ended.
+fn step(method: &mut Main, input: &[u8], out: &mut [u8]) -> Result<(usize, usize, bool)> {
+    match method {
+        Main::Inflate(z) => {
+            let mut i = hivepack_deflate::InBuffer::new(input);
+            let mut o = hivepack_deflate::OutBuffer::new(out);
+            let status = z
+                .inflate(&mut o, &mut i, Flush::SyncFlush)
+                .map_err(|_| Error::Data)?;
+            Ok((i.pos, o.pos, status == hivepack_deflate::Status::StreamEnd))
+        }
+        Main::Inflate9(z) => {
+            let mut i = hivepack_deflate::InBuffer::new(input);
+            let mut o = hivepack_deflate::OutBuffer::new(out);
+            let status = z.inflate(&mut o, &mut i).map_err(|_| Error::Data)?;
+            Ok((i.pos, o.pos, status == hivepack_deflate::Status::StreamEnd))
+        }
+        Main::Bzip2(z) => {
+            let mut i = hivepack_bzip2::InBuffer::new(input);
+            let mut o = hivepack_bzip2::OutBuffer::new(out);
+            let status = z.decompress(&mut o, &mut i).map_err(|_| Error::Data)?;
+            Ok((i.pos, o.pos, status == hivepack_bzip2::Status::StreamEnd))
+        }
+        Main::Zstd(z) => {
+            let mut i = hivepack_zstd::InBuffer::new(input);
+            let mut o = hivepack_zstd::OutBuffer::new(out);
+            let hint = z
+                .decompress_stream(&mut o, &mut i)
+                .map_err(|_| Error::Data)?;
+            Ok((i.pos, o.pos, hint == 0))
+        }
+        _ => Err(Error::Fail),
+    }
+}
+
+/// The largest window of Zstandard's that `limit` bytes hold, as a log.
+fn zstd_window_log_max(limit: u64) -> u32 {
+    let most = if usize::BITS == 64 { 31 } else { 30 };
+    limit.max(1).ilog2().clamp(10, most)
 }
 
 /// `CByteInToLook`: the range decoder's bytes, from a packed stream. Past
@@ -276,7 +373,7 @@ struct MainCoder {
     input: PackReader,
     out_size: u64,
     out_pos: u64,
-    /// liblzma's decoder has ended its stream.
+    /// The decoder has ended its stream.
     ended: bool,
 }
 
@@ -349,11 +446,11 @@ impl MainCoder {
     fn new(
         method_id: u32,
         props: &[u8],
-        pos: u64,
-        in_size: u64,
+        input: PackReader,
         out_size: u64,
         limit: &mut u64,
     ) -> Result<Self> {
+        let in_size = input.remaining();
         let method = match method_id {
             K_COPY => {
                 // Check it.
@@ -371,11 +468,22 @@ impl MainCoder {
             },
             K_LZMA2 => Main::Lzma(Box::new(lzma_decoder(props, out_size, true, limit)?)),
             K_PPMD => Main::Ppmd(ppmd_decoder(props, limit)?, false),
+            K_DEFLATE => Main::Inflate(Box::new(Inflate::new(-15).map_err(|_| Error::Mem)?)),
+            K_DEFLATE64 => Main::Inflate9(Box::new(Inflate9::new())),
+            K_BZIP2 => Main::Bzip2(Box::new(Decompress::new(false))),
+            K_ZSTD => {
+                let mut dctx = hivepack_zstd::DCtx::new();
+                dctx.set_parameter(hivepack_zstd::DParameter::WindowLogMax(
+                    zstd_window_log_max(*limit),
+                ))
+                .map_err(|_| Error::Fail)?;
+                Main::Zstd(Box::new(dctx))
+            }
             _ => return Err(Error::Unsupported),
         };
         Ok(MainCoder {
             method,
-            input: PackReader::new(pos, in_size),
+            input,
             out_size,
             out_pos: 0,
             ended: false,
@@ -440,6 +548,62 @@ impl MainCoder {
                 self.out_pos += n as u64;
                 Ok(n)
             }
+            Main::Aes(aes) => loop {
+                let n = aes.take(out);
+                if n > 0 {
+                    self.out_pos += n as u64;
+                    return Ok(n);
+                }
+                // As many whole blocks as there are, across the reads of a
+                // source that gives less than it is asked for.
+                let space = aes.space();
+                let mut filled = 0;
+                while filled < space.len() && self.input.remaining() > 0 {
+                    let buf = self.input.fill(r, Error::Data)?;
+                    let n = buf.len().min(space.len() - filled);
+                    space[filled..filled + n].copy_from_slice(&buf[..n]);
+                    self.input.consume(n);
+                    filled += n;
+                }
+                let whole = filled / AES_BLOCK_LENGTH * AES_BLOCK_LENGTH;
+                if whole == 0 {
+                    return Err(Error::Data);
+                }
+                aes.decrypt(whole);
+            },
+            Main::Inflate(_) | Main::Inflate9(_) | Main::Bzip2(_) | Main::Zstd(_) => loop {
+                let buf = if self.input.remaining() == 0 {
+                    &[][..]
+                } else {
+                    self.input.fill(r, Error::Data)?
+                };
+                let (read, written, ended) = step(&mut self.method, buf, out)?;
+                self.input.consume(read);
+                self.out_pos += written as u64;
+                self.ended = ended;
+                if ended && self.out_pos != self.out_size {
+                    // Another BZip2 stream or Zstandard frame may follow;
+                    // the others have only one stream.
+                    if self.input.remaining() == 0 {
+                        return Err(Error::Data);
+                    }
+                    match self.method {
+                        Main::Bzip2(_) => {
+                            self.method = Main::Bzip2(Box::new(Decompress::new(false)));
+                        }
+                        Main::Zstd(_) => {}
+                        _ => return Err(Error::Data),
+                    }
+                    self.ended = false;
+                }
+                if written > 0 {
+                    return Ok(written);
+                }
+                if read == 0 {
+                    // No progress.
+                    return Err(Error::Data);
+                }
+            },
             Main::Lzma(stream) => loop {
                 let buf = if self.input.remaining() == 0 {
                     &[][..]
@@ -482,6 +646,32 @@ impl MainCoder {
     /// The checks at the end of the output: all of the input read, and, for
     /// LZMA, the end of its stream.
     fn finish<R: Read + Seek>(&mut self, r: &mut R) -> Result<()> {
+        if matches!(self.method, Main::Aes(_)) {
+            // Whole blocks past the output are not looked at.
+            while self.input.remaining() > 0 {
+                let n = self.input.fill(r, Error::Data)?.len();
+                self.input.consume(n);
+            }
+        }
+        if matches!(
+            self.method,
+            Main::Inflate(_) | Main::Inflate9(_) | Main::Bzip2(_) | Main::Zstd(_)
+        ) {
+            // The decoder stops at the size: the end of its stream follows.
+            while !self.ended {
+                let buf = if self.input.remaining() == 0 {
+                    &[][..]
+                } else {
+                    self.input.fill(r, Error::Data)?
+                };
+                let (read, written, ended) = step(&mut self.method, buf, &mut [0u8; 1])?;
+                self.input.consume(read);
+                if written != 0 || (read == 0 && !ended) {
+                    return Err(Error::Data);
+                }
+                self.ended = ended;
+            }
+        }
         if let Main::Ppmd(ppmd, started) = &mut self.method {
             if !*started {
                 *started = true;
@@ -537,7 +727,7 @@ impl MainCoder {
         if self.input.remaining() != 0 {
             return Err(Error::Data);
         }
-        Ok(())
+        self.input.finish_source(r)
     }
 }
 
@@ -552,6 +742,8 @@ enum FilterKind {
     Ia64,
     Riscv,
     Delta(Box<Delta>),
+    /// Units of 2 or 4 bytes reversed.
+    Swap(usize),
 }
 
 /// How many bytes past the converted ones a branch converter keeps for its
@@ -610,6 +802,8 @@ impl FilterCoder {
                     K_SPARC => FilterKind::Sparc,
                     K_ARM => FilterKind::Arm,
                     K_ARMT => FilterKind::Armt,
+                    K_SWAP2 => FilterKind::Swap(2),
+                    K_SWAP4 => FilterKind::Swap(4),
                     _ => return Err(Error::Unsupported),
                 }
             }
@@ -641,6 +835,13 @@ impl FilterCoder {
             FilterKind::Sparc => bra::sparc_dec(data, self.pc),
             FilterKind::Ia64 => bra::ia64_dec(data, self.pc),
             FilterKind::Riscv => bra::riscv_dec(data, self.pc),
+            FilterKind::Swap(unit) => {
+                let n = data.len() / *unit * *unit;
+                for chunk in data[..n].chunks_exact_mut(*unit) {
+                    chunk.reverse();
+                }
+                n
+            }
         };
         self.pc = self.pc.wrapping_add(n as u32);
         self.converted += n;
@@ -653,7 +854,7 @@ impl FilterCoder {
 
     fn read<R: Read + Seek>(
         &mut self,
-        inner: &mut MainCoder,
+        inner: &mut Node,
         r: &mut R,
         out: &mut [u8],
     ) -> Result<usize> {
@@ -685,11 +886,11 @@ impl FilterCoder {
     }
 }
 
-/// The BCJ2 coder's inputs: three main coders and the raw RC stream.
+/// The BCJ2 coder's inputs: three coders and the RC stream.
 struct Bcj2Coder {
     dec: Bcj2Dec,
-    /// MAIN, CALL, JUMP: the outputs of coders 2, 1 and 0.
-    coders: [MainCoder; 3],
+    /// MAIN, CALL, JUMP: the outputs of coders 2, 1 and 0 in the SDK's folders.
+    coders: [Node; 3],
     rc: PackReader,
     /// Buffered input of each stream: `bufs[i][starts[i]..lens[i]]`.
     bufs: [Vec<u8>; bcj2::NUM_STREAMS],
@@ -817,32 +1018,204 @@ impl Bcj2Coder {
         if !self.dec.is_maybe_finished() {
             return Err(Error::Data);
         }
-        Ok(())
+        self.rc.finish_source(r)
     }
 }
 
-enum Root {
-    Main(MainCoder),
-    Filter(Box<FilterCoder>, MainCoder),
+/// A coder and those that feed it, as a reader of its output.
+enum Node {
+    Main(Box<MainCoder>),
+    Filter(Box<FilterCoder>, Box<Node>),
     Bcj2(Box<Bcj2Coder>),
+}
+
+impl Node {
+    fn read<R: Read + Seek>(&mut self, r: &mut R, out: &mut [u8]) -> Result<usize> {
+        match self {
+            Node::Main(main) => main.read(r, out),
+            Node::Filter(filter, inner) => filter.read(inner, r, out),
+            Node::Bcj2(bcj2) => bcj2.read(r, out),
+        }
+    }
+}
+
+/// Whether a coder with this method is a filter.
+fn is_filter(id: u32) -> bool {
+    matches!(
+        id,
+        K_DELTA
+            | K_BCJ
+            | K_PPC
+            | K_IA64
+            | K_SPARC
+            | K_ARM
+            | K_RISCV
+            | K_ARM64
+            | K_ARMT
+            | K_SWAP2
+            | K_SWAP4
+    )
+}
+
+/// A folder the SDK does not decode, as a graph of coders from the unpacked
+/// stream back to the packed ones.
+struct Graph<'a> {
+    decoding: &'a mut Decoding,
+    folder: &'a Folder,
+    data: &'a [u8],
+    unpack_sizes: &'a [u64],
+    pack_positions: &'a [u64],
+    start_pos: u64,
+    limit: u64,
+    used: [bool; arc_in::NUM_CODERS_IN_FOLDER_MAX],
+}
+
+impl Graph<'_> {
+    /// The input stream `in_index`: bound to a coder, or a packed stream.
+    fn input(&mut self, in_index: u32) -> Result<PackReader> {
+        let f = self.folder;
+        for bond in &f.bonds[..f.num_bonds as usize] {
+            if bond.in_index == in_index {
+                let coder = bond.out_index as usize;
+                let size = self.unpack_sizes[coder];
+                return Ok(PackReader::from_node(self.node(coder)?, size));
+            }
+        }
+        for (si, &stream) in f.pack_streams[..f.num_pack_streams as usize]
+            .iter()
+            .enumerate()
+        {
+            if stream == in_index {
+                let offset = self.pack_positions[si];
+                return Ok(PackReader::new(
+                    self.start_pos.wrapping_add(offset),
+                    self.pack_positions[si + 1] - offset,
+                ));
+            }
+        }
+        Err(Error::Unsupported)
+    }
+
+    /// Coder `ci`, once: the bonds may make a loop.
+    fn node(&mut self, ci: usize) -> Result<Node> {
+        if self.used[ci] {
+            return Err(Error::Unsupported);
+        }
+        self.used[ci] = true;
+        let f = self.folder;
+        let c = &f.coders[ci];
+        let props = &self.data[c.props_offset..c.props_offset + usize::from(c.props_size)];
+        let out_size = self.unpack_sizes[ci];
+        let first: u32 = f.coders[..ci]
+            .iter()
+            .map(|c| u32::from(c.num_streams))
+            .sum();
+        if is_bcj2(c) {
+            let mut inputs = Vec::with_capacity(bcj2::NUM_STREAMS);
+            for i in 0..bcj2::NUM_STREAMS as u32 {
+                inputs.push(self.input(first + i)?);
+            }
+            let mut inputs = inputs.into_iter();
+            let (Some(main), Some(call), Some(jump), Some(rc)) =
+                (inputs.next(), inputs.next(), inputs.next(), inputs.next())
+            else {
+                return Err(Error::Fail);
+            };
+            let main_size = main.remaining();
+            let (call_size, jump_size) = (call.remaining(), jump.remaining());
+            if call_size & 3 != 0
+                || jump_size & 3 != 0
+                || main_size.wrapping_add(call_size).wrapping_add(jump_size) != out_size
+            {
+                return Err(Error::Data);
+            }
+            let coders = [main, call, jump].map(|input| {
+                let size = input.remaining();
+                MainCoder {
+                    method: Main::Copy,
+                    input,
+                    out_size: size,
+                    out_pos: 0,
+                    ended: false,
+                }
+            });
+            return Ok(Node::Bcj2(Box::new(Bcj2Coder {
+                dec: Bcj2Dec::new(),
+                coders: coders.map(|main| Node::Main(Box::new(main))),
+                rc,
+                bufs: Default::default(),
+                starts: [0; bcj2::NUM_STREAMS],
+                lens: [0; bcj2::NUM_STREAMS],
+                ends: [false; bcj2::NUM_STREAMS],
+                out_size,
+                out_pos: 0,
+            })));
+        }
+        if c.num_streams != 1 {
+            return Err(Error::Unsupported);
+        }
+        let input = self.input(first)?;
+        if c.method_id == K_AES {
+            // The input is whole blocks, the last of them padded, and `7zz`
+            // takes more of them than the output needs.
+            let in_size = input.remaining();
+            if !in_size.is_multiple_of(AES_BLOCK_LENGTH as u64) || in_size < out_size {
+                return Err(Error::Data);
+            }
+            return Ok(Node::Main(Box::new(MainCoder {
+                method: Main::Aes(Box::new(AesCoder::new(props, self.decoding)?)),
+                input,
+                out_size,
+                out_pos: 0,
+                ended: false,
+            })));
+        }
+        if is_filter(c.method_id) {
+            let filter = FilterCoder::new(c.method_id, props)?;
+            // Only a size the filter's input has: it changes none.
+            if input.remaining() != out_size {
+                return Err(Error::Data);
+            }
+            let inner = MainCoder::new(K_COPY, &[], input, out_size, &mut self.limit)?;
+            return Ok(Node::Filter(
+                Box::new(filter),
+                Box::new(Node::Main(Box::new(inner))),
+            ));
+        }
+        let main = MainCoder::new(c.method_id, props, input, out_size, &mut self.limit)?;
+        Ok(Node::Main(Box::new(main)))
+    }
 }
 
 /// A folder's decoder, `SzAr_DecodeFolder`, as a reader of its unpacked
 /// stream; the folder's CRC, when it has one, is checked at its end.
 pub(crate) struct FolderDecoder {
-    root: Root,
+    root: Node,
     size: u64,
     pos: u64,
     crc: u32,
     expected_crc: Option<u32>,
     failed: Option<Error>,
+    /// Bad data then may be a wrong password.
+    encrypted: bool,
+}
+
+/// Whether folder `fo` of `p` has an AES coder.
+pub(crate) fn folder_is_encrypted(p: &Ar, fo: usize) -> bool {
+    let data = &p.coders_data[p.fo_coders_offsets[fo]..p.fo_coders_offsets[fo + 1]];
+    arc_in::get_next_folder_item(&mut Sd::new(data)).is_ok_and(|f| {
+        f.coders[..f.num_coders as usize]
+            .iter()
+            .any(|c| c.method_id == K_AES)
+    })
 }
 
 impl FolderDecoder {
     /// The decoder of folder `fo` of `p`, whose packed streams start at
     /// `start_pos` in the archive. Its coders' dictionaries and models take
-    /// no more than `limit` bytes.
-    pub(crate) fn new(p: &Ar, fo: usize, start_pos: u64, mut limit: u64) -> Result<Self> {
+    /// no more than `decoding.limit` bytes.
+    pub(crate) fn new(p: &Ar, fo: usize, start_pos: u64, decoding: &mut Decoding) -> Result<Self> {
+        let mut limit = decoding.limit;
         let start = p.fo_coders_offsets[fo];
         let data = &p.coders_data[start..p.fo_coders_offsets[fo + 1]];
         let mut sd = Sd::new(data);
@@ -856,7 +1229,34 @@ impl FolderDecoder {
         let unpack_sizes = &p.coder_unpack_sizes[p.fo_to_coder_unpack_sizes[fo] as usize..];
         let pack_positions = &p.pack_positions[p.fo_start_pack_stream_index[fo] as usize..];
 
-        check_supported_folder(&folder)?;
+        if check_supported_folder(&folder).is_err() {
+            let encrypted = folder.coders[..folder.num_coders as usize]
+                .iter()
+                .any(|c| c.method_id == K_AES);
+            let mut graph = Graph {
+                decoding,
+                folder: &folder,
+                data,
+                unpack_sizes,
+                pack_positions,
+                start_pos,
+                limit,
+                used: [false; arc_in::NUM_CODERS_IN_FOLDER_MAX],
+            };
+            let root = graph.node(folder.unpack_stream as usize)?;
+            if graph.used[..folder.num_coders as usize].contains(&false) {
+                return Err(Error::Unsupported);
+            }
+            return Ok(FolderDecoder {
+                root,
+                size: out_size,
+                pos: 0,
+                crc: 0,
+                expected_crc: p.folder_crcs.check(fo).then(|| p.folder_crcs.vals[fo]),
+                failed: None,
+                encrypted,
+            });
+        }
         let props = |ci: usize| {
             let c = &folder.coders[ci];
             &data[c.props_offset..c.props_offset + usize::from(c.props_size)]
@@ -884,8 +1284,7 @@ impl FolderDecoder {
                 mains.push(MainCoder::new(
                     folder.coders[ci].method_id,
                     props(ci),
-                    pos,
-                    in_size,
+                    PackReader::new(pos, in_size),
                     unpack_size,
                     &mut limit,
                 )?);
@@ -904,9 +1303,9 @@ impl FolderDecoder {
                 return Err(Error::Fail);
             };
             let (rc_pos, rc_size) = pack(1);
-            Root::Bcj2(Box::new(Bcj2Coder {
+            Node::Bcj2(Box::new(Bcj2Coder {
                 dec: Bcj2Dec::new(),
-                coders: [main, call, jump],
+                coders: [main, call, jump].map(|main| Node::Main(Box::new(main))),
                 rc: PackReader::new(rc_pos, rc_size),
                 bufs: Default::default(),
                 starts: [0; bcj2::NUM_STREAMS],
@@ -920,18 +1319,18 @@ impl FolderDecoder {
             let main = MainCoder::new(
                 folder.coders[0].method_id,
                 props(0),
-                pos,
-                in_size,
+                PackReader::new(pos, in_size),
                 out_size,
                 &mut limit,
             )?;
+            let main = Node::Main(Box::new(main));
             if folder.num_coders == 2 {
-                Root::Filter(
+                Node::Filter(
                     Box::new(FilterCoder::new(folder.coders[1].method_id, props(1))?),
-                    main,
+                    Box::new(main),
                 )
             } else {
-                Root::Main(main)
+                main
             }
         };
         Ok(FolderDecoder {
@@ -941,6 +1340,7 @@ impl FolderDecoder {
             crc: 0,
             expected_crc: p.folder_crcs.check(fo).then(|| p.folder_crcs.vals[fo]),
             failed: None,
+            encrypted: false,
         })
     }
 
@@ -959,7 +1359,10 @@ impl FolderDecoder {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        let res = self.read_inner(r, out);
+        let res = self.read_inner(r, out).map_err(|e| match e {
+            Error::Data | Error::Crc if self.encrypted => Error::WrongPassword,
+            e => e,
+        });
         if let Err(e) = res {
             self.failed = Some(e);
         }
@@ -975,11 +1378,7 @@ impl FolderDecoder {
         } else {
             out
         };
-        let n = match &mut self.root {
-            Root::Main(main) => main.read(r, out)?,
-            Root::Filter(filter, main) => filter.read(main, r, out)?,
-            Root::Bcj2(bcj2) => bcj2.read(r, out)?,
-        };
+        let n = self.root.read(r, out)?;
         if at_end {
             if n != 0 {
                 return Err(Error::Data);
@@ -1008,10 +1407,10 @@ pub(crate) fn decode_folder<R: Read + Seek>(
     fo: usize,
     in_stream: &mut R,
     start_pos: u64,
-    limit: u64,
+    decoding: &mut Decoding,
     out: &mut [u8],
 ) -> Result<()> {
-    let mut folder = FolderDecoder::new(p, fo, start_pos, limit)?;
+    let mut folder = FolderDecoder::new(p, fo, start_pos, decoding)?;
     if out.len() as u64 != folder.size() {
         return Err(Error::Fail);
     }

@@ -274,3 +274,59 @@ pub fn write_files(rng: &mut Rng, dir: &Path, count: usize, max: usize) -> usize
     }
     total
 }
+
+/// `archive` with bytes changed: in its data, in the header with its
+/// checksums made right again, or cut short.
+pub fn damaged(rng: &mut Rng, archive: &[u8]) -> Vec<u8> {
+    let mut bad = archive.to_vec();
+    if bad.len() < 32 {
+        return bad;
+    }
+    let le64 = |b: &[u8], at: usize| {
+        let mut word = [0; 8];
+        word.copy_from_slice(&b[at..at + 8]);
+        u64::from_le_bytes(word)
+    };
+    let next_offset = le64(&bad, 12) as usize;
+    let next_size = le64(&bad, 20) as usize;
+    let header = 32 + next_offset;
+    let valid = header <= bad.len() && header + next_size == bad.len();
+    match rng.below(if valid && next_size > 0 { 7 } else { 3 }) {
+        0 => {
+            // Anywhere, the checksums then finding it, most of the time.
+            let at = rng.below(bad.len() as u64) as usize;
+            bad[at] ^= 1 << rng.below(8);
+        }
+        1 => {
+            bad.truncate(rng.below(bad.len() as u64) as usize);
+        }
+        2 => {
+            // More after the end, which the header does not count.
+            bad.push(rng.next() as u8);
+        }
+        3 | 4 => {
+            // In the packed data.
+            if next_offset > 0 {
+                let at = 32 + rng.below(next_offset as u64) as usize;
+                bad[at] = rng.next() as u8;
+            }
+        }
+        _ => {
+            // In the header: its checksums made right, so that the parsing
+            // sees it.
+            for _ in 0..1 + rng.below(3) {
+                let at = header + rng.below(next_size as u64) as usize;
+                match rng.below(3) {
+                    0 => bad[at] ^= 1 << rng.below(8),
+                    1 => bad[at] = rng.pick(&[0, 1, 0x7F, 0x80, 0xFF]),
+                    _ => bad[at] = rng.next() as u8,
+                }
+            }
+            let crc = hivepack_deflate::crc32(0, &bad[header..header + next_size]);
+            bad[28..32].copy_from_slice(&crc.to_le_bytes());
+            let crc = hivepack_deflate::crc32(0, &bad[12..32]);
+            bad[8..12].copy_from_slice(&crc.to_le_bytes());
+        }
+    }
+    bad
+}

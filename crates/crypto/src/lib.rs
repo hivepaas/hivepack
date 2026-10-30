@@ -73,6 +73,7 @@
 
 mod aes_ct64;
 mod aes_ct64_ctr;
+mod aes_ct64_dec;
 mod aes_ct64_enc;
 mod blake2s;
 mod blake2sp;

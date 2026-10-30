@@ -44,6 +44,8 @@ pub const VER_PACK5: u32 = 50;
 pub const VER_PACK7: u32 = 70;
 pub const VER_UNKNOWN: u32 = 9999;
 
+/// The size of data whose size is not known: UnRAR's `INT64NDF`.
+pub const INT64NDF: i64 = 0x7fff_ffff_7fff_ffff;
 pub const MAXPATHSIZE: usize = 0x10000;
 pub const MAXSFXSIZE: u64 = 0x40_0000;
 /// The largest dictionary UnRAR unpacks, 64 GB.
@@ -83,23 +85,23 @@ pub const EARC_VOLNUMBER: u32 = 0x0008;
 
 // Header types: RAR 5's, then those of RAR 1.5 to 4.x. RAR 1.5 to 4.x's
 // main, file, service and end headers are read as RAR 5's types.
-pub const HEAD_MARK: u8 = 0x00;
-pub const HEAD_MAIN: u8 = 0x01;
-pub const HEAD_FILE: u8 = 0x02;
-pub const HEAD_SERVICE: u8 = 0x03;
-pub const HEAD_CRYPT: u8 = 0x04;
-pub const HEAD_ENDARC: u8 = 0x05;
-pub const HEAD_UNKNOWN: u8 = 0xff;
-pub const HEAD3_MARK: u8 = 0x72;
-pub const HEAD3_MAIN: u8 = 0x73;
-pub const HEAD3_FILE: u8 = 0x74;
-pub const HEAD3_CMT: u8 = 0x75;
-pub const HEAD3_AV: u8 = 0x76;
-pub const HEAD3_OLDSERVICE: u8 = 0x77;
-pub const HEAD3_PROTECT: u8 = 0x78;
-pub const HEAD3_SIGN: u8 = 0x79;
-pub const HEAD3_SERVICE: u8 = 0x7a;
-pub const HEAD3_ENDARC: u8 = 0x7b;
+pub const HEAD_MARK: u32 = 0x00;
+pub const HEAD_MAIN: u32 = 0x01;
+pub const HEAD_FILE: u32 = 0x02;
+pub const HEAD_SERVICE: u32 = 0x03;
+pub const HEAD_CRYPT: u32 = 0x04;
+pub const HEAD_ENDARC: u32 = 0x05;
+pub const HEAD_UNKNOWN: u32 = 0xff;
+pub const HEAD3_MARK: u32 = 0x72;
+pub const HEAD3_MAIN: u32 = 0x73;
+pub const HEAD3_FILE: u32 = 0x74;
+pub const HEAD3_CMT: u32 = 0x75;
+pub const HEAD3_AV: u32 = 0x76;
+pub const HEAD3_OLDSERVICE: u32 = 0x77;
+pub const HEAD3_PROTECT: u32 = 0x78;
+pub const HEAD3_SIGN: u32 = 0x79;
+pub const HEAD3_SERVICE: u32 = 0x7a;
+pub const HEAD3_ENDARC: u32 = 0x7b;
 
 // RAR 2.9 and earlier service headers.
 pub const EA_HEAD: u16 = 0x100;
@@ -323,7 +325,8 @@ impl HashValue {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BaseBlock {
     pub head_crc: u32,
-    pub header_type: u8,
+    /// What UnRAR keeps in its HEADER_TYPE enum, an `int`.
+    pub header_type: u32,
     pub flags: u32,
     pub head_size: u32,
     pub skip_if_unknown: bool,

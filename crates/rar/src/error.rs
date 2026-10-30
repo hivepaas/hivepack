@@ -98,8 +98,9 @@ pub enum Error {
     /// Not a RAR archive, or one whose main header is broken: what UnRAR's
     /// `IsArchive` refuses, with the exit code so far.
     NotRar { exit_code: ExitCode },
-    /// The headers are encrypted, and no password was given.
-    MissingPassword,
+    /// The headers are encrypted, and no password was given: UnRAR's
+    /// library stops there, with the exit code so far.
+    MissingPassword { exit_code: ExitCode },
     /// The archive could not be read.
     Io(io::Error),
 }
@@ -114,7 +115,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotRar { .. } => f.write_str("not a RAR archive, or its main header is broken"),
-            Error::MissingPassword => {
+            Error::MissingPassword { .. } => {
                 f.write_str("the headers are encrypted, and no password was given")
             }
             Error::Io(e) => write!(f, "{e}"),

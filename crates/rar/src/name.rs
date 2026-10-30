@@ -116,20 +116,31 @@ pub(crate) fn decode_encoded(name: &[u8], enc: &[u8], out: &mut WideString) {
     }
 }
 
-/// One character of UTF-8 as glibc's `mbrtowc` takes it: the character and
-/// its length, or `None` if the bytes are not UTF-8 (or are cut short).
+/// One character of UTF-8 as glibc's `mbrtowc` takes it in a UTF-8 locale
+/// (`utf8_internal_loop`, gconv_simple.c): the character and its length,
+/// or `None` if the bytes are not one. glibc takes four-byte sequences up
+/// to U+1FFFFF, past Unicode's end, and refuses overlong forms and
+/// surrogates.
 fn mbrtowc(bytes: &[u8]) -> Option<(u32, usize)> {
     let first = *bytes.first()?;
-    let len = match first {
+    let (count, mut c) = match first {
         0x00..=0x7f => return Some((u32::from(first), 1)),
-        0xc2..=0xdf => 2,
-        0xe0..=0xef => 3,
-        0xf0..=0xf4 => 4,
+        0xc2..=0xdf => (2, u32::from(first & 0x1f)),
+        0xe0..=0xef => (3, u32::from(first & 0x0f)),
+        0xf0..=0xf7 => (4, u32::from(first & 0x07)),
         _ => return None,
     };
-    let piece = bytes.get(..len)?;
-    let c = std::str::from_utf8(piece).ok()?.chars().next()?;
-    Some((u32::from(c), len))
+    for i in 1..count {
+        let byte = *bytes.get(i)?;
+        if byte & 0xc0 != 0x80 {
+            return None;
+        }
+        c = (c << 6) | u32::from(byte & 0x3f);
+    }
+    if count > 2 && c >> (5 * count - 4) == 0 || (0xd800..=0xdfff).contains(&c) {
+        return None;
+    }
+    Some((c, count))
 }
 
 /// A name in the system's code page, a UTF-8 locale here: `CharToWide` for
@@ -139,8 +150,14 @@ pub(crate) fn char_to_wide(src: &[u8]) -> WideString {
     let src = &src[..src.iter().position(|&b| b == 0).unwrap_or(src.len())];
     // The buffer UnRAR's std::string overload converts into.
     let dest_size = 2 * src.len() + 1;
-    if let Ok(text) = std::str::from_utf8(src) {
-        let mut out: WideString = text.chars().map(u32::from).collect();
+    // mbsrtowcs, the whole name, if it is all UTF-8 to glibc.
+    let mut out = WideString::new();
+    let mut pos = 0;
+    while let Some((c, len)) = mbrtowc(&src[pos..]) {
+        out.push(c);
+        pos += len;
+    }
+    if pos == src.len() {
         out.truncate(dest_size - 1);
         return out;
     }

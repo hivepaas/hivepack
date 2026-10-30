@@ -59,7 +59,7 @@ pub struct Archive<R> {
     pub sfx_size: u64,
     pub cur_block_pos: i64,
     pub next_block_pos: i64,
-    pub cur_header_type: u8,
+    pub cur_header_type: u32,
     pub vol_number: u32,
     pub recovery_percent: i32,
 
@@ -388,7 +388,11 @@ impl<R: ReadAt> Archive<R> {
     /// The password the headers need: there is none yet, so the reading
     /// stops as UnRAR's library stops without one.
     fn request_arc_password(&mut self) -> Result<(), Error> {
-        Err(Error::MissingPassword)
+        // `ErrHandler.Exit(RARX_USERBREAK)`, which sets the code first.
+        self.set_error_code(ExitCode::UserBreak);
+        Err(Error::MissingPassword {
+            exit_code: self.exit_code,
+        })
     }
 
     fn read_header15(&mut self) -> Result<usize, Error> {
@@ -409,7 +413,7 @@ impl<R: ReadAt> Archive<R> {
             head_crc: u32::from(raw.get2()),
             ..BaseBlock::default()
         };
-        let header_type = raw.get1();
+        let header_type = u32::from(raw.get1());
         short.flags = u32::from(raw.get2());
         short.skip_if_unknown = short.flags & SKIP_IF_UNKNOWN != 0;
         short.head_size = u32::from(raw.get2());
@@ -665,7 +669,7 @@ impl<R: ReadAt> Archive<R> {
         hd.pack_size = ((u64::from(high_pack_size) << 32) | u64::from(hd.data_size)) as i64;
         hd.unp_size = ((u64::from(high_unp_size) << 32) | u64::from(low_unp_size)) as i64;
         if hd.unknown_unp_size {
-            hd.unp_size = i64::MAX;
+            hd.unp_size = INT64NDF;
         }
 
         let read_name_size = name_size.min(MAXPATHSIZE);
@@ -808,11 +812,15 @@ impl<R: ReadAt> Archive<R> {
         }
 
         let header_crc = raw.get_crc50();
-        // UnRAR casts the vint to HEADER_TYPE, an `unsigned int` with GCC,
-        // so to its low 32 bits, then takes the smaller of it and
-        // HEAD_UNKNOWN.
+        // UnRAR casts the vint to HEADER_TYPE, an `int`, so to its low 32
+        // bits, signed, then takes the smaller of it and HEAD_UNKNOWN: a
+        // value with its top bit set stays as it is.
         let header_type = raw.get_v() as u32;
-        short.header_type = header_type.min(u32::from(HEAD_UNKNOWN)) as u8;
+        short.header_type = if (header_type as i32) < HEAD_UNKNOWN as i32 {
+            header_type
+        } else {
+            HEAD_UNKNOWN
+        };
         short.flags = raw.get_v() as u32;
         short.skip_if_unknown = short.flags & HFL_SKIPIFUNKNOWN != 0;
         short.head_size = header_size;
@@ -937,7 +945,7 @@ impl<R: ReadAt> Archive<R> {
         hd.unp_size = raw.get_v() as i64;
         hd.unknown_unp_size = hd.file_flags & FHFL_UNPUNKNOWN != 0;
         if hd.unknown_unp_size {
-            hd.unp_size = i64::MAX;
+            hd.unp_size = INT64NDF;
         }
         hd.max_size = hd.pack_size.max(hd.unp_size);
         hd.file_attr = raw.get_v() as u32;
@@ -965,7 +973,8 @@ impl<R: ReadAt> Archive<R> {
         };
 
         hd.host_os = raw.get_v() as u8;
-        let name_size = raw.get_v() as usize;
+        // On x86-64, as the oracle runs: a 64-bit size_t.
+        let name_size = raw.get_v();
         hd.inherited = short.flags & HFL_INHERITED != 0;
 
         hd.hs_type = HostSystem::Unknown;
@@ -997,7 +1006,7 @@ impl<R: ReadAt> Archive<R> {
             }
         }
 
-        let read_name_size = name_size.min(MAXPATHSIZE);
+        let read_name_size = name_size.min(MAXPATHSIZE as u64) as usize;
         let mut file_name = vec![0u8; read_name_size];
         raw.get_b(&mut file_name);
         hd.file_name = utf_to_wide(&file_name);
@@ -1031,7 +1040,7 @@ impl<R: ReadAt> Archive<R> {
         }
     }
 
-    fn process_extra50(&mut self, raw: &mut RawRead, extra_size: usize, header_type: u8) {
+    fn process_extra50(&mut self, raw: &mut RawRead, extra_size: usize, header_type: u32) {
         // The extra area is the end of the header.
         let Some(extra_start) = raw.size().checked_sub(extra_size) else {
             return;
@@ -1207,9 +1216,9 @@ impl<R: ReadAt> Archive<R> {
                     FHEXTRA_REDIR => {
                         let redir_type = raw.get_v();
                         let flags = raw.get_v() as u32;
-                        let name_size = raw.get_v() as usize;
-                        if name_size > 0 && name_size < MAXPATHSIZE {
-                            let mut name = vec![0u8; name_size];
+                        let name_size = raw.get_v();
+                        if name_size > 0 && name_size < MAXPATHSIZE as u64 {
+                            let mut name = vec![0u8; name_size as usize];
                             hd.redir_type = Redirection::of(redir_type);
                             hd.dir_target = flags & FHEXTRA_REDIR_DIR != 0;
                             raw.get_b(&mut name);
@@ -1224,7 +1233,7 @@ impl<R: ReadAt> Archive<R> {
                         hd.unix_group_name.clear();
                         // Names of 255 bytes at most, as C strings.
                         let get_name = |raw: &mut RawRead| {
-                            let length = (raw.get_v() as usize).min(255);
+                            let length = raw.get_v().min(255) as usize;
                             let mut name = vec![0u8; length];
                             raw.get_b(&mut name);
                             name.truncate(name.iter().position(|&b| b == 0).unwrap_or(name.len()));

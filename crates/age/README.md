@@ -2,7 +2,7 @@
 
 Decrypting [age](https://age-encryption.org) files in safe Rust, ported from age v1.3.2, the reference implementation in Go (`filippo.io/age`).
 
-> **Status:** decrypts files encrypted with a passphrase or to X25519 keys (`AGE-SECRET-KEY-1…`), armored or not, with age's outcomes on C2SP's test vectors and on files age encrypts. SSH keys, post-quantum keys, plugins and encrypting are not ported yet. This crate is not on crates.io.
+> **Status:** decrypts files encrypted with a passphrase, to X25519 keys (`AGE-SECRET-KEY-1…`) or to SSH Ed25519 keys, with or without a passphrase, armored or not, with age's outcomes on C2SP's test vectors and on files age encrypts. SSH RSA keys, post-quantum keys, plugins and encrypting are not ported yet. This crate is not on crates.io.
 
 ```rust
 use std::io::Read;
@@ -21,6 +21,16 @@ With keys from a file that `age-keygen` wrote:
 let keys = hivepack_age::parse_identities(std::fs::File::open("keys.txt")?)?;
 let identities: Vec<&dyn Identity> = keys.iter().map(|k| k.as_ref() as &dyn Identity).collect();
 let plaintext = decrypt_file(file, &identities)?;
+```
+
+With what `age -i` takes: a file of keys, one encrypted with age, or an SSH private key. A passphrase is asked for only when one is needed: an SSH key's when a stanza is for that key, an encrypted file of keys' when one of its keys is first tried.
+
+```rust
+use std::sync::Arc;
+use hivepack_age::{PassphraseFor, PassphrasePrompt, parse_identities_file};
+
+let prompt: PassphrasePrompt = Arc::new(|what: PassphraseFor| ask_the_person(what));
+let keys = parse_identities_file(std::fs::File::open("/home/me/.ssh/id_ed25519")?, prompt)?;
 ```
 
 `decrypt_file` reads a file as `age --decrypt` does: armored (`-----BEGIN AGE ENCRYPTED FILE-----`) or binary, told apart by its first line. The header is checked before it returns; the payload is decrypted as it is read, 64 KiB at a time, each chunk authenticated before any of it is given out. A file cut short or changed fails when the damage is reached, with what was read before it authentic but incomplete.

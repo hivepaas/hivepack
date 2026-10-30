@@ -85,7 +85,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -146,9 +146,9 @@ jobs:
   cross:
     name: Test (${{ matrix.target }})
     runs-on: ubuntu-latest
-    # The encoder's tests are slow under emulation: s390x takes about half
-    # an hour for the first run.
-    timeout-minutes: 60
+    # The encoders' tests are slow under emulation: s390x took most of an
+    # hour once the dictionary builder, lz4 and bzip2 had theirs.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -216,7 +216,7 @@ jobs:
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -254,6 +254,22 @@ jobs:
       - name: Seed the sequence API's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/sequences
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu sequences -- -max_total_time=60 -rss_limit_mb=4096
+      # Units cut at their newlines (a third byte of 1), into rooms of 1 KB
+      # and 4 KB.
+      - name: Seed the dictionary builder's corpus with the systemd units
+        run: |
+          mkdir -p fuzz/corpus/zdict
+          i=0
+          for unit in testdata/ruzstd/dict/files/*; do
+            case "$unit" in *.zst) continue ;; esac
+            i=$((i + 1))
+            {
+              if [ $((i % 2)) -eq 0 ]; then printf '\000\004\001'; else printf '\000\020\001'; fi
+              cat "$unit"
+            } > "fuzz/corpus/zdict/u$i"
+          done
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zdict -- -max_total_time=90 -rss_limit_mb=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu divsufsort -- -max_total_time=60 -rss_limit_mb=4096
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=120
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=120
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90
@@ -428,14 +444,14 @@ jobs:
           python3 - <<'PY'
           import pathlib
           # The inputs of the recorded encodings, each after a mode byte
-          # that picks their encoder and a seed.
+          # that picks their encoder (5 for the threaded one) and a seed.
           modes = {"easyenc": 0, "streamenc": 1, "aloneenc": 2}
           lines = pathlib.Path("testdata/oracle/xz-encode.txt").read_text().splitlines()
-          for i, line in enumerate(l for l in lines if l.startswith("code ")):
+          for i, line in enumerate(l for l in lines if l.startswith(("code ", "mtcode "))):
               words = line.split("\t")[0].split(" ")
               kind = words[1].split(":")[0]
               last = words[1].split("+")[-1].removeprefix("rawenc:")
-              mode = modes.get(kind, 4 if last.startswith("21:") else 3)
+              mode = 5 if words[0] == "mtcode" else modes.get(kind, 4 if last.startswith("21:") else 3)
               data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
               pathlib.Path(f"fuzz/corpus/xz_encode/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
           PY

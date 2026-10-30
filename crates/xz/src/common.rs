@@ -23,6 +23,9 @@ pub(crate) enum Ret {
     DataError = 9,
     BufError = 10,
     ProgError = 11,
+    /// `LZMA_TIMED_OUT` (`LZMA_RET_INTERNAL1`): a threaded coder's timeout
+    /// was reached, which `lzma_code` returns as LZMA_OK.
+    TimedOut = 101,
 }
 
 /// `lzma_action`, with the same numbers.
@@ -266,6 +269,10 @@ impl Internal {
                 } else {
                     self.allow_buf_error = false;
                 }
+            }
+            Ret::TimedOut => {
+                self.allow_buf_error = false;
+                ret = Ret::Ok;
             }
             Ret::StreamEnd => {
                 if matches!(

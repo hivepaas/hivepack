@@ -2,7 +2,7 @@
 
 use crate::common::{Action, Ret, bufcpy};
 use crate::filter::FILTER_LZMA2;
-use crate::lz_encoder::{LzEncOptions, Mf};
+use crate::lz_encoder::{LzEncOptions, Mf, is_enc_dict_size_valid};
 use crate::lzma_common::{DICT_SIZE_MIN, LzmaOptions};
 use crate::lzma_encoder::{
     LZMA2_CHUNK_MAX, LzmaEncoder, encoder_memusage, get_dist_slot, lclppb_encode,
@@ -304,6 +304,17 @@ pub(crate) fn lzma2_encoder_memusage(options: &LzmaOptions) -> u64 {
     }
 
     LZMA2_CODER_SIZE + lzma_mem
+}
+
+/// `lzma_lzma2_block_size`: the size of the Blocks of the threaded encoder,
+/// u64::MAX if the dictionary size is invalid.
+pub(crate) fn lzma2_block_size(options: &LzmaOptions) -> u64 {
+    if !is_enc_dict_size_valid(options.dict_size) {
+        return u64::MAX;
+    }
+
+    // Use at least 1 MiB to keep compression ratio better.
+    (u64::from(options.dict_size) * 3).max(1 << 20)
 }
 
 /// `lzma_lzma2_props_encode`: the one byte of properties of LZMA2.

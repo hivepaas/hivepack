@@ -557,6 +557,35 @@ pub fn raw_encoder_memusage(filters: &[Filter]) -> u64 {
     raw_coder_memusage(filters, encoder_memusage)
 }
 
+/// `lzma_mt_block_size`: the Block size of the threaded encoder for a
+/// chain, the largest its filters ask for, u64::MAX if none does or a
+/// filter is not supported.
+///
+/// Differs from liblzma: LZMA2 without its options gives u64::MAX, where
+/// liblzma reads through the null pointer.
+pub(crate) fn mt_block_size(filters: &[Filter]) -> u64 {
+    let mut max = 0;
+
+    for filter in filters {
+        if !encoder_is_supported(filter.id) {
+            return u64::MAX;
+        }
+
+        // Only LZMA2 has a block_size function.
+        if filter.id == FILTER_LZMA2 {
+            let size = match filter.lzma_options() {
+                Some(options) => lzma2_encoder::lzma2_block_size(options),
+                None => u64::MAX,
+            };
+            if size > max {
+                max = size;
+            }
+        }
+    }
+
+    if max == 0 { u64::MAX } else { max }
+}
+
 /// `lzma_properties_size`.
 pub(crate) fn properties_size(filter: &Filter) -> Result<u32, Ret> {
     match filter.id {

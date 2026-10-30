@@ -136,7 +136,7 @@ enum IndexSequence {
 }
 
 /// `lzma_index_coder`: the Index encoder.
-struct IndexEncoder {
+pub(crate) struct IndexEncoder {
     sequence: IndexSequence,
     /// The Record being encoded, the next after it, and how many there
     /// are: the iterator.
@@ -150,7 +150,7 @@ struct IndexEncoder {
 
 impl IndexEncoder {
     /// `index_encoder_reset`.
-    fn new() -> IndexEncoder {
+    pub(crate) fn new() -> IndexEncoder {
         IndexEncoder {
             sequence: IndexSequence::Indicator,
             record: 0,
@@ -161,7 +161,7 @@ impl IndexEncoder {
     }
 
     /// `index_encode`.
-    fn encode(&mut self, index: &Index, out: &mut [u8], out_pos: &mut usize) -> Ret {
+    pub(crate) fn encode(&mut self, index: &Index, out: &mut [u8], out_pos: &mut usize) -> Ret {
         // Position where to start calculating CRC32. The idea is that we
         // need to call lzma_crc32() only once per call to index_encode().
         let out_start = *out_pos;

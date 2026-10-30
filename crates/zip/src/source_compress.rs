@@ -1,8 +1,9 @@
 //! The decompressing and compressing layers: port of
-//! `zip_source_compress.c`, with deflate and bzip2 for algorithms.
+//! `zip_source_compress.c`, with deflate, bzip2, LZMA and XZ for algorithms.
 
 use crate::algorithm_bzip2::{self, Bzip2};
 use crate::algorithm_deflate::{self, CompressionStatus, DeflateCompress, DeflateDecompress};
+use crate::algorithm_xz::{self, Xz};
 use crate::dirent::{CM_DEFAULT, cm_actual};
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK, file_attributes};
@@ -28,12 +29,14 @@ pub(crate) struct Decompress {
 pub(crate) enum DecompressAlgorithm {
     Deflate(DeflateDecompress),
     Bzip2(Bzip2),
+    Xz(Xz),
 }
 
 /// A compressing algorithm, the same for compressing.
 pub(crate) enum CompressAlgorithm {
     Deflate(DeflateCompress),
     Bzip2(Bzip2),
+    Xz(Xz),
 }
 
 /// The algorithms' functions, the same for both directions.
@@ -44,6 +47,7 @@ macro_rules! algorithm_functions {
                 match self {
                     Self::Deflate(_) => algorithm_deflate::VERSION_NEEDED,
                     Self::Bzip2(_) => algorithm_bzip2::VERSION_NEEDED,
+                    Self::Xz(_) => algorithm_xz::VERSION_NEEDED,
                 }
             }
 
@@ -51,13 +55,15 @@ macro_rules! algorithm_functions {
                 match self {
                     Self::Deflate(a) => a.general_purpose_bit_flags(),
                     Self::Bzip2(a) => a.general_purpose_bit_flags(),
+                    Self::Xz(a) => a.general_purpose_bit_flags(),
                 }
             }
 
-            fn start(&mut self) -> Result<()> {
+            fn start(&mut self, st: &Stat<'_>, attributes: &FileAttributes) -> Result<()> {
                 match self {
                     Self::Deflate(a) => a.start(),
                     Self::Bzip2(a) => a.start(),
+                    Self::Xz(a) => a.start(st, attributes),
                 }
             }
 
@@ -65,13 +71,15 @@ macro_rules! algorithm_functions {
                 match self {
                     Self::Deflate(a) => a.end(),
                     Self::Bzip2(a) => a.end(),
+                    Self::Xz(a) => a.end(),
                 }
             }
 
-            fn input(&mut self, length: usize) -> Result<()> {
+            fn input(&mut self, buffer: &[u8], length: usize) -> Result<()> {
                 match self {
                     Self::Deflate(a) => a.input(length),
                     Self::Bzip2(a) => a.input(length),
+                    Self::Xz(a) => a.input(buffer, length),
                 }
             }
 
@@ -79,6 +87,7 @@ macro_rules! algorithm_functions {
                 match self {
                     Self::Deflate(a) => a.end_of_input(),
                     Self::Bzip2(a) => a.end_of_input(),
+                    Self::Xz(a) => a.end_of_input(),
                 }
             }
 
@@ -86,6 +95,7 @@ macro_rules! algorithm_functions {
                 match self {
                     Self::Deflate(a) => a.process(buffer, data),
                     Self::Bzip2(a) => a.process(buffer, data),
+                    Self::Xz(a) => a.process(buffer, data),
                 }
             }
         }
@@ -96,13 +106,14 @@ algorithm_functions!(CompressAlgorithm);
 
 /// The decompressing algorithm for `method`, if libzip has one: port of
 /// `_zip_get_compression_algorithm`, for decompressing. Differs from
-/// libzip, which is often built with LZMA, XZ and Zstandard too: those
-/// come with their crates; and libzip has no Deflate64, which is read here.
+/// libzip, which is often built with Zstandard too: that comes with its
+/// crate; and libzip has no Deflate64, which is read here.
 pub(crate) fn get_compression_algorithm(method: u16) -> Option<DecompressAlgorithm> {
     match method {
         cm::DEFLATE => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(false))),
         cm::DEFLATE64 => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(true))),
         cm::BZIP2 => Some(DecompressAlgorithm::Bzip2(Bzip2::decompressor())),
+        cm::LZMA | cm::XZ => Some(DecompressAlgorithm::Xz(Xz::decompressor(method))),
         _ => None,
     }
 }
@@ -118,6 +129,10 @@ fn get_compressing_algorithm(method: u16, compression_flags: u32) -> Option<Comp
         cm::BZIP2 => Some(CompressAlgorithm::Bzip2(Bzip2::compressor(
             compression_flags,
         ))),
+        cm::LZMA | cm::XZ => Some(CompressAlgorithm::Xz(Xz::compressor(
+            method,
+            compression_flags,
+        ))),
         _ => None,
     }
 }
@@ -128,6 +143,7 @@ pub(crate) fn maximum_compressed_size(method: u16, size: u64) -> Option<u64> {
     match method {
         cm::DEFLATE => Some(algorithm_deflate::maximum_compressed_size(size)),
         cm::BZIP2 => Some(algorithm_bzip2::maximum_compressed_size(size)),
+        cm::LZMA | cm::XZ => Some(algorithm_xz::maximum_compressed_size(size)),
         _ => None,
     }
 }
@@ -188,13 +204,13 @@ impl Decompress {
         })
     }
 
-    /// `ZIP_SOURCE_OPEN`.
-    pub(crate) fn open(&mut self) -> Result<()> {
+    /// `ZIP_SOURCE_OPEN`, with the lower source's stat and attributes.
+    pub(crate) fn open(&mut self, st: &Stat<'_>, attributes: &FileAttributes) -> Result<()> {
         self.size = 0;
         self.end_of_input = false;
         self.end_of_stream = false;
         self.first_read = -1;
-        if let Err(e) = self.algorithm.start() {
+        if let Err(e) = self.algorithm.start(st, attributes) {
             self.error = e;
             return Err(e);
         }
@@ -303,7 +319,7 @@ impl Decompress {
                             if self.first_read < 0 {
                                 self.first_read = n as i64;
                             }
-                            if let Err(e) = self.algorithm.input(n) {
+                            if let Err(e) = self.algorithm.input(&self.buffer[..], n) {
                                 self.error = e;
                             }
                         }
@@ -373,15 +389,14 @@ impl Compress {
         })
     }
 
-    /// `ZIP_SOURCE_OPEN`, once the lower source's stat and attributes were
-    /// read.
-    pub(crate) fn open(&mut self) -> Result<()> {
+    /// `ZIP_SOURCE_OPEN`, with the lower source's stat and attributes.
+    pub(crate) fn open(&mut self, st: &Stat<'_>, attributes: &FileAttributes) -> Result<()> {
         self.size = 0;
         self.end_of_input = false;
         self.end_of_stream = false;
         self.is_stored = false;
         self.first_read = -1;
-        if let Err(e) = self.algorithm.start() {
+        if let Err(e) = self.algorithm.start(st, attributes) {
             self.error = e;
             return Err(e);
         }
@@ -513,7 +528,7 @@ impl Compress {
                             } else {
                                 self.first_read = n as i64;
                             }
-                            if let Err(e) = self.algorithm.input(n) {
+                            if let Err(e) = self.algorithm.input(&self.buffer[..], n) {
                                 self.error = e;
                             }
                         }

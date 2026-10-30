@@ -210,10 +210,11 @@ fn read_entries<R: ReadAt>(
         // before it reads the local header. tests/deflate64.rs checks what
         // the port reads.
         let raw = Flags(fflags).intersects(Flags::COMPRESSED | Flags::ENCRYPTED);
+        let st = za.stat_index(i, Flags::NONE).ok();
         let deflate64 = !raw
-            && za
-                .stat_index(i, Flags::NONE)
-                .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
+            && st
+                .as_ref()
+                .is_some_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
         let opened = match how {
             "e" => za.fopen_index_encrypted(i, Flags(fflags), Some(password)),
             "x" => za.fopen_index_encrypted(i, Flags(fflags), Some(b"")),
@@ -221,7 +222,7 @@ fn read_entries<R: ReadAt>(
         };
         let mut zf = match opened {
             Ok(zf) => zf,
-            Err(e) if deflate64 && !matches!(e.code(), ErrorCode::Inval | ErrorCode::NoPasswd) => {
+            Err(e) if deflate64 && past_libzip_refusal(&e, st.as_ref(), 0, None) => {
                 text.push_str("e16/0");
                 continue;
             }
@@ -293,9 +294,10 @@ fn range_entries<R: ReadAt>(
     let len = u64::try_from(len).ok();
     for i in 0..n {
         text.push_str(" |");
-        let deflate64 = za
-            .stat_index(i, Flags::NONE)
-            .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
+        let st = za.stat_index(i, Flags::NONE).ok();
+        let deflate64 = st
+            .as_ref()
+            .is_some_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
         // zip_source_zip_file_create sets ZIP_ER_COMPNOTSUPP on the archive's
         // error, not on the one it is given, which stays ZIP_ER_OK; the port
         // returns the error. libzip has no Deflate64 (see read_entries).
@@ -304,7 +306,7 @@ fn range_entries<R: ReadAt>(
                 text.push_str("e0/0");
                 continue;
             }
-            Err(e) if deflate64 && !matches!(e.code(), ErrorCode::Inval | ErrorCode::NoPasswd) => {
+            Err(e) if deflate64 && past_libzip_refusal(&e, st.as_ref(), start, len) => {
                 text.push_str("e0/0");
                 continue;
             }
@@ -611,6 +613,31 @@ fn writes_invalid_zip64(want: &str) -> bool {
     })
 }
 
+/// Whether the port's error opening a Deflate64 entry comes from past the
+/// point where libzip refuses the method: not the password, nor the sizes
+/// of the entry and the part asked for, which it checks first (with no
+/// compressed data, the window on the empty buffer has no room for a size).
+/// The same ZIP_ER_INVAL comes from a seek to a local header past the end of
+/// the archive, which libzip does not reach.
+fn past_libzip_refusal(
+    e: &hivepack_zip::Error,
+    st: Option<&hivepack_zip::Stat<'_>>,
+    start: u64,
+    len: Option<u64>,
+) -> bool {
+    match (e.code(), st) {
+        (ErrorCode::NoPasswd, _) => false,
+        (ErrorCode::Inval, Some(st)) => {
+            start.saturating_add(len.unwrap_or(0)) <= st.size
+                && (len.is_some() || st.size - start <= i64::MAX as u64)
+                && st.comp_size <= i64::MAX as u64
+                && (st.comp_size != 0 || len.unwrap_or(st.size - start) == 0)
+        }
+        (ErrorCode::Inval, None) => false,
+        _ => true,
+    }
+}
+
 /// Whether the archive of a request has a Deflate64 entry.
 fn has_deflate64(request: &str) -> bool {
     let data = unhex(request.rsplit(' ').next().unwrap_or("-"));
@@ -866,6 +893,12 @@ fn check_written(expected: &ArchiveState, written: &[u8]) {
     let count = |signature: &[u8]| written.windows(4).filter(|&w| w == signature).count();
     let (eocd64, locator) = (count(b"PK\x06\x06"), count(b"PK\x06\x07"));
     if count(b"PK\x05\x06") > 1 || eocd64 > 1 || locator != eocd64 {
+        return;
+    }
+    // Bytes before the record of an archive with no entries, kept from the
+    // archive that was edited: _zip_read_cdir takes an empty archive only
+    // from offset 0.
+    if expected.entries.is_empty() && !written.starts_with(b"PK\x05\x06") {
         return;
     }
     let new = match Archive::open(written, OpenFlags(0)) {
@@ -1251,17 +1284,72 @@ fn bzipped(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `plain` as a ZIP entry's LZMA data, at a random preset: the magic, the
+/// properties, and the data, with the end of stream marker that liblzma's
+/// .lzma encoder writes (`true`), or without it, from raw LZMA1EXT.
+fn lzma_zipped(rng: &mut Rng, plain: &[u8]) -> (Vec<u8>, bool) {
+    let options = hivepack_xz::LzmaOptions::preset(rng.below(4) as u32).unwrap();
+    let eos = rng.below(3) != 0;
+    let mut out = vec![0; plain.len() + plain.len() / 2 + 4096];
+    let mut output = hivepack_xz::OutBuffer::new(&mut out);
+    let mut input = hivepack_xz::InBuffer::new(plain);
+    let mut strm = if eos {
+        hivepack_xz::Stream::alone_encoder(&options).unwrap()
+    } else {
+        hivepack_xz::Stream::raw_encoder(&[hivepack_xz::Filter {
+            id: hivepack_xz::FILTER_LZMA1EXT,
+            options: Some(hivepack_xz::FilterOptions::Lzma(options.clone())),
+        }])
+        .unwrap()
+    };
+    let ret = strm.code(&mut output, &mut input, hivepack_xz::Action::Finish);
+    assert_eq!(ret, Ok(hivepack_xz::Status::StreamEnd));
+    let len = output.pos;
+    let mut data = vec![0x09, 0x14, 0x05, 0x00];
+    if eos {
+        data.extend_from_slice(&out[..5]);
+        data.extend_from_slice(&out[13..len]);
+    } else {
+        data.push(((options.pb * 5 + options.lp) * 9 + options.lc) as u8);
+        data.extend_from_slice(&options.dict_size.to_le_bytes());
+        data.extend_from_slice(&out[..len]);
+    }
+    (data, eos)
+}
+
+/// `plain` as an .xz Stream, at a random preset, with a random check.
+fn xzed(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
+    let mut out = vec![0; hivepack_xz::stream_buffer_bound(plain.len())];
+    let mut len = 0;
+    hivepack_xz::easy_buffer_encode(
+        rng.below(4) as u32,
+        hivepack_xz::Check(rng.pick(&[0, 1, 4, 10])),
+        plain,
+        &mut out,
+        &mut len,
+    )
+    .unwrap();
+    out.truncate(len);
+    out
+}
+
 fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
     let name = name(rng, earlier);
-    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 99, 14, 93]);
+    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 14, 95, 99, 93]);
     let plain = plain(rng);
+    let mut lzma_eos = false;
     let data = match method {
         0 => plain.clone(),
-        8 | 12 => {
-            let mut data = if method == 8 {
-                deflated(rng, &plain)
-            } else {
-                bzipped(rng, &plain)
+        8 | 12 | 14 | 95 => {
+            let mut data = match method {
+                8 => deflated(rng, &plain),
+                12 => bzipped(rng, &plain),
+                14 => {
+                    let (data, eos) = lzma_zipped(rng, &plain);
+                    lzma_eos = eos;
+                    data
+                }
+                _ => xzed(rng, &plain),
             };
             match rng.below(12) {
                 // Cut short, garbage after it, or a byte changed.
@@ -1279,6 +1367,10 @@ fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
     };
     let data_len = data.len();
     let mut gpbf = 0u16;
+    // Now and then what the data does not have.
+    if lzma_eos != (rng.below(12) == 0) {
+        gpbf |= 0x0002;
+    }
     if rng.below(3) == 0 {
         gpbf |= 0x0800;
     }
@@ -1962,7 +2054,8 @@ fn edit_ops(rng: &mut Rng, zip: &[u8]) -> String {
             23 | 24 => {
                 // stored, deflated, the default, bzip2, and methods there
                 // are no compressors for, or that wrap to deflate as a u16
-                let method: i64 = rng.pick(&[0, 8, 8, -1, -1, 12, 12, 9, 14, 65544, 99]);
+                let method: i64 =
+                    rng.pick(&[0, 8, 8, -1, -1, 12, 12, 14, 14, 95, 95, 9, 65544, 99]);
                 let flags = rng.pick(&[0, 0, 1, 3, 6, 9, 10, 0xffff, 0x1_0005]);
                 format!("z{i}:{method}:{flags}")
             }
@@ -2067,7 +2160,11 @@ fn encrypting_ops(rng: &mut Rng, max_len: u64) -> (String, Vec<Vec<u8>>) {
         match rng.below(5) {
             0 => ops.push(format!("z{i}:0:0")),
             1 => ops.push(format!("z{i}:8:{}", rng.below(10))),
-            2 => ops.push(format!("z{i}:12:{}", rng.below(10))),
+            2 => ops.push(format!(
+                "z{i}:{}:{}",
+                rng.pick(&[12, 14, 95]),
+                rng.below(10)
+            )),
             _ => {}
         }
         let method = rng.pick(&[0u16, 1, 1, 257, 258, 259, 259]);
@@ -2123,7 +2220,11 @@ fn encrypt_requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max_len: u
                     format!("y{i}:{method}:{}", password(rng))
                 }
                 3 => format!("P{}", password(rng)),
-                4 => format!("z{i}:{}:{}", rng.pick(&[0, 8, -1, 12]), rng.below(10)),
+                4 => format!(
+                    "z{i}:{}:{}",
+                    rng.pick(&[0, 8, -1, 12, 14, 95]),
+                    rng.below(10)
+                ),
                 5 => format!("m{i}:{}", 1_000_000_000 + rng.below(500_000_000)),
                 6 => format!("u{i}"),
                 7 => format!("R{i}:{}:{}:s", new_mtime(rng), hex(&new_data(rng))),
@@ -2858,7 +2959,7 @@ fn record_open_answers() {
          # Regenerate with: cargo test -p hivepack-zip --test oracle record_open_answers -- --ignored\n",
     );
     for request in requests(&mut rng, 800) {
-        if request.len() > 3_000 {
+        if request.len() > 4_000 {
             continue;
         }
         let reply = oracle.ask(&request);

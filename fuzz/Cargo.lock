@@ -260,6 +260,7 @@ dependencies = [
  "hivepack-bzip2",
  "hivepack-crypto",
  "hivepack-deflate",
+ "hivepack-xz",
 ]
 
 [[package]]

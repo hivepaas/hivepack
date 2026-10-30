@@ -13,13 +13,14 @@ use std::io::{Seek, Write};
 use crate::buffer::Buffer;
 use crate::dirent::{Dirent, DosTime, cm_actual, u2d_time};
 use crate::error::{Error, ErrorCode, Result};
+use crate::extra_field::read_local_ef;
 use crate::file_get_offset::file_get_offset;
 use crate::get_encryption_implementation::{Decrypt, Encrypt, encryption_method_supported};
 use crate::hash::c_string;
 use crate::io_util::read;
 use crate::open::Archive;
 use crate::random::RandomSource;
-use crate::source::{ReadAt, Source, Whence};
+use crate::source::{ReadAhead, ReadAt, Source, Whence};
 use crate::source_compress::{Compress, Decompress, maximum_compressed_size};
 use crate::source_crc::Crc;
 use crate::source_data::time_now;
@@ -189,8 +190,13 @@ impl<R: ReadAt> Archive<R> {
             // The clone: the start of the archive as it is.
             let mut src = self.src.view();
             src.seek(0, Whence::Set)?;
-            copy_data(&mut src, &mut out, unchanged_offset)?;
+            copy_data(&mut src, &mut out, unchanged_offset, &mut Vec::new())?;
         }
+        // Local headers and data, read in order, usually: with a read ahead shared
+        // by the entries, and a buffer, these are not a few system calls and an
+        // allocation for each.
+        let mut ahead = None;
+        let mut buf = Vec::new();
         for &i in &filelist {
             if self.entry[i]
                 .orig
@@ -200,7 +206,7 @@ impl<R: ReadAt> Archive<R> {
                 // already implicitly copied by cloning
                 continue;
             }
-            self.write_entry(i, &mut out)?;
+            self.write_entry(i, &mut out, &mut ahead, &mut buf)?;
         }
 
         write_cdir(self, &filelist, &mut out)?;
@@ -210,7 +216,13 @@ impl<R: ReadAt> Archive<R> {
 
     /// The loop body of `zip_close`: writes entry `i`, its local header and
     /// its data, and keeps where in its dirent of changes.
-    fn write_entry<W: Write + Seek>(&mut self, i: usize, out: &mut Output<W>) -> Result<()> {
+    fn write_entry<W: Write + Seek>(
+        &mut self,
+        i: usize,
+        out: &mut Output<W>,
+        ahead: &mut Option<ReadAhead>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         let want_torrentzip = self.want_torrentzip();
         let entry = &self.entry[i];
         let new_data = entry.data_changed()
@@ -227,7 +239,10 @@ impl<R: ReadAt> Archive<R> {
             (Some(_), None) => {}
         }
 
-        self.read_local_ef(i as u64)?;
+        let mut src = self.src.view_with(ahead.take());
+        src.ensure_read_ahead();
+        read_local_ef(&self.entry[i], &mut src)?;
+        *ahead = src.take_read_ahead();
 
         if want_torrentzip && let Some(changes) = self.entry[i].changes.as_deref_mut() {
             changes.torrentzip_normalize();
@@ -288,10 +303,12 @@ impl<R: ReadAt> Archive<R> {
         let Some(orig) = orig.as_deref() else {
             return Err(Error::new(ErrorCode::Internal, 0));
         };
-        let mut src = src.view();
+        let mut src = src.view_with(ahead.take());
+        src.ensure_read_ahead();
         let offset = file_get_offset(&mut src, orig.offset)?;
         src.seek(offset as i64, Whence::Set)?;
-        copy_data(&mut src, out, de.comp_size)?;
+        copy_data(&mut src, out, de.comp_size, buf)?;
+        *ahead = src.take_read_ahead();
 
         if de.bitflags & GPBF_DATA_DESCRIPTOR != 0 {
             write_data_descriptor(out, de, de.needs_zip64(Flags::NONE))?;
@@ -626,8 +643,11 @@ fn copy_data<R: ReadAt + ?Sized, W: Write + Seek>(
     src: &mut Source<&R>,
     out: &mut Output<W>,
     len: u64,
+    buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut buf = vec![0; BUFSIZE];
+    if len > 0 && buf.is_empty() {
+        buf.resize(BUFSIZE, 0);
+    }
     let mut len = len;
     while len > 0 {
         let n = len.min(BUFSIZE as u64) as usize;

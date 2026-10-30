@@ -7,9 +7,10 @@ use crate::buffer::Buffer;
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::io_util::read_data;
 use crate::open::Archive;
-use crate::source::{ReadAt, Whence};
+use crate::source::{ReadAt, Source, Whence};
 use crate::source_write::Output;
 use crate::zip::Flags;
+use crate::zipint::Entry;
 use crate::zipint::{EF_CENTRAL, EF_LOCAL, EXTRA_FIELD_ALL, EXTRA_FIELD_NEW, ef_is_internal};
 
 /// `zip_extra_field_t`: one field, its header id and data. A list of them
@@ -265,48 +266,53 @@ impl<R: ReadAt> Archive<R> {
         if idx >= self.entry.len() as u64 {
             return Err(Error::new(ErrorCode::Inval, 0));
         }
-        let Some(orig) = self.entry[idx as usize].orig.as_deref() else {
-            return Ok(());
-        };
-        if orig.extra_fields.local.get().is_some() {
-            return Ok(());
-        }
-
-        if orig.offset + 26 > i64::MAX as u64 {
-            return Err(Error::new(ErrorCode::Seek, EFBIG));
-        }
-        let mut src = self.src.view();
-        src.seek((orig.offset + 26) as i64, Whence::Set)?;
-        let mut buffer = Buffer::from_source(&mut src, 4)?;
-        let fname_len = buffer.get_16();
-        let ef_len = buffer.get_16();
-        if !buffer.eof() {
-            return Err(Error::new(ErrorCode::Internal, 0));
-        }
-
-        let mut ef = Vec::new();
-        if ef_len > 0 {
-            // libzip reports ZIP_ER_SEEK with errno, which a seek past the
-            // end of the source leaves at 0, as it fails before any system
-            // call.
-            if src.seek(i64::from(fname_len), Whence::Cur).is_err() {
-                return Err(Error::new(ErrorCode::Seek, 0));
-            }
-            let ef_raw = read_data(None, &mut src, usize::from(ef_len))?;
-            ef = ef_parse(&ef_raw)?;
-            ef_remove_internal(&mut ef);
-        }
-
-        // Another reader may have set them first, to the same fields.
-        let changes = self.entry[idx as usize].changes.as_deref();
-        if let Some(changes) = changes
-            && changes.extra_fields.local.get().is_none()
-        {
-            let _ = changes.extra_fields.local.set(ef.clone());
-        }
-        let _ = orig.extra_fields.local.set(ef);
-        Ok(())
+        read_local_ef(&self.entry[idx as usize], &mut self.src.view())
     }
+}
+
+/// The local extra fields of `entry`, read from `src` if they were not: the
+/// body of `_zip_read_local_ef`.
+pub(crate) fn read_local_ef<S: ReadAt + ?Sized>(entry: &Entry, src: &mut Source<S>) -> Result<()> {
+    let Some(orig) = entry.orig.as_deref() else {
+        return Ok(());
+    };
+    if orig.extra_fields.local.get().is_some() {
+        return Ok(());
+    }
+
+    if orig.offset + 26 > i64::MAX as u64 {
+        return Err(Error::new(ErrorCode::Seek, EFBIG));
+    }
+    src.seek((orig.offset + 26) as i64, Whence::Set)?;
+    let mut buffer = Buffer::from_source(src, 4)?;
+    let fname_len = buffer.get_16();
+    let ef_len = buffer.get_16();
+    if !buffer.eof() {
+        return Err(Error::new(ErrorCode::Internal, 0));
+    }
+
+    let mut ef = Vec::new();
+    if ef_len > 0 {
+        // libzip reports ZIP_ER_SEEK with errno, which a seek past the
+        // end of the source leaves at 0, as it fails before any system
+        // call.
+        if src.seek(i64::from(fname_len), Whence::Cur).is_err() {
+            return Err(Error::new(ErrorCode::Seek, 0));
+        }
+        let ef_raw = read_data(None, src, usize::from(ef_len))?;
+        ef = ef_parse(&ef_raw)?;
+        ef_remove_internal(&mut ef);
+    }
+
+    // Another reader may have set them first, to the same fields.
+    let changes = entry.changes.as_deref();
+    if let Some(changes) = changes
+        && changes.extra_fields.local.get().is_none()
+    {
+        let _ = changes.extra_fields.local.set(ef.clone());
+    }
+    let _ = orig.extra_fields.local.set(ef);
+    Ok(())
 }
 
 /// `EFBIG`, which libzip gives with `ZIP_ER_SEEK` for an offset past

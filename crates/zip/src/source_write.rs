@@ -15,6 +15,10 @@ use crate::error::{Error, ErrorCode, Result};
 pub(crate) struct Output<W> {
     w: W,
     pub write_crc: Option<u32>,
+    /// The position, once asked for. Differs from libzip, whose `ftello` costs
+    /// little: asking a `BufWriter` writes out its buffer, and this is asked for
+    /// each entry.
+    pos: Option<u64>,
 }
 
 /// The error of a failed system call: `errno`, or 0 if it has none.
@@ -24,22 +28,33 @@ fn errno(error: &io::Error) -> i32 {
 
 impl<W: Write + Seek> Output<W> {
     pub(crate) fn new(w: W) -> Output<W> {
-        Output { w, write_crc: None }
+        Output {
+            w,
+            write_crc: None,
+            pos: None,
+        }
     }
 
     /// The position: `zip_source_tell_write`.
     pub(crate) fn tell_write(&mut self) -> Result<u64> {
-        self.w
+        if let Some(pos) = self.pos {
+            return Ok(pos);
+        }
+        let pos = self
+            .w
             .stream_position()
-            .map_err(|e| Error::new(ErrorCode::Tell, errno(&e)))
+            .map_err(|e| Error::new(ErrorCode::Tell, errno(&e)))?;
+        self.pos = Some(pos);
+        Ok(pos)
     }
 
     /// Moves to `offset`: `zip_source_seek_write` with `SEEK_SET`.
     pub(crate) fn seek_write(&mut self, offset: u64) -> Result<()> {
         self.w
             .seek(SeekFrom::Start(offset))
-            .map(|_| ())
-            .map_err(|e| Error::new(ErrorCode::Seek, errno(&e)))
+            .map_err(|e| Error::new(ErrorCode::Seek, errno(&e)))?;
+        self.pos = Some(offset);
+        Ok(())
     }
 
     /// Writes all of `data`: port of `_zip_write`.
@@ -47,6 +62,9 @@ impl<W: Write + Seek> Output<W> {
         self.w
             .write_all(data)
             .map_err(|e| Error::new(ErrorCode::Write, errno(&e)))?;
+        if let Some(pos) = self.pos.as_mut() {
+            *pos += data.len() as u64;
+        }
         if let Some(crc) = self.write_crc.as_mut() {
             *crc = crc32(*crc, data);
         }

@@ -14,6 +14,10 @@
 //!   ([`train_from_buffer_fast_cover`],
 //!   [`optimize_train_from_buffer_fast_cover`]), which the default trainer
 //!   runs.
+//! - `legacy.rs`, from `zdict.c`: the legacy trainer, which keeps the
+//!   repeated segments that save the most, found with a suffix array
+//!   ([`train_from_buffer_legacy`]).
+//! - `divsufsort.rs`, from `divsufsort.c`: that suffix array.
 //!
 //! The dictionaries are libzstd's, byte for byte, for the same samples and
 //! parameters. libzstd's notifications on stderr (`notificationLevel`) are
@@ -33,9 +37,12 @@
 //! [`optimize_train_from_buffer_cover`]: crate::optimize_train_from_buffer_cover
 //! [`train_from_buffer_fast_cover`]: crate::train_from_buffer_fast_cover
 //! [`optimize_train_from_buffer_fast_cover`]: crate::optimize_train_from_buffer_fast_cover
+//! [`train_from_buffer_legacy`]: crate::train_from_buffer_legacy
 
 pub(crate) mod cover;
+pub(crate) mod divsufsort;
 pub(crate) mod fastcover;
+pub(crate) mod legacy;
 pub(crate) mod zdict;
 
 use crate::common::error_private::{Result, error};

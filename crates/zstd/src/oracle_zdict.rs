@@ -33,6 +33,7 @@ use crate::dict_builder::cover::{
 use crate::dict_builder::fastcover::{
     FastCoverParams, optimize_train_from_buffer_fast_cover, train_from_buffer_fast_cover,
 };
+use crate::dict_builder::legacy::{LegacyParams, train_from_buffer_legacy};
 use crate::dict_builder::zdict::{
     DictParams, finalize_dictionary, get_dict_header_size, train_from_buffer,
     zdict_add_entropy_tables_from_buffer_advanced, zdict_analyze_entropy,
@@ -186,6 +187,16 @@ pub(crate) fn answer(request: &str) -> String {
                 result,
                 &format!(" {}", fast_cover_params_text(&params)),
             )
+        }
+        ["zdlegacy", capacity, selectivity, params, sizes, bytes] => {
+            let (samples, sizes) = samples_of(sizes, bytes);
+            let mut dict = vec![0u8; number(capacity)];
+            let params = LegacyParams {
+                selectivity_level: number(selectivity),
+                z_params: z_params(&unlist(params)),
+            };
+            let result = train_from_buffer_legacy(&mut dict, &samples, &sizes, params);
+            dict_answer(&dict, result, "")
         }
         ["zdfinalize", capacity, params, content, sizes, bytes] => {
             let (samples, sizes) = samples_of(sizes, bytes);
@@ -639,6 +650,20 @@ fn requests(rng: &mut Rng, files: &Files, count: usize, budget: usize) -> Vec<St
             ));
         }
 
+        // ZDICT_trainFromBuffer_legacy, whole: its segments and content are
+        // compared on their own in `oracle_dict_legacy.rs`.
+        {
+            let (samples, sizes) = sample_set(rng, files, budget);
+            let capacity = capacity(rng, samples.len());
+            requests.push(format!(
+                "zdlegacy {capacity} {} {} {} {}",
+                rng.range(0, 12),
+                z_params_request(rng),
+                list(&sizes),
+                crate::oracle::hex(&samples)
+            ));
+        }
+
         // ZDICT_finalizeDictionary.
         {
             let (samples, sizes) = sample_set(rng, files, budget / 2);
@@ -835,6 +860,7 @@ fn port_matches_libzstd_dict_builder() {
         "zdfast",
         "zdcoveropt",
         "zdfastopt",
+        "zdlegacy",
         "zdfinalize",
         "zdadd",
     ] {

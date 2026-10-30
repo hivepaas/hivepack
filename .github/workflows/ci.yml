@@ -244,6 +244,7 @@ jobs:
             } > "fuzz/corpus/zdict/u$i"
           done
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zdict -- -max_total_time=90 -rss_limit_mb=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu divsufsort -- -max_total_time=60 -rss_limit_mb=4096
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=150
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=150
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90

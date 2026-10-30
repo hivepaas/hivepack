@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "divsufsort"
+path = "fuzz_targets/divsufsort.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "inflate"
 path = "fuzz_targets/inflate.rs"
 test = false

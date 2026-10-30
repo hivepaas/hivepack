@@ -274,6 +274,7 @@ LIBZIP_CRYPTO_SOURCES = [
     "zip_source_winzip_aes_encode.c",
 ]
 LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
+LIBZIP_XZ_SOURCES = ["zip_algorithm_xz.c"]
 
 
 def zip_err_str(lib: Path) -> str:
@@ -350,8 +351,8 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, the part of
-    GnuTLS that backend uses in gnutls/, and zlib's, nettle's and
-    libbzip2's (the `extra` sets)."""
+    GnuTLS that backend uses in gnutls/, and zlib's, nettle's, libbzip2's
+    and liblzma's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
     if (source / "C" / "7zArcIn.c").exists():
@@ -373,19 +374,32 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         zlib = next(extra[0].glob("zlib-*"))
         nettle = next(extra[1].glob("nettle-*"))
         bzip2 = next(extra[2].glob("bzip2-*"))
+        xz = next(extra[3].glob("xz-*/src/liblzma"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
         files += [str(lib / name) for name in
-                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES]
+                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES
+                  + LIBZIP_XZ_SOURCES]
         files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(nettle / name) for name in NETTLE_SOURCES]
         files += [str(bzip2 / name) for name in BZIP2_SOURCES]
         include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
-        subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
-                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", *files, "-o", str(folder / "oracle")],
+        # liblzma has a config.h of its own, so it is compiled apart.
+        objects = folder / "liblzma"
+        objects.mkdir()
+        dirs = [xz / d for d in LIBLZMA_DIRS]
+        xz_files = sorted(str(f) for d in dirs for f in d.glob("*.c")
+                          if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
+        xz_includes = [f"-I{d}" for d in [ROOT / "tools/xz-oracle", xz / "api", *dirs, xz.parent / "common"]]
+        subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *xz_includes, "-c", *xz_files],
+                       check=True, cwd=objects)
+        files += sorted(str(f) for f in objects.glob("*.o"))
+        subprocess.run([compiler, "-O2", "-w", "-pthread", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
+                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", f"-I{xz / 'api'}", *files,
+                        "-o", str(folder / "oracle")],
                        check=True)
         return
     zlib = next(source.glob("zlib-*"), None)

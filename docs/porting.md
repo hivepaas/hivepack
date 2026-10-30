@@ -123,6 +123,8 @@ These loops are fragile: the register allocator moves them by several instructio
 
 What is left: the one-segment finders' candidates keep a check each, since nothing tells the compiler that a table entry is before the current position; and at level 3 the one-segment search loop still reloads three values each turn and rebuilds its 64-bit prime. Measured on a scratch copy before these loops were reshaped, with the finders' reads and table accesses unchecked, compression gained +4% to +40%, `sao` at level −1 reaching 0.71×; the safe loops gained more, and it runs at 0.76× now.
 
+With a target size for compressed blocks (`ZSTD_c_targetCBlockSize`, 1340 bytes), through `ZSTD_compress2`, on five of the files (`dickens`, `ooffice`, `sao`, `x-ray`, `xml`), best of two rounds taken in turn (`zstd-bench --target-cblock-size 1340`), October 2026, on a loaded machine: the port runs at 0.81–0.90× libzstd at level 1, 0.86–0.93× at level 3, 0.62–0.81× at level 9, and 0.92× at level 19 (`xml`), the same ratios as without the target in the same run. The target costs both sides alike, about 12% at level 1 (`dickens`: libzstd from 329 to 285 MB/s, the port from 283 to 249): the superblocks keep up, and what is left is the match finders' gap above.
+
 ### Compression with workers
 
 On the same machine (8 performance cores and 2 efficiency cores), `ZSTD_compress2` with `ZSTD_c_nbWorkers`, at the default job size, best of two rounds taken in turn (`zstd-bench --workers 1,2,4,8`); the frames are the same on both sides at every count. MB/s, libzstd / the port:

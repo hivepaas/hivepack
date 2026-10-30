@@ -1,0 +1,14 @@
+[package]
+name = "zip-bench"
+version = "0.0.0"
+description = "Times hivepack-zip against libzip on the same archives"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hivepack-zip.workspace = true

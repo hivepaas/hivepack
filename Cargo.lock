@@ -758,6 +758,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip-bench"
+version = "0.0.0"
+dependencies = [
+ "hivepack-zip",
+]
+
+[[package]]
 name = "ziptool"
 version = "0.0.0"
 dependencies = [

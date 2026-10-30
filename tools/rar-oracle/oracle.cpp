@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sys/mman.h>
 #include <unistd.h>
 
 static std::string out;
@@ -284,13 +285,16 @@ static std::vector<byte> unhex(const char *hex) {
 
 static void do_list(int enable_broken, const char *hex) {
   std::vector<byte> data = unhex(hex);
-  char path[] = "/tmp/rar-oracle-XXXXXX";
-  int fd = mkstemp(path);
+  // In memory, not in /tmp: how far a damaged header can seek depends on the
+  // file system. ext4 refuses to seek past 16 TiB, which UnRAR takes for a
+  // fatal error, and tmpfs and this file do not.
+  int fd = memfd_create("rar-oracle", 0);
   if (fd < 0 || (data.size() && write(fd, data.data(), data.size()) != (ssize_t)data.size())) {
     printf("error writing\n");
     return;
   }
-  close(fd);
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
 
   out = "list";
   ErrHandler.Clean();
@@ -326,7 +330,7 @@ static void do_list(int enable_broken, const char *hex) {
     out += " badalloc";
   }
   put("exit", ErrHandler.GetErrorCode());
-  unlink(path);
+  close(fd);
   printf("%s\n", out.c_str());
 }
 

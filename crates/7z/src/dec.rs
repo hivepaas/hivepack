@@ -6,10 +6,9 @@
 //! size can be read in pieces. Its checks are the SDK's, made when each
 //! stream ends rather than when the whole buffer is decoded. LZMA and LZMA2
 //! are decoded by `hivepack-xz`, a port of liblzma's decoders, rather than
-//! by the SDK's `LzmaDec.c`: the output is the same, but liblzma takes no
-//! LZMA properties with `lc + lp` above 4 (7-Zip's encoder makes them only
-//! when asked), which are then `SZ_ERROR_UNSUPPORTED`, and on damaged data
-//! either may stop at another byte, with the same error.
+//! by the SDK's `LzmaDec.c`: the output is the same, and on damaged data
+//! either may stop at another byte, with the same error. liblzma takes no
+//! LZMA properties with `lc + lp` above 4, though, which `lzma_dec` decodes.
 
 use std::io::{Read, Seek};
 
@@ -22,6 +21,7 @@ use crate::arc_in::{self, Ar, Folder, Sd};
 use crate::bcj2::{self, Bcj2Dec, Delta};
 use crate::bra;
 use crate::error::{Error, Result};
+use crate::lzma_dec::LzmaDec;
 use crate::ppmd7::{self, ByteIn, Ppmd7};
 
 /// `k_Copy`.
@@ -196,6 +196,8 @@ enum Main {
     Copy,
     /// `SzDecodeLzma` and `SzDecodeLzma2`.
     Lzma(Box<Stream>),
+    /// `SzDecodeLzma`, for what liblzma's decoder does not take.
+    LzmaDec(Box<LzmaDec>),
     /// `SzDecodePpmd`; the range decoder is started by the first read.
     Ppmd(Box<Ppmd7>, bool),
 }
@@ -270,8 +272,23 @@ struct MainCoder {
     ended: bool,
 }
 
-/// `LzmaProps_Decode`'s checks, and the decoder for them. The dictionary
-/// needs to be no larger than the output.
+/// `LzmaProps_Decode`: `lc`, `lp`, `pb` and the size of the dictionary.
+fn lzma_props(props: &[u8]) -> Result<(u32, u32, u32, u32)> {
+    if props.len() < 5 {
+        return Err(Error::Unsupported);
+    }
+    let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]).max(4096);
+    let mut d = u32::from(props[0]);
+    if d >= 9 * 5 * 5 {
+        return Err(Error::Unsupported);
+    }
+    let lc = d % 9;
+    d /= 9;
+    Ok((lc, d % 5, d / 5, dict_size))
+}
+
+/// The decoder for LZMA or LZMA2 properties, which are checked. The
+/// dictionary needs to be no larger than the output.
 fn lzma_decoder(props: &[u8], out_size: u64, lzma2: bool) -> Result<Stream> {
     let dict_cap = out_size.clamp(4096, u64::from(u32::MAX)) as u32;
     let filter = if lzma2 {
@@ -294,25 +311,7 @@ fn lzma_decoder(props: &[u8], out_size: u64, lzma2: bool) -> Result<Stream> {
         };
         Filter::lzma2(options)
     } else {
-        // LzmaDec_AllocateProbs, LzmaProps_Decode.
-        if props.len() < 5 {
-            return Err(Error::Unsupported);
-        }
-        let mut dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-        if dict_size < 4096 {
-            dict_size = 4096;
-        }
-        let mut d = u32::from(props[0]);
-        if d >= 9 * 5 * 5 {
-            return Err(Error::Unsupported);
-        }
-        let lc = d % 9;
-        d /= 9;
-        let pb = d / 5;
-        let lp = d % 5;
-        if lc + lp > 4 {
-            return Err(Error::Unsupported);
-        }
+        let (lc, lp, pb, dict_size) = lzma_props(props)?;
         let options = LzmaOptions {
             dict_size: dict_size.min(dict_cap).max(4096),
             lc,
@@ -344,7 +343,12 @@ impl MainCoder {
                 }
                 Main::Copy
             }
-            K_LZMA => Main::Lzma(Box::new(lzma_decoder(props, out_size, false)?)),
+            K_LZMA => match lzma_props(props)? {
+                (lc, lp, pb, dict_size) if lc + lp > 4 => {
+                    Main::LzmaDec(Box::new(LzmaDec::new(lc, lp, pb, dict_size, out_size)?))
+                }
+                _ => Main::Lzma(Box::new(lzma_decoder(props, out_size, false)?)),
+            },
             K_LZMA2 => Main::Lzma(Box::new(lzma_decoder(props, out_size, true)?)),
             K_PPMD => Main::Ppmd(ppmd_decoder(props)?, false),
             _ => return Err(Error::Unsupported),
@@ -400,6 +404,21 @@ impl MainCoder {
                 }
                 self.out_pos += want as u64;
                 Ok(want)
+            }
+            Main::LzmaDec(dec) => {
+                let mut bytes = PackBytes {
+                    input: &mut self.input,
+                    reader: r,
+                    extra: false,
+                    res: None,
+                };
+                let res = dec.read(&mut bytes, out);
+                if bytes.extra {
+                    return Err(bytes.error());
+                }
+                let n = res?;
+                self.out_pos += n as u64;
+                Ok(n)
             }
             Main::Lzma(stream) => loop {
                 let buf = if self.input.remaining() == 0 {
@@ -459,6 +478,19 @@ impl MainCoder {
             if !ppmd.range_dec_is_finished_ok() {
                 return Err(Error::Data);
             }
+        }
+        if let Main::LzmaDec(dec) = &mut self.method {
+            let mut bytes = PackBytes {
+                input: &mut self.input,
+                reader: r,
+                extra: false,
+                res: None,
+            };
+            let res = dec.finish(&mut bytes);
+            if bytes.extra {
+                return Err(bytes.error());
+            }
+            res?;
         }
         if let Main::Lzma(stream) = &mut self.method
             && !self.ended

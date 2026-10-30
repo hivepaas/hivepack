@@ -37,6 +37,7 @@ mod bcj2;
 mod bra;
 mod dec;
 mod error;
+mod lzma_dec;
 mod ppmd7;
 
 use std::io::{self, Read, Seek};

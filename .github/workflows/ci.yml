@@ -457,6 +457,15 @@ jobs:
               request, answer = line.split("\t")
               pathlib.Path(f"fuzz/corpus/open/p{i}").write_bytes(b"\0" + bytes.fromhex(request.split(" ")[3]))
               pathlib.Path(f"fuzz/corpus/open/a{i}").write_bytes(b"\0" + bytes.fromhex(answer.split(" ")[1]))
+          # pbzx, as Apple writes it: xz chunks without a check, one stored.
+          import lzma, struct
+          data = pathlib.Path("README.md").read_bytes()[:20000]
+          chunks = [data[i:i + 8192] for i in range(0, len(data), 8192)]
+          pbzx = b"pbzx" + struct.pack(">Q", 1 << 24)
+          for i, c in enumerate(chunks):
+              stored = c if i == 1 else lzma.compress(c, format=lzma.FORMAT_XZ, check=lzma.CHECK_NONE)
+              pbzx += struct.pack(">QQ", len(c), len(stored)) + stored
+          pathlib.Path("fuzz/corpus/open/pbzx").write_bytes(b"\0" + pbzx)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu open -- -max_total_time=30
       - name: Seed the UDF corpus with the descriptors of the test images

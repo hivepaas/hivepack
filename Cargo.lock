@@ -241,6 +241,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-rar"
+version = "0.0.0"
+dependencies = [
+ "hivepack-crypto",
+ "hivepack-deflate",
+]
+
+[[package]]
 name = "hivepack-tar"
 version = "0.0.0"
 dependencies = [

@@ -1,6 +1,6 @@
 //! Comparison with Go through `tools/age-oracle`: what age needs, against
 //! the code age v1.3.2 runs (Go's standard library and golang.org/x/crypto
-//! v0.55.0). SHA-256 and SHA-512 on lengths around their blocks, HMAC with
+//! v0.55.0). SHA-256, SHA-512 and BLAKE2s on lengths around their blocks, HMAC with
 //! both, PBKDF2-HMAC-SHA256, HKDF-SHA256, ChaCha20, ChaCha20-Poly1305 both
 //! ways, X25519 with points of small order among others, and scrypt.
 //!
@@ -27,8 +27,8 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hivepack_crypto::{
-    Digest, Hkdf, Hmac, HmacKey, Sha256, Sha512, chacha20, chacha20_poly1305, equal, pbkdf2,
-    scrypt, x25519,
+    Blake2s, Digest, Hkdf, Hmac, HmacKey, Sha256, Sha512, chacha20, chacha20_poly1305, equal,
+    pbkdf2, scrypt, x25519,
 };
 use support::{Oracle, Rng, hex, repository, unhex};
 
@@ -78,6 +78,15 @@ fn answer(request: &str, rng: &mut Rng) -> String {
     match words[..] {
         ["sha256", data] => digest::<Sha256>(rng, &unhex(data)),
         ["sha512", data] => digest::<Sha512>(rng, &unhex(data)),
+        ["blake2s", key, data] => match Blake2s::with_key(&unhex(key)) {
+            None => "err".to_string(),
+            Some(mut hash) => {
+                for piece in pieces(rng, &unhex(data)) {
+                    hash.update(piece);
+                }
+                ok(&hash.out())
+            }
+        },
         ["hmac256", key, data] => hmac::<Sha256>(rng, &unhex(key), &unhex(data)),
         ["hmac512", key, data] => hmac::<Sha512>(rng, &unhex(key), &unhex(data)),
         ["pbkdf2", iterations, length, password, salt] => {
@@ -233,6 +242,27 @@ fn special_point(rng: &mut Rng) -> String {
 }
 
 /// `count` requests of each kind, with data up to `max` bytes.
+/// BLAKE2s, without a key, with keys up to its 32 bytes, and with one too
+/// long, on lengths around its blocks.
+fn blake2s_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            let key_len = match rng.below(4) {
+                0 => 0,
+                1 => 32,
+                2 => 33,
+                _ => rng.below(33) as usize,
+            };
+            let len = length(rng, 64, max);
+            format!(
+                "blake2s {} {}",
+                hex(&bytes(rng, key_len)),
+                hex(&bytes(rng, len))
+            )
+        })
+        .collect()
+}
+
 fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
     let mut requests = Vec::new();
     for _ in 0..count {
@@ -378,7 +408,8 @@ fn port_matches_go() {
         return;
     };
     let mut rng = Rng(0x60_c001);
-    let requests = requests(&mut rng, 400, 3000);
+    let mut requests = requests(&mut rng, 400, 3000);
+    requests.extend(blake2s_requests(&mut rng, 400, 3000));
     for request in &requests {
         let want = oracle.ask(request);
         assert_eq!(answer(request, &mut rng), want, "{request:.300}");
@@ -411,7 +442,13 @@ fn record_oracle_answers() {
          # Regenerate with: cargo test -p hivepack-crypto --test go_oracle record_oracle_answers -- --ignored\n",
     );
     // Short data keeps the file small: the long is for the live comparison.
-    for request in requests(&mut rng, 100, 200) {
+    // BLAKE2s last, with its own generator: the others' answers stay as
+    // they were.
+    let mut blake2s_rng = Rng(0x60_c004);
+    let recorded = requests(&mut rng, 100, 200)
+        .into_iter()
+        .chain(blake2s_requests(&mut blake2s_rng, 100, 200));
+    for request in recorded {
         let reply = oracle.ask(&request);
         let _ = writeln!(text, "{request}\t{reply}");
     }

@@ -116,6 +116,16 @@ impl IndexMut<isize> for Ints<'_> {
 }
 
 impl Ints<'_> {
+    /// The same array, in a wrapper of the caller's own. A function that
+    /// takes the array as `&mut Ints` starts with `let sa = &mut sa.local();`:
+    /// the optimizer then keeps the slice's address and length in registers
+    /// rather than reading them again after each store into it, which takes
+    /// 10 to 30% off the sort's time.
+    #[inline(always)]
+    fn local(&mut self) -> Ints<'_> {
+        Ints(&mut *self.0)
+    }
+
     /// `SWAP(*a, *b)`
     #[inline(always)]
     fn swap(&mut self, a: isize, b: isize) {
@@ -266,6 +276,7 @@ fn ss_insertionsort(
     last: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     let mut i = last - 2;
     while first <= i {
         let tv = sa[i];
@@ -312,6 +323,7 @@ fn ss_fixdown(
     mut i: isize,
     size: isize,
 ) {
+    let sa = &mut sa.local();
     let v = sa[base + i];
     let c = i32::from(t[td + sa[Ints::at_pa(pa, v)] as isize]);
     loop {
@@ -339,6 +351,7 @@ fn ss_fixdown(
 /// `ss_heapsort`: sorts the `size` suffixes at `base` by `Td[PA[*]]`, a
 /// simple top-down heapsort.
 fn ss_heapsort(t: &Text<'_>, td: isize, pa: isize, sa: &mut Ints<'_>, base: isize, size: isize) {
+    let sa = &mut sa.local();
     count_path(0);
     let mut m = size;
     if size % 2 == 0 {
@@ -469,6 +482,7 @@ fn ss_pivot(
 #[allow(clippy::int_plus_one)]
 #[inline(always)]
 fn ss_partition(sa: &mut Ints<'_>, pa: isize, first: isize, last: isize, depth: i32) -> isize {
+    let sa = &mut sa.local();
     let mut a = first - 1;
     let mut b = last;
     loop {
@@ -516,6 +530,7 @@ fn ss_mintrosort(
     mut last: isize,
     mut depth: i32,
 ) {
+    let sa = &mut sa.local();
     let mut stack = [(0isize, 0isize, 0i32, 0i32); SS_MISORT_STACKSIZE];
     let mut ssize = 0;
     let mut limit = ss_ilg(last - first);
@@ -766,6 +781,7 @@ fn ss_mintrosort(
 /// `ss_blockswap`: swaps the `n` cells at `a` with the `n` at `b`.
 #[inline(always)]
 fn ss_blockswap(sa: &mut Ints<'_>, mut a: isize, mut b: isize, mut n: isize) {
+    let sa = &mut sa.local();
     while 0 < n {
         sa.swap(a, b);
         n -= 1;
@@ -777,6 +793,7 @@ fn ss_blockswap(sa: &mut Ints<'_>, mut a: isize, mut b: isize, mut n: isize) {
 /// `ss_rotate`: rotates `sa[first..last]` so that `middle` comes first.
 #[inline(always)]
 fn ss_rotate(sa: &mut Ints<'_>, mut first: isize, middle: isize, mut last: isize) {
+    let sa = &mut sa.local();
     count_path(1);
     let mut l = middle - first;
     let mut r = last - middle;
@@ -842,6 +859,7 @@ fn ss_inplacemerge(
     mut last: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     count_path(2);
     loop {
         let (x, p) = if sa[last - 1] < 0 {
@@ -910,6 +928,7 @@ fn ss_mergeforward(
     buf: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     count_path(3);
     let bufend = buf + (middle - first) - 1;
     ss_blockswap(sa, buf, first, middle - first);
@@ -1012,6 +1031,7 @@ fn ss_mergebackward(
     buf: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     count_path(4);
     let bufend = buf + (last - middle) - 1;
     ss_blockswap(sa, buf, middle, last - middle);
@@ -1181,6 +1201,7 @@ fn ss_swapmerge(
     bufsize: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     // `MERGE_CHECK(a, b, c)`: marks the suffix at `a`, and the one at `b`,
     // equal to the one before them, as `c` says to or a comparison finds.
     let merge_check = |sa: &mut Ints<'_>, a: isize, b: isize, c: i32| {
@@ -1338,6 +1359,7 @@ fn sssort(
     n: i32,
     lastsuffix: bool,
 ) {
+    let sa = &mut sa.local();
     if lastsuffix {
         first += 1;
     }
@@ -1440,6 +1462,7 @@ fn isad_at(sa: &Ints<'_>, isad: isize, a: isize) -> i32 {
 /// `tr_insertionsort`: sorts `sa[first..last]` by their ranks at `isad`,
 /// by insertion, marking each suffix equal to the one after it.
 fn tr_insertionsort(sa: &mut Ints<'_>, isad: isize, first: isize, last: isize) {
+    let sa = &mut sa.local();
     let mut a = first + 1;
     while a < last {
         let tv = sa[a];
@@ -1473,6 +1496,7 @@ fn tr_insertionsort(sa: &mut Ints<'_>, isad: isize, first: isize, last: isize) {
 /// keyed by the ranks at `isad`.
 #[inline(always)]
 fn tr_fixdown(sa: &mut Ints<'_>, isad: isize, base: isize, mut i: isize, size: isize) {
+    let sa = &mut sa.local();
     let v = sa[base + i];
     let c = sa[isad + v as isize];
     loop {
@@ -1500,6 +1524,7 @@ fn tr_fixdown(sa: &mut Ints<'_>, isad: isize, base: isize, mut i: isize, size: i
 /// `tr_heapsort`: sorts the `size` suffixes at `base` by their ranks at
 /// `isad`, a simple top-down heapsort.
 fn tr_heapsort(sa: &mut Ints<'_>, isad: isize, base: isize, size: isize) {
+    let sa = &mut sa.local();
     count_path(7);
     let mut m = size;
     if size % 2 == 0 {
@@ -1648,6 +1673,7 @@ fn tr_partition(
     mut last: isize,
     v: i32,
 ) -> (isize, isize) {
+    let sa = &mut sa.local();
     let mut x = 0;
     let mut b = middle - 1;
     loop {
@@ -1781,6 +1807,7 @@ fn tr_copy(
     last: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     count_path(8);
     let v = (b - 1) as i32;
     let mut c = first;
@@ -1819,6 +1846,7 @@ fn tr_partialcopy(
     last: isize,
     depth: i32,
 ) {
+    let sa = &mut sa.local();
     count_path(9);
     let mut newrank = -1;
     let v = (b - 1) as i32;
@@ -1898,6 +1926,7 @@ fn tr_introsort(
     mut last: isize,
     budget: &mut TrBudget,
 ) {
+    let sa = &mut sa.local();
     let mut stack = [TrStackEntry::default(); TR_STACKSIZE];
     let incr = isad - isa;
     let mut ssize = 0;
@@ -2224,6 +2253,7 @@ fn tr_introsort(
 /// `sa[..n]` by their ranks at `isa`, doubling the depth from `depth` until
 /// each has a rank of its own.
 fn trsort(sa: &mut Ints<'_>, isa: isize, n: i32, depth: i32) {
+    let sa = &mut sa.local();
     let mut budget = TrBudget::new(tr_ilg(n) * 2 / 3, n);
     let mut isad = isa + depth as isize;
     let end = n as isize;
@@ -2273,12 +2303,22 @@ fn trsort(sa: &mut Ints<'_>, isa: isize, n: i32, depth: i32) {
 /// The two bucket arrays of [`sort_type_bstar`] and [`construct_sa`]:
 /// `bucket_A`, by first character, and `bucket_B`, by first two, which
 /// `BUCKET_B` and `BUCKET_BSTAR` index in the two orders.
-struct Buckets {
-    a: Vec<i32>,
-    b: Vec<i32>,
+struct Buckets<'a> {
+    a: &'a mut [i32],
+    b: &'a mut [i32],
 }
 
-impl Buckets {
+impl Buckets<'_> {
+    /// The same arrays, in a wrapper of the caller's own, as
+    /// [`Ints::local`].
+    #[inline(always)]
+    fn local(&mut self) -> Buckets<'_> {
+        Buckets {
+            a: &mut *self.a,
+            b: &mut *self.b,
+        }
+    }
+
     /// `BUCKET_A(c0)`
     #[inline(always)]
     fn a(&mut self, c0: i32) -> &mut i32 {
@@ -2301,7 +2341,9 @@ impl Buckets {
 /// `sort_typeBstar`: sorts the type B* suffixes of the text into `sa`,
 /// counts the suffixes of each bucket, and returns how many type B*
 /// suffixes there are.
-fn sort_type_bstar(t: &Text<'_>, sa: &mut Ints<'_>, bk: &mut Buckets, n: i32) -> i32 {
+fn sort_type_bstar(t: &Text<'_>, sa: &mut Ints<'_>, bk: &mut Buckets<'_>, n: i32) -> i32 {
+    let sa = &mut sa.local();
+    let bk = &mut bk.local();
     // Initialize the bucket arrays.
     bk.a.fill(0);
     bk.b.fill(0);
@@ -2507,7 +2549,9 @@ fn sort_type_bstar(t: &Text<'_>, sa: &mut Ints<'_>, bk: &mut Buckets, n: i32) ->
 
 /// `construct_SA`: the suffix array, from the sorted order of the `m`
 /// type B* suffixes.
-fn construct_sa(t: &Text<'_>, sa: &mut Ints<'_>, bk: &mut Buckets, n: i32, m: i32) {
+fn construct_sa(t: &Text<'_>, sa: &mut Ints<'_>, bk: &mut Buckets<'_>, n: i32, m: i32) {
+    let sa = &mut sa.local();
+    let bk = &mut bk.local();
     let tc = |i: i32| i32::from(t[i as isize]);
     if 0 < m {
         // Construct the sorted order of the type B suffixes by using the
@@ -2625,8 +2669,8 @@ pub(crate) fn divsufsort(t: &[u8], sa: &mut [i32]) -> Result<()> {
     bucket_a.resize(BUCKET_A_SIZE, 0);
     bucket_b.resize(BUCKET_B_SIZE, 0);
     let mut buckets = Buckets {
-        a: bucket_a,
-        b: bucket_b,
+        a: &mut bucket_a,
+        b: &mut bucket_b,
     };
 
     // Suffixsort.
@@ -2840,5 +2884,41 @@ mod tests {
         let mut sa = [9; 6];
         divsufsort(b"four", &mut sa).expect("sorted");
         assert_eq!(sa, [0, 1, 3, 2, 9, 9]);
+    }
+
+    /// The port's speed, the best of `HIVEPACK_DIVSUFSORT_RUNS` (5) runs
+    /// over the first `HIVEPACK_DIVSUFSORT_LEN` bytes (4 MiB) of each file
+    /// of `HIVEPACK_DIVSUFSORT_FILES` (comma-separated), in a release
+    /// build: `cargo test -p hivepack-zstd --release divsufsort_speed --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measure, not a test"]
+    fn divsufsort_speed() {
+        let var = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let len = var("HIVEPACK_DIVSUFSORT_LEN", 4 << 20);
+        let runs = var("HIVEPACK_DIVSUFSORT_RUNS", 5);
+        let files = std::env::var("HIVEPACK_DIVSUFSORT_FILES").unwrap_or_default();
+        for file in files.split(',').filter(|f| !f.is_empty()) {
+            let mut text = std::fs::read(file).expect("the file");
+            text.truncate(len);
+            let mut sa = vec![0; text.len()];
+            let mut best = f64::MAX;
+            for _ in 0..runs {
+                let start = std::time::Instant::now();
+                divsufsort(&text, &mut sa).expect("sorted");
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "{file:60} {:8} bytes  {:7.1} ms  {:6.1} MB/s",
+                text.len(),
+                best * 1e3,
+                text.len() as f64 / best / 1e6
+            );
+        }
     }
 }

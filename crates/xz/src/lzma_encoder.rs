@@ -263,7 +263,10 @@ impl LzmaEncoder {
             align_price_count: 0,
             opts_end_index: 0,
             opts_current_index: 0,
-            opts: vec![Optimal::default(); OPTS].into_boxed_slice(),
+            // Differs from liblzma, without a difference to see: liblzma
+            // leaves opts[] uninitialised, and only the normal mode uses
+            // it; here only the normal mode has it, initialised.
+            opts: Box::default(),
         };
 
         // Set compression mode. Note that we haven't validated the options
@@ -273,6 +276,7 @@ impl LzmaEncoder {
             Mode::FAST => coder.fast_mode = true,
             Mode::NORMAL => {
                 coder.fast_mode = false;
+                coder.opts = vec![Optimal::default(); OPTS].into_boxed_slice();
 
                 // Set dist_table_size. Round the dictionary size up to
                 // next 2^n.

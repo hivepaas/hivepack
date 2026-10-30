@@ -40,8 +40,8 @@ lz4 = "=1.28.1"
 lz4-sys = "=1.11.1"
 hivepack-xz = { path = "../crates/xz" }
 # liblzma 5.8.4, built from liblzma-sys's bundled sources, not the system's.
-liblzma = { version = "0.4.9", features = ["static"] }
-liblzma-sys = { version = "=0.4.9", features = ["static"] }
+liblzma = { version = "0.4.9", features = ["static", "parallel"] }
+liblzma-sys = { version = "=0.4.9", features = ["static", "parallel"] }
 
 [[bin]]
 name = "decompress"

@@ -3,19 +3,22 @@
 //!
 //! The first byte chooses the encoder: .xz of a preset, .xz of LZMA2 with
 //! options, .lzma, raw LZMA1 or raw LZMA2, the last three but .lzma with
-//! delta and BCJ filters before LZMA now and then. The next eight seed the
-//! preset, the check, the options (now and then ones the encoders refuse),
-//! the filters, the pieces of input and output, and the flushes. The rest
-//! is the data.
+//! delta and BCJ filters before LZMA now and then, or the threaded .xz
+//! encoder. The next eight seed the preset, the check, the options (now
+//! and then ones the encoders refuse), the filters, the threads and Block
+//! size, the pieces of input and output, and the flushes. The rest is the
+//! data.
 //!
 //! Every call must agree: the same result, the same bytes read and
-//! written, the same output.
+//! written, the same output. The threaded encoders' calls read and write
+//! as their threads let them, so for them the Streams they end with must
+//! be the same.
 
 #![no_main]
 
 use hivepack_xz::{
-    Action, Check, Filter, InBuffer, LzmaOptions, MatchFinder, Mode, OutBuffer, PRESET_EXTREME,
-    Status, Stream,
+    Action, Check, Filter, InBuffer, LzmaOptions, MatchFinder, Mode, MtOptions, OutBuffer,
+    PRESET_EXTREME, Status, Stream,
 };
 use libfuzzer_sys::fuzz_target;
 use liblzma::stream as c;
@@ -82,6 +85,107 @@ fn filters_before(next: &mut impl FnMut(usize) -> usize, c_filters: &mut c::Filt
     }
 }
 
+fn c_action(action: Action) -> c::Action {
+    match action {
+        Action::Run => c::Action::Run,
+        Action::SyncFlush => c::Action::SyncFlush,
+        Action::FullFlush => c::Action::FullFlush,
+        Action::FullBarrier => c::Action::FullBarrier,
+        Action::Finish => c::Action::Finish,
+    }
+}
+
+/// A threaded encoder driven through `steps` (input, output room, action):
+/// LZMA_RUN once, the other actions until they are done. The Stream, or the
+/// result that failed. `code` makes one call, giving its result and the
+/// bytes read and written.
+fn drive(
+    data: &[u8],
+    steps: &[(usize, usize, Action)],
+    mut code: impl FnMut(&[u8], &mut [u8], Action) -> (i32, usize, usize),
+) -> Result<Vec<u8>, i32> {
+    let mut out = Vec::new();
+    let mut consumed = 0;
+    for &(n, room, action) in steps {
+        // The next n bytes from where the last call stopped reading.
+        let end = consumed + n.min(data.len() - consumed);
+        loop {
+            let written = out.len();
+            out.resize(written + room, 0);
+            let (ret, read, made) = code(&data[consumed..end], &mut out[written..], action);
+            consumed += read;
+            out.truncate(written + made);
+            match ret {
+                0 if action != Action::Run => {}
+                0 | 1 => break,
+                _ => return Err(ret),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The threaded encoders with `preset` or `filters`: `threads` threads and
+/// Blocks of `block_size`.
+fn mt(
+    next: &mut impl FnMut(usize) -> usize,
+    data: &[u8],
+    preset: u32,
+    (check, c_check): (u32, c::Check),
+    filters: Option<(c::Filters, Vec<Filter>)>,
+) {
+    let threads = 1 + next(4) as u32;
+    let block_size = [0, 1, 100, 4096, 65536][next(5)];
+    let mut builder = c::MtStreamBuilder::new();
+    builder.threads(threads).block_size(block_size).check(c_check).preset(preset);
+    let mut options = MtOptions { threads, block_size, preset, check: Check(check), ..MtOptions::default() };
+    if let Some((c_filters, port_filters)) = filters {
+        builder.filters(c_filters);
+        options.filters = Some(port_filters);
+    }
+    let (mut c, mut port) = match (builder.encoder(), Stream::stream_encoder_mt(&options)) {
+        (Ok(c), Ok(port)) => (c, port),
+        (Err(c), Err(port)) => {
+            assert_eq!(port.number(), c_code(Err(c)));
+            return;
+        }
+        (c, port) => panic!("liblzma {:?}, the port {port:?}", c.err()),
+    };
+
+    // LZMA_RUN with room for all the output, so that each call reads all
+    // its input; flushes and the end with little room.
+    let all = data.len() * 100 + 100_000;
+    let mut steps = Vec::new();
+    let mut offered = 0;
+    while offered < data.len() && steps.len() < 20 {
+        let n = 1 + next((data.len() - offered).min(5000));
+        offered += n;
+        steps.push(match next(8) {
+            0 => (n, 1 + next(300), Action::FullFlush),
+            1 => (n, 1 + next(300), Action::FullBarrier),
+            _ => (n, all, Action::Run),
+        });
+    }
+    steps.push((data.len(), 1 + next(300), Action::Finish));
+
+    let want = drive(data, &steps, |input, output, action| {
+        let (before_in, before_out) = (c.total_in(), c.total_out());
+        let ret = c_code(c.process(input, output, c_action(action)));
+        (ret, (c.total_in() - before_in) as usize, (c.total_out() - before_out) as usize)
+    });
+    let got = drive(data, &steps, |input, output, action| {
+        let mut p_input = InBuffer::new(input);
+        let mut p_output = OutBuffer::new(output);
+        let ret = port_code(port.code(&mut p_output, &mut p_input, action));
+        (ret, p_input.pos, p_output.pos)
+    });
+    assert_eq!(got, want);
+    // After an error, the input read depends on when the threads told it.
+    if want.is_ok() {
+        assert_eq!((port.total_in(), port.total_out()), (c.total_in(), c.total_out()));
+    }
+}
+
 const CHECKS: [(u32, c::Check); 4] = [
     (0, c::Check::None),
     (1, c::Check::Crc32),
@@ -141,9 +245,19 @@ fuzz_target!(|data: &[u8]| {
     // The encoders, and the flushes each takes.
     let mut filters = c::Filters::new();
     let mut port_filters = Vec::new();
-    if matches!(mode % 5, 1 | 3 | 4) {
+    if mode % 6 == 5 {
+        let chain = (next(2) == 0).then(|| {
+            filters_before(&mut next, &mut filters, &mut port_filters);
+            filters.lzma2(&c_options);
+            port_filters.push(Filter::lzma2(o.clone()));
+            (filters, port_filters)
+        });
+        mt(&mut next, data, preset, (check, c_check), chain);
+        return;
+    }
+    if matches!(mode % 6, 1 | 3 | 4) {
         filters_before(&mut next, &mut filters, &mut port_filters);
-        if mode % 5 == 3 {
+        if mode % 6 == 3 {
             filters.lzma1(&c_options);
             port_filters.push(Filter::lzma1(o.clone()));
         } else {
@@ -151,7 +265,7 @@ fuzz_target!(|data: &[u8]| {
             port_filters.push(Filter::lzma2(o.clone()));
         }
     }
-    let (made, flushes): (_, &[Action]) = match mode % 5 {
+    let (made, flushes): (_, &[Action]) = match mode % 6 {
         0 => (
             (c::Stream::new_easy_encoder(preset, c_check), Stream::easy_encoder(preset, Check(check))),
             &[Action::SyncFlush, Action::FullFlush, Action::FullBarrier],
@@ -171,14 +285,6 @@ fuzz_target!(|data: &[u8]| {
             return;
         }
         (c, port) => panic!("liblzma {:?}, the port {port:?}", c.err()),
-    };
-
-    let c_action = |action: Action| match action {
-        Action::Run => c::Action::Run,
-        Action::SyncFlush => c::Action::SyncFlush,
-        Action::FullFlush => c::Action::FullFlush,
-        Action::FullBarrier => c::Action::FullBarrier,
-        Action::Finish => c::Action::Finish,
     };
 
     let mut c_out = vec![0u8; 1 << 16];

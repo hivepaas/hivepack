@@ -414,14 +414,14 @@ jobs:
           python3 - <<'PY'
           import pathlib
           # The inputs of the recorded encodings, each after a mode byte
-          # that picks their encoder and a seed.
+          # that picks their encoder (5 for the threaded one) and a seed.
           modes = {"easyenc": 0, "streamenc": 1, "aloneenc": 2}
           lines = pathlib.Path("testdata/oracle/xz-encode.txt").read_text().splitlines()
-          for i, line in enumerate(l for l in lines if l.startswith("code ")):
+          for i, line in enumerate(l for l in lines if l.startswith(("code ", "mtcode "))):
               words = line.split("\t")[0].split(" ")
               kind = words[1].split(":")[0]
               last = words[1].split("+")[-1].removeprefix("rawenc:")
-              mode = modes.get(kind, 4 if last.startswith("21:") else 3)
+              mode = 5 if words[0] == "mtcode" else modes.get(kind, 4 if last.startswith("21:") else 3)
               data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
               pathlib.Path(f"fuzz/corpus/xz_encode/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
           PY

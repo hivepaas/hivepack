@@ -226,6 +226,15 @@ pub use decompress::zstd_decompress_internal::{
 /// `ZSTD_VERSION_STRING` gives it.
 pub const UPSTREAM_VERSION: &str = "1.5.7";
 
+/// The suffix array of `text` into `sa[..text.len()]`, as the dictionary
+/// builder sorts its samples: libdivsufsort's `divsufsort`, which libzstd
+/// ships. Not part of the API, which libzstd does not have it in either:
+/// it is public for the `divsufsort` fuzzer.
+#[doc(hidden)]
+pub fn divsufsort(text: &[u8], sa: &mut [i32]) -> Result<()> {
+    dict_builder::divsufsort::divsufsort(text, sa)
+}
+
 /// Whether this build has the `unsafe-fast` feature: the decoder's copies
 /// without per-piece bounds checks, and the row match finder's prefetching.
 /// Cargo turns a feature on for the whole

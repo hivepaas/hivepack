@@ -25,4 +25,4 @@ How the port follows libzstd, and the order of work, are in [docs/porting.md](..
 
 ## License
 
-BSD-3-Clause, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (c) Meta Platforms, Inc. and affiliates, and (c) 2026 HivePaaS.
+BSD-3-Clause, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (c) Meta Platforms, Inc. and affiliates, and (c) 2026 HivePaaS. The suffix sort of the dictionary builder, `src/dict_builder/divsufsort.rs`, is ported from libdivsufsort-lite, which libzstd ships, and is under the MIT license, with its notice there and in [LICENSE](LICENSE): Copyright (c) 2003-2008 Yuta Mori.

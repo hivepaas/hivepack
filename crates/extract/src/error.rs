@@ -55,6 +55,9 @@ pub enum ErrorKind {
     TimeLimit,
     /// Stopped by [`Options::cancel`](crate::Options::cancel).
     Cancelled,
+    /// The mark of origin ([`Options::origin`](crate::Options::origin))
+    /// could not be written, or this system cannot carry it.
+    Origin(std::io::Error),
     /// The archive could not be read.
     Archive(hivepack_zip::Error),
     /// The destination could not be written.
@@ -97,6 +100,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::NotADirectory => f.write_str("a directory on the path is a link or a file"),
             ErrorKind::TimeLimit => f.write_str("past the time limit"),
             ErrorKind::Cancelled => f.write_str("cancelled"),
+            ErrorKind::Origin(e) => write!(f, "mark of origin not written: {e}"),
             ErrorKind::Archive(e) => write!(f, "archive: {e}"),
             ErrorKind::Io(e) => write!(f, "{e}"),
         }
@@ -121,7 +125,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
             ErrorKind::Archive(e) => Some(e),
-            ErrorKind::Io(e) => Some(e),
+            ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }
     }

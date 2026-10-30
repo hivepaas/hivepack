@@ -27,12 +27,12 @@ fn sets() -> Vec<Set> {
         .sets
         .into_iter()
         .filter(|set| set.present())
-        // Benchmark inputs are too large for the tests; sources and tools
-        // are not data.
+        // Benchmark inputs are too large for the tests; sources, tools and
+        // other formats' vectors are not data.
         .filter(|set| {
             !matches!(
                 set.kind,
-                Kind::Bench | Kind::Source | Kind::Tool | Kind::Archives
+                Kind::Bench | Kind::Source | Kind::Tool | Kind::Archives | Kind::Vectors
             )
         })
         .collect()

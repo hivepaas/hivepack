@@ -221,10 +221,17 @@
       "kind": "tool"
     },
     {
+      "name": "tar-oracle",
+      "generate": { "group": "generated", "tool": "go", "sources": ["tools/tar-oracle/main.go", "tools/tar-oracle/go.mod", "tools/tar-oracle/go.sum"] },
+      "source": "tools/tar-oracle/main.go, built with the archive/tar of Go 1.27.2, the release hivepack-tar ports, which its go.mod names",
+      "license": "MIT (the program) and BSD-3-Clause (Go)",
+      "kind": "tool"
+    },
+    {
       "name": "age-oracle",
-      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
-      "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: golang.org/x/crypto v0.55.0, the release age v1.3.2 requires",
-      "license": "MIT (the program) and BSD-3-Clause (golang.org/x/crypto)",
+      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/identities.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
+      "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0, the release age requires",
+      "license": "MIT (the program) and BSD-3-Clause (age, golang.org/x/crypto)",
       "kind": "tool"
     },
     {
@@ -270,11 +277,39 @@
       "kind": "tool"
     },
     {
+      "name": "zipdiff-constructions",
+      "path": "zipdiff",
+      "source": "https://github.com/ouuan/ZipDiff at commit 7c427ed254bb3a5985d54870c12f97db78118e67: the archives its construction program writes, packed into constructions.zip (see zipdiff/README.md)",
+      "license": "Apache-2.0",
+      "kind": "archives"
+    },
+    {
       "name": "fifield-zipbombs",
       "fetch": { "group": "core", "files": [{ "url": "https://www.bamsoftware.com/hacks/zipbomb/zbsm.zip", "sha256": "fb4ff972d21189beec11e05109c4354d0cd6d3b629263d6c950cf8cc3f78bd99" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zblg.zip", "sha256": "f1dc920869794df3e258f42f9b99157104cd3f8c14394c1b9d043d6fcda14c0a" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zbxl.zip", "sha256": "eafd8f574ea7fd0f345eaa19eae8d0d78d5323c8154592c850a2d78a86817744" }] },
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",
       "license": "public domain",
       "kind": "archives"
+    },
+    {
+      "name": "go-tar",
+      "path": "go-tar",
+      "source": "https://github.com/golang/go/tree/go1.27.2/src/archive/tar/testdata (Go 1.27.2's archive/tar tests), with Go's LICENSE",
+      "license": "BSD-3-Clause",
+      "kind": "vectors"
+    },
+    {
+      "name": "cctv-age",
+      "fetch": { "group": "core", "files": [{ "url": "https://proxy.golang.org/c2sp.org/%21c%21c%21t%21v/age/@v/v0.0.0-20260829155415-4448f2097b2d.zip", "sha256": "6720e26a39fdea14c0f94fe1aa4d1a112b19d284996cdd0a419bd71ca7895fb1", "unpack": "zip" }] },
+      "source": "https://github.com/C2SP/CCTV/tree/4448f2097b2d/age (the Go module c2sp.org/CCTV/age, which age v1.3.2 tests with), from Go's module proxy",
+      "license": "0BSD OR CC0-1.0 OR Unlicense (the vectors)",
+      "kind": "vectors"
+    },
+    {
+      "name": "unicode-18.0.0",
+      "fetch": { "group": "core", "files": [{ "url": "https://www.unicode.org/Public/18.0.0/ucd/UnicodeData.txt", "sha256": "0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950" }, { "url": "https://www.unicode.org/Public/18.0.0/ucd/CaseFolding.txt", "sha256": "a004797658a457bec4dc11683e39f69249ea3b595b752dbea6721c4c9f587b0d" }, { "url": "https://www.unicode.org/Public/18.0.0/ucd/NormalizationTest.txt", "sha256": "25a50d816764b04abfb4a646d3eb2b2a803284c3873d9a06757b94fe4513dde3" }] },
+      "source": "https://www.unicode.org/Public/18.0.0/ucd/ (the Unicode Character Database 18.0.0)",
+      "license": "Unicode-3.0",
+      "kind": "source"
     },
     {
       "name": "decodecorpus",

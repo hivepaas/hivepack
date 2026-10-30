@@ -16,9 +16,9 @@ unsafe-fast = ["hivepack-zstd/unsafe-fast"]
 [dependencies]
 libfuzzer-sys = "0.4"
 hivepack-zstd = { path = "../crates/zstd" }
-# libzstd 1.5.7, without the x86-64 Huffman assembly, with its worker threads,
-# as the tests build it.
-zstd = { version = "0.14.3", default-features = false, features = ["experimental", "no_asm", "zstdmt"] }
+# libzstd 1.5.7, without the x86-64 Huffman assembly, with its worker threads
+# and its dictionary builder, as the tests build it.
+zstd = { version = "0.14.3", default-features = false, features = ["experimental", "no_asm", "zdict_builder", "zstdmt"] }
 hivepack-deflate = { path = "../crates/deflate" }
 hivepack-zip = { path = "../crates/zip" }
 hivepack-extract = { path = "../crates/extract" }
@@ -54,6 +54,13 @@ bench = false
 [[bin]]
 name = "sequences"
 path = "fuzz_targets/sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zdict"
+path = "fuzz_targets/zdict.rs"
 test = false
 doc = false
 bench = false

@@ -480,10 +480,10 @@ fn fastcover_convert_to_fast_cover_params(
 /// All the samples train (`split_point`, `steps`, `nb_threads` and the
 /// shrinking are the optimizer's); `f` and `accel` are 20 and 1 for 0. It
 /// needs 6 times `2^f` bytes of memory. Fails with
-/// [`ErrorCode::ParameterOutOfBound`] for parameters out of their bounds
-/// (see [`FastCoverParams`]), [`ErrorCode::SrcSizeWrong`] without samples,
+/// [`ErrorCode::ParameterOutOfBound`](crate::ErrorCode::ParameterOutOfBound) for parameters out of their bounds
+/// (see [`FastCoverParams`]), [`ErrorCode::SrcSizeWrong`](crate::ErrorCode::SrcSizeWrong) without samples,
 /// with fewer than 5, or under 8 bytes of them,
-/// [`ErrorCode::DstSizeTooSmall`] for room under 256 bytes, and as
+/// [`ErrorCode::DstSizeTooSmall`](crate::ErrorCode::DstSizeTooSmall) for room under 256 bytes, and as
 /// [`finalize_dictionary`](crate::finalize_dictionary) fails.
 pub fn train_from_buffer_fast_cover(
     dict: &mut [u8],
@@ -564,9 +564,9 @@ pub fn train_from_buffer_fast_cover(
 /// `d`, the split point, steps, `f` and `accel` used, no shrinking, and the
 /// notification level lowered by one. It fails as
 /// [`train_from_buffer_fast_cover`] does, with
-/// [`ErrorCode::ParameterOutOfBound`] for a split point out of (0, 1], an
+/// [`ErrorCode::ParameterOutOfBound`](crate::ErrorCode::ParameterOutOfBound) for a split point out of (0, 1], an
 /// `accel` over 10, a `k` under `d` or an `f` over 31, and
-/// [`ErrorCode::Generic`] when no trial succeeds (a `d` other than 6 and
+/// [`ErrorCode::Generic`](crate::ErrorCode::Generic) when no trial succeeds (a `d` other than 6 and
 /// 8, for one).
 ///
 /// Differs from libzstd: libzstd does not check `f` before it makes the
@@ -723,11 +723,12 @@ mod tests {
             )),
             Err(ErrorCode::SrcSizeWrong)
         );
-        // Too little room: the parameters first (k is over 255).
+        // Too little room: the parameters first (a k over 255).
         let mut small = vec![0u8; 255];
+        let large_k = FastCoverParams { k: 300, ..params };
         assert_eq!(
             code(train_from_buffer_fast_cover(
-                &mut small, &samples, &sizes, params
+                &mut small, &samples, &sizes, large_k
             )),
             Err(ErrorCode::ParameterOutOfBound)
         );

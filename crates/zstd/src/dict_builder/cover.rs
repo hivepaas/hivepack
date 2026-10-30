@@ -1116,7 +1116,7 @@ mod tests {
     fn the_map_counts_and_forgets_keys() {
         let mut map = CoverMap::new(5).expect("a map");
         // Keys that collide and probe past each other.
-        let keys: Vec<u32> = (0..20).map(|i| i * 0x1000_0001).collect();
+        let keys: Vec<u32> = (0..20u32).map(|i| i.wrapping_mul(0x1000_0001)).collect();
         for (i, &key) in keys.iter().enumerate() {
             for _ in 0..=i % 3 {
                 *map.at(key) += 1;
@@ -1125,9 +1125,15 @@ mod tests {
                 map.remove(keys[i - 5]);
             }
         }
+        // Looked up without inserting: the map holds no more than its five
+        // keys and a few, as COVER's never holds more than its dmers.
+        let get = |map: &CoverMap, key: u32| {
+            let (k, v) = map.data[map.index(key)];
+            (v != MAP_EMPTY_VALUE && k == key).then_some(v)
+        };
         for (i, &key) in keys.iter().enumerate() {
-            let want = if i >= 15 { (i % 3 + 1) as u32 } else { 0 };
-            assert_eq!(*map.at(key), want, "key {i}");
+            let want = (i >= 15).then_some((i % 3 + 1) as u32);
+            assert_eq!(get(&map, key), want, "key {i}");
         }
     }
 

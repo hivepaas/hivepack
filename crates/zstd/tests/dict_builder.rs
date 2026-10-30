@@ -222,6 +222,16 @@ fn sample_sets(rng: &mut Rng) -> Vec<SampleSet> {
         mixed,
         gen_budget,
     ));
+    // Samples over a block (128 KB), whose first block alone makes the
+    // statistics. Not under emulation: there libzstd's block splitter, in
+    // the frames that judge the trials, hashes in the machine's byte order
+    // (see tests/compress_dict.rs).
+    if !SLOW {
+        let large: Vec<Vec<u8>> = (0..10)
+            .map(|_| rng.data_between(140_000, 200_000, &text))
+            .collect();
+        sets.push(SampleSet::new("large samples", large, 2_000_000));
+    }
     // Too few, or too small: libzstd's errors.
     let tiny: Vec<Vec<u8>> = (0..500).map(|_| rng.data_between(0, 7, &text)).collect();
     sets.push(SampleSet::new("tiny", tiny, gen_budget));
@@ -312,7 +322,9 @@ fn check_dictionary(problems: &mut Problems, what: &str, dict: &[u8], set: &Samp
 fn train_from_buffer_trains_as_libzstd() {
     let mut rng = Rng(0x5EED_D1C7);
     let sets = sample_sets(&mut rng);
-    let capacities: &[usize] = if SLOW {
+    let capacities: &[usize] = if EMULATED {
+        &[255, 256, 1000, 4096]
+    } else if SLOW {
         &[0, 255, 256, 1000, 4096, 16_384]
     } else {
         &[0, 100, 255, 256, 257, 1000, 4096, 16_384, 65_536, 112_640]

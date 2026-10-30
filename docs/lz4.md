@@ -60,12 +60,12 @@ Running the comparisons found what is behind several of the differences above: t
 At least 0.95× liblz4's speed, as for zstd and zlib, measured with `tools/lz4-bench` on the Silesia corpus (`python3 scripts/testdata.py fetch --group bench` fetches it):
 
 ```sh
-cargo run --release -p lz4-bench -- [--levels 1,9] [--frame] target/testdata/silesia
+cargo run --release -p lz4-bench -- [--levels 1,9] [--frame] [--compress] target/testdata/silesia
 ```
 
-Blocks are decoded in one call each, with room for all the output. With `--frame`, frames of 4 MB linked blocks with a content checksum (`lz4`'s defaults) are read by each library's reader. The tool times lz4_flex too, the other LZ4 in Rust, with its safe code (its default) or, built with `--no-default-features`, its unsafe code.
+Blocks are decoded in one call each, with room for all the output. With `--frame`, frames of 4 MB linked blocks with a content checksum (`lz4`'s defaults) are read by each library's reader. With `--compress`, the same are compressed, blocks in one call each and frames through each library's writer; the port's must be liblz4's, byte for byte. The tool times lz4_flex too, the other LZ4 in Rust, with its safe code (its default) or, built with `--no-default-features`, its unsafe code; it has one compression level, its own, timed against liblz4's level 1.
 
-### Where it stands
+### Where it stands: decoding
 
 Below the target. AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files compressed by liblz4 at levels 1 and 9, decoded as blocks in one call each, best of five rounds taken in turn, on one pinned core:
 
@@ -77,6 +77,17 @@ Below the target. AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesi
 lz4_flex with its unsafe code was at 0.68–0.98× on five of the files (`dickens`, `mozilla`, `nci`, `reymont`, `x-ray`), where the port was at 0.73–0.85×.
 
 As first ported, the port was at 0.65–0.86×. Most of the gap is bounds checks in the fast loop: with the reads and writes of its main copies unchecked, in a scratch copy, it went to about 0.9×. The port now decodes the most common sequence (a token, up to 14 literals and an offset in the next 18 bytes, and a match of up to 18 bytes) through windows of the input and output of a known size, where the compiler sees the copies are in bounds, and makes wild copies whose source ends before their destination in one copy; text files gained most (`dickens` from 0.64× to 0.77–0.79×). Decoding the rest the same way, and a feature with unchecked copies as `hivepack-zstd`'s `unsafe-fast` (which needs HivePaaS's approval, see [unsafe.md](unsafe.md)), are next. arm64 is not measured yet.
+
+### Where it stands: compression
+
+The same machine and corpus, blocks compressed in one call each with room for all the output, best of five rounds (three for high compression):
+
+| | Level 1 | Acceleration 9 | Level 2 | Level 9 | Level 12 |
+|---|---|---|---|---|---|
+| hivepack-lz4 | 0.92–0.98× liblz4 (mean 0.95×) | 0.81–0.95× | 0.77–0.92× | 0.78–0.90× | 0.81–0.97× |
+| lz4_flex 0.14.0, its safe code | 0.91–0.96×, 1.23× on `x-ray` | | | | |
+
+lz4_flex makes its own blocks, not liblz4's. As first ported, the fast compressor was at 0.49–0.90×: `LZ4_compress_generic` is now inlined at each call, as liblz4's, each with its directives constant, and its search reads through a window of the input whose end is the search's own limit. High compression is next.
 
 ## Progress
 

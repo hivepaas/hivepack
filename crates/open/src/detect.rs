@@ -22,6 +22,9 @@ pub enum Layer {
     Gzip,
     /// bzip2.
     Bzip2,
+    /// pbzx, the layer of macOS packages' payloads and of `.xip` files'
+    /// content: xz streams, a block at a time.
+    Pbzx,
 }
 
 /// What is under the layers.
@@ -208,6 +211,9 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     if starts(b"LZIP") {
         return Detected::Layer(Layer::Lzip);
     }
+    if starts(b"pbzx") {
+        return Detected::Layer(Layer::Pbzx);
+    }
     if starts(&[0x1F, 0x8B]) {
         return Detected::Layer(Layer::Gzip);
     }
@@ -269,6 +275,7 @@ mod tests {
             (b"LZIP\x01\x14", Layer::Lzip),
             (&[0x1F, 0x8B, 0x08], Layer::Gzip),
             (b"BZh91AY&SY", Layer::Bzip2),
+            (b"pbzx\0\0\0\0\x01\0\0\0", Layer::Pbzx),
         ];
         for &(head, want) in cases {
             assert_eq!(layer(head), Detected::Layer(want), "{head:?}");
@@ -279,6 +286,8 @@ mod tests {
             b"BZh",
             b"\xFD7zXZ",
             b"LZI",
+            b"pbz",
+            b"PBZX",
             b"\x1F",
             b"\x60\x2A\x4D\x18",
         ] {

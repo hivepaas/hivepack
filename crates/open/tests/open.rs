@@ -11,7 +11,10 @@ mod support;
 use std::io::{self, Cursor, Read};
 
 use hivepack_open::{Container, DecodeError, Error, Layer, Limits, Opener};
-use support::{Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, sample_tar, xz, xz_preset, zstd};
+use support::{
+    Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, pbzx, pbzx_chunk, pbzx_of, sample_tar, xz,
+    xz_no_check, xz_preset, zstd,
+};
 
 /// A reference library's compressor.
 type Compress = fn(&[u8]) -> Vec<u8>;
@@ -32,6 +35,11 @@ fn open(file: &[u8]) -> Result<(Vec<Layer>, Container, Vec<u8>), Error> {
     open_named(file, None)
 }
 
+/// pbzx in chunks of 64 KiB.
+fn pbzx_64k(data: &[u8]) -> Vec<u8> {
+    pbzx(data, 1 << 16)
+}
+
 /// The layer a read failed in.
 fn failed_layer(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> Layer {
     match result {
@@ -49,7 +57,7 @@ fn failed_layer(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> Laye
 #[test]
 fn each_layer_comes_off() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 7] = [
+    let cases: [(Layer, Compress); 8] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
@@ -57,6 +65,7 @@ fn each_layer_comes_off() {
         (Layer::Lz4, lz4_legacy),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let (layers, container, data) = open(&compress(&tar)).unwrap();
@@ -97,6 +106,185 @@ fn layers_stack() {
     let (layers, _, data) = open(&lz4(&gzip(&lz4_legacy(&tar)))).unwrap();
     assert_eq!(layers, [Layer::Lz4, Layer::Gzip, Layer::Lz4]);
     assert!(data == tar);
+}
+
+/// The message of the layer `result` failed in.
+fn failure(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> (Layer, String) {
+    match result {
+        Err(Error::Io(e)) => {
+            let inner = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<DecodeError>())
+                .unwrap_or_else(|| panic!("not a DecodeError: {e}"));
+            (inner.layer, inner.message.clone())
+        }
+        other => panic!("not a decoding error: {other:?}"),
+    }
+}
+
+/// pbzx, as macOS packages' payloads have it, read as Apple's tools read
+/// it (`pkgutil --expand-full`, on files like these: see docs/open.md):
+/// chunks to the end of the stream, short ones among them; stored chunks,
+/// whatever their first bytes; chunks of nothing.
+#[test]
+fn pbzx_chunks_come_off() {
+    let tar = sample_tar();
+    let (layers, container, data) = open(&pbzx(&tar, 1 << 16)).unwrap();
+    assert_eq!((layers, container), (vec![Layer::Pbzx], Container::Tar));
+    assert!(data == tar);
+    let xz_chunk = |c: &[u8]| pbzx_chunk(c.len() as u64, &xz_no_check(c));
+    let stored = |c: &[u8]| pbzx_chunk(c.len() as u64, c);
+    let (a, b) = tar.split_at(1000);
+    let files = [
+        // One chunk.
+        pbzx(&tar, tar.len()),
+        // Chunks of the block's size.
+        pbzx_of(4096, &tar.chunks(4096).map(xz_chunk).collect::<Vec<_>>()),
+        // A short chunk, then more.
+        pbzx_of(1 << 24, &[xz_chunk(a), xz_chunk(b)]),
+        // Stored chunks, and chunks of nothing, before and after.
+        pbzx_of(
+            1 << 16,
+            &[
+                stored(&[]),
+                xz_chunk(&tar[..30_000]),
+                stored(&tar[30_000..60_000]),
+                stored(&[]),
+                xz_chunk(&tar[60_000..]),
+                stored(&[]),
+            ],
+        ),
+        // A check in each stream.
+        pbzx_of(
+            1 << 24,
+            &tar.chunks(50_000)
+                .map(|c| pbzx_chunk(c.len() as u64, &xz(c)))
+                .collect::<Vec<_>>(),
+        ),
+    ];
+    for (i, file) in files.iter().enumerate() {
+        assert_eq!(
+            open(file).unwrap(),
+            (vec![Layer::Pbzx], Container::Tar, tar.clone()),
+            "file {i}"
+        );
+    }
+    // A stored chunk that starts with xz's magic is stored.
+    let mut text = b"some notes ".repeat(100);
+    let at = text.len();
+    text.extend(b"\xFD7zXZ\0 and then more notes");
+    let file = pbzx_of(1 << 24, &[xz_chunk(&text[..at]), stored(&text[at..])]);
+    assert_eq!(
+        open(&file).unwrap(),
+        (vec![Layer::Pbzx], Container::Data, text)
+    );
+    // Nothing but the header: nothing.
+    assert_eq!(
+        open(&pbzx_of(1 << 24, &[])).unwrap(),
+        (vec![Layer::Pbzx], Container::Data, vec![])
+    );
+}
+
+/// What Apple's tools refuse in pbzx (see docs/open.md) is refused.
+#[test]
+fn pbzx_refuses_what_apple_s_tools_refuse() {
+    let text = b"Notes, in chunks.\n".repeat(2000);
+    let chunks: Vec<_> = text
+        .chunks(8192)
+        .map(|c| pbzx_chunk(c.len() as u64, &xz_no_check(c)))
+        .collect();
+    let good = pbzx_of(1 << 24, &chunks);
+    assert_eq!(open(&good).unwrap().2, text);
+    let (part, more) = text.split_at(200);
+    let cut_after = |n: usize| {
+        let mut file = good.clone();
+        file.truncate(file.len() - n);
+        file
+    };
+    let then = |extra: &[u8]| {
+        let mut file = good.clone();
+        file.extend(extra);
+        file
+    };
+    let two_streams = [xz_no_check(part), xz_no_check(&more[..100])].concat();
+    let short_stream = {
+        let stream = xz_no_check(part);
+        stream[..stream.len() - 10].to_vec()
+    };
+    let cases: [(&str, Vec<u8>, &str); 12] = [
+        (
+            "chunks larger than the block",
+            pbzx_of(4096, &chunks),
+            "a chunk is larger than the block size",
+        ),
+        (
+            "a stored chunk larger than the block",
+            pbzx_of(100, &[pbzx_chunk(200, part)]),
+            "a chunk is larger than the block size",
+        ),
+        (
+            "a chunk that decompresses to more",
+            pbzx_of(1 << 24, &[pbzx_chunk(199, &xz_no_check(part))]),
+            "a chunk decompresses to more than its size",
+        ),
+        (
+            "a chunk that decompresses to less",
+            pbzx_of(1 << 24, &[pbzx_chunk(201, &xz_no_check(part))]),
+            "a chunk decompresses to less than its size",
+        ),
+        (
+            "two xz streams in a chunk",
+            pbzx_of(1 << 24, &[pbzx_chunk(300, &two_streams)]),
+            "data after a chunk's xz stream",
+        ),
+        (
+            "a chunk neither stored nor xz",
+            pbzx_of(1 << 24, &[pbzx_chunk(201, part)]),
+            "file format not recognized",
+        ),
+        (
+            "a chunk's header cut short",
+            then(&[0; 8]),
+            "the stream is cut short",
+        ),
+        (
+            "a chunk cut short",
+            cut_after(10),
+            "the stream is cut short",
+        ),
+        (
+            "an xz stream longer than its chunk",
+            pbzx_of(1 << 24, &[pbzx_chunk(200, &short_stream)]),
+            "a chunk's xz stream is cut short",
+        ),
+        (
+            "a chunk's stored size past the end",
+            cut_after(0)
+                .into_iter()
+                .chain(pbzx_chunk(100, &[1; 100]).into_iter().take(16 + 5))
+                .collect(),
+            "the stream is cut short",
+        ),
+        (
+            "anything after the last chunk",
+            then(b"and something after it"),
+            "a chunk is larger than the block size",
+        ),
+        (
+            "the header cut short",
+            good[..8].to_vec(),
+            "the stream is cut short",
+        ),
+    ];
+    for (what, file, message) in cases {
+        assert_eq!(
+            failure(open(&file)),
+            (Layer::Pbzx, message.to_string()),
+            "{what}"
+        );
+    }
+    // Zeros after the last chunk are chunks of nothing.
+    assert_eq!(open(&then(&[0; 32])).unwrap().2, text);
 }
 
 #[test]
@@ -286,12 +474,13 @@ fn streams_one_after_another() {
 #[test]
 fn other_data_after_the_streams_fails() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 5] = [
+    let cases: [(Layer, Compress); 6] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lz4, lz4),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let mut file = compress(&tar);
@@ -303,7 +492,7 @@ fn other_data_after_the_streams_fails() {
 #[test]
 fn a_stream_cut_short_fails() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 8] = [
+    let cases: [(Layer, Compress); 9] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
@@ -312,6 +501,7 @@ fn a_stream_cut_short_fails() {
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
         (Layer::Lzma, lzma),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let file = compress(&tar);
@@ -368,13 +558,14 @@ fn what_comes_before_an_error_is_given_out() {
     // its error, so that what is read does not depend on the size of the
     // reads (the fuzz target found it with a .lzma file).
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 6] = [
+    let cases: [(Layer, Compress); 7] = [
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
         (Layer::Lzma, lzma),
         (Layer::Lz4, lz4),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let mut file = compress(&tar);
@@ -435,6 +626,7 @@ fn input_a_byte_at_a_time() {
         lzip(&tar),
         lz4(&tar),
         lz4_legacy(&tar),
+        pbzx_64k(&tar),
     ] {
         let mut opener = Opener::new(|| Ok(Trickle(&file, false)));
         let mut opened = opener.open().unwrap();

@@ -234,6 +234,39 @@ pub fn xz_preset(data: &[u8], preset: u32) -> Vec<u8> {
     lzma_stream(stream, data)
 }
 
+/// An xz stream without a check, as Apple's packages' pbzx chunks have.
+pub fn xz_no_check(data: &[u8]) -> Vec<u8> {
+    let stream =
+        liblzma::stream::Stream::new_easy_encoder(6, liblzma::stream::Check::None).expect("xz");
+    lzma_stream(stream, data)
+}
+
+/// A pbzx chunk: its size, the size of what stores it, and that.
+pub fn pbzx_chunk(size: u64, stored: &[u8]) -> Vec<u8> {
+    let mut chunk = size.to_be_bytes().to_vec();
+    chunk.extend((stored.len() as u64).to_be_bytes());
+    chunk.extend(stored);
+    chunk
+}
+
+/// pbzx with the block size `block`, and these chunks.
+pub fn pbzx_of(block: u64, chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut file = b"pbzx".to_vec();
+    file.extend(block.to_be_bytes());
+    file.extend(chunks.concat());
+    file
+}
+
+/// pbzx as Apple writes it: blocks of 16 MiB, each compressed with xz,
+/// here cut every `chunk` bytes.
+pub fn pbzx(data: &[u8], chunk: usize) -> Vec<u8> {
+    let chunks: Vec<_> = data
+        .chunks(chunk)
+        .map(|c| pbzx_chunk(c.len() as u64, &xz_no_check(c)))
+        .collect();
+    pbzx_of(1 << 24, &chunks)
+}
+
 /// .lzma, LZMA_Alone.
 pub fn lzma(data: &[u8]) -> Vec<u8> {
     let options = liblzma::stream::LzmaOptions::new_preset(6).expect("preset");

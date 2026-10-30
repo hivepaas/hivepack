@@ -60,6 +60,7 @@ Each set has a `kind`:
 | `7zz` | 7-Zip's console program, built with its makefile: the archives hivepack-7z's tests read. Only a tool: nothing is linked with it | LGPL-2.1-or-later, BSD-3-Clause, and the unRAR restriction for its RAR code | generated |
 | `nettle-oracle` | `tools/nettle-oracle`, built with nettle 3.10.2's AES, SHA-1, HMAC and PBKDF2 sources: for comparing hivepack-crypto with them | MIT, and nettle's licenses | generated |
 | `tar-oracle` | `tools/tar-oracle`, built with Go 1.27.2's archive/tar, the release its `go.mod` names: for comparing hivepack-tar with it | MIT, and BSD-3-Clause (Go) | generated |
+| `tar-bench-go` | `tools/tar-bench/go`, built with Go 1.27.2's `archive/tar`: Go's side of `tools/tar-bench` | MIT and BSD-3-Clause | generated, `bench` |
 | `unrar-7.3.2-source` | the UnRAR 7.3.2 source, RARLAB's, to build the next set from | UnRAR | fetched, `generated` |
 | `rar-oracle` | `tools/rar-oracle`, built with the UnRAR 7.3.2 sources as UnRAR's library is built: UnRAR's reading of headers, for comparing hivepack-rar with it | UnRAR | generated |
 | `libarchive-3.8.10-source` | the libarchive 3.8.10 release, for its RAR test archives and to build `iso-oracle` from | BSD-2-Clause | fetched, `core` |

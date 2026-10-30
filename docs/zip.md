@@ -100,7 +100,7 @@ python3 scripts/testdata.py fetch --group bench
 cargo run --release -p zip-bench -- [--only TEXT] [--rounds 5] [--seconds 0.5]
 ```
 
-AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. Opening, finding and editing were measured after the work on opening below, the other rows just before it, which does not touch them. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
+AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. Opening and finding were measured after the work on opening below, and editing after the work on closing, the other rows before them, as that work does not touch them. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
 
 | Workload | hivepack-zip | libzip | Port / libzip |
 |---|---|---|---|
@@ -142,17 +142,17 @@ AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 
 | WinZip AES-256 | 160 MB/s | 251 MB/s | 0.64× |
 | WinZip AES-256, small entries | 1.2 k entries/s | 2.1 k entries/s | 0.57× |
 | **Editing** | | | |
-| Rename one entry, the data copied | 8776 MB/s | 5909 MB/s | 1.49× |
-| Add one entry, the data copied | 8677 MB/s | 5958 MB/s | 1.46× |
-| Rename each of many entries | 621 k entries/s | 1016 k entries/s | 0.61× |
-| Set each of many entries' comment | 788 k entries/s | 1640 k entries/s | 0.48× |
-| Delete half of many entries | 1437 k entries/s | 3009 k entries/s | 0.48× |
+| Rename one entry, the data copied | 9814 MB/s | 6174 MB/s | 1.59× |
+| Add one entry, the data copied | 9584 MB/s | 6138 MB/s | 1.56× |
+| Rename each of many entries | 1523 k entries/s | 1041 k entries/s | 1.46× |
+| Set each of many entries' comment | 3343 k entries/s | 1683 k entries/s | 1.99× |
+| Delete half of many entries | 4642 k entries/s | 3079 k entries/s | 1.51× |
 
 What to read in it:
 
 - **Compression and decompression** are the speed of hivepack's other ports, which their own documents go into: Deflate and bzip2 at their libraries' speed, and LZMA and XZ reading below liblzma's on x86-64, where its range decoder is inline assembly ([xz.md](xz.md)). Writing them, where the compressor is most of the time, is even.
 - **Opening many entries** went from 0.33× to 0.78×, and with `ZIP_CHECKCONS` from 0.35× to 1.30×, once the port read ahead (`stdio` does that for libzip, and without it each entry was a system call or two) and stopped allocating and copying for each entry. About a quarter of what is left is hashing names. libzip hashes with SipHash and random keys too, and the port keeps them, so that an archive cannot be made to collide on purpose.
-- **Editing many entries** is now the widest gap, and it is not in opening, which is not timed here. It has not been looked into yet.
+- **Editing many entries** went from 0.48–0.61× to 1.46–1.99×. Closing was five system calls an entry: asking a `BufWriter` where it is writes out its buffer, so each entry's `tell` was a write and a seek, and each read of a local header or of data a `pread`, from a view of the source of its own. Now the writer keeps its position, and the entries share a read ahead, for about 1% of the system calls, and share one copy buffer where each had 8 KiB allocated and cleared.
 - **AES** compares two different things. libzip here uses nettle's C code, with no AES instructions and table lookups, where BearSSL's `aes_ct64`, which the port uses, runs in constant time. A profile of the AES-256 workloads, reading and writing, gives 44% to SHA-1 (WinZip AES authenticates with HMAC-SHA1, and hashes its key with PBKDF2) and about 30% to AES. A libzip that uses the processor's AES instructions, as a usual build with GnuTLS or OpenSSL does, would be further ahead than this table shows.
 - **Not compared:** Deflate64 and PPMd, which libzip does not have, and split archives. Files are read and written on the machine's disk, through its cache.
 

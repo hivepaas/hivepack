@@ -70,8 +70,8 @@ Against libzip 1.12.1, with `tools/zip-bench`. Above 1× the port is faster.
 | Finding entries | 1.16–2.67× |
 | ZipCrypto | 0.90–0.93× |
 | WinZip AES | 0.57–0.66× |
-| Editing, the data copied | 1.46–1.49× |
-| Editing each of 200,000 entries | 0.48–0.61× |
+| Editing, the data copied | 1.56–1.59× |
+| Editing each of 200,000 entries | 1.46–1.99× |
 
 **Measured on:** AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, in October 2026. libzip is built with GCC 15.2 and `-O2`, from the releases of zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8 and XZ Utils 5.8.4, without assembly files. The data is the Silesia corpus cut to 64 MiB, on a nearly idle machine, the best of five rounds taken in turn. What the two wrote without encryption was the same, byte for byte.
 

@@ -67,7 +67,7 @@ What to read in it:
 
 - **Headers** are where a tar reader does its own work, and the port takes about half of Go's time. Neither was profiled, so why is not shown; Go's `Header` holds strings and maps, and Go has a garbage collector.
 - **Data** is mostly a copy, so it measures memory: from a file, the page cache. Compressors in front of tar will set the speed, not this.
-- **Skipping a file given as it is** is the real gap. `archive/tar` seeks past data when its reader can seek, and `hivepack_tar::Reader` takes any `Read` and goes through it, so listing a large archive on disk reads all of it. Reading and extracting are not affected, and neither is a compressed archive, which cannot seek. From memory, the 134× is not the port's doing: its skip reads into a buffer nothing looks at, and 13 µs for 64 MiB can only mean the compiler took the copy out, where Go's copy through a plain reader stays. A real source is a file or a decompressor, as in the rows beside it.
+- **Skipping a file given as it is** is the real gap. `archive/tar` seeks past data when its reader can seek, and `hivepack_tar::Reader` takes any `Read` and goes through it, so listing a large archive on disk reads all of it. Reading and extracting are not affected, and neither is a compressed archive, which cannot seek. From memory, the 134× is not the port's doing: its skip reads into a buffer nothing looks at, and about 14 µs for 64 MiB can only mean the compiler took the copy out, where Go's copy through a plain reader stays. A real source is a file or a decompressor, as in the rows beside it.
 
 ## How it is shown
 

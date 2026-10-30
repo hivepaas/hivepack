@@ -50,4 +50,4 @@ A new libarchive release's changes to `archive_read_support_format_iso9660.c`, a
 
 ## Licenses
 
-The port is derived from libarchive, under the BSD-2-Clause license (Copyright Tim Kientzle, Andreas Henriksson, Michihiro NAKAJIMA and Martin Matuska); `hivepack-iso` is under the same license, with libarchive's notice in its [LICENSE](../crates/iso/LICENSE). libarchive's test images in `testdata/libarchive-iso` are under it too, with libarchive's `COPYING` beside them.
+The port is derived from libarchive, under the BSD-2-Clause license (Copyright Tim Kientzle, Andreas Henriksson, Michihiro NAKAJIMA and Martin Matuska); `hivepack-iso` is under the same license, with libarchive's notice in its [LICENSE](../crates/iso/LICENSE). libarchive's test images in `testdata/libarchive-iso` are under it too, with libarchive's `COPYING` beside them, as `LICENSE`.

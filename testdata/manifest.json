@@ -328,7 +328,7 @@
     {
       "name": "libarchive-iso",
       "path": "libarchive-iso",
-      "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING",
+      "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING (as LICENSE)",
       "license": "BSD-2-Clause",
       "kind": "vectors"
     },

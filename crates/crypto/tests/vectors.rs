@@ -1,13 +1,19 @@
 //! The published test vectors: AES from FIPS-197 (appendix C) and NIST SP
-//! 800-38A (F.1, ECB), SHA-1 from FIPS 180, HMAC-SHA1 from RFC 2202 and
-//! PBKDF2-HMAC-SHA1 from RFC 6070. `tests/oracle.rs` compares many more
-//! inputs with nettle.
+//! 800-38A (F.1, ECB); SHA-1, SHA-256 and SHA-512 from FIPS 180; HMAC-SHA1
+//! from RFC 2202, HMAC-SHA256 and HMAC-SHA512 from RFC 4231;
+//! PBKDF2-HMAC-SHA1 from RFC 6070 and PBKDF2-HMAC-SHA256 from RFC 7914;
+//! HKDF from RFC 5869; ChaCha20 and ChaCha20-Poly1305 from RFC 8439;
+//! X25519 from RFC 7748; scrypt from RFC 7914. `tests/oracle.rs` compares
+//! many more inputs with nettle, and `tests/go_oracle.rs` with Go.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod support;
 
-use hivepack_crypto::{Aes, Hmac, HmacKey, Sha1, pbkdf2_hmac_sha1};
+use hivepack_crypto::{
+    Aes, Digest, Hkdf, Hmac, HmacKey, ScryptError, Sha1, Sha256, Sha512, chacha20,
+    chacha20_poly1305, equal, pbkdf2, scrypt, x25519, x25519_base,
+};
 use support::{hex, unhex};
 
 fn encrypt(key: &str, blocks: &str) -> String {
@@ -123,9 +129,13 @@ fn sha1_goes_on_after_out() {
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> String {
-    let mut hmac = Hmac::new(&HmacKey::new(key));
+    hmac_with::<Sha1>(key, data)
+}
+
+fn hmac_with<H: Digest>(key: &[u8], data: &[u8]) -> String {
+    let mut hmac = Hmac::new(&HmacKey::<H>::new(key));
     hmac.update(data);
-    hex(&hmac.out())
+    hex(hmac.out().as_ref())
 }
 
 #[test]
@@ -167,28 +177,28 @@ fn hmac_sha1_rfc_2202() {
     );
 }
 
-fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32, length: usize) -> String {
+fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, length: usize) -> String {
     let mut out = vec![0; length];
-    pbkdf2_hmac_sha1(password, salt, iterations, &mut out);
+    pbkdf2::<Sha1>(password, salt, iterations, &mut out);
     hex(&out)
 }
 
 #[test]
 fn pbkdf2_hmac_sha1_rfc_6070() {
     assert_eq!(
-        pbkdf2(b"password", b"salt", 1, 20),
+        pbkdf2_sha1(b"password", b"salt", 1, 20),
         "0c60c80f961f0e71f3a9b524af6012062fe037a6"
     );
     assert_eq!(
-        pbkdf2(b"password", b"salt", 2, 20),
+        pbkdf2_sha1(b"password", b"salt", 2, 20),
         "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"
     );
     assert_eq!(
-        pbkdf2(b"password", b"salt", 4096, 20),
+        pbkdf2_sha1(b"password", b"salt", 4096, 20),
         "4b007901b765489abead49d926f721d065a429c1"
     );
     assert_eq!(
-        pbkdf2(
+        pbkdf2_sha1(
             b"passwordPASSWORDpassword",
             b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
             4096,
@@ -197,7 +207,7 @@ fn pbkdf2_hmac_sha1_rfc_6070() {
         "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"
     );
     assert_eq!(
-        pbkdf2(b"pass\0word", b"sa\0lt", 4096, 16),
+        pbkdf2_sha1(b"pass\0word", b"sa\0lt", 4096, 16),
         "56fa6aa75548099dcc37d7f03425e0c3"
     );
 }
@@ -206,7 +216,7 @@ fn pbkdf2_hmac_sha1_rfc_6070() {
 #[ignore = "16,777,216 rounds"]
 fn pbkdf2_hmac_sha1_rfc_6070_long() {
     assert_eq!(
-        pbkdf2(b"password", b"salt", 16_777_216, 20),
+        pbkdf2_sha1(b"password", b"salt", 16_777_216, 20),
         "eefe3d61cd4da4e4e9945b3d6ba2158c2634e984"
     );
 }
@@ -214,7 +224,414 @@ fn pbkdf2_hmac_sha1_rfc_6070_long() {
 #[test]
 fn pbkdf2_zero_rounds_count_as_one() {
     assert_eq!(
-        pbkdf2(b"password", b"salt", 0, 20),
-        pbkdf2(b"password", b"salt", 1, 20)
+        pbkdf2_sha1(b"password", b"salt", 0, 20),
+        pbkdf2_sha1(b"password", b"salt", 1, 20)
+    );
+}
+
+fn digest<H: Digest>(data: &[u8]) -> String {
+    let mut h = H::new();
+    h.update(data);
+    hex(h.out().as_ref())
+}
+
+#[test]
+fn sha256_fips_180() {
+    assert_eq!(
+        digest::<Sha256>(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        digest::<Sha256>(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        digest::<Sha256>(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+    let mut sha256 = Sha256::new();
+    for _ in 0..1000 {
+        sha256.update(&[b'a'; 1000]);
+    }
+    assert_eq!(
+        hex(&sha256.out()),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+}
+
+#[test]
+fn sha512_fips_180() {
+    assert_eq!(
+        digest::<Sha512>(b""),
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+         47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    );
+    assert_eq!(
+        digest::<Sha512>(b"abc"),
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+         2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    );
+    assert_eq!(
+        digest::<Sha512>(
+            b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+              hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+        ),
+        "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018\
+         501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
+    );
+    let mut sha512 = Sha512::new();
+    for _ in 0..1000 {
+        sha512.update(&[b'a'; 1000]);
+    }
+    assert_eq!(
+        hex(&sha512.out()),
+        "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb\
+         de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b"
+    );
+}
+
+#[test]
+fn hmac_sha256_and_sha512_rfc_4231() {
+    let long_data: &[u8] = b"This is a test using a larger than block-size key and a larger \
+        than block-size data. The key needs to be hashed before being used by the HMAC \
+        algorithm.";
+    let key4: Vec<u8> = (1..=25).collect();
+    // Test cases 1 to 4, 6 and 7; case 5 truncates the output.
+    let cases: [(&[u8], &[u8], &str, &str); 6] = [
+        (
+            &[0x0b; 20],
+            b"Hi There",
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde\
+             daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854",
+        ),
+        (
+            b"Jefe",
+            b"what do ya want for nothing?",
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554\
+             9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737",
+        ),
+        (
+            &[0xaa; 20],
+            &[0xdd; 50],
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+            "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39\
+             bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb",
+        ),
+        (
+            &key4,
+            &[0xcd; 50],
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+            "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3db\
+             a91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd",
+        ),
+        (
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352\
+             6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598",
+        ),
+        (
+            &[0xaa; 131],
+            long_data,
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944\
+             b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58",
+        ),
+    ];
+    for (key, data, sha256, sha512) in cases {
+        assert_eq!(hmac_with::<Sha256>(key, data), sha256);
+        assert_eq!(hmac_with::<Sha512>(key, data), sha512);
+    }
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, length: usize) -> String {
+    let mut out = vec![0; length];
+    pbkdf2::<Sha256>(password, salt, iterations, &mut out);
+    hex(&out)
+}
+
+#[test]
+fn pbkdf2_hmac_sha256_rfc_7914() {
+    assert_eq!(
+        pbkdf2_sha256(b"passwd", b"salt", 1, 64),
+        "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+         49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+    );
+    assert_eq!(
+        pbkdf2_sha256(b"Password", b"NaCl", 80000, 64),
+        "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56\
+         a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d"
+    );
+}
+
+/// HKDF-SHA256 of `ikm` with `salt` and `info`, `length` bytes, taken in
+/// pieces of `piece` bytes.
+fn hkdf(ikm: &str, salt: Option<&str>, info: &str, length: usize, piece: usize) -> String {
+    let salt = salt.map(unhex);
+    let mut extract = Hkdf::<Sha256>::new(salt.as_deref());
+    extract.inject(&unhex(ikm));
+    let mut expand = extract.flip();
+    let mut out = vec![0; length];
+    for chunk in out.chunks_mut(piece) {
+        assert_eq!(expand.produce(&unhex(info), chunk), chunk.len());
+    }
+    hex(&out)
+}
+
+#[test]
+fn hkdf_sha256_rfc_5869() {
+    let ikm = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    for piece in [1, 7, 32, 100] {
+        assert_eq!(
+            hkdf(
+                ikm,
+                Some("000102030405060708090a0b0c"),
+                "f0f1f2f3f4f5f6f7f8f9",
+                42,
+                piece
+            ),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+    }
+    let ikm_2: Vec<u8> = (0x00..=0x4f).collect();
+    let salt: Vec<u8> = (0x60..=0xaf).collect();
+    let info: Vec<u8> = (0xb0..=0xff).collect();
+    assert_eq!(
+        hkdf(&hex(&ikm_2), Some(&hex(&salt)), &hex(&info), 82, 82),
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c\
+         59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71\
+         cc30c58179ec3e87c14c01d5c1f3434f1d87"
+    );
+    // Test case 3: no salt and no info; an empty salt is the same.
+    for salt in [None, Some("-")] {
+        assert_eq!(
+            hkdf(ikm, salt, "-", 42, 42),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+        );
+    }
+}
+
+#[test]
+fn hkdf_stops_at_255_blocks() {
+    let mut expand = Hkdf::<Sha256>::new(None).flip();
+    let mut out = vec![0; 255 * 32 + 1];
+    assert_eq!(expand.produce(b"", &mut out), 255 * 32);
+    assert_eq!(expand.produce(b"", &mut out), 0);
+    assert_eq!(expand.produce(b"", &mut out), 0);
+}
+
+#[test]
+fn chacha20_rfc_8439() {
+    // Section 2.4.2.
+    let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+    let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you \
+        only one tip for the future, sunscreen would be it.";
+    let ciphertext = "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b\
+        f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8\
+        07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736\
+        5af90bbf74a35be6b40b8eedf2785e42874d";
+    let mut data = plaintext.to_vec();
+    assert_eq!(chacha20(&key, &nonce, 1, &mut data), 3);
+    assert_eq!(hex(&data), ciphertext);
+    // The same in two calls, the second going on from the counter the
+    // first returned.
+    let mut data = plaintext.to_vec();
+    let (first, second) = data.split_at_mut(64);
+    let next = chacha20(&key, &nonce, 1, first);
+    chacha20(&key, &nonce, next, second);
+    assert_eq!(hex(&data), ciphertext);
+}
+
+#[test]
+fn chacha20_poly1305_rfc_8439() {
+    // Section 2.8.2.
+    let key: [u8; 32] = unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+        .try_into()
+        .unwrap();
+    let nonce: [u8; 12] = unhex("070000004041424344454647").try_into().unwrap();
+    let aad = unhex("50515253c0c1c2c3c4c5c6c7");
+    let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you \
+        only one tip for the future, sunscreen would be it.";
+    let ciphertext = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6\
+        3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36\
+        92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc\
+        3ff4def08e4b7a9de576d26586cec64b6116";
+    let tag = "1ae10b594f09e26a7e902ecbd0600691";
+
+    let mut data = plaintext.to_vec();
+    assert_eq!(
+        hex(&chacha20_poly1305(&key, &nonce, &mut data, &aad, true)),
+        tag
+    );
+    assert_eq!(hex(&data), ciphertext);
+
+    let computed = chacha20_poly1305(&key, &nonce, &mut data, &aad, false);
+    assert!(equal(&computed, &unhex(tag)));
+    assert_eq!(data, plaintext);
+
+    // One bit off in the ciphertext changes the tag.
+    let mut data = unhex(ciphertext);
+    data[50] ^= 4;
+    let computed = chacha20_poly1305(&key, &nonce, &mut data, &aad, false);
+    assert!(!equal(&computed, &unhex(tag)));
+}
+
+#[test]
+fn equal_compares_whole_slices() {
+    assert!(equal(b"", b""));
+    assert!(equal(b"abc", b"abc"));
+    assert!(!equal(b"abc", b"abd"));
+    assert!(!equal(b"abc", b"ab"));
+    assert!(!equal(&[0x80], &[0]));
+}
+
+fn x25519_hex(k: &str, u: &str) -> String {
+    let k: [u8; 32] = unhex(k).try_into().unwrap();
+    let u: [u8; 32] = unhex(u).try_into().unwrap();
+    hex(&x25519(&k, &u))
+}
+
+#[test]
+fn x25519_rfc_7748() {
+    // Section 5.2.
+    assert_eq!(
+        x25519_hex(
+            "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+            "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"
+        ),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
+    );
+    // This u-coordinate has its top bit set, which is ignored.
+    assert_eq!(
+        x25519_hex(
+            "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+            "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"
+        ),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"
+    );
+
+    // Section 6.1.
+    let a = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+    let b = "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb";
+    let ka = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+    let kb = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+    let shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+    let private = |k: &str| -> [u8; 32] { unhex(k).try_into().unwrap() };
+    assert_eq!(hex(&x25519_base(&private(a))), ka);
+    assert_eq!(hex(&x25519_base(&private(b))), kb);
+    assert_eq!(x25519_hex(a, kb), shared);
+    assert_eq!(x25519_hex(b, ka), shared);
+}
+
+fn x25519_iterations(count: u32) -> String {
+    let mut k = [0u8; 32];
+    k[0] = 9;
+    let mut u = k;
+    for _ in 0..count {
+        let next = x25519(&k, &u);
+        u = k;
+        k = next;
+    }
+    hex(&k)
+}
+
+#[test]
+fn x25519_rfc_7748_iterated() {
+    assert_eq!(
+        x25519_iterations(1),
+        "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079"
+    );
+    assert_eq!(
+        x25519_iterations(1000),
+        "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51"
+    );
+}
+
+#[test]
+#[ignore = "a million scalar multiplications"]
+fn x25519_rfc_7748_iterated_long() {
+    assert_eq!(
+        x25519_iterations(1_000_000),
+        "7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424"
+    );
+}
+
+#[test]
+fn x25519_small_order_gives_zero() {
+    let k = [0x42; 32];
+    assert_eq!(x25519(&k, &[0; 32]), [0; 32]);
+    let mut one = [0; 32];
+    one[0] = 1;
+    assert_eq!(x25519(&k, &one), [0; 32]);
+}
+
+fn scrypt_hex(password: &[u8], salt: &[u8], log_n: u8, r: u32, p: u32) -> String {
+    let mut out = [0; 64];
+    scrypt(password, salt, log_n, r, p, &mut out).unwrap();
+    hex(&out)
+}
+
+#[test]
+fn scrypt_rfc_7914() {
+    assert_eq!(
+        scrypt_hex(b"", b"", 4, 1, 1),
+        "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442\
+         fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906"
+    );
+    assert_eq!(
+        scrypt_hex(b"password", b"NaCl", 10, 8, 16),
+        "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b373162\
+         2eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640"
+    );
+    assert_eq!(
+        scrypt_hex(b"pleaseletmein", b"SodiumChloride", 14, 8, 1),
+        "7023bdcb3afd7348461c06cd81fd38ebfda8fbba904f8e3ea9b543f6545da1f2\
+         d5432955613f0fcf62d49705242a9af9e61e85dc0d651e40dfcf017b45575887"
+    );
+}
+
+#[test]
+#[ignore = "1 GiB of memory"]
+fn scrypt_rfc_7914_large() {
+    assert_eq!(
+        scrypt_hex(b"pleaseletmein", b"SodiumChloride", 20, 8, 1),
+        "2101cb9b6a511aaeaddbbe09cf70f881ec568d574a2ffd4dabe5ee9820adaa47\
+         8e56fd8f4ba5d09ffa1c6d927c40f4c337304049e8a952fbcbf45c6fa77a41a4"
+    );
+}
+
+#[test]
+fn scrypt_refuses_parameters_outside_rfc_7914() {
+    let mut out = [0; 32];
+    for (log_n, r, p) in [
+        (0, 8, 1),
+        (64, 8, 1),
+        (4, 0, 1),
+        (4, 8, 0),
+        (4, 1 << 15, 1 << 15),
+    ] {
+        assert_eq!(
+            scrypt(b"", b"", log_n, r, p, &mut out),
+            Err(ScryptError::Parameters),
+            "{log_n} {r} {p}"
+        );
+    }
+    // RFC 7914 wants N below 2^(16 r); like Go, the port does not check.
+    assert!(scrypt(b"", b"", 16, 1, 1, &mut out).is_ok());
+}
+
+#[test]
+fn scrypt_reports_memory_it_cannot_have() {
+    let mut out = [0; 32];
+    // 2^40 × 128 × 8 bytes, a pebibyte, are more than any machine's
+    // address space; a 32-bit machine cannot even count them.
+    let result = scrypt(b"", b"", 40, 8, 1, &mut out);
+    assert!(
+        matches!(result, Err(ScryptError::Memory | ScryptError::Parameters)),
+        "{result:?}"
     );
 }

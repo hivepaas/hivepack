@@ -114,6 +114,13 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
+      # The oracle written in Go, tools/age-oracle, with the Go its go.mod
+      # names.
+      - if: contains(matrix.groups, 'generated')
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: tools/age-oracle/go.mod
+          cache-dependency-path: tools/age-oracle/go.sum
       - uses: actions/cache@v6
         with:
           path: target/testdata

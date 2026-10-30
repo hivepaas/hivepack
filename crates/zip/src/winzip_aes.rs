@@ -2,7 +2,7 @@
 //! password and salt, and AES in WinZip's counter mode with HMAC-SHA1 over
 //! the encrypted data, on `hivepack-crypto`.
 
-use hivepack_crypto::{AES_BLOCK_LENGTH, Aes, Hmac, HmacKey, SHA1_LENGTH, pbkdf2_hmac_sha1};
+use hivepack_crypto::{AES_BLOCK_LENGTH, Aes, Hmac, HmacKey, SHA1_LENGTH, Sha1, pbkdf2};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::zip::em;
@@ -20,7 +20,7 @@ const PAD_LENGTH: usize = 4 * AES_BLOCK_LENGTH;
 /// values encrypted at once, where libzip encrypts one block at a time.
 pub(crate) struct WinzipAes {
     aes: Aes,
-    hmac: Hmac,
+    hmac: Hmac<Sha1>,
     counter: [u8; AES_BLOCK_LENGTH],
     pad: [u8; PAD_LENGTH],
     pad_offset: usize,
@@ -76,7 +76,7 @@ impl WinzipAes {
 
         let mut buffer = [0u8; 2 * (MAX_KEY_LENGTH / 8) + WINZIP_AES_PASSWORD_VERIFY_LENGTH];
         let derived = &mut buffer[..2 * key_length + WINZIP_AES_PASSWORD_VERIFY_LENGTH];
-        pbkdf2_hmac_sha1(password, salt, PBKDF2_ITERATIONS, derived);
+        pbkdf2::<Sha1>(password, salt, PBKDF2_ITERATIONS, derived);
 
         let aes = Aes::new(&derived[..key_length]).ok_or(Error::new(ErrorCode::Inval, 0))?;
         let hmac = Hmac::new(&HmacKey::new(&derived[key_length..2 * key_length]));

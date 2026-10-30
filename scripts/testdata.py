@@ -7,7 +7,8 @@ testdata/manifest.json lists every set:
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
   by the oracles in tools/, built from the pinned zstd, zlib, bzip2, XZ
-  Utils, libzip and nettle releases.
+  Utils, libzip and nettle releases, or with Go from the modules their go.sum
+  pins.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
@@ -341,12 +342,34 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                    check=True)
 
 
+def build_go(sources: list, folder: Path) -> None:
+    """An oracle written in Go, built by the go command from its module in
+    tools/. go.sum pins the modules it downloads, which the go command also
+    checks against Go's checksum database; -mod=readonly keeps it from
+    changing go.mod. An installed Go older than the one go.mod asks for
+    downloads that one (GOTOOLCHAIN=auto, the default)."""
+    go = shutil.which("go")
+    if go is None:
+        sys.exit("building the Go oracles needs Go: https://go.dev/dl/")
+    module = ROOT / Path(sources[0]).parent
+    subprocess.run([go, "build", "-trimpath", "-mod=readonly", "-o", str(folder / "oracle"), "."],
+                   cwd=module, check=True, env={**os.environ, "CGO_ENABLED": "0"})
+
+
 def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     folder = cache / entry["name"]
     generate = entry["generate"]
     stamp = stamp_of(entry)
     if is_current(folder, stamp):
         print(f"  {entry['name']}: up to date")
+        return
+    if generate["tool"] == "go":
+        if folder.exists():
+            shutil.rmtree(folder)
+        folder.mkdir(parents=True)
+        build_go(generate["sources"], folder)
+        mark_current(folder, stamp)
+        print(f"  {entry['name']}: generated")
         return
     origin = sets[generate["from"]]
     fetch_set(origin, cache)

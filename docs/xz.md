@@ -28,6 +28,7 @@ The other differences:
 - **The Index hash** is liblzma's: SHA-256 of each Block's two sizes. liblzma hashes them as they are in memory, the port in little-endian order, on the Blocks' side and the Records' alike, so the comparison is the same.
 - **The memory usage** counts liblzma's structures by their sizes on 64-bit machines (`sizeof(lzma_lzma1_decoder)`, 28,352 bytes, and the others), on every machine: the numbers are liblzma's on x86-64 and arm64, and the port's own structures are not those.
 - **What C needs and Rust does not:** custom allocators, `lzma_end()` (dropping the stream), and the checks of null pointers and reserved members. A buffer whose `pos` is past its end fails with `LZMA_PROG_ERROR`.
+- **A stream is `Send`**, so that it can be moved to another thread, as an `lzma_stream` can: `NextCoder` asks it of every coder.
 - **CRC32 and CRC64** are computed slice-by-eight from their tables, as liblzma's generic code does; liblzma's CLMUL, ARM64 and LoongArch versions give the same values.
 
 ### What liblzma does, kept

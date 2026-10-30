@@ -196,6 +196,7 @@ dependencies = [
  "hivepack-bzip2",
  "hivepack-deflate",
  "hivepack-extract",
+ "hivepack-open",
  "hivepack-tar",
  "hivepack-xz",
  "hivepack-zip",
@@ -205,6 +206,17 @@ dependencies = [
  "liblzma-sys",
  "libz-sys",
  "zstd",
+]
+
+[[package]]
+name = "hivepack-open"
+version = "0.0.0"
+dependencies = [
+ "hivepack-age",
+ "hivepack-bzip2",
+ "hivepack-deflate",
+ "hivepack-xz",
+ "hivepack-zstd",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/open", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,7 @@ hivepack-bzip2 = { path = "crates/bzip2" }
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-extract = { path = "crates/extract" }
+hivepack-open = { path = "crates/open" }
 hivepack-tar = { path = "crates/tar" }
 hivepack-xz = { path = "crates/xz" }
 hivepack-zip = { path = "crates/zip" }

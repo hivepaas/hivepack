@@ -1,10 +1,10 @@
 //! Extracting tar archives made to attack extractors, as `tests/extract.rs`
 //! does for ZIP: names that climb out, the same path twice, symbolic and
-//! hard links, devices, the limits, archives cut short, and an archive that
-//! changes between its two readings. Each must stop with its reason and
-//! leave nothing outside the destination, and nothing at all when the
-//! checks before writing stop it. Then Go's test archives, each extracted
-//! or stopped with its reason.
+//! hard links, devices, the limits, archives cut short, a stream that
+//! fails after the archive's end, and an archive that changes between its
+//! two readings. Each must stop with its reason and leave nothing outside
+//! the destination, and nothing at all when the checks before writing stop
+//! it. Then Go's test archives, each extracted or stopped with its reason.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -413,6 +413,70 @@ fn an_archive_cut_short_leaves_no_file_cut_off() {
     let s = Scratch::new();
     let e = extract(&data, &s.out(), &Options::default()).unwrap_err();
     assert!(matches!(e.kind, ErrorKind::Tar(_)), "{e}");
+    assert!(!s.out().exists());
+}
+
+/// A stream that fails once `data` is read, as a compressor fails its
+/// check at its end.
+struct FailsAtTheEnd(Cursor<Vec<u8>>);
+
+impl std::io::Read for FailsAtTheEnd {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.read(buf)? {
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the check at the end failed",
+            )),
+            n => Ok(n),
+        }
+    }
+}
+
+#[test]
+fn the_stream_is_read_past_the_archive_to_its_end() {
+    // What follows the archive's end is read, so that a check at the end
+    // of the stream fails before anything is written.
+    let mut data = tar(&[E::File(b"a.txt", b"whole")]);
+    data.extend([0; 10_000]);
+    let s = Scratch::new();
+    let e = extract_tar(
+        || Ok(FailsAtTheEnd(Cursor::new(data.clone()))),
+        &s.out(),
+        &Options::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::Io(_)), "{e}");
+    assert!(!s.out().exists());
+
+    // In the second reading too, after the first passed.
+    let calls = Cell::new(0);
+    let s = Scratch::new();
+    let e = extract_tar(
+        || -> std::io::Result<Box<dyn std::io::Read>> {
+            calls.set(calls.get() + 1);
+            Ok(if calls.get() == 1 {
+                Box::new(Cursor::new(data.clone()))
+            } else {
+                Box::new(FailsAtTheEnd(Cursor::new(data.clone())))
+            })
+        },
+        &s.out(),
+        &Options::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::Io(_)), "{e}");
+
+    // What follows is limited by the limit on all that is written, or by
+    // 1 MiB, the largest record tar pads to, if that is less.
+    let limited = options(|o| o.limits.max_total_size = 5_000);
+    let mut padded = tar(&[E::File(b"a.txt", b"whole")]);
+    padded.resize(padded.len() + (1 << 20), 0);
+    let s = Scratch::new();
+    assert_eq!(extract(&padded, &s.out(), &limited).unwrap().files, 1);
+    padded.push(0);
+    let s = Scratch::new();
+    let e = extract(&padded, &s.out(), &limited).unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::TotalTooLarge), "{e}");
     assert!(!s.out().exists());
 }
 

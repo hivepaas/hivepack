@@ -105,7 +105,10 @@ pub(crate) fn bufcpy(
 /// (`in`, `in_pos`, `in_size`) to its output (`out`, `out_pos`,
 /// `out_size`). The input is `input[*in_pos..]` and the output
 /// `output[*out_pos..]`.
-pub(crate) trait NextCoder {
+///
+/// Differs from liblzma: `Send`, so that a [`Stream`](crate::Stream) is,
+/// as an `lzma_stream` may be used from any thread.
+pub(crate) trait NextCoder: Send {
     /// `code`.
     fn code(
         &mut self,

@@ -64,6 +64,7 @@ jobs:
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-extract --lib --locked
+      - run: cargo check -p hivepack-open --lib --locked
       - run: cargo check -p hivepack-tar --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
@@ -338,6 +339,21 @@ jobs:
               pathlib.Path(f"fuzz/corpus/extract_tar/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_tar -- -max_total_time=60
+      - name: Seed the layers corpus with the recorded age files and what they hold
+        run: |
+          mkdir -p fuzz/corpus/open
+          python3 - <<'PY'
+          import pathlib
+          # Compressed tar archives and plain data, and age files of them,
+          # most to the key the target tries, each after a byte that picks
+          # no name.
+          lines = pathlib.Path("testdata/oracle/open.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("encrypt")):
+              request, answer = line.split("\t")
+              pathlib.Path(f"fuzz/corpus/open/p{i}").write_bytes(b"\0" + bytes.fromhex(request.split(" ")[3]))
+              pathlib.Path(f"fuzz/corpus/open/a{i}").write_bytes(b"\0" + bytes.fromhex(answer.split(" ")[1]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu open -- -max_total_time=30
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

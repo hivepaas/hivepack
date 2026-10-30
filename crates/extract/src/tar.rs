@@ -6,6 +6,8 @@
 //! skipping the data, and once to write, each header compared with the
 //! first reading's. The caller gives a function that opens it again, which
 //! for a compressed or encrypted archive decompresses or decrypts it again.
+//! Each reading goes on past the archive's end to the end of the stream,
+//! so that what checks the stream there is made.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -175,7 +177,36 @@ fn read_headers<R: Read>(
             target,
         });
     }
+    read_rest(tr.into_inner(), run, options)?;
     Ok((entries, items))
+}
+
+/// After the archive's end, the rest of the stream, read to its end: a
+/// compressor checks its data there (gzip's and bzip2's CRC-32, xz's and
+/// zstd's checks), and an age file's last chunk is authenticated, as GNU
+/// tar reads its compressor's output to the end. The tar reader stops at
+/// the archive's end, which comes before. A compressed stream can go on
+/// far past it: what is read is limited to
+/// [`Limits::max_total_size`](crate::Limits::max_total_size), or 1 MiB if
+/// that is less, the largest record tar pads an archive to (`-b 2048`).
+fn read_rest<R: Read>(mut r: R, run: &Run<'_>, options: &Options) -> Result<(), Error> {
+    let limit = options.limits.max_total_size.max(1 << 20);
+    let mut buf = vec![0u8; 64 << 10];
+    let mut total = 0u64;
+    loop {
+        run.check().map_err(Error::global)?;
+        match r.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                total += n as u64;
+                if total > limit {
+                    return Err(Error::global(ErrorKind::TotalTooLarge));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::global(ErrorKind::Io(e))),
+        }
+    }
 }
 
 /// What to do with a link once the entries are checked.
@@ -279,7 +310,12 @@ fn plan_links(
 /// links, the sizes against the limits), and the second writes them, each
 /// header compared with the first reading's ([`ErrorKind::Changed`] if one
 /// differs). For a compressed or encrypted archive, `open` decompresses or
-/// decrypts it again.
+/// decrypts it again (`hivepack_open::Opener` does). Each reading goes on
+/// past the archive's end to the end of the stream, so that a compressor's
+/// check there, or age's last chunk, fails the first reading before
+/// anything is written ([`ErrorKind::Io`]); what follows the end is
+/// limited to [`Limits::max_total_size`](crate::Limits::max_total_size),
+/// or 1 MiB if that is less.
 ///
 /// Besides ZIP's rules: a leading `./` is dropped from names, and `./`
 /// itself, the archive's root, is not an entry; a hard link is created
@@ -416,6 +452,7 @@ pub fn extract_tar<R: Read, F: FnMut() -> io::Result<R>>(
         }
         Err(e) => return Err(Error::global(ErrorKind::Tar(e))),
     }
+    read_rest(tr.into_inner(), &run, options)?;
 
     for &item in kept.iter().filter(|item| created_later(item)) {
         let error = |kind| item.error(kind);

@@ -1604,6 +1604,108 @@ static void stream(char** args, int nargs)
     puts(line_out);
 }
 
+/* bufferless <mode> <room> <dictkind> <dict|-> <steps> <src>: decodes the
+ * frames of `src` one after the other with ZSTD_decompressContinue, each
+ * begun with ZSTD_decompressBegin, or with the dictionary through
+ * ZSTD_decompressBegin_usingDict (dictkind 1; 3 with the dictionary at the
+ * start of the output, which then follows it) or _usingDDict (2). Each call
+ * takes what ZSTD_nextSrcSizeToDecompress asks for, or the step's input
+ * size; its output goes where `mode` says: 0, right after the last, in one
+ * buffer; 1, in a round buffer of `room` bytes, from its start again when
+ * less than the step's room is left; 2, at the start of a buffer of its own
+ * of `room` bytes, apart from the others. Steps are pairs of an input size
+ * and a room, 0 for what is asked and for 128 KB; once used up, what is
+ * asked and the last room.
+ * Answers each call's result, the next size and input type, an error ending
+ * the answer, then the hash of all the output. */
+static void bufferless(char** args, int nargs)
+{
+    static long long steps[2 * 1024];
+    /* The dictionary well inside its buffer: no other buffer starts where
+     * it ends, which ZSTD_decompressContinue would take as one segment. */
+    static unsigned char dictBuffer[MAX_BYTES + 64];
+    unsigned char* const dict = dictBuffer + 32;
+    ZSTD_DCtx* dctx;
+    ZSTD_DDict* ddict = NULL;
+    size_t room, pos = 0, inPos = 0, r;
+    long n, dictSize = 0, nsteps, call;
+    int mode, kind, begin = 1;
+    unsigned long long hash = 0xcbf29ce484222325ULL;
+    char text[80];
+    if (nargs != 6 || (n = parse_hex(args[5])) < 0) { puts("bad"); return; }
+    mode = atoi(args[0]);
+    room = strtoul(args[1], NULL, 10);
+    kind = atoi(args[2]);
+    if (strcmp(args[3], "-") && (dictSize = parse_hex_into(args[3], dict)) < 0) { puts("bad"); return; }
+    nsteps = parse_list(args[4], steps, 2 * 1024);
+    if (nsteps < 0 || nsteps % 2 || room == 0 || room > MAX_BYTES / 2 || mode < 0 || mode > 2
+        || kind < 0 || kind > 3 || (kind == 3 && (mode != 0 || dictSize == 0))) {
+        puts("bad");
+        return;
+    }
+    if (kind == 2 && !(ddict = ZSTD_createDDict(dict, (size_t)dictSize))) { puts("nodict"); return; }
+    if (kind == 3) {
+        memcpy(output, dict, (size_t)dictSize);
+        pos = (size_t)dictSize;
+    }
+    dctx = ZSTD_createDCtx();
+    line_reset();
+    line_append("ok", 2);
+    for (call = 0; call < 100000 && (inPos < (size_t)n || !begin); call++) {
+        long const step = 2 * call < nsteps ? 2 * call : -1;
+        long const last = step >= 0 ? step : nsteps - 2;
+        size_t const want = last >= 0 && steps[last + 1] ? (size_t)steps[last + 1] : (1 << 17);
+        size_t next, in, cap;
+        unsigned char* dst;
+        if (begin) {
+            if (kind == 1) r = ZSTD_decompressBegin_usingDict(dctx, dict, (size_t)dictSize);
+            else if (kind == 3) r = ZSTD_decompressBegin_usingDict(dctx, output, (size_t)dictSize);
+            else if (kind == 2) r = ZSTD_decompressBegin_usingDDict(dctx, ddict);
+            else r = ZSTD_decompressBegin(dctx);
+            if (ZSTD_isError(r)) {
+                snprintf(text, sizeof(text), " b%d", (int)ERR_getErrorCode(r));
+                line_append(text, strlen(text));
+                break;
+            }
+            begin = 0;
+        }
+        next = ZSTD_nextSrcSizeToDecompress(dctx);
+        in = step >= 0 && steps[step] ? (size_t)steps[step] : next;
+        if (in > (size_t)n - inPos) in = (size_t)n - inPos;
+        if (mode == 0) {
+            cap = MAX_BYTES - pos < want ? MAX_BYTES - pos : want;
+            dst = output + pos;
+        } else if (mode == 1) {
+            if (room - pos < want) pos = 0;
+            cap = room - pos < want ? room - pos : want;
+            dst = output + pos;
+        } else {
+            size_t const slots = MAX_BYTES / (room + 1);
+            dst = output + (size_t)(call % (long)slots) * (room + 1);
+            cap = room < want ? room : want;
+        }
+        r = ZSTD_decompressContinue(dctx, dst, cap, input + inPos, in);
+        if (ZSTD_isError(r)) {
+            snprintf(text, sizeof(text), " e%d", (int)ERR_getErrorCode(r));
+            line_append(text, strlen(text));
+            break;
+        }
+        hash = fnv64_from(hash, dst, r);
+        inPos += in;
+        if (mode != 2) pos += r;
+        next = ZSTD_nextSrcSizeToDecompress(dctx);
+        snprintf(text, sizeof(text), " %u/%u/%d", (unsigned)r, (unsigned)next,
+                 (int)ZSTD_nextInputType(dctx));
+        line_append(text, strlen(text));
+        if (next == 0) begin = 1;
+    }
+    ZSTD_freeDCtx(dctx);
+    ZSTD_freeDDict(ddict);
+    snprintf(text, sizeof(text), " %016llx", hash);
+    line_append(text, strlen(text));
+    puts(line_out);
+}
+
 /* ---- The dictionary builder ---- */
 
 #if defined(__APPLE__)
@@ -2156,6 +2258,7 @@ int main(void)
         else if (!strcmp(command, "mkframe")) mkframe(args, nargs);
         else if (!strcmp(command, "frames")) frames(args, nargs);
         else if (!strcmp(command, "stream")) stream(args, nargs);
+        else if (!strcmp(command, "bufferless")) bufferless(args, nargs);
         else if (!strcmp(command, "hist")) hist(args, nargs);
         else if (!strcmp(command, "fseoptlog")) fseoptlog(args, nargs);
         else if (!strcmp(command, "fsenorm")) fsenorm(args, nargs);

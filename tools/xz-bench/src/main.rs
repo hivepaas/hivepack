@@ -4,8 +4,12 @@
 //! give the input back, and the same Streams.
 //!
 //! ```text
-//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--compress] [--rounds 3] [--seconds 1] PATH...
+//! cargo run --release -p xz-bench -- [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--filter FILTER] [--compress] [--rounds 3] [--seconds 1] PATH...
 //! ```
+//!
+//! With `--filter`, the Streams have that filter before LZMA2: `x86`,
+//! `powerpc`, `ia64`, `arm`, `armthumb`, `arm64`, `sparc`, `riscv`, or
+//! `delta:<distance>`.
 //!
 //! Each run is one call, with all the input and room for all the output,
 //! on a new .xz decoder or encoder.
@@ -21,15 +25,49 @@ use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
 
+/// A filter before LZMA2.
+#[derive(Clone, Copy)]
+enum Filter {
+    /// A BCJ filter, by its ID.
+    Bcj(u64),
+    /// Delta, with its distance.
+    Delta(u32),
+}
+
+impl Filter {
+    fn parse(text: &str) -> Result<Filter> {
+        if let Some(distance) = text.strip_prefix("delta:") {
+            return match distance.parse() {
+                Ok(distance @ 1..=256) => Ok(Filter::Delta(distance)),
+                _ => Err(format!("bad delta distance {distance:?}")),
+            };
+        }
+        let id = match text {
+            "x86" => hivepack_xz::FILTER_X86,
+            "powerpc" => hivepack_xz::FILTER_POWERPC,
+            "ia64" => hivepack_xz::FILTER_IA64,
+            "arm" => hivepack_xz::FILTER_ARM,
+            "armthumb" => hivepack_xz::FILTER_ARMTHUMB,
+            "arm64" => hivepack_xz::FILTER_ARM64,
+            "sparc" => hivepack_xz::FILTER_SPARC,
+            "riscv" => hivepack_xz::FILTER_RISCV,
+            _ => return Err(format!("bad filter {text:?}")),
+        };
+        Ok(Filter::Bcj(id))
+    }
+}
+
 trait Codec {
     fn name(&self) -> String;
     /// Decodes `input`, whose content is `size` bytes long.
     fn decompress(&mut self, input: &[u8], size: usize, output: &mut Vec<u8>) -> Result<()>;
-    /// Encodes `input` as a .xz Stream at `preset`, with `check`.
+    /// Encodes `input` as a .xz Stream at `preset`, with `check`, and
+    /// `filter` before LZMA2 if any.
     fn compress(
         &mut self,
         preset: u32,
         check: liblzma::stream::Check,
+        filter: Option<Filter>,
         input: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<()>;
@@ -49,10 +87,65 @@ fn check_number(check: liblzma::stream::Check) -> u32 {
 struct Liblzma;
 
 impl Liblzma {
-    /// `input` as `xz -<preset>` writes it, with `check`.
-    fn compress(preset: u32, check: liblzma::stream::Check, input: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = liblzma::stream::Stream::new_easy_encoder(preset, check)
+    /// The .xz encoder of `xz -<preset>`, with `check`, and `filter` before
+    /// LZMA2 if any.
+    fn encoder(
+        preset: u32,
+        check: liblzma::stream::Check,
+        filter: Option<Filter>,
+    ) -> Result<liblzma::stream::Stream> {
+        let Some(filter) = filter else {
+            return liblzma::stream::Stream::new_easy_encoder(preset, check)
+                .map_err(|e| format!("liblzma: {e}"));
+        };
+        let mut filters = liblzma::stream::Filters::new();
+        match filter {
+            Filter::Delta(distance) => {
+                filters
+                    .delta_properties(&[(distance - 1) as u8])
+                    .map_err(|e| format!("liblzma: {e}"))?;
+            }
+            Filter::Bcj(hivepack_xz::FILTER_X86) => {
+                filters.x86();
+            }
+            Filter::Bcj(hivepack_xz::FILTER_POWERPC) => {
+                filters.powerpc();
+            }
+            Filter::Bcj(hivepack_xz::FILTER_IA64) => {
+                filters.ia64();
+            }
+            Filter::Bcj(hivepack_xz::FILTER_ARM) => {
+                filters.arm();
+            }
+            Filter::Bcj(hivepack_xz::FILTER_ARMTHUMB) => {
+                filters.arm_thumb();
+            }
+            Filter::Bcj(hivepack_xz::FILTER_ARM64) => {
+                filters.arm64();
+            }
+            Filter::Bcj(hivepack_xz::FILTER_SPARC) => {
+                filters.sparc();
+            }
+            Filter::Bcj(_) => {
+                filters.riscv();
+            }
+        }
+        let options = liblzma::stream::LzmaOptions::new_preset(preset)
             .map_err(|e| format!("liblzma: {e}"))?;
+        filters.lzma2(&options);
+        liblzma::stream::Stream::new_stream_encoder(&filters, check)
+            .map_err(|e| format!("liblzma: {e}"))
+    }
+
+    /// `input` as `xz -<preset>` writes it, with `check`, and `filter`
+    /// before LZMA2 if any.
+    fn compress(
+        preset: u32,
+        check: liblzma::stream::Check,
+        filter: Option<Filter>,
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut stream = Liblzma::encoder(preset, check, filter)?;
         let mut output = Vec::with_capacity(input.len() + input.len() / 2 + 4096);
         match stream.process_vec(input, &mut output, liblzma::stream::Action::Finish) {
             Ok(liblzma::stream::Status::StreamEnd) => Ok(output),
@@ -70,11 +163,11 @@ impl Codec for Liblzma {
         &mut self,
         preset: u32,
         check: liblzma::stream::Check,
+        filter: Option<Filter>,
         input: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        let mut stream = liblzma::stream::Stream::new_easy_encoder(preset, check)
-            .map_err(|e| format!("liblzma: {e}"))?;
+        let mut stream = Liblzma::encoder(preset, check, filter)?;
         output.clear();
         output.resize(hivepack_xz::stream_buffer_bound(input.len()), 0);
         match stream.process(input, output, liblzma::stream::Action::Finish) {
@@ -110,12 +203,26 @@ impl Codec for Port {
         &mut self,
         preset: u32,
         check: liblzma::stream::Check,
+        filter: Option<Filter>,
         input: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        let mut stream =
-            hivepack_xz::Stream::easy_encoder(preset, hivepack_xz::Check(check_number(check)))
-                .map_err(|e| format!("port: {e}"))?;
+        let check = hivepack_xz::Check(check_number(check));
+        let mut stream = match filter {
+            None => hivepack_xz::Stream::easy_encoder(preset, check),
+            Some(filter) => {
+                let lzma2 = hivepack_xz::LzmaOptions::preset(preset).ok_or("port: bad preset")?;
+                let filters = [
+                    match filter {
+                        Filter::Bcj(id) => hivepack_xz::Filter::bcj(id, 0),
+                        Filter::Delta(distance) => hivepack_xz::Filter::delta(distance),
+                    },
+                    hivepack_xz::Filter::lzma2(lzma2),
+                ];
+                hivepack_xz::Stream::stream_encoder(&filters, check)
+            }
+        }
+        .map_err(|e| format!("port: {e}"))?;
         output.clear();
         output.resize(hivepack_xz::stream_buffer_bound(input.len()), 0);
         let mut out = hivepack_xz::OutBuffer::new(output);
@@ -156,6 +263,7 @@ struct Options {
     compress: bool,
     presets: Vec<u32>,
     check: liblzma::stream::Check,
+    filter: Option<Filter>,
     rounds: u32,
     budget: Duration,
     paths: Vec<PathBuf>,
@@ -166,6 +274,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
         compress: false,
         presets: vec![0, 6, 9],
         check: liblzma::stream::Check::Crc64,
+        filter: None,
         rounds: 3,
         budget: Duration::from_secs(1),
         paths: Vec::new(),
@@ -192,6 +301,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
                     other => return Err(format!("bad check {other:?}")),
                 };
             }
+            "--filter" => options.filter = Some(Filter::parse(&value()?)?),
             "--compress" => options.compress = true,
             "--rounds" => options.rounds = value()?.parse().map_err(|_| "bad --rounds")?,
             "--seconds" => {
@@ -201,7 +311,7 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--compress] [--rounds N] [--seconds S] PATH..."
+                    "usage: xz-bench [--presets 0,6,9] [--check none|crc32|crc64|sha256] [--filter FILTER] [--compress] [--rounds N] [--seconds S] PATH..."
                         .into(),
                 );
             }
@@ -280,14 +390,14 @@ fn bench(options: &Options, codecs: &mut [Box<dyn Codec>], input: &Path) -> Resu
     let megabytes = data.len() as f64 / 1e6;
     let mut scratch = Vec::new();
     for &preset in &options.presets {
-        let compressed = Liblzma::compress(preset, options.check, &data)?;
+        let compressed = Liblzma::compress(preset, options.check, options.filter, &data)?;
         let ratio = data.len() as f64 / compressed.len().max(1) as f64;
         let mut speeds: Vec<Option<Range>> = codecs.iter().map(|_| None).collect();
         for _ in 0..options.rounds {
             for (i, codec) in codecs.iter_mut().enumerate() {
                 let seconds = if options.compress {
                     let seconds = time(options.budget, || {
-                        codec.compress(preset, options.check, &data, &mut scratch)
+                        codec.compress(preset, options.check, options.filter, &data, &mut scratch)
                     })?;
                     if scratch != compressed {
                         return Err(format!(

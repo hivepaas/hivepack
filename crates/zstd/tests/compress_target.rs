@@ -294,6 +294,19 @@ fn compare_compress2(
             ))
         }
         (Err(want), Err(got)) if want == got => Ok(false),
+        // On 32-bit machines libzstd's bit streams decide whether they fit
+        // 4 bytes before the end of their room, the size of their register;
+        // the port decides 8 bytes before, as libzstd does on 64-bit
+        // machines (`docs/porting.md`, "64-bit results"). With room for
+        // less than 8 bytes past the frame, libzstd can fit it there where
+        // the port finds too little room.
+        (Ok(want), Err(got))
+            if cfg!(target_pointer_width = "32")
+                && got == "Destination buffer is too small"
+                && room < want.len() + 8 =>
+        {
+            Ok(false)
+        }
         _ => Err(format!(
             "libzstd {:?}, port {:?}",
             want.map(|frame| frame.len()),

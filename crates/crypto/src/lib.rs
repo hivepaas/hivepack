@@ -22,6 +22,11 @@
 //! - [`x25519`] is BearSSL's `ec_c25519_m31.c`, in constant time.
 //! - [`scrypt`] follows RFC 7914, as BearSSL has no scrypt.
 //!
+//! What RAR 5 hashes files with, in hivepack-rar:
+//!
+//! - [`Blake2sp`] and [`Blake2s`] are the BLAKE2 reference implementation's
+//!   `blake2sp-ref.c` and `blake2s-ref.c`, as BearSSL has no BLAKE2.
+//!
 //! Secrets are overwritten when the values that hold them are dropped, as
 //! libzip clears them with `_zip_crypto_clear`. That is best effort: safe
 //! Rust has no volatile write, and the compiler could leave out the
@@ -69,6 +74,8 @@
 mod aes_ct64;
 mod aes_ct64_ctr;
 mod aes_ct64_enc;
+mod blake2s;
+mod blake2sp;
 mod chacha20_ct;
 mod clear;
 mod ct;
@@ -84,6 +91,8 @@ mod sha2big;
 mod sha2small;
 
 pub use aes_ct64_ctr::{AES_BLOCK_LENGTH, Aes};
+pub use blake2s::{BLAKE2S_KEY_LENGTH, BLAKE2S_LENGTH, Blake2s};
+pub use blake2sp::{BLAKE2SP_LENGTH, Blake2sp};
 pub use chacha20_ct::{CHACHA20_KEY_LENGTH, CHACHA20_NONCE_LENGTH, chacha20};
 pub use ct::equal;
 pub use digest::Digest;

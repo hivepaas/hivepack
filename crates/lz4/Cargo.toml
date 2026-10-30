@@ -1,0 +1,24 @@
+[package]
+name = "hivepack-lz4"
+version = "0.0.0"
+description = "LZ4 compression and decompression in safe Rust, ported from the official library, liblz4"
+license = "BSD-2-Clause"
+readme = "README.md"
+keywords = ["lz4", "compression", "decompression"]
+categories = ["compression"]
+# Nothing to publish yet.
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# liblz4 1.10.0, the reference (see the workspace's Cargo.toml). lz4-sys
+# is named only to pin the release it bundles.
+lz4.workspace = true
+lz4-sys.workspace = true

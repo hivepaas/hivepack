@@ -228,6 +228,13 @@
       "kind": "tool"
     },
     {
+      "name": "tar-bench-go",
+      "generate": { "group": "bench", "tool": "go", "sources": ["tools/tar-bench/go/main.go", "tools/tar-bench/go/go.mod"] },
+      "source": "tools/tar-bench/go/main.go, built with the archive/tar of Go 1.27.2, which its go.mod names",
+      "license": "MIT (the program) and BSD-3-Clause (Go)",
+      "kind": "tool"
+    },
+    {
       "name": "age-oracle",
       "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/identities.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
       "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0, the release age requires",

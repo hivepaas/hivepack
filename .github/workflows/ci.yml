@@ -377,14 +377,15 @@ jobs:
           python3 - <<'PY'
           import pathlib
           # The inputs of the recorded requests, each after a mode byte that
-          # picks their decoder (raw LZMA1 for the filters 1 and 2, raw LZMA2
-          # for 21) and a seed.
+          # picks their decoder (raw LZMA1 for chains that end with the
+          # filters 1 and 2, raw LZMA2 for 21) and a seed.
           modes = {"stream": 0, "auto": 1, "lzip": 2, "alone": 3}
           lines = pathlib.Path("testdata/oracle/xz.txt").read_text().splitlines()
           for i, line in enumerate(l for l in lines if l.startswith("decode ")):
               words = line.split("\t")[0].split(" ")
               kind = words[1].split(":")[0]
-              mode = modes.get(kind, 4 if words[1].startswith(("raw:1:", "raw:2:")) else 5)
+              last = words[1].split("+")[-1].removeprefix("raw:")
+              mode = modes.get(kind, 4 if last.startswith(("1:", "2:")) else 5)
               data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
               pathlib.Path(f"fuzz/corpus/xz/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
           PY
@@ -401,7 +402,8 @@ jobs:
           for i, line in enumerate(l for l in lines if l.startswith("code ")):
               words = line.split("\t")[0].split(" ")
               kind = words[1].split(":")[0]
-              mode = modes.get(kind, 4 if words[1].startswith("rawenc:21:") else 3)
+              last = words[1].split("+")[-1].removeprefix("rawenc:")
+              mode = modes.get(kind, 4 if last.startswith("21:") else 3)
               data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
               pathlib.Path(f"fuzz/corpus/xz_encode/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
           PY

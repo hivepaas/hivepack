@@ -51,7 +51,10 @@
 //! # }
 //! ```
 //!
-//! The design, and what comes next (tar and RAR), are in the repository's
+//! [`extract_tar`] extracts tar archives with the same rules, reading them
+//! twice: once to check, once to write.
+//!
+//! The design, and what comes next (RAR), are in the repository's
 //! `docs/extract.md`.
 
 mod destination;
@@ -60,6 +63,7 @@ mod name;
 mod origin;
 mod plan;
 mod progress;
+mod tar;
 mod unicode;
 mod zip;
 
@@ -68,6 +72,7 @@ pub use name::{MAX_COMPONENT, Name, NameError, check_name};
 pub use origin::Origin;
 pub use plan::{Limits, Links, Names, OnRefused, Options, Permissions};
 pub use progress::{Cancel, Progress, ProgressFn};
+pub use tar::extract_tar;
 /// The version of Unicode names are compared with: major, minor, update.
 pub use unicode::VERSION as UNICODE_VERSION;
 pub use zip::{Summary, extract_zip};

@@ -1,0 +1,48 @@
+# Porting Go's archive/tar
+
+`hivepack-tar` reads tar archives in safe Rust. It is a port of the reading half of `archive/tar` in Go's standard library: a small, well-tested reader of every format in use, hardened by years of fuzzing, under the BSD-3-Clause license. Most `.tar.gz`, `.tar.zst`, `.tar.xz` and `.tar.zst.age` files are tar inside a compressor, which hivepack's other crates read.
+
+## The source
+
+The port follows **Go 1.27.2** (`src/archive/tar`), the latest release as of October 2026. `hivepack_tar::UPSTREAM_VERSION` names it. As in the other ports ([porting.md](porting.md)), each Go file is a module, functions keep their names in snake case, and each doc comment names its Go original.
+
+| Go | Port | What |
+|---|---|---|
+| `reader.go` | `reader.rs` (`Reader`) | entries in order: PAX records and GNU long names merged into the entries they describe, global PAX headers as entries of their own, data read and skipped, sparse files in GNU's formats 0.0, 0.1, 1.0 and the old one |
+| `format.go` | `format.rs` | the 512-byte block, its checksum (unsigned or signed) and layouts: V7, USTAR, PAX, GNU, STAR |
+| `strconv.go` | `strconv.rs` | numbers in octal or GNU's base-256, PAX records and times |
+| `common.go` | `common.rs` (`Header`, `Format`, `Time`, `Error`, the `TYPE_` constants) | headers, formats, sparse maps validated and turned into holes |
+
+## What differs
+
+- **Bytes, not strings.** Go's strings hold any bytes; here names, link targets, owners and PAX records are `Vec<u8>`, which most archives fill with UTF-8. PAX records and extended attributes are `BTreeMap`s, in key order.
+- **Times are `Time`** (seconds and nanoseconds since 1970, normalised as `time.Unix` does), and `Option<Time>` where Go would leave its zero time: the access and change times when the archive has none, and a global PAX header's modification time.
+- **Errors are a type.** Go's `ErrHeader`, `ErrFieldTooLong`, `errSparseTooLong`, `errMissData`, `errUnrefData` and `io.ErrUnexpectedEOF` are `Error`'s variants; the data's errors travel inside `io::Error` and come back out with `Error::from`. A failure is kept and returned again by every later call, as Go keeps it.
+- **An error that comes with the last bytes comes after them.** Go's `Read` can return bytes and an error at once (a sparse file with more data than its map ends so); Rust's cannot, so the bytes come first and the error at the next call, which `read_to_end` sees the same way.
+- **No seeking.** Go skips the rest of an entry with `Seek` when the input can; the port reads past it. The outcome is the same; the tests give Go an input that cannot seek.
+- **No `GODEBUG=tarinsecurepath`.** Names are checked where files are written, in hivepack-extract.
+- **The global PAX header's records are merged in key order.** Go merges them in its map's random order and ignores the error of a bad one, so a global header with both a bad record and a `path` can come out either way in Go; here the order is fixed.
+- **Not ported:** the writer (`writer.go`), `FileInfoHeader` and `Header.FileInfo`, which convert to and from the file system's `fs.FileInfo`.
+
+## Bounded resources
+
+As in Go: PAX records and GNU long names at most 1 MiB, sparse maps at most 1 MiB and a million entries, one header block at a time. An entry's data is read as the caller reads it, and skipped otherwise; a sparse file's holes are produced as zeros, so a reader that takes all of a terabyte of holes reads a terabyte. hivepack-extract will write holes without reading them.
+
+## How it is shown
+
+- **`src/strconv.rs`'s tests**: the tables of Go's `strconv_test.go` for `parseNumeric`, `parsePAXTime` and `parsePAXRecord`, the last two generated from Go's test source.
+- **`tests/oracle.rs`**: comparison with Go 1.27.2's `archive/tar` through `tools/tar-oracle`, a small Go program built by `scripts/testdata.py`; CI installs the Go its `go.mod` names. Both read every entry and up to 8 MiB of its data, the port in pieces of random sizes; the headers (every field, the PAX records and extended attributes as hashes), the data's length and SHA-256, its error, and how the archive ends must be the same. The archives:
+  - Go's own 46 test archives (`testdata/go-tar`, from Go 1.27.2, the base64 and bzip2 ones decoded), as they are and each damaged twenty ways: a bit flipped; a field of a block (name, mode, owner, size, time, type, link, magic, version, devices, prefix, GNU's sparse map, its extension flag and real size) given zeros, spaces, octal, base-256, a type or random bytes, with the checksum fixed so that the damage gets past it; cut at a block's end or anywhere; zero blocks inserted, a block repeated or removed; garbage after the end; a PAX record's bytes scribbled on.
+  - 1,500 archives that Go's `tar.Writer` makes from random headers, as they are or damaged: every type, names around USTAR's 100 and 155 bytes in ASCII and UTF-8, link names, owners and devices past what octal holds, times before 1970 and with nanoseconds, PAX records and extended attributes, global headers, the format chosen or left to the writer.
+  - 800 sparse files built by the test in GNU's formats 0.1, 1.0 and the old one, with maps that are random and sometimes overlap, and a few bytes more or less of data than the map needs, as they are or damaged; Go's writer does not write sparse files.
+
+  About 3,300 archives are compared where the oracle is built (Linux and macOS in CI), every ending among them: the end, a bad header, an archive cut short, a field or sparse map too long, a sparse file with data missing or left over. `testdata/oracle/tar.txt` replays 1,066 everywhere else, Go's archives and their damage by name and number, which the test makes again.
+- **Fuzzing**: the `tar` target reads any input, every entry and up to 4 MiB of its data, twice, in pieces of different sizes: the same headers, data and end both times, and no panic. CI seeds it with Go's test archives.
+
+## Following new releases
+
+A new Go release's changes to `src/archive/tar` are ported, `tools/tar-oracle/go.mod` names the release, and `testdata/go-tar` takes its test archives.
+
+## Licenses
+
+The port is derived from Go, under the BSD-3-Clause license (Copyright 2009 The Go Authors); `hivepack-tar` is under the same license, with Go's notice in its [LICENSE](../crates/tar/LICENSE). Go's test archives in `testdata/go-tar` are under it too, with the same notice beside them.

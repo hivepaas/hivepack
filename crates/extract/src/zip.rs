@@ -348,8 +348,17 @@ pub fn extract_zip<R: ReadAt>(
         run.entry_done();
     }
 
-    // The directories' times, the deepest first, once nothing more is
-    // written in them.
+    set_dir_times(&destination, &kept, &run)?;
+    Ok(summary)
+}
+
+/// The directories' times, the deepest first, once nothing more is
+/// written in them.
+pub(crate) fn set_dir_times(
+    destination: &Destination<'_>,
+    kept: &[&Item],
+    run: &Run<'_>,
+) -> Result<(), Error> {
     let mut dirs: Vec<(&[String], std::time::SystemTime, &Item)> = kept
         .iter()
         .filter(|item| item.kind == Kind::Dir)
@@ -368,7 +377,7 @@ pub fn extract_zip<R: ReadAt>(
         let dir = destination.directory(parents).map_err(error)?;
         Destination::set_time(&dir, last, mtime).map_err(error)?;
     }
-    Ok(summary)
+    Ok(())
 }
 
 /// Writes the data of `item` into `file`, at most `remaining` bytes in
@@ -423,7 +432,7 @@ fn write_file<R: ReadAt>(
 
 /// The permission bits of `mode`, as `permissions` says, on Unix.
 #[cfg(unix)]
-fn set_permissions(
+pub(crate) fn set_permissions(
     file: &std::fs::File,
     mode: Option<u32>,
     permissions: Permissions,
@@ -442,7 +451,7 @@ fn set_permissions(
 
 /// Windows has no permission bits.
 #[cfg(not(unix))]
-fn set_permissions(
+pub(crate) fn set_permissions(
     _file: &std::fs::File,
     _mode: Option<u32>,
     _permissions: Permissions,

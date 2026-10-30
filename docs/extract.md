@@ -1,10 +1,10 @@
 # Extracting safely
 
-`hivepack-extract` writes an archive's entries to disk, and is safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs. It starts with ZIP archives that `hivepack-zip` opened; tar and RAR will use the same checks and the same writing.
+`hivepack-extract` writes an archive's entries to disk, and is safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs. It extracts ZIP archives that `hivepack-zip` opened and tar archives that `hivepack-tar` reads, with the same checks and the same writing; RAR will too.
 
 Extractors no longer break on memory, which safe Rust settles, but on logic, and memory-safe code gets that wrong as often as C: writing through a link (the `zip` crate's CVE-2025-29787, adm-zip's CVE-2026-76845), keeping setuid bits or chmod through a link (RUSTSEC-2026-0367 and 0369), links that point outside (RUSTSEC-2026-0368), alternate data streams on Windows (WinRAR's CVE-2025-8088, exploited), and Python's tarfile filter, which took five CVEs in June 2025 for checking strings and `realpath`. The rules below answer those, and come from the research behind this repository's ZIP plan.
 
-> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, the options that relax them, a time limit, cancelling and progress, names compared as file systems compare them, and marks of origin: done, for ZIP, checked on libzip's test archives, Fifield's bombs and Unicode's own tests, and fuzzed. Next: tar and RAR (see [What comes next](#what-comes-next)).
+> **Status:** names, the same path twice, links, overlapping data, the limits, writing by handle, integrity, masked permissions and times, the options that relax them, a time limit, cancelling and progress, names compared as file systems compare them, and marks of origin: done, for ZIP, checked on libzip's test archives, Fifield's bombs and Unicode's own tests, and fuzzed; and for tar (see [tar](#tar)), checked on Go's test archives and fuzzed. Next: RAR (see [What comes next](#what-comes-next)).
 
 ## Refuse, do not repair
 
@@ -104,6 +104,20 @@ Each rule that is not about writing outside the destination can be relaxed, by n
 | `cancel` | none | a `Cancel` token that stops it |
 | `progress` | none | a function told how far it is |
 
+## tar
+
+A tar archive has no central directory: each header comes before its data, one after the other, often inside a compressor (`.tar.gz`, `.tar.zst`) or age (`.tar.zst.age`). To check every entry before anything is written, as for ZIP, `extract_tar` reads it twice, through a function that opens it again (and so decompresses or decrypts it again): first the headers, the data skipped, for every check of the plan; then the entries are written, each header compared with the first reading's, its type, name, link target and size, and an archive that is not the one checked stops (`ErrorKind::Changed`) at the first that differs, or where the readings end differently. Data cut short stops the first reading, before anything is written; a file whose data fails in the second is removed.
+
+What differs from ZIP:
+
+- **`./`**: `tar -cf x.tar .` writes every name with a leading `./`, which is dropped; `./` itself, the archive's root, is not an entry. Every other `.` component is refused, as in ZIP.
+- **Symbolic links** take their target from the header, not the data; the options are ZIP's.
+- **Hard links** are a second name for a file the archive extracted before them: the target, a name in the archive (`./` dropped, the same rules), must be such a file, kept and earlier, or the link is refused (`ErrorKind::HardLinkTarget`, or `LinkTarget` for a target refused as a name). So a hard link can neither lead outside nor reach a file that was there before. It is created as a hard link inside the destination, by handle; with `Links::AsFile`, as a copy, which counts against the limits as written data.
+- **Devices and FIFOs** have no data in tar, only what to create, and nothing is created as one: they are refused (`ErrorKind::Special`), or left out with `OnRefused::Skip`.
+- **Global PAX headers and GNU volume labels** describe the archive, and are not entries. GNU's dump directories (`D`) are directories; every other type is a regular file, as GNU tar and Python take them.
+- **Sizes**: tar does not compress, so there is no ratio to check here; the compressor's ratio is its own. A sparse file's holes are written as zeros, and count against the limits.
+- **Every entry counts against `max_entries`**, metadata too, so that an archive of global headers does not grow the first reading's list without end.
+
 ## Errors
 
 An extraction stops at the first entry refused (unless `on_refused` is `Skip`), with its index, its name as the archive has it, and the reason (`Error`, `ErrorKind`). What is checked before writing (names, the same path, links, overlaps, declared sizes) stops it before anything is written, the destination included.
@@ -118,9 +132,14 @@ Fifield's three published bombs (the `fifield-zipbombs` set) stop before anythin
 
 ZipDiff's archives (the `zipdiff-constructions` set: 5,927 archives that ZIP parsers read differently, made once by ZipDiff's own program) each extract or stop with their reason, opened with `ZIP_CHECKCONS` and without, and the test holds the count of each outcome for each type, so that a change shows. `hivepack-zip` reads every one as libzip does (see [zip.md](zip.md)), so what is extracted is what libzip reads. With `ZIP_CHECKCONS`, most of those whose headers disagree do not open (4,248 of `a2`'s 4,609 size combinations, every several-ends archive of `c2`, the moved central directory of `c4`). The name rules refuse every one of `b3`'s twenty forms of `a/b` (`/a/b`, `a//b`, `a\b`, `./a/b`, `../a/b`, `.../a/b`, `c/../a/b`...), whichever comes first, and the same path stops `b1` (one name twice, without the check) and `b4` (`test.txt` and `test.TXT`). The data that overlaps stops one of `c1`'s. It was this run that found the characters Windows does not allow (`a<b`, `a*b` and the others of `b2`), which were extracted on Linux and would have failed on Windows; they are refused now.
 
+`crates/extract/tests/tar.rs` does the same for tar, with archives the test writes: names that climb, are absolute, carry backslashes, drives, devices or control characters, or are not UTF-8; the same path, as `./` and without, and in two cases; symbolic links refused, as files, and inside, with targets climbing out, absolute or through another link; hard links to an earlier file (the same inode on Unix), as copies, and to nothing, to a later file, outside or to a directory; devices and FIFOs, refused and skipped; the limits; archives cut in the middle of a file and headers that say more than the archive holds, which stop before anything is written; an archive that changes between its readings (another name, another size, an entry more or fewer), which writes nothing the first reading did not check; a time limit; and files already there. Each of Go's 38 plain test archives (`testdata/go-tar`) is extracted with `OnRefused::Stop` and `Skip` beside a file that must stay as it was, and the test holds each outcome: links and a FIFO refused or left out, names that are not UTF-8, the archives Go's reader refuses, and `writer-big.tar`, whose 16 GiB file is cut short.
+
 The `extract` fuzz target (see [fuzz/README.md](../fuzz/README.md)) extracts its input with options its first byte picks, cancelling it after some progress if that byte says so, and checks that nothing is written beside the destination, that every link created stays inside it by its text, that the summary counts what is there, and, however the extraction ends, that the files left hold exactly the bytes of the entries written in full, so that none is left cut off. 11 million inputs over four minutes found nothing before the first commit, and 9.6 million with cancelling; with the removal of a failed file taken out, it fails on the seed corpus, before mutating anything.
+
+The `extract_tar` fuzz target does the same for tar, seeded with Go's test archives behind a choice of options, a hard link's file counted once. Its first three minutes found that the progress totals left out what links written as files write (a symbolic link's target, a hard link's copy), so that progress passed its total; they count it now, which `tests/tar.rs` checks. The next three minutes, 5.4 million inputs, found nothing.
 
 ## What comes next
 
-- **tar and RAR**, through the same checks and writing.
+- **RAR**, through the same checks and writing.
+- **Sparse files written with holes**, rather than zeros.
 - **Corpora**: the archives behind recent CVEs.

@@ -58,7 +58,9 @@ Each set has a `kind`:
 | `libzip-1.12.1-source` | the libzip 1.12.1 release, to build the next set from, and its `regress/` archives | BSD-3-Clause | fetched, `generated` |
 | `go-tar` | Go 1.27.2's test archives for archive/tar (`src/archive/tar/testdata`), with Go's LICENSE | BSD-3-Clause | committed, `go-tar/` |
 | `cctv-age` | C2SP's CCTV test vectors for age (`c2sp.org/CCTV/age` at commit 4448f2097b2d, the module age v1.3.2 tests with), from Go's module proxy: 147 files, each with the outcome it must have and the SHA-256 of its plaintext | 0BSD, CC0-1.0 or Unlicense | fetched, `core` |
+| `zipdiff-constructions` | ZipDiff (USENIX Security 2025): the 5,927 archives its `construction` program writes, which ZIP parsers read differently, made once and packed into `constructions.zip`; how, and what each folder holds, is in `zipdiff/README.md` | Apache-2.0 | committed, `zipdiff/` |
 | `fifield-zipbombs` | David Fifield's zip bombs from "A better zip bomb" (WOOT 2019): `zbsm.zip` (42 kB to 5.5 GB), `zblg.zip` (10 MB to 281 TB) and `zbxl.zip` (46 MB to 4.5 PB, Zip64), whose entries share one stream | public domain | fetched, `core` |
+| `unicode-18.0.0` | the Unicode Character Database 18.0.0: `UnicodeData.txt` and `CaseFolding.txt`, which `scripts/unicode.py` makes hivepack-extract's tables from, and `NormalizationTest.txt`, which its tests check them with | Unicode-3.0 | fetched, `core` |
 | `zip-oracle` | `tools/zip-oracle`, built with the libzip 1.12.1, zlib 1.3.2, nettle 3.10.2 and bzip2 1.0.8 sources, and its crypto backend for GnuTLS on nettle: libzip's API, for comparing hivepack-zip with it | MIT, BSD-3-Clause, Zlib, nettle's licenses, and bzip2-1.0.6 | generated |
 
 zstd's `tests/gzip` is GPLv3, and nothing is taken from it.

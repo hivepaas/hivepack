@@ -207,6 +207,60 @@ fn hash5(sequence: u64, table_type: TableType) -> u32 {
     }
 }
 
+/// The 8 bytes at `p` of `window`, which ends 8 bytes after the last
+/// position the search may hash (`mflimitPlusOne`, `last`): none past it.
+/// The search compares `p` with `last` itself, which spares the compiler
+/// the bounds checks.
+#[inline(always)]
+fn chunk8(window: &[u8], last: usize, p: usize) -> Option<[u8; 8]> {
+    if p > last {
+        return None;
+    }
+    window.get(p..)?.first_chunk::<8>().copied()
+}
+
+/// `LZ4_read32` at `m`, a match in `window`, which liblz4 asserts is
+/// before the position searched, itself at `last` at most. Read at `last`
+/// at most, which tells the compiler the read is in bounds, and changes
+/// nothing for such a match.
+#[inline(always)]
+fn read32_before(window: &[u8], last: usize, m: usize) -> u32 {
+    let at = m.min(last);
+    match window.get(at..).and_then(|w| w.first_chunk::<4>()) {
+        Some(bytes) => u32::from_ne_bytes(*bytes),
+        None => 0,
+    }
+}
+
+/// `LZ4_read32` of the bytes `chunk` starts with.
+#[inline(always)]
+fn word(chunk: [u8; 8]) -> u32 {
+    u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+}
+
+/// `LZ4_hashPosition` of the bytes `chunk` holds.
+#[inline(always)]
+fn hash_chunk(chunk: [u8; 8], table_type: TableType) -> u32 {
+    if REG_IS_64 && table_type != TableType::ByU16 {
+        return hash5(u64::from_ne_bytes(chunk), table_type);
+    }
+    hash4(word(chunk), table_type)
+}
+
+/// A hash's entry in the `U32` table. Hashes are always below the table's
+/// size; the mask tells the compiler, which loses track of it between a
+/// search's steps.
+#[inline(always)]
+fn slot(h: u32) -> usize {
+    h as usize & (HASH_SIZE_U32 - 1)
+}
+
+/// A hash's entry in the `U16` table.
+#[inline(always)]
+fn slot16(h: u32) -> usize {
+    h as usize & (2 * HASH_SIZE_U32 - 1)
+}
+
 /// `LZ4_hashPosition`: the hash of the bytes at `p`, read as the machine
 /// reads them.
 #[inline(always)]
@@ -235,8 +289,8 @@ impl StreamState {
             // a dictionary of less than HASH_UNIT bytes was loaded (the
             // offset moved by 64 KB, the table still cleared), and then
             // every match is refused (dictSmall).
-            TableType::ByU16 => self.hash_table16[h as usize] = idx as u16,
-            _ => self.hash_table[h as usize] = idx,
+            TableType::ByU16 => self.hash_table16[slot16(h)] = idx as u16,
+            _ => self.hash_table[slot(h)] = idx,
         }
     }
 
@@ -244,8 +298,8 @@ impl StreamState {
     #[inline(always)]
     fn get_index_on_hash(&self, h: u32, table_type: TableType) -> u32 {
         match table_type {
-            TableType::ByU16 => u32::from(self.hash_table16[h as usize]),
-            _ => self.hash_table[h as usize],
+            TableType::ByU16 => u32::from(self.hash_table16[slot16(h)]),
+            _ => self.hash_table[slot(h)],
         }
     }
 
@@ -419,9 +473,20 @@ fn compress_generic_validated(
             break 'last_literals;
         }
 
+        // Where the search reads: up to 8 bytes after mflimitPlusOne.
+        let window = &src[..iend - MFLIMIT + 1 + 8];
+        let Some(last) = window.len().checked_sub(8) else {
+            break 'last_literals;
+        };
+        // The bytes at the next position the search looks at.
+        let mut forward_chunk: [u8; 8];
+
         // First byte.
         {
-            let h = hash_position(src, ip, table_type);
+            let Some(chunk) = chunk8(window, last, ip) else {
+                break 'last_literals;
+            };
+            let h = hash_chunk(chunk, table_type);
             if table_type == TableType::ByPtr {
                 cctx.put_index_on_hash(ip as u32 + 1, h, table_type);
             } else {
@@ -429,7 +494,11 @@ fn compress_generic_validated(
             }
         }
         ip += 1;
-        forward_h = hash_position(src, ip, table_type);
+        let Some(chunk) = chunk8(window, last, ip) else {
+            break 'last_literals;
+        };
+        forward_chunk = chunk;
+        forward_h = hash_chunk(chunk, table_type);
 
         // Main loop.
         loop {
@@ -443,16 +512,19 @@ fn compress_generic_validated(
                 loop {
                     let h = forward_h;
                     ip = forward_ip;
+                    let ip_word = word(forward_chunk);
                     forward_ip += step;
                     step = (search_match_nb >> SKIP_TRIGGER) as usize;
                     search_match_nb += 1;
 
-                    if forward_ip as isize > mflimit_plus_one {
+                    // forward_ip > mflimitPlusOne.
+                    let Some(chunk) = chunk8(window, last, forward_ip) else {
                         break 'last_literals;
-                    }
+                    };
 
                     let stored = cctx.get_index_on_hash(h, table_type);
-                    forward_h = hash_position(src, forward_ip, table_type);
+                    forward_chunk = chunk;
+                    forward_h = hash_chunk(chunk, table_type);
                     cctx.put_index_on_hash(ip as u32 + 1, h, table_type);
 
                     // NULL is more than LZ4_DISTANCE_MAX behind: liblz4
@@ -462,7 +534,7 @@ fn compress_generic_validated(
                         continue;
                     }
                     let m = stored as usize - 1;
-                    if m + DISTANCE_MAX < ip || read32(src, m) != read32(src, ip) {
+                    if m + DISTANCE_MAX < ip || read32_before(window, last, m) != ip_word {
                         continue;
                     }
                     mtch = (Seg::Buf, m);
@@ -479,13 +551,15 @@ fn compress_generic_validated(
                     let mut match_index = cctx.get_index_on_hash(h, table_type);
                     debug_assert!(match_index <= current);
                     ip = forward_ip;
+                    let ip_word = word(forward_chunk);
                     forward_ip += step;
                     step = (search_match_nb >> SKIP_TRIGGER) as usize;
                     search_match_nb += 1;
 
-                    if forward_ip as isize > mflimit_plus_one {
+                    // forward_ip > mflimitPlusOne.
+                    let Some(chunk) = chunk8(window, last, forward_ip) else {
                         break 'last_literals;
-                    }
+                    };
 
                     match dict_directive {
                         DictDirective::UsingDictCtx => {
@@ -516,7 +590,8 @@ fn compress_generic_validated(
                         // A single continuous memory segment.
                         _ => mtch = (Seg::Buf, pos_of(match_index)),
                     }
-                    forward_h = hash_position(src, forward_ip, table_type);
+                    forward_chunk = chunk;
+                    forward_h = hash_chunk(chunk, table_type);
                     cctx.put_index_on_hash(current, h, table_type);
 
                     if dict_issue == DictIssue::DictSmall && match_index < prefix_idx_limit {
@@ -532,10 +607,10 @@ fn compress_generic_validated(
                     }
 
                     let candidate = match mtch.0 {
-                        Seg::Buf => read32(src, mtch.1),
+                        Seg::Buf => read32_before(window, last, mtch.1),
                         Seg::Dict => read32(dictionary, mtch.1),
                     };
-                    if candidate == read32(src, ip) {
+                    if candidate == ip_word {
                         if maybe_ext_mem {
                             offset = current - match_index;
                         }
@@ -730,14 +805,18 @@ fn compress_generic_validated(
                     }
                 }
 
-                // Test the next position.
+                // Test the next position (ip < mflimitPlusOne).
+                let Some(chunk) = chunk8(window, last, ip) else {
+                    break 'last_literals;
+                };
+                let ip_word = word(chunk);
                 if table_type == TableType::ByPtr {
-                    let h = hash_position(src, ip, table_type);
+                    let h = hash_chunk(chunk, table_type);
                     let stored = cctx.get_index_on_hash(h, table_type);
                     cctx.put_index_on_hash(ip as u32 + 1, h, table_type);
                     if stored != 0 {
                         let m = stored as usize - 1;
-                        if m + DISTANCE_MAX >= ip && read32(src, m) == read32(src, ip) {
+                        if m + DISTANCE_MAX >= ip && read32_before(window, last, m) == ip_word {
                             mtch = (Seg::Buf, m);
                             token = op;
                             op += 1;
@@ -747,7 +826,7 @@ fn compress_generic_validated(
                     }
                 } else {
                     // byU32, byU16.
-                    let h = hash_position(src, ip, table_type);
+                    let h = hash_chunk(chunk, table_type);
                     let current = ((ip - source) as u32).wrapping_add(start_index);
                     let mut match_index = cctx.get_index_on_hash(h, table_type);
                     debug_assert!(match_index < current);
@@ -785,10 +864,10 @@ fn compress_generic_validated(
                             || match_index as usize + DISTANCE_MAX >= current as usize)
                     {
                         let candidate = match mtch.0 {
-                            Seg::Buf => read32(src, mtch.1),
+                            Seg::Buf => read32_before(window, last, mtch.1),
                             Seg::Dict => read32(dictionary, mtch.1),
                         };
-                        if candidate == read32(src, ip) {
+                        if candidate == ip_word {
                             token = op;
                             op += 1;
                             dst[token] = 0;
@@ -802,9 +881,13 @@ fn compress_generic_validated(
                 break;
             }
 
-            // Prepare the next loop.
+            // Prepare the next loop (ip <= mflimitPlusOne).
             ip += 1;
-            forward_h = hash_position(src, ip, table_type);
+            let Some(chunk) = chunk8(window, last, ip) else {
+                break 'last_literals;
+            };
+            forward_chunk = chunk;
+            forward_h = hash_chunk(chunk, table_type);
         }
     }
 
@@ -873,8 +956,10 @@ pub(crate) fn wild_copy8_from(
 }
 
 /// `LZ4_compress_generic`: also takes care of an empty source, and of one
-/// too large.
+/// too large. Inlined, as liblz4's (`LZ4_FORCE_INLINE`), so that each
+/// caller's constant directives and table type specialise the loop.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn compress_generic(
     cctx: &mut StreamState,
     input: &Input<'_>,
@@ -953,29 +1038,33 @@ impl StreamState {
             dict: &[],
         };
         let mut unused = 0;
-        let table = if src.len() < LIMIT_64K {
-            TableType::ByU16
-        } else {
-            large_table()
-        };
-        let (directive, capacity) = if dst.len() >= compress_bound(src.len()) {
-            (OutputDirective::NotLimited, 0)
-        } else {
-            (OutputDirective::LimitedOutput, dst.len())
-        };
-        compress_generic(
-            self,
-            &input,
-            dst,
-            &mut unused,
-            capacity,
-            directive,
-            table,
-            DictDirective::NoDict,
-            DictIssue::NoDictIssue,
-            acceleration,
-            None,
-        )
+        let limited = dst.len() < compress_bound(src.len());
+        let capacity = if limited { dst.len() } else { 0 };
+        // One call for each case, with its directives constant, as in
+        // liblz4, so that each is specialised.
+        macro_rules! generic {
+            ($output:expr, $table:expr) => {
+                compress_generic(
+                    self,
+                    &input,
+                    dst,
+                    &mut unused,
+                    capacity,
+                    $output,
+                    $table,
+                    DictDirective::NoDict,
+                    DictIssue::NoDictIssue,
+                    acceleration,
+                    None,
+                )
+            };
+        }
+        match (limited, src.len() < LIMIT_64K) {
+            (false, true) => generic!(OutputDirective::NotLimited, TableType::ByU16),
+            (false, false) => generic!(OutputDirective::NotLimited, large_table()),
+            (true, true) => generic!(OutputDirective::LimitedOutput, TableType::ByU16),
+            (true, false) => generic!(OutputDirective::LimitedOutput, large_table()),
+        }
     }
 
     /// `LZ4_compress_fast_extState_fastReset`: as `compress_fast_ext_state`,
@@ -994,48 +1083,64 @@ impl StreamState {
             dict: &[],
         };
         let mut unused = 0;
-        let (directive, capacity) = if dst.len() >= compress_bound(src.len()) {
-            (OutputDirective::NotLimited, 0)
-        } else {
-            (OutputDirective::LimitedOutput, dst.len())
-        };
-        if src.len() < LIMIT_64K {
-            let table = TableType::ByU16;
-            self.prepare_table(src.len(), table);
-            let issue = if self.current_offset != 0 {
-                DictIssue::DictSmall
-            } else {
-                DictIssue::NoDictIssue
+        let limited = dst.len() < compress_bound(src.len());
+        let capacity = if limited { dst.len() } else { 0 };
+        macro_rules! generic {
+            ($output:expr, $table:expr, $issue:expr) => {
+                compress_generic(
+                    self,
+                    &input,
+                    dst,
+                    &mut unused,
+                    capacity,
+                    $output,
+                    $table,
+                    DictDirective::NoDict,
+                    $issue,
+                    acceleration,
+                    None,
+                )
             };
-            compress_generic(
-                self,
-                &input,
-                dst,
-                &mut unused,
-                capacity,
-                directive,
-                table,
-                DictDirective::NoDict,
-                issue,
-                acceleration,
-                None,
-            )
+        }
+        let small = src.len() < LIMIT_64K;
+        let table = if small {
+            TableType::ByU16
         } else {
-            let table = large_table();
-            self.prepare_table(src.len(), table);
-            compress_generic(
-                self,
-                &input,
-                dst,
-                &mut unused,
-                capacity,
-                directive,
-                table,
-                DictDirective::NoDict,
-                DictIssue::NoDictIssue,
-                acceleration,
-                None,
-            )
+            large_table()
+        };
+        self.prepare_table(src.len(), table);
+        let dict_small = self.current_offset != 0;
+        match (limited, small, dict_small) {
+            (false, true, true) => generic!(
+                OutputDirective::NotLimited,
+                TableType::ByU16,
+                DictIssue::DictSmall
+            ),
+            (false, true, false) => generic!(
+                OutputDirective::NotLimited,
+                TableType::ByU16,
+                DictIssue::NoDictIssue
+            ),
+            (false, false, _) => generic!(
+                OutputDirective::NotLimited,
+                large_table(),
+                DictIssue::NoDictIssue
+            ),
+            (true, true, true) => generic!(
+                OutputDirective::LimitedOutput,
+                TableType::ByU16,
+                DictIssue::DictSmall
+            ),
+            (true, true, false) => generic!(
+                OutputDirective::LimitedOutput,
+                TableType::ByU16,
+                DictIssue::NoDictIssue
+            ),
+            (true, false, _) => generic!(
+                OutputDirective::LimitedOutput,
+                large_table(),
+                DictIssue::NoDictIssue
+            ),
         }
     }
 
@@ -1065,25 +1170,29 @@ impl StreamState {
             len: src.len(),
             dict: &[],
         };
-        let table = if src.len() < LIMIT_64K {
-            TableType::ByU16
-        } else {
-            large_table()
-        };
         let capacity = dst.len();
-        compress_generic(
-            self,
-            &input,
-            dst,
-            src_size,
-            capacity,
-            OutputDirective::FillOutput,
-            table,
-            DictDirective::NoDict,
-            DictIssue::NoDictIssue,
-            acceleration,
-            None,
-        )
+        macro_rules! generic {
+            ($table:expr) => {
+                compress_generic(
+                    self,
+                    &input,
+                    dst,
+                    src_size,
+                    capacity,
+                    OutputDirective::FillOutput,
+                    $table,
+                    DictDirective::NoDict,
+                    DictIssue::NoDictIssue,
+                    acceleration,
+                    None,
+                )
+            };
+        }
+        if src.len() < LIMIT_64K {
+            generic!(TableType::ByU16)
+        } else {
+            generic!(large_table())
+        }
     }
 }
 
@@ -1312,24 +1421,30 @@ impl StreamState {
         match history {
             // Prefix mode: the source follows the dictionary.
             History::Prefix => {
-                let issue = if dict_small {
-                    DictIssue::DictSmall
+                // One call for each case, as in liblz4, so that each is
+                // specialised.
+                macro_rules! generic {
+                    ($issue:expr) => {
+                        compress_generic(
+                            self,
+                            input,
+                            dst,
+                            &mut unused,
+                            capacity,
+                            OutputDirective::LimitedOutput,
+                            table_type,
+                            DictDirective::WithPrefix64k,
+                            $issue,
+                            acceleration,
+                            None,
+                        )
+                    };
+                }
+                if dict_small {
+                    generic!(DictIssue::DictSmall)
                 } else {
-                    DictIssue::NoDictIssue
-                };
-                compress_generic(
-                    self,
-                    input,
-                    dst,
-                    &mut unused,
-                    capacity,
-                    OutputDirective::LimitedOutput,
-                    table_type,
-                    DictDirective::WithPrefix64k,
-                    issue,
-                    acceleration,
-                    None,
-                )
+                    generic!(DictIssue::NoDictIssue)
+                }
             }
             // External dictionary mode.
             History::Ext(dict) => {
@@ -1394,24 +1509,28 @@ impl StreamState {
                         len: input.len,
                         dict,
                     };
-                    let issue = if dict_small {
-                        DictIssue::DictSmall
+                    macro_rules! generic {
+                        ($issue:expr) => {
+                            compress_generic(
+                                self,
+                                &with_dict,
+                                dst,
+                                &mut unused,
+                                capacity,
+                                OutputDirective::LimitedOutput,
+                                table_type,
+                                DictDirective::UsingExtDict,
+                                $issue,
+                                acceleration,
+                                None,
+                            )
+                        };
+                    }
+                    if dict_small {
+                        generic!(DictIssue::DictSmall)
                     } else {
-                        DictIssue::NoDictIssue
-                    };
-                    compress_generic(
-                        self,
-                        &with_dict,
-                        dst,
-                        &mut unused,
-                        capacity,
-                        OutputDirective::LimitedOutput,
-                        table_type,
-                        DictDirective::UsingExtDict,
-                        issue,
-                        acceleration,
-                        None,
-                    )
+                        generic!(DictIssue::NoDictIssue)
+                    }
                 };
                 // The history is now the source.
                 self.dict_size = input.len as u32;

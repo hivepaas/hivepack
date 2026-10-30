@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Read};
 use hivepack_age::{BoxedIdentity, FileKey, FileKeyIdentity, Identity};
 
 use crate::decode::{DecodeLimits, decoder};
-use crate::detect::{Container, Detected, HEAD_LEN, Layer, detect};
+use crate::detect::{Container, Detected, HEAD_LEN, ISO_HEAD_LEN, Layer, detect};
 use crate::error::Error;
 
 /// How far an [`Opener`] goes.
@@ -160,8 +160,21 @@ where
         let container = loop {
             let mut head = Vec::with_capacity(HEAD_LEN);
             (&mut reader).take(HEAD_LEN as u64).read_to_end(&mut head)?;
-            let detected = detect(&head, name);
-            reader = Box::new(Cursor::new(head).chain(reader));
+            let mut detected = detect(&head, name);
+            let mut deferred = None;
+            if detected == Detected::Container(Container::Data) && head.len() == HEAD_LEN {
+                // An ISO 9660 image tells further in. An error there comes
+                // when the data is read up to it, as it would have.
+                deferred = read_more(&mut reader, &mut head, ISO_HEAD_LEN);
+                detected = detect(&head, name);
+            }
+            reader = match deferred {
+                None => Box::new(Cursor::new(head).chain(reader)),
+                Some(error) => Box::new(Cursor::new(head).chain(Deferred {
+                    error: Some(error),
+                    inner: reader,
+                })),
+            };
             let layer = match detected {
                 Detected::Container(container) => break container,
                 Detected::Layer(layer) => layer,
@@ -217,5 +230,41 @@ where
         self.file_keys.truncate(index);
         self.file_keys.push(decryptor.file_key().clone());
         Ok(Box::new(decryptor))
+    }
+}
+
+/// Reads `reader` into `head` until it holds `len` bytes or the stream
+/// ends; an error stops it, and is given back.
+fn read_more(reader: &mut impl Read, head: &mut Vec<u8>, len: usize) -> Option<io::Error> {
+    let mut buf = vec![0u8; len - head.len().min(len)];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                head.extend_from_slice(&buf[..filled]);
+                return Some(e);
+            }
+        }
+    }
+    head.extend_from_slice(&buf[..filled]);
+    None
+}
+
+/// A stream whose first read gives an error met while looking ahead, and
+/// the stream's reads after it.
+struct Deferred<R> {
+    error: Option<io::Error>,
+    inner: R,
+}
+
+impl<R: Read> Read for Deferred<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.error.take() {
+            Some(error) => Err(error),
+            None => self.inner.read(buf),
+        }
     }
 }

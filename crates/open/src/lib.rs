@@ -42,6 +42,6 @@ mod error;
 mod open;
 
 pub use decode::DecodeError;
-pub use detect::{Container, Detected, HEAD_LEN, Layer, detect};
+pub use detect::{Container, Detected, HEAD_LEN, ISO_HEAD_LEN, Layer, detect};
 pub use error::Error;
 pub use open::{Limits, Opened, Opener};

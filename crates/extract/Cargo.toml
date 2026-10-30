@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 hivepack-zip.workspace = true
+hivepack-tar.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
 

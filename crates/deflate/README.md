@@ -28,6 +28,18 @@ The goals:
 
 How the port follows zlib, how it is checked, and what is left are in [docs/deflate.md](../../docs/deflate.md).
 
+## Speed
+
+Against zlib 1.3.2, with `tools/deflate-bench`, on the Silesia corpus at levels 1, 6 and 9. Above 1× the port is faster.
+
+| | Mean | Range |
+|---|---|---|
+| Compression | 0.99× | 0.95–1.03× |
+| Decompression, in one call | 1.00× | 0.92–1.09× |
+| Decompression, streaming | 1.05× | 0.95–1.14× |
+
+**Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of three rounds taken in turn. More is in [docs/deflate.md](../../docs/deflate.md#the-speed-target).
+
 ## License
 
 The zlib license, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler, and (c) 2026 HivePaaS.

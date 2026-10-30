@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-fuzz"
 version = "0.0.0"
-description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso and hivepack-open any input"
+description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open and hivepack-7z any input"
 publish = false
 license = "MIT"
 edition = "2024"
@@ -16,6 +16,7 @@ unsafe-fast = ["hivepack-zstd/unsafe-fast", "hivepack-lz4/unsafe-fast"]
 
 [dependencies]
 libfuzzer-sys = "0.4"
+hivepack-7z = { path = "../crates/7z" }
 hivepack-zstd = { path = "../crates/zstd" }
 # libzstd 1.5.7, without the x86-64 Huffman assembly, with its worker threads
 # and its dictionary builder, as the tests build it.
@@ -30,6 +31,7 @@ hivepack-bzip2 = { path = "../crates/bzip2" }
 hivepack-age = { path = "../crates/age" }
 hivepack-tar = { path = "../crates/tar" }
 hivepack-iso = { path = "../crates/iso" }
+hivepack-rar = { path = "../crates/rar" }
 hivepack-open = { path = "../crates/open" }
 # libbzip2 1.0.8, built from bzip2-sys's bundled sources, as the tests build
 # it.
@@ -191,6 +193,12 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_headers"
+path = "fuzz_targets/rar_headers.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false
@@ -200,3 +208,10 @@ bench = false
 # Not in the main workspace: cargo-fuzz builds it with nightly and its own
 # flags.
 [workspace]
+
+[[bin]]
+name = "sevenz"
+path = "fuzz_targets/sevenz.rs"
+test = false
+doc = false
+bench = false

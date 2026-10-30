@@ -10,7 +10,8 @@
 //! Differs from liblzma, without a difference to see: liblzma's main
 //! thread writes the input of a Block into the worker's buffer while the
 //! worker reads the part before it; here the main thread appends it to
-//! [`WorkerShared::pending`], which the worker moves to its own buffer.
+//! [`WorkerShared::pending`], which the worker moves to its own buffer
+//! ([`take_pending`]).
 //! The worker writes its output to a buffer it has taken from the output
 //! queue and gives back when it has finished, as liblzma's main thread
 //! reads only finished Blocks.
@@ -238,9 +239,22 @@ struct WorkerLocal {
     /// What the main thread has given for the Block.
     outbuf: Option<WorkerOutBuf>,
     filters: Vec<Filter>,
+    /// Block encoder, kept from one Block to the next.
+    block_encoder: Option<BlockEncoder>,
     /// The Block's sizes, for the Index, once it has been encoded.
     unpadded_size: u64,
     uncompressed_size: u64,
+}
+
+/// The input the main thread has given, moved to the worker's buffer: by
+/// exchanging the two if the worker's is empty, as it is when a Block comes
+/// in one piece, else by copying.
+fn take_pending(input: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    if input.is_empty() {
+        core::mem::swap(input, pending);
+    } else {
+        input.append(pending);
+    }
 }
 
 /// Room in `buf` to write at `out_pos`, up to `out_size` bytes in all.
@@ -295,13 +309,14 @@ impl WorkerLocal {
         }
 
         // Initialize the Block encoder.
-        let mut block_encoder = match BlockEncoder::new(block_options.clone()) {
-            Ok(encoder) => encoder,
-            Err(ret) => {
-                worker_error(&self.coder, ret);
-                return WorkerState::Stop;
-            }
-        };
+        let block_encoder =
+            match BlockEncoder::new(block_options.clone(), self.block_encoder.take()) {
+                Ok(encoder) => self.block_encoder.insert(encoder),
+                Err(ret) => {
+                    worker_error(&self.coder, ret);
+                    return WorkerState::Stop;
+                }
+            };
 
         let mut in_pos = 0;
         let mut in_size = 0;
@@ -326,7 +341,7 @@ impl WorkerLocal {
 
                 *state = shared.state;
                 in_size = shared.in_size;
-                self.input.append(&mut shared.pending);
+                take_pending(&mut self.input, &mut shared.pending);
             }
 
             // Return if we were asked to stop or exit.
@@ -372,7 +387,7 @@ impl WorkerLocal {
                 // Encode the Block Header. By doing it after the
                 // compression, we can store the Compressed Size and
                 // Uncompressed Size fields.
-                block_options = block_encoder.block;
+                block_options.clone_from(&block_encoder.block);
                 let ret = block_options.header_encode(&mut outbuf.buf);
                 if ret != Ret::Ok {
                     worker_error(&self.coder, ret);
@@ -393,7 +408,7 @@ impl WorkerLocal {
 
                     *state = shared.state;
                     in_size = shared.in_size;
-                    self.input.append(&mut shared.pending);
+                    take_pending(&mut self.input, &mut shared.pending);
                 }
 
                 if *state >= WorkerState::Stop {
@@ -568,8 +583,8 @@ impl StreamEncoderMt {
 
     /// `initialize_new_thread`: a new worker and its thread.
     fn initialize_new_thread(&mut self) -> Ret {
-        let mut input = Vec::new();
-        if input.try_reserve_exact(self.block_size).is_err() {
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(self.block_size).is_err() {
             return Ret::MemError;
         }
 
@@ -577,7 +592,7 @@ impl StreamEncoderMt {
             mutex: Mutex::new(WorkerShared {
                 state: WorkerState::Idle,
                 in_size: 0,
-                pending: Vec::new(),
+                pending,
                 outbuf: None,
                 filters: Vec::new(),
                 progress_in: 0,
@@ -592,9 +607,10 @@ impl StreamEncoderMt {
             index: self.threads.len(),
             check: self.stream_flags.check,
             block_size: self.block_size,
-            input,
+            input: Vec::new(),
             outbuf: None,
             filters: Vec::new(),
+            block_encoder: None,
             unpadded_size: 0,
             uncompressed_size: 0,
         };

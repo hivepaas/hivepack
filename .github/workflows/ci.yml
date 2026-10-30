@@ -58,6 +58,7 @@ jobs:
           v=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
+      - run: cargo check -p hivepack-7z --lib --locked
       - run: cargo check -p hivepack-age --lib --locked
       - run: cargo check -p hivepack-bzip2 --lib --locked
       - run: cargo check -p hivepack-xz --lib --locked
@@ -314,6 +315,20 @@ jobs:
               pathlib.Path(f"fuzz/corpus/extract/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract -- -max_total_time=60
+      - name: Seed the RAR corpus with the recorded archives
+        run: |
+          mkdir -p fuzz/corpus/rar_headers
+          python3 - <<'PY'
+          import pathlib
+          # The archives of the recorded requests, after the byte that says
+          # whether a broken main header is read past.
+          lines = pathlib.Path("testdata/oracle/rar-list.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              words = line.split("\t")[0].split(" ")
+              data = b"" if words[2] == "-" else bytes.fromhex(words[2])
+              pathlib.Path(f"fuzz/corpus/rar_headers/r{i}").write_bytes(bytes([int(words[1])]) + data)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_headers -- -max_total_time=45
       - name: Seed the bzip2 corpus
         run: |
           mkdir -p fuzz/corpus/bzip2
@@ -377,6 +392,17 @@ jobs:
           PY
       # With the `unsafe-fast` feature: the decoder's unchecked fast loop.
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu --features unsafe-fast lz4 -- -max_total_time=60 -rss_limit_mb=4096
+      - name: Seed the 7z corpus
+        run: |
+          mkdir -p fuzz/corpus/sevenz
+          python3 - <<'PY'
+          import pathlib
+          # The archives of the recorded answers.
+          lines = pathlib.Path("testdata/oracle/7z.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/sevenz/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu sevenz -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the tar corpus with Go's test archives
         run: |
           mkdir -p fuzz/corpus/tar

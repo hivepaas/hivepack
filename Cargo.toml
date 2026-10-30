@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/iso", "crates/lz4", "crates/open", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/7z", "crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/iso", "crates/lz4", "crates/open", "crates/rar", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ repository = "https://github.com/hivepaas/hivepack-rs"
 homepage = "https://github.com/hivepaas/hivepack-rs"
 
 [workspace.dependencies]
+hivepack-7z = { path = "crates/7z" }
 hivepack-age = { path = "crates/age" }
 hivepack-bzip2 = { path = "crates/bzip2" }
 hivepack-crypto = { path = "crates/crypto" }
@@ -19,6 +20,7 @@ hivepack-extract = { path = "crates/extract" }
 hivepack-iso = { path = "crates/iso" }
 hivepack-lz4 = { path = "crates/lz4" }
 hivepack-open = { path = "crates/open" }
+hivepack-rar = { path = "crates/rar" }
 hivepack-tar = { path = "crates/tar" }
 hivepack-xz = { path = "crates/xz" }
 hivepack-zip = { path = "crates/zip" }
@@ -69,6 +71,8 @@ serde_json = "1"
 # The safety rules in docs/safety.md, enforced for every crate.
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `cargo fuzz` builds with `--cfg fuzzing`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

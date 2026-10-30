@@ -143,6 +143,13 @@ pub(crate) trait NextCoder: Send {
     fn get_progress(&self) -> Option<(u64, u64)> {
         None
     }
+
+    /// This coder as an LZ encoder, if it is one: what
+    /// `lzma_next_coder_init()` keeps for the encoder of the next Block.
+    /// The other coders are small, and are made anew.
+    fn into_lz_encoder(self: Box<Self>) -> Option<Box<crate::lz_encoder::LzEncCoder>> {
+        None
+    }
 }
 
 /// The state of `lzma_internal`: what the next call to `lzma_code()`

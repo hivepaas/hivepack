@@ -5,9 +5,12 @@
 
 use crate::common::{FILTER_RESERVED_START, MEMUSAGE_BASE, NextCoder, Ret, VLI_UNKNOWN};
 use crate::lz_decoder::{Lz, LzCoder};
+use crate::lz_encoder::{LzEnc, LzEncCoder};
 use crate::lzma_common::{LZMA1EXT_ALLOW_EOPM, LzmaOptions, is_lclppb_valid};
 use crate::lzma_decoder::{self, LzmaDecoder};
+use crate::lzma_encoder::{self, LzmaEncoder};
 use crate::lzma2_decoder::{self, Lzma2Decoder};
+use crate::lzma2_encoder::{self, Lzma2Encoder};
 use crate::vli;
 
 /// `LZMA_FILTER_LZMA1`.
@@ -255,4 +258,179 @@ pub(crate) fn filter_flags_decode(input: &[u8], in_pos: &mut usize) -> Result<Fi
         id,
         options: options?,
     })
+}
+
+// filter_encoder.c
+
+/// `lzma_filter_encoder_is_supported`.
+pub fn encoder_is_supported(id: u64) -> bool {
+    matches!(id, FILTER_LZMA1 | FILTER_LZMA1EXT | FILTER_LZMA2)
+}
+
+/// The `init` of an encoder in `encoders[]`: the LZMA1 or LZMA2 encoder of
+/// `filter`, the LZ encoder around it.
+fn encoder_filter_init(filter: &Filter) -> Result<Box<dyn NextCoder>, Ret> {
+    // lzma_encoder_init() and lzma2_encoder_init().
+    let options = lzma_options(filter)?;
+    let (lz, lz_options) = match filter.id {
+        FILTER_LZMA1 | FILTER_LZMA1EXT => {
+            let (lzma, lz_options) = LzmaEncoder::create(filter.id, options)?;
+            (LzEnc::Lzma(Box::new(lzma)), lz_options)
+        }
+        FILTER_LZMA2 => {
+            let (lzma2, lz_options) = Lzma2Encoder::new(options)?;
+            (LzEnc::Lzma2(Box::new(lzma2)), lz_options)
+        }
+        _ => return Err(Ret::OptionsError),
+    };
+    Ok(Box::new(LzEncCoder::new(lz, &lz_options)?))
+}
+
+/// `lzma_raw_encoder_init`: the encoders of a filter chain.
+///
+/// Differs from liblzma, without a difference to see: liblzma reverses
+/// the chain for its encoders, LZMA last in the chain and first to run;
+/// with LZMA1 and LZMA2 only, the chain is the one filter.
+pub(crate) fn raw_encoder_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>, Ret> {
+    // Do some basic validation and get the number of filters.
+    let count = validate_chain(filters)?;
+
+    for filter in &filters[..count] {
+        if !encoder_is_supported(filter.id) {
+            return Err(Ret::OptionsError);
+        }
+    }
+
+    encoder_filter_init(&filters[0])
+}
+
+/// The `memusage` of an encoder in `encoders[]`.
+fn encoder_memusage(filter: &Filter) -> u64 {
+    // liblzma reads the options without checking for NULL.
+    let Some(options) = filter.options.as_ref() else {
+        return u64::MAX;
+    };
+    match filter.id {
+        FILTER_LZMA1 | FILTER_LZMA1EXT => lzma_encoder::encoder_memusage(options),
+        FILTER_LZMA2 => lzma2_encoder::lzma2_encoder_memusage(options),
+        _ => u64::MAX,
+    }
+}
+
+/// `lzma_raw_encoder_memusage`: the memory the encoders of a chain need,
+/// or u64::MAX if the chain is invalid or not supported.
+pub fn raw_encoder_memusage(filters: &[Filter]) -> u64 {
+    // The chain has to have at least one filter.
+    if validate_chain(filters).is_err() {
+        return u64::MAX;
+    }
+
+    let mut total: u64 = 0;
+    for filter in filters {
+        if !encoder_is_supported(filter.id) {
+            return u64::MAX; // Unsupported Filter ID
+        }
+
+        // Call the filter-specific memory usage calculation function.
+        let usage = encoder_memusage(filter);
+        if usage == u64::MAX {
+            return u64::MAX; // Invalid options
+        }
+
+        total += usage;
+    }
+
+    // Add some fixed amount of extra. It's to compensate memory usage of
+    // Stream, Block etc. coders, malloc() overhead, stack etc.
+    total + MEMUSAGE_BASE
+}
+
+/// `lzma_properties_size`.
+pub(crate) fn properties_size(filter: &Filter) -> Result<u32, Ret> {
+    match filter.id {
+        FILTER_LZMA1 | FILTER_LZMA1EXT => Ok(5),
+        FILTER_LZMA2 => Ok(1),
+        // Unknown filter - if the Filter ID is a proper VLI, return
+        // LZMA_OPTIONS_ERROR instead of LZMA_PROG_ERROR, because it's
+        // possible that we just don't have support compiled in for the
+        // requested filter.
+        id if id <= crate::common::VLI_MAX => Err(Ret::OptionsError),
+        _ => Err(Ret::ProgError),
+    }
+}
+
+/// `lzma_properties_encode`.
+pub(crate) fn properties_encode(filter: &Filter, props: &mut [u8]) -> Ret {
+    let Some(options) = filter.options.as_ref() else {
+        return Ret::ProgError;
+    };
+    match filter.id {
+        FILTER_LZMA1 | FILTER_LZMA1EXT => lzma_encoder::props_encode(options, props),
+        FILTER_LZMA2 => lzma2_encoder::lzma2_props_encode(options, props),
+        _ => Ret::ProgError,
+    }
+}
+
+// filter_flags_encoder.c
+
+/// `lzma_filter_flags_size`.
+pub(crate) fn filter_flags_size(filter: &Filter) -> Result<u32, Ret> {
+    if filter.id >= FILTER_RESERVED_START {
+        return Err(Ret::ProgError);
+    }
+
+    let size = properties_size(filter)?;
+    Ok(size + vli::size(filter.id) + vli::size(u64::from(size)))
+}
+
+/// `lzma_filter_flags_encode`.
+pub(crate) fn filter_flags_encode(filter: &Filter, out: &mut [u8], out_pos: &mut usize) -> Ret {
+    // Filter ID
+    if filter.id >= FILTER_RESERVED_START {
+        return Ret::ProgError;
+    }
+
+    let ret = vli::encode_single(filter.id, out, out_pos);
+    if ret != Ret::Ok {
+        return ret;
+    }
+
+    // Size of Properties
+    let props_size = match properties_size(filter) {
+        Ok(size) => size,
+        Err(ret) => return ret,
+    };
+    let ret = vli::encode_single(u64::from(props_size), out, out_pos);
+    if ret != Ret::Ok {
+        return ret;
+    }
+
+    // Filter Properties
+    if out.len() - *out_pos < props_size as usize {
+        return Ret::ProgError;
+    }
+
+    let ret = properties_encode(filter, &mut out[*out_pos..]);
+    if ret != Ret::Ok {
+        return ret;
+    }
+
+    *out_pos += props_size as usize;
+
+    Ret::Ok
+}
+
+/// `lzma_filters_copy`: a copy of the chain, or LZMA_OPTIONS_ERROR for more
+/// than four filters, or options of a filter this build does not know.
+pub(crate) fn filters_copy(filters: &[Filter]) -> Result<Vec<Filter>, Ret> {
+    for (i, filter) in filters.iter().enumerate() {
+        if i == FILTERS_MAX {
+            return Err(Ret::OptionsError);
+        }
+
+        if filter.options.is_some() && !FEATURES.iter().any(|f| f.id == filter.id) {
+            return Err(Ret::OptionsError);
+        }
+    }
+    Ok(filters.to_vec())
 }

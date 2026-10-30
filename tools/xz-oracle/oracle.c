@@ -40,6 +40,32 @@
  *
  *   memusage <filter>
  *       lzma_raw_decoder_memusage of one filter, as above.
+ *
+ *   code <coder> <steps> <hex>
+ *       As decode, with the decoders above or an encoder:
+ *         easyenc:<preset>:<check>    lzma_easy_encoder
+ *         streamenc:<check>:<efilter> lzma_stream_encoder, one filter
+ *         aloneenc:<efilter>          lzma_alone_encoder
+ *         rawenc:<efilter>            lzma_raw_encoder, one filter
+ *       where an <efilter> is <id>:<dict>:<lc>:<lp>:<pb>:<mode>:<nice_len>:
+ *       <mf>:<depth>:<ext_flags>:<ext_size>:<preset>, <id> 1, 2 or 21 as
+ *       above or any other number as the Filter ID itself.
+ *
+ *   encmem <efilter>
+ *       lzma_raw_encoder_memusage of one filter.
+ *
+ *   easymem <preset>
+ *       lzma_easy_encoder_memusage and lzma_easy_decoder_memusage.
+ *
+ *   ebuf <preset>:<check>:<out_size> <hex>
+ *   sbuf <check>:<out_size>:<efilter> <hex>
+ *   rbuf <out_size>:<efilter> <hex>
+ *       lzma_easy_buffer_encode, lzma_stream_buffer_encode and
+ *       lzma_raw_buffer_encode into <out_size> bytes. Answered "ok <hex>"
+ *       or "err <code>".
+ *
+ *   bound <size>
+ *       lzma_stream_buffer_bound.
  */
 
 #include <stdio.h>
@@ -148,6 +174,49 @@ static int parse_filter(const char *text, lzma_filter *filter) {
     return 1;
 }
 
+/* An encoder's filter from its text: <id>:<dict>:<lc>:<lp>:<pb>:<mode>:
+ * <nice_len>:<mf>:<depth>:<ext_flags>:<ext_size>:<preset>. */
+static int parse_efilter(const char *text, lzma_filter *filter) {
+    unsigned long id, dict, lc, lp, pb, mode, nice_len, mf, depth, ext_flags;
+    unsigned long long ext_size;
+    const char *preset_hex = text;
+    size_t preset_len;
+    int colons = 0;
+    if (sscanf(text, "%lu:%lu:%lu:%lu:%lu:%lu:%lu:%lu:%lu:%lu:%llu:", &id, &dict, &lc, &lp, &pb,
+               &mode, &nice_len, &mf, &depth, &ext_flags, &ext_size) != 11)
+        return 0;
+    while (colons < 11 && (preset_hex = strchr(preset_hex, ':')) != NULL) {
+        preset_hex++;
+        colons++;
+    }
+    if (preset_hex == NULL || *preset_hex == '\0')
+        return 0;
+    memset(&options, 0, sizeof(options));
+    options.dict_size = (uint32_t)dict;
+    options.lc = (uint32_t)lc;
+    options.lp = (uint32_t)lp;
+    options.pb = (uint32_t)pb;
+    options.mode = (lzma_mode)mode;
+    options.nice_len = (uint32_t)nice_len;
+    options.mf = (lzma_match_finder)mf;
+    options.depth = (uint32_t)depth;
+    options.ext_flags = (uint32_t)ext_flags;
+    options.ext_size_low = (uint32_t)ext_size;
+    options.ext_size_high = (uint32_t)(ext_size >> 32);
+    free(preset);
+    preset = unhex(preset_hex, &preset_len);
+    options.preset_dict = preset_len ? preset : NULL;
+    options.preset_dict_size = (uint32_t)preset_len;
+    filter[0].id = id == 1 ? LZMA_FILTER_LZMA1
+                 : id == 2 ? LZMA_FILTER_LZMA1EXT
+                 : id == 21 ? LZMA_FILTER_LZMA2
+                            : (lzma_vli)id;
+    filter[0].options = &options;
+    filter[1].id = LZMA_VLI_UNKNOWN;
+    filter[1].options = NULL;
+    return 1;
+}
+
 /* The number of output bytes the steps can ask for, at most. */
 static size_t output_space(const char *steps) {
     size_t total = 0;
@@ -172,7 +241,7 @@ static void do_decode(const char *decoder, const char *steps, const char *data_h
     unsigned char *data, *out;
     size_t len, space, consumed = 0, written = 0;
     unsigned long long memlimit = 0;
-    unsigned long flags = 0;
+    unsigned long flags = 0, preset_level = 0, check = 0;
     lzma_ret ret;
     const char *p;
 
@@ -187,6 +256,15 @@ static void do_decode(const char *decoder, const char *steps, const char *data_h
         ret = lzma_alone_decoder(&strm, memlimit);
     else if (strncmp(decoder, "raw:", 4) == 0 && parse_filter(decoder + 4, filters))
         ret = lzma_raw_decoder(&strm, filters);
+    else if (sscanf(decoder, "easyenc:%lu:%lu", &preset_level, &check) == 2)
+        ret = lzma_easy_encoder(&strm, (uint32_t)preset_level, (lzma_check)check);
+    else if (sscanf(decoder, "streamenc:%lu:", &check) == 1
+             && parse_efilter(strchr(decoder + 10, ':') + 1, filters))
+        ret = lzma_stream_encoder(&strm, filters, (lzma_check)check);
+    else if (strncmp(decoder, "aloneenc:", 9) == 0 && parse_efilter(decoder + 9, filters))
+        ret = lzma_alone_encoder(&strm, &options);
+    else if (strncmp(decoder, "rawenc:", 7) == 0 && parse_efilter(decoder + 7, filters))
+        ret = lzma_raw_encoder(&strm, filters);
     else {
         puts("bad");
         return;
@@ -302,6 +380,47 @@ static void do_encode(const char *format, unsigned long preset_level, int check,
     free(out);
 }
 
+/* The single-call encoders: ebuf, sbuf and rbuf. */
+static void do_buffer(const char *kind, const char *args, const char *data_hex) {
+    lzma_filter filters[2];
+    unsigned long preset_level, check, out_size;
+    const char *rest;
+    unsigned char *data, *out;
+    size_t len, out_pos = 0;
+    lzma_ret ret;
+
+    if (strcmp(kind, "ebuf") == 0 && sscanf(args, "%lu:%lu:%lu", &preset_level, &check, &out_size) == 3) {
+        data = unhex(data_hex, &len);
+        out = malloc(out_size + 1);
+        ret = lzma_easy_buffer_encode((uint32_t)preset_level, (lzma_check)check, NULL, data, len, out,
+                                      &out_pos, out_size);
+    } else if (strcmp(kind, "sbuf") == 0 && sscanf(args, "%lu:%lu:", &check, &out_size) == 2
+               && (rest = strchr(args, ':')) != NULL && (rest = strchr(rest + 1, ':')) != NULL
+               && parse_efilter(rest + 1, filters)) {
+        data = unhex(data_hex, &len);
+        out = malloc(out_size + 1);
+        ret = lzma_stream_buffer_encode(filters, (lzma_check)check, NULL, data, len, out, &out_pos,
+                                        out_size);
+    } else if (strcmp(kind, "rbuf") == 0 && sscanf(args, "%lu:", &out_size) == 1
+               && (rest = strchr(args, ':')) != NULL && parse_efilter(rest + 1, filters)) {
+        data = unhex(data_hex, &len);
+        out = malloc(out_size + 1);
+        ret = lzma_raw_buffer_encode(filters, NULL, data, len, out, &out_pos, out_size);
+    } else {
+        puts("bad");
+        return;
+    }
+    if (ret != LZMA_OK)
+        printf("err %d\n", ret);
+    else {
+        fputs("ok ", stdout);
+        put_hex(out, out_pos);
+        putchar('\n');
+    }
+    free(data);
+    free(out);
+}
+
 int main(void) {
     size_t cap = 1 << 20;
     char *line = malloc(cap);
@@ -321,8 +440,23 @@ int main(void) {
             line[--n] = '\0';
         for (word = strtok(line, " "); word && count < 6; word = strtok(NULL, " "))
             words[count++] = word;
-        if (count == 4 && strcmp(words[0], "decode") == 0)
+        if (count == 4 && (strcmp(words[0], "decode") == 0 || strcmp(words[0], "code") == 0))
             do_decode(words[1], words[2], words[3]);
+        else if (count == 3 && (strcmp(words[0], "ebuf") == 0 || strcmp(words[0], "sbuf") == 0
+                                || strcmp(words[0], "rbuf") == 0))
+            do_buffer(words[0], words[1], words[2]);
+        else if (count == 2 && strcmp(words[0], "encmem") == 0) {
+            lzma_filter filters[2];
+            if (parse_efilter(words[1], filters))
+                printf("%llu\n", (unsigned long long)lzma_raw_encoder_memusage(filters));
+            else
+                puts("bad");
+        } else if (count == 2 && strcmp(words[0], "easymem") == 0) {
+            uint32_t level = (uint32_t)strtoul(words[1], NULL, 10);
+            printf("%llu %llu\n", (unsigned long long)lzma_easy_encoder_memusage(level),
+                   (unsigned long long)lzma_easy_decoder_memusage(level));
+        } else if (count == 2 && strcmp(words[0], "bound") == 0)
+            printf("%zu\n", lzma_stream_buffer_bound((size_t)strtoull(words[1], NULL, 10)));
         else if (count == 5 && strcmp(words[0], "encode") == 0)
             do_encode(words[1], strtoul(words[2], NULL, 10), atoi(words[3]), words[4]);
         else if (count == 2 && strcmp(words[0], "memusage") == 0) {

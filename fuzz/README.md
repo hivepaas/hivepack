@@ -23,6 +23,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `lz4` | After a mode byte and eight bytes of seed: decoding the rest as a block with `LZ4_decompress_safe` into an output of a size the seed picks, with the same result and every byte of the output the same, past what is decoded too, as liblz4; reading it as a frame in reads of sizes the seed picks, through the lz4 crate's `Decoder` and the same loop over the port's context, with the same bytes from every read; decoding it partially, with dictionaries, after a prefix and in a stream, and reading it with the port's `Decoder`: no panic (`crates/lz4/tests/oracle.rs` compares those with liblz4) |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
 | `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). Where the port refuses a Block's filters and liblzma, which has the delta and BCJ filters, goes on, the comparison stops; and the automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
+| `xz_encode` | Encoding the rest of the input with the encoder its first byte picks (`.xz` of a preset, `.xz` of LZMA2 with options, `.lzma`, raw LZMA1 or LZMA2), with the preset, check, options, pieces and flushes its next eight bytes pick: every call gives the same result, bytes read and written, and output as liblzma |
 | `age` | Decrypting the input as an age file, armored or not, with CCTV's usual X25519 key and the passphrase `password` (work factors up to 2^4), twice, in pieces of different sizes its first eight bytes pick: the same plaintext and the same end both times, and no panic (`crates/age/tests/oracle.rs` compares the outcomes with age) |
 | `age_keys` | Reading the input as an identity file, as `age -i` does (a file of keys, an SSH key, a file of keys encrypted with age): no panic. Only the parsing, as decrypting an encrypted key file could ask scrypt for 4 GiB |
 | `tar` | Reading the input as a tar archive, every entry and up to 4 MiB of each one's data, twice, in pieces of different sizes its first eight bytes pick: the same headers, data and end both times, and no panic (`crates/tar/tests/oracle.rs` compares the answers with Go's archive/tar) |
@@ -45,8 +46,10 @@ without).
 
 The `inflate`, `deflate` and `inflate9` targets start from an empty
 corpus, CI seeds `bzip2` with the streams and inputs of
-`testdata/oracle/bzip2.txt`, and `xz` with the inputs of
-`testdata/oracle/xz.txt`, behind the byte for their decoder:
+`testdata/oracle/bzip2.txt`, `xz` with the inputs of
+`testdata/oracle/xz.txt`, behind the byte for their decoder, and `xz_encode`
+with those of `testdata/oracle/xz-encode.txt`, behind the byte for their
+encoder:
 
 ```sh
 cargo fuzz run inflate -- -max_total_time=3600
@@ -54,6 +57,7 @@ cargo fuzz run deflate -- -max_total_time=3600
 cargo fuzz run inflate9 -- -max_total_time=3600
 cargo fuzz run bzip2 -- -max_total_time=3600
 cargo fuzz run xz -- -max_total_time=3600 -rss_limit_mb=4096
+cargo fuzz run xz_encode -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `lz4` with the blocks and frames of `testdata/oracle/lz4.txt`, each

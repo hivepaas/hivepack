@@ -90,3 +90,61 @@ pub(crate) fn size(mut vli: u64) -> u32 {
     }
     i
 }
+
+/// `lzma_vli_encode` in single-call mode (`vli_pos` NULL): all of `vli`
+/// into `out`, or LZMA_PROG_ERROR if it does not fit.
+pub(crate) fn encode_single(vli: u64, out: &mut [u8], out_pos: &mut usize) -> Ret {
+    if *out_pos >= out.len() {
+        return Ret::ProgError;
+    }
+    let mut vli_pos = 0;
+    match encode_inner(vli, &mut vli_pos, out, out_pos) {
+        // The output got full before the end.
+        Ret::Ok => Ret::ProgError,
+        Ret::StreamEnd => Ret::Ok,
+        ret => ret,
+    }
+}
+
+/// `lzma_vli_encode` in multi-call mode: LZMA_STREAM_END once all of
+/// `vli` is written, LZMA_OK while the output is full first.
+pub(crate) fn encode(vli: u64, vli_pos: &mut usize, out: &mut [u8], out_pos: &mut usize) -> Ret {
+    if *out_pos >= out.len() {
+        return Ret::BufError;
+    }
+    encode_inner(vli, vli_pos, out, out_pos)
+}
+
+fn encode_inner(mut vli: u64, vli_pos: &mut usize, out: &mut [u8], out_pos: &mut usize) -> Ret {
+    // Validate the arguments.
+    if *vli_pos >= VLI_BYTES_MAX || vli > VLI_MAX {
+        return Ret::ProgError;
+    }
+
+    // Shift vli so that the next bits to encode are the lowest. In
+    // single-call mode this never changes vli since *vli_pos is zero.
+    vli >>= *vli_pos * 7;
+
+    // Write the non-last bytes in a loop.
+    while vli >= 0x80 {
+        // We don't need *vli_pos during this function call anymore, but
+        // update it here so that it is ready if we need to return before
+        // the whole integer has been decoded.
+        *vli_pos += 1;
+
+        out[*out_pos] = (vli as u8) | 0x80;
+        vli >>= 7;
+
+        *out_pos += 1;
+        if *out_pos == out.len() {
+            return Ret::Ok;
+        }
+    }
+
+    // Write the last byte.
+    out[*out_pos] = vli as u8;
+    *out_pos += 1;
+    *vli_pos += 1;
+
+    Ret::StreamEnd
+}

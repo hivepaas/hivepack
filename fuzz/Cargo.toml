@@ -141,6 +141,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "xz_encode"
+path = "fuzz_targets/xz_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tar"
 path = "fuzz_targets/tar.rs"
 test = false

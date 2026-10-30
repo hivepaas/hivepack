@@ -1,14 +1,19 @@
-//! .xz, .lzma and .lz decompression in safe Rust, ported from the official
-//! library, liblzma of [XZ Utils](https://tukaani.org/xz/) 5.8.4.
+//! .xz and .lzma compression, and .xz, .lzma and .lz decompression, in safe
+//! Rust, ported from the official library, liblzma of
+//! [XZ Utils](https://tukaani.org/xz/) 5.8.4.
 //!
-//! A [`Stream`] decodes as an `lzma_stream` does, with the decoder it was
-//! made with: `.xz` ([`Stream::stream_decoder`]), `.lzma`
+//! A [`Stream`] codes as an `lzma_stream` does, with the coder it was made
+//! with. The decoders: `.xz` ([`Stream::stream_decoder`]), `.lzma`
 //! ([`Stream::alone_decoder`]), `.lz` ([`Stream::lzip_decoder`]), any of
 //! them by their first byte ([`Stream::auto_decoder`]), or raw LZMA1 and
-//! LZMA2 ([`Stream::raw_decoder`]). Each call gives liblzma's result and
-//! reads and writes what liblzma reads and writes. The rules the port
-//! follows, and how it is checked, are in the repository: `docs/xz.md` and
-//! `docs/safety.md`.
+//! LZMA2 ([`Stream::raw_decoder`]). The encoders: `.xz` of a preset
+//! ([`Stream::easy_encoder`]) or of a filter chain
+//! ([`Stream::stream_encoder`]), `.lzma` ([`Stream::alone_encoder`]), or
+//! raw ([`Stream::raw_encoder`]); and in one call, [`easy_buffer_encode`],
+//! [`stream_buffer_encode`] and [`raw_buffer_encode`]. Each call gives
+//! liblzma's result and reads and writes what liblzma reads and writes: the
+//! encoders write liblzma's bytes. The rules the port follows, and how it
+//! is checked, are in the repository: `docs/xz.md` and `docs/safety.md`.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_xz::Error> {
@@ -33,12 +38,31 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Encoding, in one call:
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_xz::Error> {
+//! use hivepack_xz::{Check, PRESET_DEFAULT, easy_buffer_encode, stream_buffer_bound};
+//!
+//! let data = b"hello\n";
+//! let mut xz = vec![0; stream_buffer_bound(data.len())];
+//! let mut len = 0;
+//! easy_buffer_encode(PRESET_DEFAULT, Check::CRC64, data, &mut xz, &mut len)?;
+//! xz.truncate(len);
+//! // The Stream liblzma writes, byte for byte.
+//! assert_eq!(&xz[..6], b"\xfd7zXZ\0");
+//! assert_eq!(len, 64);
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 // Loops keep liblzma's indices, so the port reads side by side with the C.
 #![allow(clippy::needless_range_loop)]
 
 mod alone_decoder;
+mod alone_encoder;
 mod auto_decoder;
 mod block;
 mod check;
@@ -46,12 +70,17 @@ mod common;
 mod filter;
 mod index_hash;
 mod lz_decoder;
+mod lz_encoder;
 mod lzip_decoder;
 mod lzma2_decoder;
+mod lzma2_encoder;
 mod lzma_common;
 mod lzma_decoder;
+mod lzma_encoder;
 mod range_decoder;
+mod range_encoder;
 mod stream_decoder;
+mod stream_encoder;
 mod stream_flags;
 mod vli;
 
@@ -64,9 +93,13 @@ pub use common::{
 };
 pub use filter::{
     FILTER_LZMA1, FILTER_LZMA1EXT, FILTER_LZMA2, FILTERS_MAX, Filter, decoder_is_supported,
-    raw_decoder_memusage,
+    encoder_is_supported, raw_decoder_memusage, raw_encoder_memusage,
 };
-pub use lzma_common::{DICT_SIZE_MIN, LCLP_MAX, LZMA1EXT_ALLOW_EOPM, LzmaOptions, PB_MAX};
+pub use lzma_common::{
+    DICT_SIZE_DEFAULT, DICT_SIZE_MIN, LC_DEFAULT, LCLP_MAX, LP_DEFAULT, LZMA1EXT_ALLOW_EOPM,
+    LzmaOptions, MatchFinder, Mode, PB_DEFAULT, PB_MAX, PRESET_DEFAULT, PRESET_EXTREME,
+    PRESET_LEVEL_MASK,
+};
 
 use common::{Internal, Ret};
 
@@ -152,6 +185,10 @@ impl Status {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// `LZMA_UNSUPPORTED_CHECK` where it is an error: an encoder cannot be
+    /// made with an integrity check this build cannot compute. (From
+    /// [`Stream::code`] it is [`Status::UnsupportedCheck`].)
+    UnsupportedCheck = 3,
     /// `LZMA_MEM_ERROR`: not enough memory.
     Mem = 5,
     /// `LZMA_MEMLIMIT_ERROR`: the memory usage limit was reached. Not
@@ -178,6 +215,7 @@ impl Error {
     /// A short description of the error.
     pub fn message(self) -> &'static str {
         match self {
+            Error::UnsupportedCheck => "unsupported type of integrity check",
             Error::Mem => "cannot allocate memory",
             Error::Memlimit => "memory usage limit reached",
             Error::Format => "file format not recognized",
@@ -221,6 +259,7 @@ fn result(ret: Ret) -> Result<Status> {
 fn init_error(ret: Ret) -> Error {
     match result(ret) {
         Err(e) => e,
+        Ok(Status::UnsupportedCheck) => Error::UnsupportedCheck,
         Ok(_) => Error::Prog,
     }
 }
@@ -239,9 +278,55 @@ const _: fn() = || {
 
 impl Stream {
     fn new(next: Box<dyn common::NextCoder>) -> Stream {
+        Stream::with_actions(next, &[Action::Run, Action::Finish])
+    }
+
+    fn with_actions(next: Box<dyn common::NextCoder>, actions: &[Action]) -> Stream {
         Stream {
-            internal: Internal::new(next, &[Action::Run, Action::Finish]),
+            internal: Internal::new(next, actions),
         }
+    }
+
+    /// `lzma_easy_encoder`: a .xz encoder of a preset, 0 to 9 with
+    /// [`PRESET_EXTREME`] or not, with an integrity check.
+    pub fn easy_encoder(preset: u32, check: Check) -> Result<Stream> {
+        let filters = easy_preset(preset).ok_or(Error::Options)?;
+        Stream::stream_encoder(&filters, check)
+    }
+
+    /// `lzma_stream_encoder`: a .xz encoder of a filter chain, with an
+    /// integrity check. It takes all the actions: [`Action::SyncFlush`]
+    /// makes all the input so far decodable, [`Action::FullFlush`] and
+    /// [`Action::FullBarrier`] end the Block too.
+    pub fn stream_encoder(filters: &[Filter], check: Check) -> Result<Stream> {
+        let encoder = stream_encoder::StreamEncoder::new(filters, check).map_err(init_error)?;
+        Ok(Stream::with_actions(
+            Box::new(encoder),
+            &[
+                Action::Run,
+                Action::SyncFlush,
+                Action::FullFlush,
+                Action::FullBarrier,
+                Action::Finish,
+            ],
+        ))
+    }
+
+    /// `lzma_alone_encoder`: a .lzma encoder. The header gives the size
+    /// as unknown, and the data ends with the end of payload marker.
+    pub fn alone_encoder(options: &LzmaOptions) -> Result<Stream> {
+        let encoder = alone_encoder::AloneEncoder::new(options).map_err(init_error)?;
+        Ok(Stream::new(Box::new(encoder)))
+    }
+
+    /// `lzma_raw_encoder`: an encoder of the raw data of a filter chain.
+    /// LZMA2 takes [`Action::SyncFlush`]; LZMA1 does not.
+    pub fn raw_encoder(filters: &[Filter]) -> Result<Stream> {
+        let next = filter::raw_encoder_init(filters).map_err(init_error)?;
+        Ok(Stream::with_actions(
+            next,
+            &[Action::Run, Action::SyncFlush, Action::Finish],
+        ))
     }
 
     /// `lzma_stream_decoder`: a .xz decoder, with a memory usage limit and
@@ -350,4 +435,108 @@ impl fmt::Debug for Stream {
             .field("total_out", &self.internal.total_out)
             .finish_non_exhaustive()
     }
+}
+
+/// `lzma_easy_preset`: the filter chain of a preset, LZMA2 alone.
+fn easy_preset(preset: u32) -> Option<Vec<Filter>> {
+    Some(vec![Filter {
+        id: FILTER_LZMA2,
+        options: Some(LzmaOptions::preset(preset)?),
+    }])
+}
+
+/// `lzma_easy_encoder_memusage`: the memory the encoder of a preset needs,
+/// or u32::MAX for an invalid preset, as liblzma returns.
+pub fn easy_encoder_memusage(preset: u32) -> u64 {
+    match easy_preset(preset) {
+        Some(filters) => raw_encoder_memusage(&filters),
+        None => u64::from(u32::MAX),
+    }
+}
+
+/// `lzma_easy_decoder_memusage`: the memory the decoder of what a preset
+/// encodes needs, or u32::MAX for an invalid preset.
+pub fn easy_decoder_memusage(preset: u32) -> u64 {
+    match easy_preset(preset) {
+        Some(filters) => raw_decoder_memusage(&filters),
+        None => u64::from(u32::MAX),
+    }
+}
+
+/// The result of a single-call encoder.
+fn buffer_result(ret: Ret) -> Result<()> {
+    match ret {
+        Ret::Ok => Ok(()),
+        ret => Err(init_error(ret)),
+    }
+}
+
+/// `lzma_easy_buffer_encode`: `input` as a .xz Stream of a preset, in one
+/// call, written to `output[*out_pos..]`; `*out_pos` moves past it on
+/// success.
+pub fn easy_buffer_encode(
+    preset: u32,
+    check: Check,
+    input: &[u8],
+    output: &mut [u8],
+    out_pos: &mut usize,
+) -> Result<()> {
+    let filters = easy_preset(preset).ok_or(Error::Options)?;
+    stream_buffer_encode(&filters, check, input, output, out_pos)
+}
+
+/// `lzma_stream_buffer_encode`: `input` as a .xz Stream of a filter chain,
+/// in one call, as [`easy_buffer_encode`] writes it. Empty input makes a
+/// Stream without Blocks; data that does not compress is stored in
+/// LZMA2's uncompressed chunks.
+pub fn stream_buffer_encode(
+    filters: &[Filter],
+    check: Check,
+    input: &[u8],
+    output: &mut [u8],
+    out_pos: &mut usize,
+) -> Result<()> {
+    buffer_result(stream_encoder::stream_buffer_encode(
+        filters, check, input, output, out_pos,
+    ))
+}
+
+/// `lzma_stream_buffer_bound`: the most output [`stream_buffer_encode`]
+/// can need for `uncompressed_size` bytes, or 0 if too large.
+pub fn stream_buffer_bound(uncompressed_size: usize) -> usize {
+    stream_encoder::stream_buffer_bound(uncompressed_size)
+}
+
+/// `lzma_raw_buffer_encode`: `input` as the raw data of a filter chain, in
+/// one call; on failure `*out_pos` is left as it was.
+pub fn raw_buffer_encode(
+    filters: &[Filter],
+    input: &[u8],
+    output: &mut [u8],
+    out_pos: &mut usize,
+) -> Result<()> {
+    if *out_pos > output.len() {
+        return Err(Error::Prog);
+    }
+
+    let mut next = filter::raw_encoder_init(filters).map_err(init_error)?;
+
+    // Do the actual encoding with LZMA_FINISH.
+    let out_start = *out_pos;
+    let mut in_pos = 0;
+    let mut ret = next.code(input, &mut in_pos, output, out_pos, Action::Finish);
+
+    if ret == Ret::StreamEnd {
+        ret = Ret::Ok;
+    } else {
+        if ret == Ret::Ok {
+            // Output buffer was too small.
+            ret = Ret::BufError;
+        }
+
+        // Restore the output position.
+        *out_pos = out_start;
+    }
+
+    buffer_result(ret)
 }

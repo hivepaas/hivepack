@@ -2,7 +2,7 @@
 
 ZIP archives in safe Rust, the container logic ported from [libzip](https://libzip.org) 1.12.1.
 
-> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard and Deflate64 entries, with libzip's rules and errors; edits entries' names, comments, times and attributes, deletes them, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes the archive as libzip writes it, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES entries. All compared with libzip itself. This crate is not on crates.io.
+> **Status:** opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard, Deflate64 and PPMd entries, with libzip's rules and errors (PPMd, which libzip lacks, as 7-Zip reads it); edits entries' names, comments, times and attributes, deletes them, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes the archive as libzip writes it, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES entries. All compared with libzip itself. This crate is not on crates.io.
 
 ```rust
 use hivepack_zip::{Archive, Flags, OpenFlags};
@@ -54,6 +54,28 @@ The goals:
 - **libzip's answers.** An archive libzip opens opens, with the same entries; one it refuses is refused with the same error and detail.
 
 How the port follows libzip, how it is checked, and what is left are in [docs/zip.md](../../docs/zip.md).
+
+## Speed
+
+Against libzip 1.12.1, with `tools/zip-bench`. Above 1× the port is faster.
+
+| | hivepack-zip / libzip |
+|---|---|
+| Reading stored entries | 1.29–1.37× |
+| Reading Deflate and bzip2 | 0.98–1.06× |
+| Reading LZMA and XZ | 0.76–0.79× |
+| Writing stored entries | 1.21–1.25× |
+| Writing compressed, every method and level | 0.96–1.05× |
+| Opening 200,000 entries | 0.78×, 1.30× with `ZIP_CHECKCONS` |
+| Finding entries | 1.16–2.67× |
+| ZipCrypto | 0.90–0.93× |
+| WinZip AES | 0.57–0.66× |
+| Editing, the data copied | 1.46–1.49× |
+| Editing each of 200,000 entries | 0.48–0.61× |
+
+**Measured on:** AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, in October 2026. libzip is built with GCC 15.2 and `-O2`, from the releases of zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8 and XZ Utils 5.8.4, without assembly files. The data is the Silesia corpus cut to 64 MiB, on a nearly idle machine, the best of five rounds taken in turn. What the two wrote without encryption was the same, byte for byte.
+
+LZMA and XZ read below liblzma because its x86-64 range decoder is inline assembly. AES here is against nettle's C: a libzip that uses the processor's AES instructions, as a usual build does, is further ahead. The whole table and the reasons are in [docs/zip.md](../../docs/zip.md#the-speed).
 
 ## License
 

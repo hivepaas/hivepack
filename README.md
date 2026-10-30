@@ -21,10 +21,34 @@ Read and write archives and compressed files in Rust: one library for many forma
 | [`hivepack-tar`](crates/tar) | tar archives in safe Rust, ported from Go 1.27.2's `archive/tar`, its reading half | Reads V7, USTAR, PAX, GNU and STAR archives, PAX records, GNU long names and sparse files included, with Go's headers, data and errors on Go's test archives, archives Go writes and thousands of damaged ones |
 | [`hivepack-udf`](crates/udf) | Reading UDF volumes in safe Rust, ported from NetBSD's UDF file system (`sys/fs/udf`): DVD, Blu-ray and disk images | Reads UDF 1.02 to 2.60 on physical, sparable, virtual (VAT) and metadata partitions, with blocks of 512 to 4096 bytes, as NetBSD mounts them, but where NetBSD loops, crashes or reads wrong; the same as Linux's udf file system on 36 images mkudffs, genisoimage and its tests make; extracted by `hivepack-extract` |
 | [`hivepack-xz`](crates/xz) | XZ and LZMA in safe Rust, ported from liblzma of XZ Utils 5.8.4: the same output, at the same speed | Compresses `.xz`, `.lzma`, and raw LZMA1 and LZMA2 with liblzma's output, byte for byte, with every preset, option and match finder, at about its speed; decompresses those and `.lz` with its results, call by call, at 1.06–1.34× the speed of liblzma's C and 0.74–0.89× of its x86-64 assembly; with the delta and BCJ filters, and in threads for `.xz` |
-| [`hivepack-zip`](crates/zip) | ZIP archives in safe Rust, the container logic ported from libzip 1.12.1 | Opens archives, reads their headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard and Deflate64 entries with libzip's rules and errors; edits names, comments, times and attributes, deletes entries, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes the archive as libzip does, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES. All compared with libzip, and 174 of libzip's own tests pass through the port's `ziptool` |
+| [`hivepack-zip`](crates/zip) | ZIP archives in safe Rust, the container logic ported from libzip 1.12.1 | Opens archives, reads their headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard, Deflate64 and PPMd entries with libzip's rules and errors; edits names, comments, times and attributes, deletes entries, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes the archive as libzip does, byte for byte; encrypts and decrypts ZipCrypto and WinZip AES. All compared with libzip, and 174 of libzip's own tests pass through the port's `ziptool` |
 | [`hivepack-zstd`](crates/zstd) | Zstandard in safe Rust, ported from libzstd 1.5.7: the same output, at the same speed | Decompresses, in one call or streaming, with the same output and errors as libzstd, at about 0.9× its speed. Compresses at every level, in one call or streaming, with dictionaries, on several threads, with libzstd's frames. Trains dictionaries as libzstd does |
 
 Every crate forbids `unsafe` code; the exceptions, the `unsafe-fast` features of `hivepack-zstd` and `hivepack-lz4`, are off by default (see [docs/unsafe.md](docs/unsafe.md)). The dependencies with `unsafe` code, cap-std and, on macOS, rustix, are in `hivepack-extract` only, until the standard library can open files from a directory's handle and set extended attributes. The rules are in [docs/safety.md](docs/safety.md), and how the ports follow the official libraries is in [docs/porting.md](docs/porting.md) (zstd), [docs/deflate.md](docs/deflate.md) (zlib), [docs/bzip2.md](docs/bzip2.md) (libbzip2), [docs/lz4.md](docs/lz4.md) (liblz4), [docs/xz.md](docs/xz.md) (liblzma), [docs/zip.md](docs/zip.md) (libzip), [docs/crypto.md](docs/crypto.md) (BearSSL) and [docs/age.md](docs/age.md) (age), [docs/tar.md](docs/tar.md) (Go's archive/tar), [docs/7z.md](docs/7z.md) (the LZMA SDK), [docs/iso.md](docs/iso.md) (libarchive) and [docs/udf.md](docs/udf.md) (NetBSD's UDF).
+
+## ⚡ Speed
+
+Each port is timed against the library it comes from, on the same data, and every tool is in `tools/`. Above 1× the port is faster. Each crate's README has its table, and how it was measured.
+
+| Crate | Against | Where it is ahead or even | Where it is behind |
+|---|---|---|---|
+| [`hivepack-bzip2`](crates/bzip2#speed) | libbzip2 1.0.8 | compression 1.05×, decompression 1.01× | |
+| [`hivepack-deflate`](crates/deflate#speed) | zlib 1.3.2 | compression 0.99×, decompression 1.00–1.05× | |
+| [`hivepack-xz`](crates/xz#speed) | liblzma 5.8.4 | compression 1.02×, decompression 1.18× against its C | decompression 0.81× against its x86-64 assembly |
+| [`hivepack-lz4`](crates/lz4#speed) | liblz4 1.10.0 | decoding 0.96× with `unsafe-fast`, compression 0.95× at level 1 | decoding 0.75× without it, high compression 0.74–0.98× |
+| [`hivepack-zstd`](crates/zstd#speed) | libzstd 1.5.7 | levels 13 and 15, 0.94–1.05× | decompression 0.72–0.92× (0.78–0.96× with `unsafe-fast`), levels 5 to 12 0.49–0.84× (0.69–0.87×) |
+| [`hivepack-zip`](crates/zip#speed) | libzip 1.12.1 | stored data 1.21–1.37×, compression 0.96–1.05×, finding entries 1.16–2.67× | opening 200,000 entries 0.78×, editing each of them 0.48–0.61×, WinZip AES 0.57–0.66× |
+| [`hivepack-7z`](crates/7z#speed) | LZMA SDK 26.05, 7-Zip | LZMA and LZMA2 1.10–1.24× against C, Deflate 1.39× | PPMd 0.88–0.92×, BZip2 0.62×, AES-256 with Copy 0.08× |
+| [`hivepack-tar`](crates/tar#speed) | Go 1.27.2's `archive/tar` | going through entries 1.48–2.61×, reading data 1.02–2.00× | skipping data in a file, which Go seeks past, 0.01× |
+| [`hivepack-crypto`](crates/crypto#speed) | BearSSL 0.6 | 1.01–1.94× | Go's assembly, by up to 5.7×, on SHA-256 and ChaCha20-Poly1305 |
+
+**Measured on,** in October 2026, with safe code unless it says otherwise:
+
+- `hivepack-zip`, `hivepack-7z` and `hivepack-tar`: AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile; the libraries built with GCC 15.2.
+- `hivepack-bzip2`, `hivepack-deflate`, `hivepack-lz4`, `hivepack-xz` and `hivepack-crypto`: an AMD Ryzen 9 9950X (x86-64, Linux).
+- `hivepack-zstd`: an Apple M1 Pro, and GitHub's runners, an AMD EPYC 7763 and a Neoverse-N2.
+
+These are snapshots of one machine or two, on the Silesia corpus: run the tools to see your own. How a reference is built matters: liblzma and libzstd have x86-64 assembly, and the usual builds of 7-Zip and of libzip's crypto libraries go further than the ones timed here, as each README says. `hivepack-age`, `hivepack-iso`, `hivepack-udf`, `hivepack-rar`, `hivepack-open` and `hivepack-extract` have no such comparison yet.
 
 ## 🧪 Tests
 

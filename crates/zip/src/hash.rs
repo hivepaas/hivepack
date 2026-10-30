@@ -3,6 +3,7 @@
 //! libzip 1.12 does.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, DefaultHasher, Hasher, RandomState};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::zip::Flags;
@@ -24,10 +25,38 @@ struct Indices {
     current_index: i64,
 }
 
+/// The standard library's hasher, without the length it hashes before a slice:
+/// keys here are one slice each, and SipHash counts the bytes itself. Hashing
+/// is about a quarter of opening an archive of many entries.
+struct NameHasher(DefaultHasher);
+
+impl Hasher for NameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    fn write_usize(&mut self, _length: usize) {}
+
+    fn finish(&self) -> u64 {
+        self.0.finish()
+    }
+}
+
+#[derive(Clone, Default)]
+struct NameState(RandomState);
+
+impl BuildHasher for NameState {
+    type Hasher = NameHasher;
+
+    fn build_hasher(&self) -> NameHasher {
+        NameHasher(self.0.build_hasher())
+    }
+}
+
 /// `zip_hash_t`: each name, and the entries that have it.
 #[derive(Clone, Default)]
 pub(crate) struct Names {
-    table: HashMap<Vec<u8>, Indices>,
+    table: HashMap<Vec<u8>, Indices, NameState>,
 }
 
 impl Names {

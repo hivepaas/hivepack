@@ -228,6 +228,13 @@
       "kind": "tool"
     },
     {
+      "name": "tar-bench-go",
+      "generate": { "group": "bench", "tool": "go", "sources": ["tools/tar-bench/go/main.go", "tools/tar-bench/go/go.mod"] },
+      "source": "tools/tar-bench/go/main.go, built with the archive/tar of Go 1.27.2, which its go.mod names",
+      "license": "MIT (the program) and BSD-3-Clause (Go)",
+      "kind": "tool"
+    },
+    {
       "name": "age-oracle",
       "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/identities.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
       "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0, the release age requires",
@@ -314,7 +321,14 @@
     {
       "name": "7z-oracle",
       "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/oracle.c"] },
-      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
+      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder and PPMd var.I from 7-Zip 26.05",
+      "license": "MIT (the program), public domain (the LZMA SDK's files)",
+      "kind": "tool"
+    },
+    {
+      "name": "7z-bench-sdk",
+      "generate": { "group": "bench", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/bench.c"] },
+      "source": "tools/7z-oracle/bench.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
       "license": "MIT (the program), public domain (the LZMA SDK's files)",
       "kind": "tool"
     },
@@ -385,6 +399,13 @@
       "name": "libarchive-rar",
       "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/*rar*.uu" },
       "source": "libarchive 3.8.10's RAR test archives (libarchive/test/*rar*.uu), decoded",
+      "license": "BSD-2-Clause",
+      "kind": "archives"
+    },
+    {
+      "name": "libarchive-zip-ppmd",
+      "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/test_read_format_zip*ppmd*.uu" },
+      "source": "libarchive 3.8.10's ZIP test archives with PPMd entries (libarchive/test/test_read_format_zip*ppmd*.uu), decoded",
       "license": "BSD-2-Clause",
       "kind": "archives"
     },

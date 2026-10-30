@@ -12,14 +12,19 @@
 //! - [`ScryptIdentity`] is a passphrase; [`X25519Identity`] an age key,
 //!   `AGE-SECRET-KEY-1…`; [`parse_identities`] reads a file of keys, as
 //!   `age-keygen` writes them.
+//! - [`parse_identities_file`] reads what `age -i` takes: a file of keys,
+//!   one encrypted with age and a passphrase, or an SSH Ed25519 private
+//!   key ([`SshEd25519Identity`]), protected by a passphrase or not
+//!   ([`EncryptedSshIdentity`]). Passphrases are asked for through a
+//!   callback, only once one is needed.
 //! - [`Error`] tells why a file did not decrypt, in the categories of
 //!   C2SP's test vectors: a malformed header, no matching identity, a
 //!   header MAC that does not match, malformed armor, or a payload that
 //!   fails.
 //!
 //! The cryptography is hivepack-crypto's, ported from BearSSL, in place of
-//! Go's `golang.org/x/crypto`. Encrypting, SSH keys, post-quantum keys and
-//! plugins are not ported yet. How the port follows age, and how it is
+//! Go's `golang.org/x/crypto`. Encrypting, SSH RSA keys, post-quantum keys
+//! and plugins are not ported yet. How the port follows age, and how it is
 //! checked, is in the repository: `docs/age.md`.
 //!
 //! ```no_run
@@ -35,23 +40,31 @@
 //! ```
 
 mod age;
+mod agessh;
 mod armor;
 mod base64;
+mod bcrypt_pbkdf;
 mod bech32;
+mod blowfish;
 mod error;
 mod format;
+mod identity_file;
 mod parse;
+mod pem;
 mod primitives;
 mod scrypt;
+mod ssh_keys;
 mod stream;
 mod x25519;
 
 use std::io::{self, BufRead, BufReader, Read};
 
 pub use age::{Decryptor, FileKey, Identity, UnwrapError, decrypt};
+pub use agessh::{EncryptedSshIdentity, SshEd25519Identity};
 pub use armor::{ArmoredReader, FOOTER as ARMOR_FOOTER, HEADER as ARMOR_HEADER};
 pub use error::{Error, NoIdentityMatch};
 pub use format::Stanza;
+pub use identity_file::{PassphraseFor, PassphrasePrompt, parse_identities_file};
 pub use parse::{BoxedIdentity, parse_identities};
 pub use scrypt::{DEFAULT_MAX_WORK_FACTOR, ScryptIdentity};
 pub use x25519::X25519Identity;

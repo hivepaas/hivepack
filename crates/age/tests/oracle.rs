@@ -1,9 +1,12 @@
 //! Comparison with age v1.3.2 itself, through `tools/age-oracle`: files that
-//! age encrypts, to X25519 keys or a passphrase, armored or not, with
-//! payloads around the 64 KiB chunks, then damaged in many ways, are
-//! decrypted by both with right and wrong keys and passphrases. The
-//! outcome, and the length and SHA-256 of all the plaintext given out,
-//! must be the same.
+//! age encrypts, to X25519 keys, SSH Ed25519 keys or a passphrase, armored
+//! or not, with payloads around the 64 KiB chunks, then damaged in many
+//! ways, are decrypted by both with right and wrong keys and passphrases,
+//! and with identity files as `age -i` reads them: SSH keys with and
+//! without passphrases, files of keys, and files of keys encrypted with
+//! age, some of them damaged too. The outcome, the length and SHA-256 of
+//! all the plaintext given out, and how many times a passphrase was asked
+//! for must be the same.
 //!
 //! The oracle decrypts as `age --decrypt` does (`decrypt` in
 //! `cmd/age/age.go`), and tells the outcome apart as age's
@@ -25,8 +28,13 @@ mod support;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hivepack_age::{Error, Identity, ScryptIdentity, X25519Identity, decrypt_file};
+use hivepack_age::{
+    Error, Identity, PassphrasePrompt, ScryptIdentity, X25519Identity, decrypt_file,
+    parse_identities_file,
+};
 use hivepack_crypto::Sha256;
 use support::{Oracle, Rng, hex, repository, unhex};
 
@@ -45,10 +53,15 @@ fn outcome(error: &Error) -> &'static str {
     }
 }
 
-fn answer_with(what: &str, out: &[u8]) -> String {
+fn answer_with(what: &str, out: &[u8], prompts: &AtomicUsize) -> String {
     let mut h = Sha256::new();
     h.update(out);
-    format!("{what} {} {}", out.len(), hex(&h.out()))
+    format!(
+        "{what} {} {} {}",
+        out.len(),
+        hex(&h.out()),
+        prompts.load(Ordering::Relaxed)
+    )
 }
 
 /// The port's answer to a `decrypt` request, as the oracle words it.
@@ -57,9 +70,26 @@ fn answer(request: &str, rng: &mut Rng) -> String {
     let ["decrypt", spec, file] = words[..] else {
         panic!("unknown request {request:.100}");
     };
+    let prompts = Arc::new(AtomicUsize::new(0));
     let mut identities: Vec<Box<dyn Identity>> = Vec::new();
     for s in spec.split(',') {
-        if let Some(p) = s.strip_prefix("p:") {
+        if let Some(f) = s.strip_prefix("f:") {
+            let (contents, pass) = f.split_once(':').unwrap();
+            let pass = pass.to_string();
+            let counter = prompts.clone();
+            let prompt: PassphrasePrompt = Arc::new(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                if pass == "-" {
+                    Err("no passphrase".into())
+                } else {
+                    Ok(unhex(&pass))
+                }
+            });
+            match parse_identities_file(&unhex(contents)[..], prompt) {
+                Ok(ids) => identities.extend(ids.into_iter().map(|i| i as Box<dyn Identity>)),
+                Err(_) => return answer_with("identity", &[], &prompts),
+            }
+        } else if let Some(p) = s.strip_prefix("p:") {
             let (pass, log_n) = p.split_once(':').unwrap();
             let mut i = ScryptIdentity::new(&unhex(pass)).unwrap();
             i.set_max_work_factor(log_n.parse().unwrap());
@@ -72,16 +102,16 @@ fn answer(request: &str, rng: &mut Rng) -> String {
     let file = unhex(file);
     let mut r = match decrypt_file(&file[..], &identities) {
         Ok(r) => r,
-        Err(e) => return answer_with(outcome(&e), &[]),
+        Err(e) => return answer_with(outcome(&e), &[], &prompts),
     };
     // Read in pieces of random sizes, some of them empty.
     let mut out = Vec::new();
     loop {
         let mut buf = vec![0; rng.below(100_000) as usize];
         match r.read(&mut buf) {
-            Ok(0) if !buf.is_empty() => return answer_with("success", &out),
+            Ok(0) if !buf.is_empty() => return answer_with("success", &out, &prompts),
             Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(e) => return answer_with(outcome(&Error::from(e)), &out),
+            Err(e) => return answer_with(outcome(&Error::from(e)), &out, &prompts),
         }
     }
 }
@@ -258,15 +288,145 @@ fn keys() -> Vec<(String, String)> {
         .collect()
 }
 
+/// An SSH key the oracle made: its private key file, the passphrase it is
+/// encrypted with (or `-`), and its `authorized_keys` line.
+struct SshKey {
+    file: Vec<u8>,
+    passphrase: String,
+    line: String,
+}
+
+/// Three SSH keys: one without a passphrase, one with `password`, one with
+/// another.
+fn ssh_keys(oracle: &mut Oracle) -> Vec<SshKey> {
+    let passphrases = ["-".to_string(), hex(b"password"), hex(b"another one")];
+    passphrases
+        .into_iter()
+        .enumerate()
+        .map(|(i, passphrase)| {
+            let reply = oracle.ask(&format!("sshkey {} {passphrase}", hex(&[i as u8 + 1; 32])));
+            let mut words = reply.split(' ').skip(1);
+            SshKey {
+                file: unhex(words.next().unwrap()),
+                passphrase,
+                line: words.next().unwrap().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// An identity file, damaged now and then: a bit flipped, or cut short.
+fn damage_identity_file(rng: &mut Rng, mut file: Vec<u8>) -> Vec<u8> {
+    match rng.below(10) {
+        0 if !file.is_empty() => {
+            let i = rng.below(file.len() as u64) as usize;
+            file[i] ^= 1 << rng.below(8);
+        }
+        1 => {
+            let len = rng.below(file.len() as u64 + 1) as usize;
+            file.truncate(len);
+        }
+        _ => {}
+    }
+    file
+}
+
+/// A file of keys, with comments, empty lines and CRLF now and then, and
+/// rarely a public key or garbage where a key should be.
+fn keys_file(rng: &mut Rng, keys: &[(String, String)], with: &[usize]) -> Vec<u8> {
+    let mut text = String::new();
+    let eol = if rng.below(4) == 0 { "\r\n" } else { "\n" };
+    if rng.below(2) == 0 {
+        text.push_str("# created: 2026-10-30T12:00:00Z");
+        text.push_str(eol);
+    }
+    for &i in with {
+        if rng.below(3) == 0 {
+            text.push_str(eol);
+        }
+        text.push_str(&keys[i].0);
+        text.push_str(eol);
+    }
+    match rng.below(12) {
+        0 => text.push_str(&keys[0].1),
+        1 => text.push_str("AGE-SECRET-KEY-1NOTAKEY"),
+        _ => {}
+    }
+    text.into_bytes()
+}
+
 /// `count` decrypt requests for files the oracle encrypts, with
 /// plaintexts up to `max` bytes.
 fn requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
     let keys = keys();
+    let ssh = ssh_keys(oracle);
     let mut requests = Vec::new();
     for _ in 0..count {
         let armored = rng.below(3) == 0;
-        let with_passphrase = rng.below(3) == 0;
-        let (recipients, identities) = if with_passphrase {
+        let kind = rng.below(8);
+        let (recipients, identities) = if kind >= 6 {
+            // To SSH keys, and maybe an X25519 key; decrypted with key
+            // files, and their passphrases right, wrong or missing.
+            let mut to: Vec<usize> = (0..3).filter(|_| rng.below(2) == 0).collect();
+            if to.is_empty() {
+                to.push(rng.below(3) as usize);
+            }
+            let mut recipients: Vec<String> =
+                to.iter().map(|&i| format!("s:{}", ssh[i].line)).collect();
+            if rng.below(4) == 0 {
+                recipients.push(keys[1].1.clone());
+            }
+            let mut with: Vec<usize> = (0..3).filter(|_| rng.below(3) == 0).collect();
+            if with.is_empty() || rng.below(2) == 0 {
+                with.push(to[rng.below(to.len() as u64) as usize]);
+            }
+            let mut identities: Vec<String> = with
+                .iter()
+                .map(|&i| {
+                    let pass = match rng.below(6) {
+                        0 => hex(b"wrong"),
+                        1 => "-".to_string(),
+                        _ => ssh[i].passphrase.clone(),
+                    };
+                    let file = damage_identity_file(rng, ssh[i].file.clone());
+                    format!("f:{}:{pass}", hex(&file))
+                })
+                .collect();
+            if rng.below(4) == 0 {
+                identities.push(keys[1].0.clone());
+            }
+            (recipients.join(","), identities)
+        } else if kind == 5 {
+            // To X25519 keys; decrypted with a file of keys, as it is or
+            // encrypted with a passphrase.
+            let to: Vec<usize> = vec![rng.below(4) as usize];
+            let recipients = keys[to[0]].1.clone();
+            let mut with: Vec<usize> = (0..4).filter(|_| rng.below(3) == 0).collect();
+            if rng.below(3) != 0 {
+                with.push(to[0]);
+            }
+            let text = keys_file(rng, &keys, &with);
+            let identity = if rng.below(2) == 0 {
+                format!("f:{}:-", hex(&damage_identity_file(rng, text)))
+            } else {
+                let pass = passphrase(rng);
+                let reply = oracle.ask(&format!(
+                    "encrypt p:{}:{} {} {}",
+                    hex(&pass),
+                    1 + rng.below(4),
+                    rng.below(2),
+                    hex(&text)
+                ));
+                let file = damage_identity_file(rng, unhex(reply.strip_prefix("ok ").unwrap()));
+                let try_pass = match rng.below(5) {
+                    0 => hex(b"wrong"),
+                    1 => "-".to_string(),
+                    _ => hex(&pass),
+                };
+                format!("f:{}:{try_pass}", hex(&file))
+            };
+            (recipients, vec![identity])
+        } else if kind <= 1 {
             let pass = passphrase(rng);
             let log_n = 1 + rng.below(4);
             let recipients = format!("p:{}:{log_n}", hex(&pass));
@@ -288,6 +448,7 @@ fn requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max: usize) -> Vec
             }
             (recipients, identities)
         } else {
+            // To X25519 keys.
             let mut to: Vec<usize> = (0..4).filter(|_| rng.below(2) == 0).collect();
             if to.is_empty() {
                 to.push(rng.below(4) as usize);
@@ -335,7 +496,9 @@ fn port_matches_age() {
     }
     eprintln!("{outcomes:?}");
     // Every outcome comes up.
-    for what in ["success", "header", "no-match", "hmac", "armor", "payload"] {
+    for what in [
+        "success", "header", "no-match", "hmac", "armor", "payload", "identity",
+    ] {
         assert!(outcomes.contains_key(what), "no {what} in {outcomes:?}");
     }
 }

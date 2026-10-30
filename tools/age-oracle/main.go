@@ -44,20 +44,33 @@
 //	    x/crypto/scrypt. Answered "ok <key>", or "err" for parameters it
 //	    refuses.
 //
+//	sshkey <seed> <passphrase>
+//	    The Ed25519 key of the 32-byte <seed>, as an OpenSSH private key
+//	    file, encrypted with <passphrase> unless it is "-" (ssh-keygen's
+//	    defaults: bcrypt with 16 rounds, aes256-ctr). Answered
+//	    "ok <key file> <authorized_keys line>".
+//
 //	encrypt <recipients> <armor> <plaintext>
 //	    An age file of <plaintext>, to <recipients>: a comma-separated list
-//	    of age1... public keys, or one "p:<passphrase>:<work factor>".
-//	    Armored if <armor> is 1. Answered "ok <file>".
+//	    of age1... public keys and "s:<authorized_keys line>" SSH keys, or
+//	    one "p:<passphrase>:<work factor>". Armored if <armor> is 1.
+//	    Answered "ok <file>".
 //
 //	decrypt <identities> <file>
 //	    <file> decrypted as age --decrypt reads it (cmd/age's decrypt: the
 //	    armor found from the first line, PowerShell's mangling refused),
 //	    with <identities>: a comma-separated list of AGE-SECRET-KEY-1...
-//	    keys and "p:<passphrase>:<max work factor>". Answered
-//	    "<outcome> <length> <sha256>", the outcome as age's testkit_test.go
-//	    tells it ("success", "header", "no-match", "hmac", "armor" or
-//	    "payload"), with the length and SHA-256 of all the plaintext given
-//	    out, even when the payload fails later.
+//	    keys, "p:<passphrase>:<max work factor>", and
+//	    "f:<file>:<passphrase>", an identity file read as age -i reads it
+//	    (cmd/age's parseIdentitiesFile: a file of keys, an age file of
+//	    them, or an SSH key), whose passphrase prompts all answer
+//	    <passphrase>, or fail if it is "-". Answered
+//	    "<outcome> <length> <sha256> <prompts>", the outcome as age's
+//	    testkit_test.go tells it ("success", "header", "no-match", "hmac",
+//	    "armor" or "payload", or "identity" if an identity file did not
+//	    parse), with the length and SHA-256 of all the plaintext given out,
+//	    even when the payload fails later, and how many times a passphrase
+//	    was asked for.
 package main
 
 import (
@@ -68,6 +81,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"hash"
@@ -76,13 +90,17 @@ import (
 	"strconv"
 	"strings"
 
+	"crypto/ed25519"
+
 	"filippo.io/age"
+	"filippo.io/age/agessh"
 	"filippo.io/age/armor"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/scrypt"
+	"golang.org/x/crypto/ssh"
 )
 
 func unhex(s string) []byte {
@@ -186,6 +204,8 @@ func answer(words []string) string {
 			return "err"
 		}
 		return ok(key)
+	case words[0] == "sshkey" && len(words) == 3:
+		return sshkey(unhex(words[1]), words[2])
 	case words[0] == "encrypt" && len(words) == 4:
 		return encrypt(words[1], words[2] == "1", unhex(words[3]))
 	case words[0] == "decrypt" && len(words) == 3:
@@ -204,6 +224,14 @@ func encrypt(spec string, armored bool, plaintext []byte) string {
 				return "bad"
 			}
 			r.SetWorkFactor(number(logN))
+			recipients = append(recipients, r)
+			continue
+		}
+		if line, ok := strings.CutPrefix(s, "s:"); ok {
+			r, err := agessh.ParseRecipient(string(unhex(line)))
+			if err != nil {
+				return "bad"
+			}
 			recipients = append(recipients, r)
 			continue
 		}
@@ -240,9 +268,39 @@ func encrypt(spec string, armored bool, plaintext []byte) string {
 const crlfMangledIntro = "age-encryption.org/v1" + "\r"
 const utf16MangledIntro = "\xff\xfe" + "a\x00g\x00e\x00-\x00e\x00n\x00c\x00r\x00y\x00p\x00"
 
+func sshkey(seed []byte, passphrase string) string {
+	key := ed25519.NewKeyFromSeed(seed)
+	var block *pem.Block
+	var err error
+	if passphrase == "-" {
+		block, err = ssh.MarshalPrivateKey(key, "")
+	} else {
+		block, err = ssh.MarshalPrivateKeyWithPassphrase(key, "", unhex(passphrase))
+	}
+	if err != nil {
+		return "bad"
+	}
+	pub, err := ssh.NewPublicKey(key.Public())
+	if err != nil {
+		return "bad"
+	}
+	line := bytes.TrimSuffix(ssh.MarshalAuthorizedKey(pub), []byte("\n"))
+	return ok(pem.EncodeToMemory(block)) + " " + hex.EncodeToString(line)
+}
+
 func decrypt(spec string, file []byte) string {
 	var identities []age.Identity
+	prompts = 0
 	for _, s := range strings.Split(spec, ",") {
+		if f, ok := strings.CutPrefix(s, "f:"); ok {
+			contents, pass, _ := strings.Cut(f, ":")
+			ids, err := parseIdentitiesFile(unhex(contents), pass)
+			if err != nil {
+				return outcome("identity", nil)
+			}
+			identities = append(identities, ids...)
+			continue
+		}
 		if p, ok := strings.CutPrefix(s, "p:"); ok {
 			pass, logN, _ := strings.Cut(p, ":")
 			i, err := age.NewScryptIdentity(string(unhex(pass)))
@@ -296,7 +354,7 @@ func decrypt(spec string, file []byte) string {
 
 func outcome(what string, out []byte) string {
 	sum := sha256.Sum256(out)
-	return fmt.Sprintf("%s %d %s", what, len(out), hex.EncodeToString(sum[:]))
+	return fmt.Sprintf("%s %d %s %d", what, len(out), hex.EncodeToString(sum[:]), prompts)
 }
 
 func main() {

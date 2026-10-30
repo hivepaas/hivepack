@@ -108,6 +108,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "age_keys"
+path = "fuzz_targets/age_keys.rs"
+test = false
+doc = false
+bench = false
+
 # Not in the main workspace: cargo-fuzz builds it with nightly and its own
 # flags.
 [workspace]

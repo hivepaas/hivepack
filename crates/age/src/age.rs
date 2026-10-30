@@ -16,13 +16,15 @@ pub(crate) const FILE_KEY_SIZE: usize = 16;
 const STREAM_NONCE_SIZE: usize = 16;
 
 /// The key a file's payload is derived from, which each recipient stanza
-/// wraps. It is overwritten when it is dropped (best effort).
+/// wraps. age's own stanzas wrap 16 bytes; `ssh-ed25519`'s do not check,
+/// and take what the stanza holds, as age does. It is overwritten when it
+/// is dropped (best effort).
 #[derive(Clone, PartialEq, Eq)]
-pub struct FileKey(pub(crate) [u8; FILE_KEY_SIZE]);
+pub struct FileKey(pub(crate) Vec<u8>);
 
 impl FileKey {
     /// The key's bytes.
-    pub fn as_bytes(&self) -> &[u8; FILE_KEY_SIZE] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }

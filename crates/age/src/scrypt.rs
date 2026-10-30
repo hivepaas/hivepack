@@ -101,12 +101,7 @@ impl ScryptIdentity {
         let file_key = aead_decrypt(&k, FILE_KEY_SIZE, &block.body);
         k.fill(0);
         match file_key {
-            Ok(mut file_key) => {
-                let mut key = [0; FILE_KEY_SIZE];
-                key.copy_from_slice(&file_key);
-                file_key.fill(0);
-                Ok(FileKey(key))
-            }
+            Ok(file_key) => Ok(FileKey(file_key)),
             Err(AeadError::Size) => Err(UnwrapError::Invalid(
                 "invalid scrypt recipient block: incorrect file key size".into(),
             )),

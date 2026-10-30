@@ -298,6 +298,27 @@
       "kind": "tool"
     },
     {
+      "name": "7zip-26.05-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-src.tar.xz", "sha256": "0b6080b8c3e7a579161d2d495224c0e51c467576cb4c7048b0ab485ef44cc22e", "unpack": "tar.xz" }] },
+      "source": "https://github.com/ip7z/7zip/releases/tag/26.05, 7-Zip's source release (its releases are not signed)",
+      "license": "public domain (the LZMA SDK's files of the next set), LGPL-2.1-or-later and BSD-3-Clause (7-Zip, built as a tool)",
+      "kind": "source"
+    },
+    {
+      "name": "7z-oracle",
+      "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/oracle.c"] },
+      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
+      "license": "MIT (the program), public domain (the LZMA SDK's files)",
+      "kind": "tool"
+    },
+    {
+      "name": "7zz",
+      "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "7zz" },
+      "source": "7-Zip 26.05's console program, built from the release's sources with its makefile (CPP/7zip/Bundles/Alone2)",
+      "license": "LGPL-2.1-or-later, BSD-3-Clause, and the unRAR restriction for its RAR code",
+      "kind": "tool"
+    },
+    {
       "name": "fifield-zipbombs",
       "fetch": { "group": "core", "files": [{ "url": "https://www.bamsoftware.com/hacks/zipbomb/zbsm.zip", "sha256": "fb4ff972d21189beec11e05109c4354d0cd6d3b629263d6c950cf8cc3f78bd99" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zblg.zip", "sha256": "f1dc920869794df3e258f42f9b99157104cd3f8c14394c1b9d043d6fcda14c0a" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zbxl.zip", "sha256": "eafd8f574ea7fd0f345eaa19eae8d0d78d5323c8154592c850a2d78a86817744" }] },
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",

@@ -23,6 +23,7 @@ import binascii
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -96,8 +97,8 @@ def unpack(archive: Path, kind: str, into: Path) -> None:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, dest.open("wb") as out:
                     shutil.copyfileobj(src, out)
-    elif kind == "tar.gz":
-        with tarfile.open(archive, "r:gz") as t:
+    elif kind in ("tar.gz", "tar.xz"):
+        with tarfile.open(archive, "r:gz" if kind == "tar.gz" else "r:xz") as t:
             for member in t.getmembers():
                 rel = safe_member(member.name)
                 if not rel.parts:
@@ -172,6 +173,25 @@ def build_tool(source: Path, tool: str) -> Path:
     return binary
 
 
+def build_7zz(source: Path, folder: Path) -> None:
+    """7-Zip's console program from the release's sources, with its own
+    makefile: what makes the archives the tests read. The makefile for GCC
+    leaves out assembly; the one for arm64 macs has it."""
+    bundle = source / "CPP" / "7zip" / "Bundles" / "Alone2"
+    print(f"  building 7zz from {source.name}")
+    makefile = "cmpl_gcc.mak"
+    if sys.platform == "darwin":
+        makefile = "cmpl_mac_arm64.mak" if platform.machine() == "arm64" else "cmpl_mac_x64.mak"
+    jobs = str(os.cpu_count() or 2)
+    build = subprocess.run(["make", "-f", f"../../{makefile}", "-j", jobs], cwd=bundle,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if build.returncode != 0:
+        # The end of what it said: it warns a lot before an error.
+        print(build.stderr[-4000:], file=sys.stderr)
+        raise SystemExit(f"building 7zz failed with {build.returncode}")
+    shutil.copy2(next(bundle.glob("b/*/7zz")), folder / "7zz")
+
+
 def libzip_sources(lib: Path) -> list:
     """The library's C files, as lib/CMakeLists.txt lists them in ZIP_SOURCES,
     with the Unix ones it adds; zip_err_str.c is generated apart."""
@@ -187,6 +207,16 @@ BZIP2_SOURCES = [
     "blocksort.c", "huffman.c", "crctable.c", "randtable.c", "compress.c", "decompress.c",
     "bzlib.c",
 ]
+
+
+# The LZMA SDK's 7z decoder: the files C/Util/7z/makefile.gcc builds 7zdec
+# with, without its LZMA assembly loop and with PPMd, as it builds it.
+SEVENZ_SOURCES = [
+    "Bcj2.c", "Bra.c", "Bra86.c", "BraIA64.c", "CpuArch.c", "Delta.c", "Lzma2Dec.c", "LzmaDec.c",
+    "Ppmd7.c", "Ppmd7Dec.c", "7zCrc.c", "7zCrcOpt.c", "7zAlloc.c", "7zArcIn.c", "7zBuf.c",
+    "7zBuf2.c", "7zDec.c", "7zFile.c", "7zStream.c",
+]
+SEVENZ_FLAGS = ["-DZ7_PPMD_SUPPORT", "-DZ7_EXTRACT_ONLY"]
 
 
 # liblz4: the library's files (lib/), as lz4's lib/Makefile builds them,
@@ -324,6 +354,12 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     libbzip2's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
+    if (source / "C" / "7zArcIn.c").exists():
+        sdk = source / "C"
+        files += [str(sdk / name) for name in SEVENZ_SOURCES]
+        subprocess.run([compiler, "-O2", "-w", *SEVENZ_FLAGS, f"-I{sdk}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
     unrar = source / "unrar"
     if unrar.is_dir():
         files = [str(ROOT / s) for s in sources if s.endswith(".cpp")]
@@ -436,7 +472,9 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
-    if generate["tool"] == "uudecode":
+    if generate["tool"] == "7zz":
+        build_7zz(cache / origin["name"], folder)
+    elif generate["tool"] == "uudecode":
         # Each file the glob finds, decoded, named without its `.uu` and
         # libarchive's `test_read_format_`.
         for uu in sorted((cache / origin["name"]).glob(generate["glob"])):

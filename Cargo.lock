@@ -168,6 +168,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-7z"
+version = "0.0.0"
+dependencies = [
+ "hivepack-deflate",
+ "hivepack-xz",
+]
+
+[[package]]
 name = "hivepack-age"
 version = "0.0.0"
 dependencies = [

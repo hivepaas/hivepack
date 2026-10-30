@@ -19,6 +19,14 @@
 //! The rules the port follows, and how it is checked, are in the
 //! repository: `docs/lz4.md` and `docs/safety.md`.
 //!
+//! # Features
+//!
+//! - `unsafe-fast`, off by default: the decoder's fast loop reads and writes
+//!   without bounds checks, as liblz4 does, which makes it faster, with
+//!   some `unsafe` code, which without the feature the crate forbids.
+//!   [`UNSAFE_FAST`] says whether a build has it. See `docs/unsafe.md` in
+//!   the repository.
+//!
 //! ```
 //! # fn main() -> Result<(), hivepack_lz4::frame::Error> {
 //! use hivepack_lz4::frame::{DecompressionContext, DecompressOptions, InBuffer, OutBuffer};
@@ -49,11 +57,16 @@
 //! # }
 //! ```
 
-#![forbid(unsafe_code)]
+// No unsafe code at all, unless the `unsafe-fast` feature is on: then only
+// in `unchecked.rs` and the block of `lz4.rs` that uses it (see
+// `docs/unsafe.md`).
+#![cfg_attr(not(feature = "unsafe-fast"), forbid(unsafe_code))]
 
 mod decoder;
 mod lz4;
 mod lz4frame;
+#[cfg(feature = "unsafe-fast")]
+mod unchecked;
 mod xxhash;
 
 pub use decoder::{Decoder, LEGACY_BLOCKSIZE, LEGACY_MAGICNUMBER};
@@ -82,6 +95,11 @@ pub mod frame {
 /// XXH32, the checksum of the frame format, from the xxHash 0.6.5 that
 /// liblz4 ships.
 pub use xxhash::{Xxh32, xxh32};
+
+/// Whether this build has the `unsafe-fast` feature: the decoder's fast
+/// loop without bounds checks. Cargo turns a feature on for the whole build
+/// as soon as one crate asks for it, so a program can check which it got.
+pub const UNSAFE_FAST: bool = cfg!(feature = "unsafe-fast");
 
 /// The liblz4 release this crate follows.
 pub const UPSTREAM_VERSION: &str = "1.10.0";

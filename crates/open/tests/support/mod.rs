@@ -182,6 +182,30 @@ pub fn zstd(data: &[u8]) -> Vec<u8> {
     zstd::encode_all(data, 3).expect("zstd")
 }
 
+/// An `.lz4` frame, as `lz4` writes one: with its content checksum.
+pub fn lz4(data: &[u8]) -> Vec<u8> {
+    let mut e = lz4::EncoderBuilder::new()
+        .level(1)
+        .build(Vec::new())
+        .expect("lz4");
+    e.write_all(data).expect("lz4");
+    let (out, result) = e.finish();
+    result.expect("lz4");
+    out
+}
+
+/// LZ4's legacy format (`lz4 -l`): its magic, then blocks of 8 MiB at
+/// most, each after its compressed size.
+pub fn lz4_legacy(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x02, 0x21, 0x4C, 0x18];
+    for block in data.chunks(8 << 20) {
+        let compressed = lz4::block::compress(block, None, false).expect("lz4 block");
+        out.extend((compressed.len() as u32).to_le_bytes());
+        out.extend(compressed);
+    }
+    out
+}
+
 pub fn gzip(data: &[u8]) -> Vec<u8> {
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     e.write_all(data).expect("gzip");

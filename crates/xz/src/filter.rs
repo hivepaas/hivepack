@@ -1,9 +1,11 @@
-//! Filters and filter chains: port of the decoding parts of
-//! `common/filter_common.c`, `common/filter_decoder.c` and
-//! `common/filter_flags_decoder.c`, with the filter IDs of
-//! `api/lzma/lzma12.h`.
+//! Filters and filter chains: port of `common/filter_common.c`,
+//! `common/filter_decoder.c`, `common/filter_encoder.c`,
+//! `common/filter_flags_decoder.c` and `common/filter_flags_encoder.c`,
+//! with the filter IDs and options of `api/lzma/lzma12.h`,
+//! `api/lzma/bcj.h` and `api/lzma/delta.h`.
 
-use crate::common::{FILTER_RESERVED_START, MEMUSAGE_BASE, NextCoder, Ret, VLI_UNKNOWN};
+use crate::common::{FILTER_RESERVED_START, MEMUSAGE_BASE, NextCoder, Ret, VLI_MAX, VLI_UNKNOWN};
+use crate::delta::{self, DeltaDecoder, DeltaEncoder};
 use crate::lz_decoder::{Lz, LzCoder};
 use crate::lz_encoder::{LzEnc, LzEncCoder};
 use crate::lzma_common::{LZMA1EXT_ALLOW_EOPM, LzmaOptions, is_lclppb_valid};
@@ -11,6 +13,7 @@ use crate::lzma_decoder::{self, LzmaDecoder};
 use crate::lzma_encoder::{self, LzmaEncoder};
 use crate::lzma2_decoder::{self, Lzma2Decoder};
 use crate::lzma2_encoder::{self, Lzma2Encoder};
+use crate::simple::{self, SimpleCoder};
 use crate::vli;
 
 /// `LZMA_FILTER_LZMA1`.
@@ -19,9 +22,64 @@ pub const FILTER_LZMA1: u64 = 0x4000_0000_0000_0001;
 pub const FILTER_LZMA1EXT: u64 = 0x4000_0000_0000_0002;
 /// `LZMA_FILTER_LZMA2`.
 pub const FILTER_LZMA2: u64 = 0x21;
+/// `LZMA_FILTER_DELTA`.
+pub const FILTER_DELTA: u64 = 0x03;
+/// `LZMA_FILTER_X86`: BCJ for x86 and x86-64.
+pub const FILTER_X86: u64 = 0x04;
+/// `LZMA_FILTER_POWERPC`: BCJ for big-endian PowerPC.
+pub const FILTER_POWERPC: u64 = 0x05;
+/// `LZMA_FILTER_IA64`: BCJ for IA-64 (Itanium).
+pub const FILTER_IA64: u64 = 0x06;
+/// `LZMA_FILTER_ARM`: BCJ for 32-bit ARM.
+pub const FILTER_ARM: u64 = 0x07;
+/// `LZMA_FILTER_ARMTHUMB`: BCJ for ARM-Thumb.
+pub const FILTER_ARMTHUMB: u64 = 0x08;
+/// `LZMA_FILTER_SPARC`: BCJ for SPARC.
+pub const FILTER_SPARC: u64 = 0x09;
+/// `LZMA_FILTER_ARM64`: BCJ for ARM64.
+pub const FILTER_ARM64: u64 = 0x0A;
+/// `LZMA_FILTER_RISCV`: BCJ for RISC-V.
+pub const FILTER_RISCV: u64 = 0x0B;
 
 /// `LZMA_FILTERS_MAX`.
 pub const FILTERS_MAX: usize = 4;
+
+/// `LZMA_DELTA_TYPE_BYTE`: the delta of bytes, the only type.
+pub const DELTA_TYPE_BYTE: u32 = 0;
+/// `LZMA_DELTA_DIST_MIN`.
+pub const DELTA_DIST_MIN: u32 = 1;
+/// `LZMA_DELTA_DIST_MAX`.
+pub const DELTA_DIST_MAX: u32 = 256;
+
+/// `lzma_options_delta`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaOptions {
+    /// The type of delta, [`DELTA_TYPE_BYTE`].
+    pub delta_type: u32,
+    /// The distance, in bytes: from [`DELTA_DIST_MIN`] to
+    /// [`DELTA_DIST_MAX`].
+    pub dist: u32,
+}
+
+/// `lzma_options_bcj`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BcjOptions {
+    /// The offset of the start of the data in the file, a multiple of the
+    /// filter's alignment. No options is an offset of 0.
+    pub start_offset: u32,
+}
+
+/// The options of a filter: `options` of `lzma_filter`, which points to
+/// one of liblzma's options structures, as the Filter ID says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilterOptions {
+    /// `lzma_options_lzma`, for LZMA1, LZMA1EXT and LZMA2.
+    Lzma(LzmaOptions),
+    /// `lzma_options_delta`, for delta.
+    Delta(DeltaOptions),
+    /// `lzma_options_bcj`, for the BCJ filters.
+    Bcj(BcjOptions),
+}
 
 /// `lzma_filter`: a filter of a chain, its ID and its options.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,11 +87,59 @@ pub struct Filter {
     /// The Filter ID, such as [`FILTER_LZMA2`].
     pub id: u64,
     /// The options, for the filters that have them.
-    pub options: Option<LzmaOptions>,
+    ///
+    /// Differs from liblzma: options of the kind of another filter (which
+    /// liblzma would read as its own) are refused, as no options are for
+    /// LZMA, as invalid options are for delta and BCJ.
+    pub options: Option<FilterOptions>,
 }
 
-/// An entry of the `features` table of `filter_common.c`, for the filters
-/// the port has.
+impl Filter {
+    /// LZMA2 with `options`.
+    pub fn lzma2(options: LzmaOptions) -> Filter {
+        Filter {
+            id: FILTER_LZMA2,
+            options: Some(FilterOptions::Lzma(options)),
+        }
+    }
+
+    /// LZMA1 with `options`.
+    pub fn lzma1(options: LzmaOptions) -> Filter {
+        Filter {
+            id: FILTER_LZMA1,
+            options: Some(FilterOptions::Lzma(options)),
+        }
+    }
+
+    /// Delta of bytes at a distance.
+    pub fn delta(dist: u32) -> Filter {
+        Filter {
+            id: FILTER_DELTA,
+            options: Some(FilterOptions::Delta(DeltaOptions {
+                delta_type: DELTA_TYPE_BYTE,
+                dist,
+            })),
+        }
+    }
+
+    /// A BCJ filter, such as [`FILTER_X86`], with a start offset.
+    pub fn bcj(id: u64, start_offset: u32) -> Filter {
+        Filter {
+            id,
+            options: Some(FilterOptions::Bcj(BcjOptions { start_offset })),
+        }
+    }
+
+    /// The LZMA options, if these are.
+    pub(crate) fn lzma_options(&self) -> Option<&LzmaOptions> {
+        match &self.options {
+            Some(FilterOptions::Lzma(options)) => Some(options),
+            _ => None,
+        }
+    }
+}
+
+/// An entry of the `features` table of `filter_common.c`.
 struct Feature {
     id: u64,
     /// true if it is OK to use this filter as non-last filter in the
@@ -48,26 +154,40 @@ struct Feature {
     changes_size: bool,
 }
 
+/// An LZMA filter's entry.
+const fn lzma_feature(id: u64) -> Feature {
+    Feature {
+        id,
+        non_last_ok: false,
+        last_ok: true,
+        changes_size: true,
+    }
+}
+
+/// A delta or BCJ filter's entry.
+const fn simple_feature(id: u64) -> Feature {
+    Feature {
+        id,
+        non_last_ok: true,
+        last_ok: false,
+        changes_size: false,
+    }
+}
+
 /// `features`.
-const FEATURES: [Feature; 3] = [
-    Feature {
-        id: FILTER_LZMA1,
-        non_last_ok: false,
-        last_ok: true,
-        changes_size: true,
-    },
-    Feature {
-        id: FILTER_LZMA1EXT,
-        non_last_ok: false,
-        last_ok: true,
-        changes_size: true,
-    },
-    Feature {
-        id: FILTER_LZMA2,
-        non_last_ok: false,
-        last_ok: true,
-        changes_size: true,
-    },
+const FEATURES: [Feature; 12] = [
+    lzma_feature(FILTER_LZMA1),
+    lzma_feature(FILTER_LZMA1EXT),
+    lzma_feature(FILTER_LZMA2),
+    simple_feature(FILTER_X86),
+    simple_feature(FILTER_POWERPC),
+    simple_feature(FILTER_IA64),
+    simple_feature(FILTER_ARM),
+    simple_feature(FILTER_ARMTHUMB),
+    simple_feature(FILTER_ARM64),
+    simple_feature(FILTER_SPARC),
+    simple_feature(FILTER_RISCV),
+    simple_feature(FILTER_DELTA),
 ];
 
 /// `lzma_validate_chain`: the number of filters in a valid chain.
@@ -90,7 +210,7 @@ pub(crate) fn validate_chain(filters: &[Filter]) -> Result<usize, Ret> {
     let mut last_ok = false;
 
     for filter in filters {
-        // Don't allow too many filters, and look for the filter.
+        // Look for the filter.
         let Some(feature) = FEATURES.iter().find(|f| f.id == filter.id) else {
             return Err(Ret::OptionsError);
         };
@@ -115,27 +235,81 @@ pub(crate) fn validate_chain(filters: &[Filter]) -> Result<usize, Ret> {
     Ok(filters.len())
 }
 
+/// Whether a filter is one of the BCJ filters.
+fn is_bcj(id: u64) -> bool {
+    matches!(
+        id,
+        FILTER_X86
+            | FILTER_POWERPC
+            | FILTER_IA64
+            | FILTER_ARM
+            | FILTER_ARMTHUMB
+            | FILTER_ARM64
+            | FILTER_SPARC
+            | FILTER_RISCV
+    )
+}
+
+/// Whether the port has a coder of a filter: liblzma's decoders and
+/// encoders are the same filters.
+fn is_supported(id: u64) -> bool {
+    matches!(
+        id,
+        FILTER_LZMA1 | FILTER_LZMA1EXT | FILTER_LZMA2 | FILTER_DELTA
+    ) || is_bcj(id)
+}
+
 /// `lzma_filter_decoder_is_supported`.
 pub fn decoder_is_supported(id: u64) -> bool {
-    matches!(id, FILTER_LZMA1 | FILTER_LZMA1EXT | FILTER_LZMA2)
+    is_supported(id)
+}
+
+/// `lzma_filter_encoder_is_supported`.
+pub fn encoder_is_supported(id: u64) -> bool {
+    is_supported(id)
 }
 
 /// The options of an LZMA filter, or `LZMA_PROG_ERROR` as liblzma gives
 /// for a filter without them.
 fn lzma_options(filter: &Filter) -> Result<&LzmaOptions, Ret> {
-    filter.options.as_ref().ok_or(Ret::ProgError)
+    filter.lzma_options().ok_or(Ret::ProgError)
 }
 
-/// The decoder of one filter, `init` of the decoders' table: the LZMA
-/// decoders' `lzma_lzma_decoder_init` and `lzma_lzma2_decoder_init`.
-pub(crate) fn filter_init(
-    filter: &Filter,
-    next: Option<Box<dyn NextCoder>>,
-) -> Result<Box<dyn NextCoder>, Ret> {
-    let options = lzma_options(filter)?;
+/// The start offset of a BCJ filter: 0 without options.
+fn bcj_start_offset(filter: &Filter) -> Result<u32, Ret> {
+    match &filter.options {
+        None => Ok(0),
+        Some(FilterOptions::Bcj(options)) => Ok(options.start_offset),
+        Some(_) => Err(Ret::OptionsError),
+    }
+}
+
+/// The options of a delta filter, if valid.
+fn delta_options(filter: &Filter) -> Option<&DeltaOptions> {
+    match &filter.options {
+        Some(FilterOptions::Delta(options)) => Some(options),
+        _ => None,
+    }
+}
+
+/// `lzma_next_filter_init` of the decoders: the decoder of `filters[0]`,
+/// reading from the decoders of the others, made after it as liblzma
+/// makes them (so that an error of the first comes first).
+pub(crate) fn filter_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>, Ret> {
+    let Some((filter, rest)) = filters.split_first() else {
+        return Err(Ret::ProgError);
+    };
+    let next_init = |rest: &[Filter]| -> Result<Option<Box<dyn NextCoder>>, Ret> {
+        if rest.is_empty() {
+            Ok(None)
+        } else {
+            filter_init(rest).map(Some)
+        }
+    };
     match filter.id {
         FILTER_LZMA1 | FILTER_LZMA1EXT => {
             // `lzma_decoder_init`.
+            let options = lzma_options(filter)?;
             if !is_lclppb_valid(options) {
                 return Err(Ret::ProgError);
             }
@@ -154,15 +328,28 @@ pub(crate) fn filter_init(
             let (mut lzma, lz_options) = LzmaDecoder::create(options);
             lzma.reset(options);
             lzma.set_uncompressed(uncomp_size, allow_eopm);
-            let coder = LzCoder::new(Lz::Lzma(Box::new(lzma)), &lz_options, next)?;
+            let mut coder = LzCoder::new(Lz::Lzma(Box::new(lzma)), &lz_options, None)?;
+            coder.set_next(next_init(rest)?);
             Ok(Box::new(coder))
         }
         FILTER_LZMA2 => {
+            let options = lzma_options(filter)?;
             let (lzma2, lz_options) = Lzma2Decoder::new(options);
-            let coder = LzCoder::new(Lz::Lzma2(Box::new(lzma2)), &lz_options, next)?;
+            let mut coder = LzCoder::new(Lz::Lzma2(Box::new(lzma2)), &lz_options, None)?;
+            coder.set_next(next_init(rest)?);
             Ok(Box::new(coder))
         }
-        _ => Err(Ret::OptionsError),
+        FILTER_DELTA => {
+            let options = delta_options(filter).copied();
+            let mut coder = DeltaDecoder::new(options)?;
+            coder.set_next(next_init(rest)?);
+            Ok(Box::new(coder))
+        }
+        id => {
+            let mut coder = SimpleCoder::new(id, bcj_start_offset(filter)?, false)?;
+            coder.set_next(next_init(rest)?);
+            Ok(Box::new(coder))
+        }
     }
 }
 
@@ -178,52 +365,73 @@ pub(crate) fn raw_decoder_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>,
         }
     }
 
-    // `lzma_next_filter_init`, from the last filter to the first.
-    let mut next = None;
-    for filter in filters[..count].iter().rev() {
-        next = Some(filter_init(filter, next)?);
-    }
-    next.ok_or(Ret::ProgError)
+    filter_init(&filters[..count])
 }
 
-/// `memusage` of the decoders' table.
-fn filter_memusage(filter: &Filter) -> u64 {
-    let Some(options) = filter.options.as_ref() else {
-        return u64::MAX;
-    };
+/// `memusage` of the decoders' table, None for the filters without one.
+fn filter_memusage(filter: &Filter) -> Option<u64> {
     match filter.id {
-        FILTER_LZMA1 | FILTER_LZMA1EXT => lzma_decoder::decoder_memusage(options),
-        FILTER_LZMA2 => lzma2_decoder::decoder_memusage(options),
-        _ => u64::MAX,
+        FILTER_LZMA1 | FILTER_LZMA1EXT => Some(
+            filter
+                .lzma_options()
+                .map_or(u64::MAX, lzma_decoder::decoder_memusage),
+        ),
+        FILTER_LZMA2 => Some(
+            filter
+                .lzma_options()
+                .map_or(u64::MAX, lzma2_decoder::decoder_memusage),
+        ),
+        FILTER_DELTA => Some(delta::coder_memusage(delta_options(filter))),
+        _ => None,
     }
+}
+
+/// `lzma_raw_coder_memusage`, for decoders and encoders: their memory,
+/// filter by filter.
+fn raw_coder_memusage(filters: &[Filter], memusage: impl Fn(&Filter) -> Option<u64>) -> u64 {
+    // The chain has to have at least one filter.
+    if validate_chain(filters).is_err() {
+        return u64::MAX;
+    }
+
+    let mut total: u64 = 0;
+    for filter in filters {
+        if !is_supported(filter.id) {
+            return u64::MAX; // Unsupported Filter ID
+        }
+
+        match memusage(filter) {
+            // This filter doesn't have a function to calculate the memory
+            // usage and validate the options. Such filters need only
+            // little memory, so we use 1 KiB as a good estimate. They also
+            // accept all possible options, so there's no need to worry
+            // about lack of validation.
+            None => total += 1024,
+            // Invalid options
+            Some(u64::MAX) => return u64::MAX,
+            Some(usage) => total += usage,
+        }
+    }
+
+    // Add some fixed amount of extra. It's to compensate memory usage of
+    // Stream, Block etc. coders, malloc() overhead, stack etc.
+    total + MEMUSAGE_BASE
 }
 
 /// `lzma_raw_decoder_memusage`: `u64::MAX` for an invalid chain.
 pub fn raw_decoder_memusage(filters: &[Filter]) -> u64 {
-    if validate_chain(filters).is_err() {
-        return u64::MAX;
-    }
-    let mut total: u64 = 0;
-    for filter in filters {
-        if !decoder_is_supported(filter.id) {
-            // Unsupported Filter ID
-            return u64::MAX;
-        }
-        let usage = filter_memusage(filter);
-        if usage == u64::MAX {
-            // Invalid options
-            return u64::MAX;
-        }
-        total += usage;
-    }
-    total + MEMUSAGE_BASE
+    raw_coder_memusage(filters, filter_memusage)
 }
 
 /// `lzma_properties_decode`: the options of `id` from its properties.
-pub(crate) fn properties_decode(id: u64, props: &[u8]) -> Result<Option<LzmaOptions>, Ret> {
+pub(crate) fn properties_decode(id: u64, props: &[u8]) -> Result<Option<FilterOptions>, Ret> {
     match id {
-        FILTER_LZMA1 | FILTER_LZMA1EXT => lzma_decoder::props_decode(props).map(Some),
-        FILTER_LZMA2 => lzma2_decoder::props_decode(props).map(Some),
+        FILTER_LZMA1 | FILTER_LZMA1EXT => {
+            lzma_decoder::props_decode(props).map(|o| Some(FilterOptions::Lzma(o)))
+        }
+        FILTER_LZMA2 => lzma2_decoder::props_decode(props).map(|o| Some(FilterOptions::Lzma(o))),
+        FILTER_DELTA => delta::props_decode(props).map(|o| Some(FilterOptions::Delta(o))),
+        id if is_bcj(id) => simple::props_decode(props).map(|o| o.map(FilterOptions::Bcj)),
         _ => Err(Ret::OptionsError),
     }
 }
@@ -262,35 +470,54 @@ pub(crate) fn filter_flags_decode(input: &[u8], in_pos: &mut usize) -> Result<Fi
 
 // filter_encoder.c
 
-/// `lzma_filter_encoder_is_supported`.
-pub fn encoder_is_supported(id: u64) -> bool {
-    matches!(id, FILTER_LZMA1 | FILTER_LZMA1EXT | FILTER_LZMA2)
-}
-
-/// The `init` of an encoder in `encoders[]`: the LZMA1 or LZMA2 encoder of
-/// `filter`, the LZ encoder around it.
-fn encoder_filter_init(filter: &Filter) -> Result<Box<dyn NextCoder>, Ret> {
-    // lzma_encoder_init() and lzma2_encoder_init().
-    let options = lzma_options(filter)?;
-    let (lz, lz_options) = match filter.id {
-        FILTER_LZMA1 | FILTER_LZMA1EXT => {
-            let (lzma, lz_options) = LzmaEncoder::create(filter.id, options)?;
-            (LzEnc::Lzma(Box::new(lzma)), lz_options)
-        }
-        FILTER_LZMA2 => {
-            let (lzma2, lz_options) = Lzma2Encoder::new(options)?;
-            (LzEnc::Lzma2(Box::new(lzma2)), lz_options)
-        }
-        _ => return Err(Ret::OptionsError),
+/// `lzma_next_filter_init` of the encoders, whose chain liblzma reverses:
+/// the encoder of the last filter of `filters`, reading from the encoders
+/// of the ones before it, made after it as liblzma makes them (so that an
+/// error of the last comes first).
+fn encoder_filter_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>, Ret> {
+    let Some((filter, rest)) = filters.split_last() else {
+        return Err(Ret::ProgError);
     };
-    Ok(Box::new(LzEncCoder::new(lz, &lz_options)?))
+    let next_init = |rest: &[Filter]| -> Result<Option<Box<dyn NextCoder>>, Ret> {
+        if rest.is_empty() {
+            Ok(None)
+        } else {
+            encoder_filter_init(rest).map(Some)
+        }
+    };
+    match filter.id {
+        // lzma_encoder_init() and lzma2_encoder_init().
+        FILTER_LZMA1 | FILTER_LZMA1EXT | FILTER_LZMA2 => {
+            let (lz, lz_options) = if filter.id == FILTER_LZMA2 {
+                let (lzma2, lz_options) = Lzma2Encoder::new(lzma_options(filter)?)?;
+                (LzEnc::Lzma2(Box::new(lzma2)), lz_options)
+            } else {
+                let (lzma, lz_options) = LzmaEncoder::create(filter.id, lzma_options(filter)?)?;
+                (LzEnc::Lzma(Box::new(lzma)), lz_options)
+            };
+            let mut coder = LzEncCoder::new(lz, &lz_options)?;
+            coder.set_next(next_init(rest)?);
+            Ok(Box::new(coder))
+        }
+        FILTER_DELTA => {
+            let options = delta_options(filter).copied();
+            let mut coder = DeltaEncoder::new(options)?;
+            coder.set_next(next_init(rest)?);
+            Ok(Box::new(coder))
+        }
+        id => {
+            let mut coder = SimpleCoder::new(id, bcj_start_offset(filter)?, true)?;
+            coder.set_next(next_init(rest)?);
+            Ok(Box::new(coder))
+        }
+    }
 }
 
 /// `lzma_raw_encoder_init`: the encoders of a filter chain.
 ///
-/// Differs from liblzma, without a difference to see: liblzma reverses
-/// the chain for its encoders, LZMA last in the chain and first to run;
-/// with LZMA1 and LZMA2 only, the chain is the one filter.
+/// liblzma reverses the chain for its encoders: the last filter (LZMA) is
+/// the first coder, which reads from the one before it, and so on to the
+/// first filter, which reads the input.
 pub(crate) fn raw_encoder_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>, Ret> {
     // Do some basic validation and get the number of filters.
     let count = validate_chain(filters)?;
@@ -301,72 +528,72 @@ pub(crate) fn raw_encoder_init(filters: &[Filter]) -> Result<Box<dyn NextCoder>,
         }
     }
 
-    encoder_filter_init(&filters[0])
+    encoder_filter_init(&filters[..count])
 }
 
-/// The `memusage` of an encoder in `encoders[]`.
-fn encoder_memusage(filter: &Filter) -> u64 {
-    // liblzma reads the options without checking for NULL.
-    let Some(options) = filter.options.as_ref() else {
-        return u64::MAX;
-    };
+/// The `memusage` of an encoder in `encoders[]`, None for the filters
+/// without one.
+fn encoder_memusage(filter: &Filter) -> Option<u64> {
+    // liblzma reads the LZMA options without checking for NULL.
     match filter.id {
-        FILTER_LZMA1 | FILTER_LZMA1EXT => lzma_encoder::encoder_memusage(options),
-        FILTER_LZMA2 => lzma2_encoder::lzma2_encoder_memusage(options),
-        _ => u64::MAX,
+        FILTER_LZMA1 | FILTER_LZMA1EXT => Some(
+            filter
+                .lzma_options()
+                .map_or(u64::MAX, lzma_encoder::encoder_memusage),
+        ),
+        FILTER_LZMA2 => Some(
+            filter
+                .lzma_options()
+                .map_or(u64::MAX, lzma2_encoder::lzma2_encoder_memusage),
+        ),
+        FILTER_DELTA => Some(delta::coder_memusage(delta_options(filter))),
+        _ => None,
     }
 }
 
 /// `lzma_raw_encoder_memusage`: the memory the encoders of a chain need,
 /// or u64::MAX if the chain is invalid or not supported.
 pub fn raw_encoder_memusage(filters: &[Filter]) -> u64 {
-    // The chain has to have at least one filter.
-    if validate_chain(filters).is_err() {
-        return u64::MAX;
-    }
-
-    let mut total: u64 = 0;
-    for filter in filters {
-        if !encoder_is_supported(filter.id) {
-            return u64::MAX; // Unsupported Filter ID
-        }
-
-        // Call the filter-specific memory usage calculation function.
-        let usage = encoder_memusage(filter);
-        if usage == u64::MAX {
-            return u64::MAX; // Invalid options
-        }
-
-        total += usage;
-    }
-
-    // Add some fixed amount of extra. It's to compensate memory usage of
-    // Stream, Block etc. coders, malloc() overhead, stack etc.
-    total + MEMUSAGE_BASE
+    raw_coder_memusage(filters, encoder_memusage)
 }
 
 /// `lzma_properties_size`.
 pub(crate) fn properties_size(filter: &Filter) -> Result<u32, Ret> {
     match filter.id {
         FILTER_LZMA1 | FILTER_LZMA1EXT => Ok(5),
-        FILTER_LZMA2 => Ok(1),
+        FILTER_LZMA2 | FILTER_DELTA => Ok(1),
+        // `lzma_simple_props_size`.
+        id if is_bcj(id) => Ok(match &filter.options {
+            Some(FilterOptions::Bcj(options)) if options.start_offset != 0 => 4,
+            _ => 0,
+        }),
         // Unknown filter - if the Filter ID is a proper VLI, return
         // LZMA_OPTIONS_ERROR instead of LZMA_PROG_ERROR, because it's
         // possible that we just don't have support compiled in for the
         // requested filter.
-        id if id <= crate::common::VLI_MAX => Err(Ret::OptionsError),
+        id if id <= VLI_MAX => Err(Ret::OptionsError),
         _ => Err(Ret::ProgError),
     }
 }
 
 /// `lzma_properties_encode`.
 pub(crate) fn properties_encode(filter: &Filter, props: &mut [u8]) -> Ret {
-    let Some(options) = filter.options.as_ref() else {
-        return Ret::ProgError;
-    };
     match filter.id {
-        FILTER_LZMA1 | FILTER_LZMA1EXT => lzma_encoder::props_encode(options, props),
-        FILTER_LZMA2 => lzma2_encoder::lzma2_props_encode(options, props),
+        FILTER_LZMA1 | FILTER_LZMA1EXT => match filter.lzma_options() {
+            Some(options) => lzma_encoder::props_encode(options, props),
+            None => Ret::ProgError,
+        },
+        FILTER_LZMA2 => match filter.lzma_options() {
+            Some(options) => lzma2_encoder::lzma2_props_encode(options, props),
+            None => Ret::ProgError,
+        },
+        FILTER_DELTA => delta::props_encode(delta_options(filter), props),
+        id if is_bcj(id) => {
+            if let Some(FilterOptions::Bcj(options)) = &filter.options {
+                simple::props_encode(options, props);
+            }
+            Ret::Ok
+        }
         _ => Ret::ProgError,
     }
 }

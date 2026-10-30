@@ -1,8 +1,8 @@
 //! Opening what hivepack reads, through the layers around it: age
-//! encryption and zstd, xz, lzip, .lzma, gzip or bzip2 compression, found
-//! by their first bytes and taken off one after the other, as many as
-//! there are, until what is under them is a tar or ZIP archive, or plain
-//! data.
+//! encryption and zstd, xz, lzip, .lzma, LZ4, gzip or bzip2 compression,
+//! found by their first bytes and taken off one after the other, as many
+//! as there are, until what is under them is a tar or ZIP archive, or
+//! plain data.
 //!
 //! ```no_run
 //! use std::sync::Arc;

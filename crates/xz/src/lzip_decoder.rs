@@ -5,7 +5,7 @@ use crate::common::{
     Action, CONCATENATED, IGNORE_CHECK, MEMUSAGE_BASE, NextCoder, Ret, SUPPORTED_FLAGS,
     TELL_ANY_CHECK, bufcpy, read32le, read64le,
 };
-use crate::filter::{FILTER_LZMA1, Filter, filter_init};
+use crate::filter::{FILTER_LZMA1, Filter, FilterOptions, filter_init};
 use crate::lzma_common::LzmaOptions;
 use crate::lzma_decoder::decoder_memusage_nocheck;
 
@@ -231,9 +231,9 @@ impl NextCoder for LzipDecoder {
 
                     let filter = Filter {
                         id: FILTER_LZMA1,
-                        options: Some(self.options.clone()),
+                        options: Some(FilterOptions::Lzma(self.options.clone())),
                     };
-                    match filter_init(&filter, None) {
+                    match filter_init(core::slice::from_ref(&filter)) {
                         Ok(decoder) => self.lzma_decoder = Some(decoder),
                         Err(ret) => {
                             self.lzma_decoder = None;

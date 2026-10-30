@@ -9,8 +9,8 @@ use crate::common::{
     Action, NextCoder, Ret, VLI_MAX, VLI_UNKNOWN, bufcpy, read32le, vli_is_valid, write32le,
 };
 use crate::filter::{
-    FILTER_LZMA2, FILTERS_MAX, Filter, filter_flags_decode, filter_flags_encode, filter_flags_size,
-    raw_decoder_init, raw_encoder_init,
+    FILTER_LZMA2, FILTERS_MAX, Filter, FilterOptions, filter_flags_decode, filter_flags_encode,
+    filter_flags_size, raw_decoder_init, raw_encoder_init,
 };
 use crate::lzma_common::{DICT_SIZE_MIN, LzmaOptions};
 use crate::lzma_encoder::LZMA2_CHUNK_MAX;
@@ -786,7 +786,7 @@ fn block_encode_uncompressed(
         &mut block.filters,
         vec![Filter {
             id: FILTER_LZMA2,
-            options: Some(lzma2),
+            options: Some(FilterOptions::Lzma(lzma2)),
         }],
     );
 

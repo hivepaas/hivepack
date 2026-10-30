@@ -2,9 +2,11 @@
 //! difference is a bug.
 //!
 //! The first byte chooses the encoder: .xz of a preset, .xz of LZMA2 with
-//! options, .lzma, raw LZMA1 or raw LZMA2. The next eight seed the preset,
-//! the check, the options (now and then ones the encoders refuse), the
-//! pieces of input and output, and the flushes. The rest is the data.
+//! options, .lzma, raw LZMA1 or raw LZMA2, the last three but .lzma with
+//! delta and BCJ filters before LZMA now and then. The next eight seed the
+//! preset, the check, the options (now and then ones the encoders refuse),
+//! the filters, the pieces of input and output, and the flushes. The rest
+//! is the data.
 //!
 //! Every call must agree: the same result, the same bytes read and
 //! written, the same output.
@@ -12,8 +14,8 @@
 #![no_main]
 
 use hivepack_xz::{
-    Action, Check, FILTER_LZMA1, FILTER_LZMA2, Filter, InBuffer, LzmaOptions, MatchFinder, Mode,
-    OutBuffer, PRESET_EXTREME, Status, Stream,
+    Action, Check, Filter, InBuffer, LzmaOptions, MatchFinder, Mode, OutBuffer, PRESET_EXTREME,
+    Status, Stream,
 };
 use libfuzzer_sys::fuzz_target;
 use liblzma::stream as c;
@@ -40,6 +42,43 @@ fn c_code(ret: Result<c::Status, c::Error>) -> i32 {
         Err(c::Error::Data) => 9,
         Ok(c::Status::MemNeeded) => 10,
         Err(c::Error::Program) => 11,
+    }
+}
+
+/// Up to three delta and BCJ filters from their properties, for liblzma's
+/// chain and the port's: delta's distance, and a BCJ filter's start offset
+/// (in or out of alignment) or none.
+fn filters_before(next: &mut impl FnMut(usize) -> usize, c_filters: &mut c::Filters, port: &mut Vec<Filter>) {
+    for _ in 0..[0, 0, 1, 2, 3][next(5)] {
+        let kind = next(9);
+        if kind == 0 {
+            let byte = next(256) as u8;
+            c_filters.delta_properties(&[byte]).unwrap();
+            port.push(Filter::delta(u32::from(byte) + 1));
+            continue;
+        }
+        let id = 3 + kind as u64;
+        let props: Vec<u8> = match next(4) {
+            0 => Vec::new(),
+            1 => (next(1 << 16) as u32).to_le_bytes().to_vec(),
+            2 => (u32::MAX - next(64) as u32).to_le_bytes().to_vec(),
+            _ => ((next(1 << 16) as u32) << 4).to_le_bytes().to_vec(),
+        };
+        let added = match id {
+            4 => c_filters.x86_properties(&props),
+            5 => c_filters.powerpc_properties(&props),
+            6 => c_filters.ia64_properties(&props),
+            7 => c_filters.arm_properties(&props),
+            8 => c_filters.arm_thumb_properties(&props),
+            9 => c_filters.sparc_properties(&props),
+            10 => c_filters.arm64_properties(&props),
+            _ => c_filters.riscv_properties(&props),
+        };
+        added.unwrap();
+        port.push(match props.first_chunk::<4>() {
+            Some(start) => Filter::bcj(id, u32::from_le_bytes(*start)),
+            None => Filter { id, options: None },
+        });
     }
 }
 
@@ -100,34 +139,30 @@ fuzz_target!(|data: &[u8]| {
     let (check, c_check) = CHECKS[next(4)];
 
     // The encoders, and the flushes each takes.
-    let lzma2 = |c_options: &c::LzmaOptions| {
-        let mut filters = c::Filters::new();
-        filters.lzma2(c_options);
-        filters
-    };
-    let port_filter = |id| [Filter { id, options: Some(o.clone()) }];
+    let mut filters = c::Filters::new();
+    let mut port_filters = Vec::new();
+    if matches!(mode % 5, 1 | 3 | 4) {
+        filters_before(&mut next, &mut filters, &mut port_filters);
+        if mode % 5 == 3 {
+            filters.lzma1(&c_options);
+            port_filters.push(Filter::lzma1(o.clone()));
+        } else {
+            filters.lzma2(&c_options);
+            port_filters.push(Filter::lzma2(o.clone()));
+        }
+    }
     let (made, flushes): (_, &[Action]) = match mode % 5 {
         0 => (
             (c::Stream::new_easy_encoder(preset, c_check), Stream::easy_encoder(preset, Check(check))),
             &[Action::SyncFlush, Action::FullFlush, Action::FullBarrier],
         ),
         1 => (
-            (
-                c::Stream::new_stream_encoder(&lzma2(&c_options), c_check),
-                Stream::stream_encoder(&port_filter(FILTER_LZMA2), Check(check)),
-            ),
+            (c::Stream::new_stream_encoder(&filters, c_check), Stream::stream_encoder(&port_filters, Check(check))),
             &[Action::SyncFlush, Action::FullFlush, Action::FullBarrier],
         ),
         2 => ((c::Stream::new_lzma_encoder(&c_options), Stream::alone_encoder(&o)), &[]),
-        3 => {
-            let mut filters = c::Filters::new();
-            filters.lzma1(&c_options);
-            ((c::Stream::new_raw_encoder(&filters), Stream::raw_encoder(&port_filter(FILTER_LZMA1))), &[])
-        }
-        _ => (
-            (c::Stream::new_raw_encoder(&lzma2(&c_options)), Stream::raw_encoder(&port_filter(FILTER_LZMA2))),
-            &[Action::SyncFlush],
-        ),
+        3 => ((c::Stream::new_raw_encoder(&filters), Stream::raw_encoder(&port_filters)), &[]),
+        _ => ((c::Stream::new_raw_encoder(&filters), Stream::raw_encoder(&port_filters)), &[Action::SyncFlush]),
     };
     let (mut c, mut port) = match made {
         (Ok(c), Ok(port)) => (c, port),

@@ -1,5 +1,6 @@
 //! The decompressors as `io::Read`: zstd, xz (and lzip and .lzma), gzip and
-//! bzip2, each over hivepack's port of its library.
+//! bzip2, each over hivepack's port of its library, through one adapter;
+//! and LZ4, whose port has its own reader of `.lz4` files.
 //!
 //! A file can hold several streams one after the other, as their tools
 //! make and read them: zstd frames (skippable ones too), gzip members,
@@ -7,11 +8,13 @@
 //! padding, lzip members. After the last, gzip and bzip2 allow zeros, which
 //! tar's blocking leaves; lzip allows anything, as its format says, which
 //! is read and ignored. Anything else after a stream is an error, as is a
-//! stream cut short.
+//! stream cut short. LZ4's reader does the same as `lz4 -d`: frames,
+//! skippable frames and the legacy format one after the other, and nothing
+//! else after them.
 
 use std::io::{self, Read};
 
-use crate::detect::Layer;
+use crate::detect::{Layer, is_skippable};
 
 /// An error of a layer's data, inside the `io::Error` a read returns.
 #[derive(Debug)]
@@ -29,6 +32,11 @@ impl std::fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
+
+/// A layer's error, as a read returns it.
+fn decode_error(layer: Layer, message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, DecodeError { layer, message })
+}
 
 /// What a step of a codec did.
 #[derive(Default)]
@@ -108,13 +116,7 @@ impl<R: Read, C: Codec> Decoder<R, C> {
 
     fn error(&mut self, message: String) -> io::Error {
         self.failed = Some(message.clone());
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            DecodeError {
-                layer: self.layer,
-                message,
-            },
-        )
+        decode_error(self.layer, message)
     }
 
     /// At least `want` bytes in the buffer, unless the input ends first.
@@ -247,10 +249,7 @@ impl Codec for ZstdCodec {
 
     fn restart(&mut self, next: &[u8]) -> bool {
         // Another frame, or a skippable one: the context reads on.
-        let frame = next.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
-        let skippable =
-            next.len() >= 4 && next[0] & 0xF0 == 0x50 && next[1..4] == [0x2A, 0x4D, 0x18];
-        frame || skippable
+        next.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) || is_skippable(next)
     }
 }
 
@@ -366,6 +365,59 @@ impl Codec for XzCodec {
     }
 }
 
+/// An error of the reader under LZ4's, told apart from LZ4's own on its
+/// way through LZ4's reader, which passes it on as it is.
+#[derive(Debug)]
+struct Below(io::Error);
+
+impl std::fmt::Display for Below {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Below {}
+
+/// The reader under LZ4's, its errors marked [`Below`].
+struct Tagged<R>(R);
+
+impl<R: Read> Read for Tagged<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf).map_err(|e| match e.kind() {
+            io::ErrorKind::Interrupted => e,
+            kind => io::Error::new(kind, Below(e)),
+        })
+    }
+}
+
+/// LZ4: hivepack-lz4's reader of `.lz4` files, its errors given as the
+/// other layers' are: a [`DecodeError`] that stays, and the errors of the
+/// reader under it as they are.
+struct Lz4Layer<R> {
+    decoder: hivepack_lz4::Decoder<Tagged<R>>,
+    failed: Option<String>,
+}
+
+impl<R: Read> Read for Lz4Layer<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(message) = &self.failed {
+            return Err(decode_error(Layer::Lz4, message.clone()));
+        }
+        let e = match self.decoder.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) => e,
+        };
+        let kind = e.kind();
+        let message = match e.into_inner().map(|inner| inner.downcast::<Below>()) {
+            Some(Ok(below)) => return Err(below.0),
+            Some(Err(inner)) => inner.to_string(),
+            None => io::Error::from(kind).to_string(),
+        };
+        self.failed = Some(message.clone());
+        Err(decode_error(Layer::Lz4, message))
+    }
+}
+
 /// The limits of the decoders.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodeLimits {
@@ -416,6 +468,10 @@ pub(crate) fn decoder<'a, R: Read + Send + 'a>(
             };
             Box::new(Decoder::new(inner, XzCodec { s, after }, layer))
         }
+        Layer::Lz4 => Box::new(Lz4Layer {
+            decoder: hivepack_lz4::Decoder::new(Tagged(inner)),
+            failed: None,
+        }),
         Layer::Age => return Err(invalid("age is not a compressor".into())),
     })
 }

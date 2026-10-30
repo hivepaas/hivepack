@@ -1,7 +1,7 @@
 //! The .lzma encoder: port of `common/alone_encoder.c`.
 
 use crate::common::{Action, NextCoder, Ret, bufcpy, write32le};
-use crate::filter::{FILTER_LZMA1, Filter, raw_encoder_init};
+use crate::filter::{FILTER_LZMA1, Filter, FilterOptions, raw_encoder_init};
 use crate::lzma_common::{DICT_SIZE_MIN, LzmaOptions};
 use crate::lzma_encoder::lclppb_encode;
 
@@ -56,7 +56,7 @@ impl AloneEncoder {
         // Initialize the LZMA encoder.
         let filter = Filter {
             id: FILTER_LZMA1,
-            options: Some(options.clone()),
+            options: Some(FilterOptions::Lzma(options.clone())),
         };
         let next = raw_encoder_init(core::slice::from_ref(&filter))?;
 

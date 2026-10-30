@@ -2,23 +2,21 @@
 //! bug.
 //!
 //! The first byte chooses the decoder: the .xz decoder, the auto decoder,
-//! the .lz decoder, the .lzma decoder, or a raw LZMA1 or LZMA2 decoder. The
-//! next eight seed its flags, its memory limit or its options, and the
-//! pieces. The rest is its input.
+//! the .lz decoder, the .lzma decoder, or a raw LZMA1 or LZMA2 decoder,
+//! with delta and BCJ filters before it now and then. The next eight seed
+//! its flags, its memory limit or its options, and the pieces. The rest is
+//! its input.
 //!
 //! Every call must agree, up to the first error: the same result, the same
 //! bytes read and written, the same output. Now and then a memory limit is
 //! set between the calls, with the same result.
-//!
-//! liblzma has the delta and BCJ filters, which the port does not have yet:
-//! where the port refuses a Block's filters with LZMA_OPTIONS_ERROR and
-//! liblzma goes on, the comparison stops.
 
 #![no_main]
 
 use hivepack_xz::{
-    Action, CONCATENATED, FAIL_FAST, FILTER_LZMA1, FILTER_LZMA2, Filter, IGNORE_CHECK, InBuffer,
-    LzmaOptions, OutBuffer, Status, Stream, TELL_ANY_CHECK, TELL_NO_CHECK, TELL_UNSUPPORTED_CHECK,
+    Action, CONCATENATED, FAIL_FAST, FILTER_LZMA1, FILTER_LZMA2, Filter, FilterOptions,
+    IGNORE_CHECK, InBuffer, LzmaOptions, OutBuffer, Status, Stream, TELL_ANY_CHECK, TELL_NO_CHECK,
+    TELL_UNSUPPORTED_CHECK,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -45,6 +43,47 @@ fn c_code(ret: Result<liblzma::stream::Status, liblzma::stream::Error>) -> i32 {
         Err(Error::Data) => 9,
         Ok(Status::MemNeeded) => 10,
         Err(Error::Program) => 11,
+    }
+}
+
+/// Up to three delta and BCJ filters from their properties, for liblzma's
+/// chain and the port's: delta's distance, and a BCJ filter's start offset
+/// (in or out of alignment) or none.
+fn filters_before(
+    next: &mut impl FnMut(usize) -> usize,
+    c_filters: &mut liblzma::stream::Filters,
+    port: &mut Vec<Filter>,
+) {
+    for _ in 0..[0, 0, 1, 2, 3][next(5)] {
+        let kind = next(9);
+        if kind == 0 {
+            let byte = next(256) as u8;
+            c_filters.delta_properties(&[byte]).unwrap();
+            port.push(Filter::delta(u32::from(byte) + 1));
+            continue;
+        }
+        let id = 3 + kind as u64;
+        let props: Vec<u8> = match next(4) {
+            0 => Vec::new(),
+            1 => (next(1 << 16) as u32).to_le_bytes().to_vec(),
+            2 => (u32::MAX - next(64) as u32).to_le_bytes().to_vec(),
+            _ => ((next(1 << 16) as u32) << 4).to_le_bytes().to_vec(),
+        };
+        let added = match id {
+            4 => c_filters.x86_properties(&props),
+            5 => c_filters.powerpc_properties(&props),
+            6 => c_filters.ia64_properties(&props),
+            7 => c_filters.arm_properties(&props),
+            8 => c_filters.arm_thumb_properties(&props),
+            9 => c_filters.sparc_properties(&props),
+            10 => c_filters.arm64_properties(&props),
+            _ => c_filters.riscv_properties(&props),
+        };
+        added.unwrap();
+        port.push(match props.first_chunk::<4>() {
+            Some(start) => Filter::bcj(id, u32::from_le_bytes(*start)),
+            None => Filter { id, options: None },
+        });
     }
 }
 
@@ -121,24 +160,26 @@ fuzz_target!(|data: &[u8]| {
                 .literal_position_bits(lp)
                 .position_bits(pb);
             let mut filters = liblzma::stream::Filters::new();
+            let mut port_filters = Vec::new();
+            filters_before(&mut next, &mut filters, &mut port_filters);
             if lzma2 {
                 filters.lzma2(&c_options);
             } else {
                 filters.lzma1(&c_options);
             }
-            let filter = Filter {
+            port_filters.push(Filter {
                 id: if lzma2 { FILTER_LZMA2 } else { FILTER_LZMA1 },
-                options: Some(LzmaOptions {
+                options: Some(FilterOptions::Lzma(LzmaOptions {
                     dict_size,
                     lc,
                     lp,
                     pb,
                     ..LzmaOptions::default()
-                }),
-            };
+                })),
+            });
             (
                 liblzma::stream::Stream::new_raw_decoder(&filters),
-                Stream::raw_decoder(&[filter]),
+                Stream::raw_decoder(&port_filters),
             )
         }
     };
@@ -192,10 +233,6 @@ fuzz_target!(|data: &[u8]| {
         let mut p_input = InBuffer::new(input);
         let mut p_output = OutBuffer::new(&mut p_out[..output_len]);
         let got = port_code(port.code(&mut p_output, &mut p_input, action));
-        if got == 8 && want != 8 {
-            // A filter the port does not have yet.
-            return;
-        }
         assert_eq!(got, want, "result at input {pos}");
         assert_eq!(p_input.pos, c_read, "bytes read at input {pos}");
         assert_eq!(p_output.pos, c_written, "bytes written at input {pos}");

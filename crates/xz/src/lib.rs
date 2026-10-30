@@ -56,6 +56,36 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A filter chain ends with LZMA1 or LZMA2, and may have up to three
+//! delta ([`Filter::delta`]) and BCJ ([`Filter::bcj`]) filters before it,
+//! which help executables and tables of numbers compress:
+//!
+//! ```
+//! # fn main() -> Result<(), hivepack_xz::Error> {
+//! use hivepack_xz::{
+//!     Action, Check, FILTER_X86, Filter, InBuffer, LzmaOptions, OutBuffer, Stream,
+//!     stream_buffer_bound, stream_buffer_encode,
+//! };
+//!
+//! // x86 calls to a function at 0x1000, from all over.
+//! let mut code = Vec::new();
+//! for at in (0..4000u32).step_by(5) {
+//!     code.push(0xe8);
+//!     code.extend_from_slice(&0x1000u32.wrapping_sub(at + 5).to_le_bytes());
+//! }
+//! let filters = [Filter::bcj(FILTER_X86, 0), Filter::lzma2(LzmaOptions::preset(6).unwrap())];
+//! let mut xz = vec![0; stream_buffer_bound(code.len())];
+//! let mut len = 0;
+//! stream_buffer_encode(&filters, Check::CRC64, &code, &mut xz, &mut len)?;
+//!
+//! let mut stream = Stream::stream_decoder(u64::MAX, 0)?;
+//! let mut out = vec![0; code.len()];
+//! stream.code(&mut OutBuffer::new(&mut out), &mut InBuffer::new(&xz[..len]), Action::Finish)?;
+//! assert_eq!(out, code);
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 // Loops keep liblzma's indices, so the port reads side by side with the C.
@@ -67,6 +97,7 @@ mod auto_decoder;
 mod block;
 mod check;
 mod common;
+mod delta;
 mod filter;
 mod index_hash;
 mod lz_decoder;
@@ -79,6 +110,7 @@ mod lzma_decoder;
 mod lzma_encoder;
 mod range_decoder;
 mod range_encoder;
+mod simple;
 mod stream_decoder;
 mod stream_encoder;
 mod stream_flags;
@@ -92,13 +124,20 @@ pub use common::{
     TELL_UNSUPPORTED_CHECK,
 };
 pub use filter::{
-    FILTER_LZMA1, FILTER_LZMA1EXT, FILTER_LZMA2, FILTERS_MAX, Filter, decoder_is_supported,
-    encoder_is_supported, raw_decoder_memusage, raw_encoder_memusage,
+    BcjOptions, DELTA_DIST_MAX, DELTA_DIST_MIN, DELTA_TYPE_BYTE, DeltaOptions, FILTER_ARM,
+    FILTER_ARM64, FILTER_ARMTHUMB, FILTER_DELTA, FILTER_IA64, FILTER_LZMA1, FILTER_LZMA1EXT,
+    FILTER_LZMA2, FILTER_POWERPC, FILTER_RISCV, FILTER_SPARC, FILTER_X86, FILTERS_MAX, Filter,
+    FilterOptions, decoder_is_supported, encoder_is_supported, raw_decoder_memusage,
+    raw_encoder_memusage,
 };
 pub use lzma_common::{
     DICT_SIZE_DEFAULT, DICT_SIZE_MIN, LC_DEFAULT, LCLP_MAX, LP_DEFAULT, LZMA1EXT_ALLOW_EOPM,
     LzmaOptions, MatchFinder, Mode, PB_DEFAULT, PB_MAX, PRESET_DEFAULT, PRESET_EXTREME,
     PRESET_LEVEL_MASK,
+};
+pub use simple::{
+    bcj_arm64_decode, bcj_arm64_encode, bcj_riscv_decode, bcj_riscv_encode, bcj_x86_decode,
+    bcj_x86_encode,
 };
 
 use common::{Internal, Ret};
@@ -439,10 +478,7 @@ impl fmt::Debug for Stream {
 
 /// `lzma_easy_preset`: the filter chain of a preset, LZMA2 alone.
 fn easy_preset(preset: u32) -> Option<Vec<Filter>> {
-    Some(vec![Filter {
-        id: FILTER_LZMA2,
-        options: Some(LzmaOptions::preset(preset)?),
-    }])
+    Some(vec![Filter::lzma2(LzmaOptions::preset(preset)?)])
 }
 
 /// `lzma_easy_encoder_memusage`: the memory the encoder of a preset needs,

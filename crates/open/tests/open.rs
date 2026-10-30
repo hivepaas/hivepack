@@ -11,7 +11,7 @@ mod support;
 use std::io::{self, Cursor, Read};
 
 use hivepack_open::{Container, DecodeError, Error, Layer, Limits, Opener};
-use support::{Scratch, bzip2, gzip, lzip, lzma, sample_tar, xz, xz_preset, zstd};
+use support::{Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, sample_tar, xz, xz_preset, zstd};
 
 /// A reference library's compressor.
 type Compress = fn(&[u8]) -> Vec<u8>;
@@ -49,10 +49,12 @@ fn failed_layer(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> Laye
 #[test]
 fn each_layer_comes_off() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 5] = [
+    let cases: [(Layer, Compress); 7] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
+        (Layer::Lz4, lz4),
+        (Layer::Lz4, lz4_legacy),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
     ];
@@ -91,6 +93,9 @@ fn layers_stack() {
     let (layers, container, data) = open(&file).unwrap();
     assert_eq!(layers, [Layer::Gzip, Layer::Bzip2, Layer::Xz, Layer::Zstd]);
     assert_eq!(container, Container::Tar);
+    assert!(data == tar);
+    let (layers, _, data) = open(&lz4(&gzip(&lz4_legacy(&tar)))).unwrap();
+    assert_eq!(layers, [Layer::Lz4, Layer::Gzip, Layer::Lz4]);
     assert!(data == tar);
 }
 
@@ -148,6 +153,16 @@ fn streams_one_after_another() {
             "{layer:?}"
         );
     }
+    // LZ4 frames, a skippable one first and between them: the frame after
+    // it tells LZ4 from zstd.
+    let mut file = vec![0x50, 0x2A, 0x4D, 0x18, 2, 0, 0, 0, 7, 7];
+    file.extend(lz4(a));
+    file.extend([0x5A, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]);
+    file.extend(lz4(b));
+    assert_eq!(
+        open(&file).unwrap(),
+        (vec![Layer::Lz4], Container::Tar, tar.clone())
+    );
     // xz streams, Stream Padding between and after them.
     let mut file = xz(a);
     file.extend([0; 8]);
@@ -178,9 +193,10 @@ fn streams_one_after_another() {
 #[test]
 fn other_data_after_the_streams_fails() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 4] = [
+    let cases: [(Layer, Compress); 5] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
+        (Layer::Lz4, lz4),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
     ];
@@ -194,10 +210,12 @@ fn other_data_after_the_streams_fails() {
 #[test]
 fn a_stream_cut_short_fails() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 6] = [
+    let cases: [(Layer, Compress); 8] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
+        (Layer::Lz4, lz4),
+        (Layer::Lz4, lz4_legacy),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
         (Layer::Lzma, lzma),
@@ -215,6 +233,9 @@ fn a_stream_cut_short_fails() {
         failed_layer(open(&gzip(&inner[..inner.len() - 3]))),
         Layer::Zstd
     );
+    // The outer one's error comes through LZ4's reader as it is.
+    let outer = gzip(&lz4(&tar));
+    assert_eq!(failed_layer(open(&outer[..outer.len() - 3])), Layer::Gzip);
 }
 
 #[test]
@@ -254,10 +275,11 @@ fn what_comes_before_an_error_is_given_out() {
     // its error, so that what is read does not depend on the size of the
     // reads (the fuzz target found it with a .lzma file).
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 5] = [
+    let cases: [(Layer, Compress); 6] = [
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
         (Layer::Lzma, lzma),
+        (Layer::Lz4, lz4),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
     ];
@@ -313,7 +335,14 @@ impl Read for Trickle<'_> {
 #[test]
 fn input_a_byte_at_a_time() {
     let tar = sample_tar();
-    for file in [zstd(&tar), xz(&tar), gzip(&bzip2(&tar)), lzip(&tar)] {
+    for file in [
+        zstd(&tar),
+        xz(&tar),
+        gzip(&bzip2(&tar)),
+        lzip(&tar),
+        lz4(&tar),
+        lz4_legacy(&tar),
+    ] {
         let mut opener = Opener::new(|| Ok(Trickle(&file, false)));
         let mut opened = opener.open().unwrap();
         let mut data = Vec::new();

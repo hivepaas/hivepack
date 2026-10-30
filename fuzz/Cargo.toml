@@ -10,8 +10,9 @@ edition = "2024"
 cargo-fuzz = true
 
 [features]
-# Fuzz the build with the sequence loop's unchecked copies.
-unsafe-fast = ["hivepack-zstd/unsafe-fast"]
+# Fuzz the builds with the unchecked copies: zstd's sequence loop, and
+# lz4's fast loop.
+unsafe-fast = ["hivepack-zstd/unsafe-fast", "hivepack-lz4/unsafe-fast"]
 
 [dependencies]
 libfuzzer-sys = "0.4"

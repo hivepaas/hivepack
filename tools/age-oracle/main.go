@@ -1,8 +1,9 @@
 // The Go side of hivepack's comparison tests for age.
 //
 // It reads one request per line on stdin and answers each on one line of
-// stdout, with the code age v1.3.2 runs: its primitives from Go's standard
-// library and golang.org/x/crypto v0.55.0, the release age v1.3.2 requires.
+// stdout, with the code age v1.3.2 runs: age itself (filippo.io/age), and
+// its primitives from Go's standard library and golang.org/x/crypto
+// v0.55.0, the release age v1.3.2 requires.
 // The Rust tests ask the port the same questions and compare the answers as
 // text. scripts/testdata.py builds it with the Go toolchain; go.sum pins
 // what it is built from.
@@ -42,15 +43,32 @@
 //	scrypt <log2 N> <r> <p> <length> <password> <salt>
 //	    x/crypto/scrypt. Answered "ok <key>", or "err" for parameters it
 //	    refuses.
+//
+//	encrypt <recipients> <armor> <plaintext>
+//	    An age file of <plaintext>, to <recipients>: a comma-separated list
+//	    of age1... public keys, or one "p:<passphrase>:<work factor>".
+//	    Armored if <armor> is 1. Answered "ok <file>".
+//
+//	decrypt <identities> <file>
+//	    <file> decrypted as age --decrypt reads it (cmd/age's decrypt: the
+//	    armor found from the first line, PowerShell's mangling refused),
+//	    with <identities>: a comma-separated list of AGE-SECRET-KEY-1...
+//	    keys and "p:<passphrase>:<max work factor>". Answered
+//	    "<outcome> <length> <sha256>", the outcome as age's testkit_test.go
+//	    tells it ("success", "header", "no-match", "hmac", "armor" or
+//	    "payload"), with the length and SHA-256 of all the plaintext given
+//	    out, even when the payload fails later.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/hmac"
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -58,6 +76,8 @@ import (
 	"strconv"
 	"strings"
 
+	"filippo.io/age"
+	"filippo.io/age/armor"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -166,8 +186,117 @@ func answer(words []string) string {
 			return "err"
 		}
 		return ok(key)
+	case words[0] == "encrypt" && len(words) == 4:
+		return encrypt(words[1], words[2] == "1", unhex(words[3]))
+	case words[0] == "decrypt" && len(words) == 3:
+		return decrypt(words[1], unhex(words[2]))
 	}
 	return "bad"
+}
+
+func encrypt(spec string, armored bool, plaintext []byte) string {
+	var recipients []age.Recipient
+	for _, s := range strings.Split(spec, ",") {
+		if p, ok := strings.CutPrefix(s, "p:"); ok {
+			pass, logN, _ := strings.Cut(p, ":")
+			r, err := age.NewScryptRecipient(string(unhex(pass)))
+			if err != nil {
+				return "bad"
+			}
+			r.SetWorkFactor(number(logN))
+			recipients = append(recipients, r)
+			continue
+		}
+		r, err := age.ParseX25519Recipient(s)
+		if err != nil {
+			return "bad"
+		}
+		recipients = append(recipients, r)
+	}
+	out := &bytes.Buffer{}
+	var dst io.Writer = out
+	var a io.WriteCloser
+	if armored {
+		a = armor.NewWriter(out)
+		dst = a
+	}
+	w, err := age.Encrypt(dst, recipients...)
+	if err != nil {
+		return "bad"
+	}
+	w.Write(plaintext)
+	if err := w.Close(); err != nil {
+		return "bad"
+	}
+	if a != nil {
+		if err := a.Close(); err != nil {
+			return "bad"
+		}
+	}
+	return ok(out.Bytes())
+}
+
+// What cmd/age's decrypt checks first.
+const crlfMangledIntro = "age-encryption.org/v1" + "\r"
+const utf16MangledIntro = "\xff\xfe" + "a\x00g\x00e\x00-\x00e\x00n\x00c\x00r\x00y\x00p\x00"
+
+func decrypt(spec string, file []byte) string {
+	var identities []age.Identity
+	for _, s := range strings.Split(spec, ",") {
+		if p, ok := strings.CutPrefix(s, "p:"); ok {
+			pass, logN, _ := strings.Cut(p, ":")
+			i, err := age.NewScryptIdentity(string(unhex(pass)))
+			if err != nil {
+				return "bad"
+			}
+			i.SetMaxWorkFactor(number(logN))
+			identities = append(identities, i)
+			continue
+		}
+		i, err := age.ParseX25519Identity(s)
+		if err != nil {
+			return "bad"
+		}
+		identities = append(identities, i)
+	}
+
+	// cmd/age's decrypt, its errors returned rather than printed.
+	rr := bufio.NewReader(bytes.NewReader(file))
+	var in io.Reader = rr
+	if intro, _ := rr.Peek(len(crlfMangledIntro)); string(intro) == crlfMangledIntro ||
+		string(intro) == utf16MangledIntro {
+		return outcome("header", nil)
+	}
+	const maxWhitespace = 1024
+	start, _ := rr.Peek(maxWhitespace + len(armor.Header))
+	if strings.HasPrefix(string(bytes.TrimSpace(start)), armor.Header) {
+		in = armor.NewReader(rr)
+	}
+
+	// As testkit_test.go tells the outcomes apart.
+	r, err := age.Decrypt(in, identities...)
+	if err != nil && strings.HasSuffix(err.Error(), "bad header MAC") {
+		return outcome("hmac", nil)
+	} else if e := new(armor.Error); errors.As(err, &e) {
+		return outcome("armor", nil)
+	} else if _, ok := err.(*age.NoIdentityMatchError); ok {
+		return outcome("no-match", nil)
+	} else if err != nil {
+		return outcome("header", nil)
+	}
+	out, err := io.ReadAll(r)
+	if err == nil {
+		return outcome("success", out)
+	}
+	if e := new(armor.Error); errors.As(err, &e) {
+		return outcome("armor", out)
+	}
+	return outcome("payload", out)
+}
+
+func outcome(what string, out []byte) string {
+	sum := sha256.Sum256(out)
+	return fmt.Sprintf("%s %d %s", what, len(out), hex.EncodeToString(sum[:]))
 }
 
 func main() {

@@ -737,6 +737,106 @@ fn packed_data_unpacks_like_unrar() {
     eprintln!("{compared} inputs compared");
 }
 
+// The same for RAR 1.5 and 2.x, which go on from each other, and into RAR 3.
+#[cfg(target_os = "linux")]
+#[test]
+fn old_packed_data_unpacks_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0006);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    for i in 0..count * 10 {
+        let size = rng.below(4096) as usize;
+        let mut input = vec![0; size];
+        for byte in &mut input {
+            *byte = rng.next() as u8;
+        }
+        let request = old_unpack_request(&hex(&input));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("random input {i}"));
+    }
+    for (input, _) in recorded_old_unpack() {
+        let request = old_unpack_request(&input);
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("recorded input {input:.40}"));
+    }
+    let Some(folder) = std::env::var_os("HIVEPACK_RAR_OLD_UNPACK_CORPUS") else {
+        return;
+    };
+    let mut compared = 0;
+    for entry in std::fs::read_dir(folder).expect("the folder") {
+        let path = entry.expect("an entry").path();
+        let input = std::fs::read(&path).expect("an input");
+        let request = old_unpack_request(&hex(&input));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &path.display().to_string());
+        compared += 1;
+    }
+    eprintln!("{compared} inputs compared");
+}
+
+// Archives that RAR itself made, of every age, and what other projects keep as
+// tests for reading broken ones, as they are and damaged.
+#[cfg(target_os = "linux")]
+#[test]
+fn other_projects_archives_test_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0007);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(2);
+    let archives = support::other_projects_archives();
+    let mut with_data = 0;
+    for (name, data) in &archives {
+        for request in [
+            format!("list 0 {}", hex(data)),
+            format!("list 1 {}", hex(data)),
+            format!("test {}", hex(data)),
+            // The dictionary of a RAR 7 archive may be over the default limit.
+            format!("test {} {}", hex(data), 8u64 << 30),
+        ] {
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, name);
+            with_data += want
+                .split(' ')
+                .filter(|w| w.starts_with("data=") && *w != "data=0")
+                .count();
+        }
+        if data.len() > 64 << 10 {
+            continue;
+        }
+        for i in 0..count {
+            let mut damaged = damage(&mut rng, data);
+            if i % 2 == 1 {
+                support::patch::fix_header_crcs(&mut damaged);
+            }
+            let request = format!("test {}", hex(&damaged));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, damaged {i}"));
+        }
+    }
+    eprintln!("{} archives: {with_data} entries with data", archives.len());
+    assert!(
+        archives.is_empty() || with_data >= 200,
+        "only {with_data} entries with data"
+    );
+}
+
 // A dictionary too large for the limit, on archives that hold what they say:
 // random damage rarely gets to a size past the default 4 GiB.
 #[cfg(target_os = "linux")]
@@ -912,11 +1012,30 @@ fn unpack_request(input: &str) -> String {
     )
 }
 
+fn recorded_old_unpack_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-unpack-old.txt")
+}
+
+fn old_unpack_request(input: &str) -> String {
+    format!(
+        "test {}",
+        hex(&support::patch::with_old_packed_data(&unhex(input)))
+    )
+}
+
 /// What the `rar_unpack` target found, which damage does not get to: the
 /// inputs, and UnRAR's answers for where the oracle is not.
 fn recorded_unpack() -> Vec<(String, String)> {
-    let text =
-        std::fs::read_to_string(recorded_unpack_path()).expect("testdata/oracle/rar-unpack.txt");
+    recorded_inputs(&recorded_unpack_path())
+}
+
+/// The same from the `rar_unpack_old` target.
+fn recorded_old_unpack() -> Vec<(String, String)> {
+    recorded_inputs(&recorded_old_unpack_path())
+}
+
+fn recorded_inputs(path: &std::path::Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path).expect("the recorded inputs");
     text.lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
         .map(|line| {
@@ -955,6 +1074,32 @@ fn record_unpack_answers() {
         let _ = writeln!(text, "{input}\t{}", support::recorded_form(&reply));
     }
     std::fs::write(recorded_unpack_path(), text).expect("written");
+}
+
+#[test]
+fn port_unpacks_old_as_recorded() {
+    let recorded = recorded_old_unpack();
+    assert!(recorded.len() > 50, "only {} inputs", recorded.len());
+    for (input, want) in recorded {
+        let got = answer(&old_unpack_request(&input));
+        assert_eq!(support::recorded_form(&got), want, "{input:.300}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-unpack-old.txt from the oracle"]
+fn record_old_unpack_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle) for inputs the rar_unpack_old fuzz target found, replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_old_unpack_answers -- --ignored\n",
+    );
+    for (input, _) in recorded_old_unpack() {
+        let reply = oracle.ask(&old_unpack_request(&input));
+        let _ = writeln!(text, "{input}\t{}", support::recorded_form(&reply));
+    }
+    std::fs::write(recorded_old_unpack_path(), text).expect("written");
 }
 
 #[cfg(target_os = "linux")]

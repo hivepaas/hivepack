@@ -69,6 +69,18 @@ fn put_file(out: &mut Vec<u8>, comp_info: u64, unp_size: u64, packed: &[u8]) {
 
 /// `rar.rar`'s first file header with these fields changed.
 fn put_file15(out: &mut Vec<u8>, dictionary: u16, solid: bool, unp_size: u32, packed: &[u8]) {
+    put_file15_as(out, 29, dictionary, solid, unp_size, packed);
+}
+
+/// The same, with this version of the algorithm.
+fn put_file15_as(
+    out: &mut Vec<u8>,
+    unp_ver: u8,
+    dictionary: u16,
+    solid: bool,
+    unp_size: u32,
+    packed: &[u8],
+) {
     let flags = 0x8000 | dictionary << 5 | u16::from(solid) << 4;
     let size = 32 + NAME15.len() as u16;
     let mut body = vec![0x74];
@@ -80,8 +92,8 @@ fn put_file15(out: &mut Vec<u8>, dictionary: u16, solid: bool, unp_size: u32, pa
     // No file CRC to speak of, and its time.
     body.extend_from_slice(&[0; 4]);
     body.extend_from_slice(b"\xb7\x76\xda\x3e");
-    // RAR 2.9's algorithm, and a method that is not stored.
-    body.extend_from_slice(&[29, 0x33]);
+    // The algorithm, and a method that is not stored.
+    body.extend_from_slice(&[unp_ver, 0x33]);
     body.extend_from_slice(&(NAME15.len() as u16).to_le_bytes());
     body.extend_from_slice(ATTRIBUTES15);
     body.extend_from_slice(NAME15);
@@ -150,6 +162,58 @@ pub fn with_packed_data(input: &[u8]) -> Vec<u8> {
         put_file(&mut out, comp_info, unp_size, packed);
     }
     out.extend_from_slice(END);
+    out
+}
+
+/// A copy of `rar.rar` with `input` from its fifth byte as data compressed by
+/// RAR 1.5 or 2.x, with entries going on from each other as only these can. The
+/// first byte says the algorithm (bits 0 and 1), the dictionary (bits 2 and 3),
+/// whether a second entry follows (bit 4), whether the archive is solid (bit 5),
+/// whether only 4 KiB are to come out (bit 6) and whether the second entry says
+/// it is solid (bit 7), and the next two where the second entry's data starts.
+/// The fourth says what the second entry's algorithm is (bits 0 and 1, the same
+/// first) and how much larger its dictionary (bits 2 and 3).
+pub fn with_old_packed_data(input: &[u8]) -> Vec<u8> {
+    const ALGORITHMS: [u8; 4] = [15, 20, 26, 13];
+    const SECOND: [u8; 4] = [0, 15, 20, 29];
+    let options = input.first().copied().unwrap_or(0);
+    let split = match input {
+        [_, a, b, ..] => usize::from(*a) | usize::from(*b) << 8,
+        _ => 0,
+    };
+    let more = input.get(3).copied().unwrap_or(0);
+    let packed = input.get(4..).unwrap_or(&[]);
+    let (first, second) = packed.split_at(split.min(packed.len()));
+
+    let algorithm = ALGORITHMS[usize::from(options & 3)];
+    let dictionary = u16::from(options >> 2 & 3);
+    let unp_size = if options & 64 != 0 { 4096 } else { u32::MAX };
+
+    // `MAIN15` with the archive's solid flag.
+    let mut main = vec![0x73];
+    main.extend_from_slice(&(u16::from(options & 32 != 0) << 3).to_le_bytes());
+    main.extend_from_slice(&MAIN15[12..20]);
+    let mut out = MAIN15[..7].to_vec();
+    out.extend_from_slice(&(crc32(&main) as u16).to_le_bytes());
+    out.extend_from_slice(&main);
+
+    if options & 16 != 0 {
+        put_file15_as(&mut out, algorithm, dictionary, false, unp_size, first);
+        let chosen = SECOND[usize::from(more & 3)];
+        let later = if chosen == 0 { algorithm } else { chosen };
+        let dictionary = dictionary + u16::from(more >> 2 & 3);
+        put_file15_as(
+            &mut out,
+            later,
+            dictionary,
+            options & 128 != 0,
+            unp_size,
+            second,
+        );
+    } else {
+        put_file15_as(&mut out, algorithm, dictionary, false, unp_size, packed);
+    }
+    out.extend_from_slice(END15);
     out
 }
 

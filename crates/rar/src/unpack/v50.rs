@@ -60,10 +60,10 @@ impl Unpack {
 
         loop {
             self.unp_ptr = self.wrap_up(self.unp_ptr);
-            self.reserve_window()?;
 
             self.first_win_done |= self.prev_ptr > self.unp_ptr;
             self.prev_ptr = self.unp_ptr;
+            self.reserve_window()?;
 
             if self.inp.in_addr >= self.read_border {
                 let mut file_done = false;

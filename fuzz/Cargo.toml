@@ -227,6 +227,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_unpack_old"
+path = "fuzz_targets/rar_unpack_old.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

@@ -13,8 +13,8 @@
 //! when testing an archive: each entry's data is read, given to a callback
 //! and checked against its hash, and nothing is created.
 //!
-//! So far stored entries and the compression of RAR 2.9 and later, not
-//! encrypted and whole in this volume: anything else is [`Error::NotYet`].
+//! So far entries not encrypted and whole in this volume: anything else is
+//! [`Error::NotYet`].
 
 use std::io;
 
@@ -87,6 +87,8 @@ pub struct Extract {
     pub broken_file: bool,
     /// `Unp`: made when first needed, and it lasts for a solid archive's sake.
     unp: Option<Box<Unpack>>,
+    /// `FileCount`: the entries gone through that were to be read.
+    file_count: u32,
 }
 
 impl Default for Extract {
@@ -97,6 +99,7 @@ impl Default for Extract {
             skip_solid: false,
             broken_file: false,
             unp: None,
+            file_count: 0,
         }
     }
 }
@@ -150,12 +153,6 @@ impl Extract {
         }
 
         let head = &arc.file_head;
-        if head.method != 0
-            && arc.format != Format::Rar50
-            && matches!(head.unp_ver, 13..=15 | 20 | 26)
-        {
-            return Err(Error::NotYet("compression of RAR 1.5 and 2.x"));
-        }
         if head.encrypted {
             return Err(Error::NotYet("encrypted data"));
         }
@@ -214,6 +211,8 @@ impl Extract {
             return Ok(true);
         }
 
+        self.file_count = self.file_count.wrapping_add(1);
+
         let mut hash = DataHash::new(arc.file_head.file_hash.kind);
         let mut show_checksum = true;
         if link_entry {
@@ -229,7 +228,12 @@ impl Extract {
             let unp = self.unp.get_or_insert_with(|| Box::new(Unpack::new()));
             unp.init(arc.file_head.win_size, arc.file_head.solid)?;
             unp.set_dest_size(arc.file_head.unp_size);
-            let (method, solid) = (arc.file_head.unp_ver, arc.file_head.solid);
+            // RAR 1.3 to 1.5 archives do not set a solid flag per file.
+            let (method, solid) = if arc.format != Format::Rar50 && arc.file_head.unp_ver <= 15 {
+                (15, self.file_count > 1 && arc.solid)
+            } else {
+                (arc.file_head.unp_ver, arc.file_head.solid)
+            };
             let packed_left = arc.file_head.pack_size as u64;
             let mut io = DataIo {
                 arc: &mut *arc,

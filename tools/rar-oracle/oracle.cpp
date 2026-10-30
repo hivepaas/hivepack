@@ -455,9 +455,7 @@ static void do_test(const char *hex, unsigned long long limit) {
         // character. That is choosing files, and hivepack-rar has no masks.
         if (size != 0 && Arc.GetHeaderType() == HEAD_FILE) {
           FileHeader &h = Arc.FileHead;
-          bool old_method = h.UnpVer >= 13 && h.UnpVer <= 15 || h.UnpVer == 20 || h.UnpVer == 26;
-          if ((h.Method != 0 && Arc.Format != RARFMT50 && old_method) || h.Encrypted ||
-              h.SplitBefore || h.SplitAfter ||
+          if (h.Encrypted || h.SplitBefore || h.SplitAfter ||
               !Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
             out += " later";
             Arc.SeekToNext();

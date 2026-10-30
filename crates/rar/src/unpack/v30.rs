@@ -127,10 +127,10 @@ impl Unpack {
 
         loop {
             self.unp_ptr &= self.max_win_mask();
-            self.reserve_window()?;
 
             self.first_win_done |= self.prev_ptr > self.unp_ptr;
             self.prev_ptr = self.unp_ptr;
+            self.reserve_window()?;
 
             if self.inp.in_addr > self.read_border && !self.unp_read_buf30(io)? {
                 break;

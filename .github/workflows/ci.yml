@@ -66,6 +66,7 @@ jobs:
       - run: cargo check -p hivepack-extract --lib --locked
       - run: cargo check -p hivepack-lz4 --lib --locked
       - run: cargo check -p hivepack-lz4 --lib --locked --features unsafe-fast
+      - run: cargo check -p hivepack-open --lib --locked
       - run: cargo check -p hivepack-tar --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
@@ -209,13 +210,13 @@ jobs:
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
   # feature, the compressor's frames and streaming calls against libzstd's,
   # inflate and deflate against zlib, bzip2 against libbzip2, lz4 against
-  # liblz4, and the xz decoders against liblzma, under AddressSanitizer. A
-  # few minutes per target; longer runs are done by hand (see
-  # fuzz/README.md).
+  # liblz4, and the xz decoders and encoders against liblzma, under
+  # AddressSanitizer. A few minutes per target; longer runs are done by hand
+  # (see fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         with:
@@ -367,21 +368,55 @@ jobs:
               pathlib.Path(f"fuzz/corpus/extract_tar/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_tar -- -max_total_time=60
+      - name: Seed the layers corpus with the recorded age files and what they hold
+        run: |
+          mkdir -p fuzz/corpus/open
+          python3 - <<'PY'
+          import pathlib
+          # Compressed tar archives and plain data, and age files of them,
+          # most to the key the target tries, each after a byte that picks
+          # no name.
+          lines = pathlib.Path("testdata/oracle/open.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("encrypt")):
+              request, answer = line.split("\t")
+              pathlib.Path(f"fuzz/corpus/open/p{i}").write_bytes(b"\0" + bytes.fromhex(request.split(" ")[3]))
+              pathlib.Path(f"fuzz/corpus/open/a{i}").write_bytes(b"\0" + bytes.fromhex(answer.split(" ")[1]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu open -- -max_total_time=30
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz
           python3 - <<'PY'
           import pathlib
           # The inputs of the recorded requests, each after a mode byte that
-          # picks their decoder (raw LZMA1 for the filters 1 and 2, raw LZMA2
-          # for 21) and a seed.
+          # picks their decoder (raw LZMA1 for chains that end with the
+          # filters 1 and 2, raw LZMA2 for 21) and a seed.
           modes = {"stream": 0, "auto": 1, "lzip": 2, "alone": 3}
           lines = pathlib.Path("testdata/oracle/xz.txt").read_text().splitlines()
           for i, line in enumerate(l for l in lines if l.startswith("decode ")):
               words = line.split("\t")[0].split(" ")
               kind = words[1].split(":")[0]
-              mode = modes.get(kind, 4 if words[1].startswith(("raw:1:", "raw:2:")) else 5)
+              last = words[1].split("+")[-1].removeprefix("raw:")
+              mode = modes.get(kind, 4 if last.startswith(("1:", "2:")) else 5)
               data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
               pathlib.Path(f"fuzz/corpus/xz/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu xz -- -max_total_time=90 -rss_limit_mb=4096
+      - name: Seed the xz_encode corpus
+        run: |
+          mkdir -p fuzz/corpus/xz_encode
+          python3 - <<'PY'
+          import pathlib
+          # The inputs of the recorded encodings, each after a mode byte
+          # that picks their encoder and a seed.
+          modes = {"easyenc": 0, "streamenc": 1, "aloneenc": 2}
+          lines = pathlib.Path("testdata/oracle/xz-encode.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("code ")):
+              words = line.split("\t")[0].split(" ")
+              kind = words[1].split(":")[0]
+              last = words[1].split("+")[-1].removeprefix("rawenc:")
+              mode = modes.get(kind, 4 if last.startswith("21:") else 3)
+              data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
+              pathlib.Path(f"fuzz/corpus/xz_encode/r{i}").write_bytes(bytes([mode]) + i.to_bytes(8, "little") + data)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu xz_encode -- -max_total_time=90 -rss_limit_mb=4096

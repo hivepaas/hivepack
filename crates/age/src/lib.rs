@@ -59,12 +59,14 @@ mod x25519;
 
 use std::io::{self, BufRead, BufReader, Read};
 
-pub use age::{Decryptor, FileKey, Identity, UnwrapError, decrypt};
+pub use age::{Decryptor, FileKey, FileKeyIdentity, Identity, UnwrapError, decrypt};
 pub use agessh::{EncryptedSshIdentity, SshEd25519Identity};
 pub use armor::{ArmoredReader, FOOTER as ARMOR_FOOTER, HEADER as ARMOR_HEADER};
 pub use error::{Error, NoIdentityMatch};
 pub use format::Stanza;
-pub use identity_file::{PassphraseFor, PassphrasePrompt, parse_identities_file};
+pub use identity_file::{
+    LazyScryptIdentity, PassphraseFor, PassphrasePrompt, parse_identities_file,
+};
 pub use parse::{BoxedIdentity, parse_identities};
 pub use scrypt::{DEFAULT_MAX_WORK_FACTOR, ScryptIdentity};
 pub use x25519::X25519Identity;

@@ -1,7 +1,7 @@
 //! The .lzma (LZMA_Alone) decoder: port of `common/alone_decoder.c`.
 
 use crate::common::{Action, MEMUSAGE_BASE, NextCoder, Ret, VLI_UNKNOWN};
-use crate::filter::{FILTER_LZMA1EXT, Filter, filter_init};
+use crate::filter::{FILTER_LZMA1EXT, Filter, FilterOptions, filter_init};
 use crate::lzma_common::{LZMA1EXT_ALLOW_EOPM, LzmaOptions};
 use crate::lzma_decoder::{decoder_memusage_nocheck, lclppb_decode};
 
@@ -60,9 +60,9 @@ impl AloneDecoder {
         }
         let filter = Filter {
             id: FILTER_LZMA1EXT,
-            options: Some(self.options.clone()),
+            options: Some(FilterOptions::Lzma(self.options.clone())),
         };
-        match filter_init(&filter, None) {
+        match filter_init(core::slice::from_ref(&filter)) {
             Ok(next) => self.next = Some(next),
             Err(ret) => {
                 self.next = None;

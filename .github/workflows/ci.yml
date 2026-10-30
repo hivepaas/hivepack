@@ -58,6 +58,7 @@ jobs:
           v=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
+      - run: cargo check -p hivepack-age --lib --locked
       - run: cargo check -p hivepack-bzip2 --lib --locked
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
@@ -291,3 +292,16 @@ jobs:
               pathlib.Path(f"fuzz/corpus/bzip2/r{i}").write_bytes(mode + bytes(8) + data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu bzip2 -- -max_total_time=90
+      - name: Seed the age corpus with the recorded files
+        run: |
+          mkdir -p fuzz/corpus/age
+          python3 - <<'PY'
+          import pathlib
+          # Files age encrypted, damaged or not, many to the identity and
+          # passphrase the target tries.
+          lines = pathlib.Path("testdata/oracle/age.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith("decrypt")):
+              data = line.split("\t")[0].split(" ")[2]
+              pathlib.Path(f"fuzz/corpus/age/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu age -- -max_total_time=60

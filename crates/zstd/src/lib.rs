@@ -190,11 +190,14 @@
 mod common;
 mod compress;
 mod decompress;
+mod dict_builder;
 
 #[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod oracle_compress;
+#[cfg(test)]
+mod oracle_dict_legacy;
 #[cfg(test)]
 mod oracle_sequences;
 

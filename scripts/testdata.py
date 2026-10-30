@@ -304,7 +304,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                         "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))
-    for part in ("common", "compress", "decompress"):
+    for part in ("common", "compress", "decompress", "dictBuilder"):
         files += sorted(str(f) for f in (lib / part).glob("*.c")
                         if f"{part}/{f.name}" not in included)
     subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", "-DZSTD_MULTITHREAD", "-pthread",

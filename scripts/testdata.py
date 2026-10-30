@@ -235,15 +235,15 @@ LIBLZMA_LEFT_OUT = ["hardware_",
                     "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
 
 
-# nettle's AES (encryption only), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, in
-# C: what the oracles call, without the assembly versions or the fat
+# nettle's AES (encryption only), SHA-1, MD5, HMAC-SHA1 and PBKDF2-HMAC-SHA1,
+# in C: what the oracles call, without the assembly versions or the fat
 # builds that choose between them.
 NETTLE_SOURCES = [
     "aes-set-encrypt-key.c", "aes128-set-encrypt-key.c", "aes192-set-encrypt-key.c",
     "aes256-set-encrypt-key.c", "aes-set-key-internal.c", "aes-encrypt-internal.c",
     "aes-encrypt-table.c", "aes128-encrypt.c", "aes192-encrypt.c", "aes256-encrypt.c",
-    "sha1.c", "sha1-compress.c", "sha1-meta.c", "hmac.c", "hmac-sha1.c", "pbkdf2.c",
-    "pbkdf2-hmac-sha1.c", "memxor.c", "write-be32.c",
+    "sha1.c", "sha1-compress.c", "sha1-meta.c", "md5.c", "hmac.c", "hmac-sha1.c", "pbkdf2.c",
+    "pbkdf2-hmac-sha1.c", "memxor.c", "write-be32.c", "write-le32.c",
 ]
 
 

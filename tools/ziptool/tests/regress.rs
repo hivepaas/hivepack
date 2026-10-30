@@ -6,7 +6,7 @@
 //! The programs are this crate's `ziptool`, which stands for libzip's
 //! `ziptool_regress`, and `tryopen`. A test that uses a command the port's
 //! ziptool has not got yet (adding data, compression, encryption), needs a
-//! feature hivepack-zip has not got (LZMA, Zstandard), or runs
+//! feature hivepack-zip has not got (`FTS`), or runs
 //! another of libzip's test programs, is skipped and counted. Each file a
 //! test gives must hold what it says afterwards, or be gone where it says
 //! `{}`, and no other file may be left in the folder. The tests come from the libzip 1.12.1
@@ -167,7 +167,11 @@ fn parse(text: &str) -> Test {
             }
             // WinZip AES, which needs a crypto library in libzip, bzip2,
             // and LZMA and XZ.
-            "features" if matches!(rest, "HAVE_CRYPTO" | "HAVE_LIBBZ2" | "HAVE_LIBLZMA") => {}
+            "features"
+                if matches!(
+                    rest,
+                    "HAVE_CRYPTO" | "HAVE_LIBBZ2" | "HAVE_LIBLZMA" | "HAVE_LIBZSTD"
+                ) => {}
             "stdin" if rest.is_empty() => test.stdin = inline(&mut lines),
             "stdout" if rest.is_empty() => test.stdout = inline(&mut lines),
             "stderr" if rest.is_empty() => test.stderr = inline(&mut lines),

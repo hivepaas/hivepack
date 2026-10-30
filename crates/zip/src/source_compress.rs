@@ -1,9 +1,10 @@
 //! The decompressing and compressing layers: port of
-//! `zip_source_compress.c`, with deflate, bzip2, LZMA and XZ for algorithms.
+//! `zip_source_compress.c`, with deflate, bzip2, LZMA, XZ and Zstandard for algorithms.
 
 use crate::algorithm_bzip2::{self, Bzip2};
 use crate::algorithm_deflate::{self, CompressionStatus, DeflateCompress, DeflateDecompress};
 use crate::algorithm_xz::{self, Xz};
+use crate::algorithm_zstd::{self, Zstd};
 use crate::dirent::{CM_DEFAULT, cm_actual};
 use crate::error::{Detail, Error, ErrorCode, Result};
 use crate::source_data::{FileAttributes, GENERAL_PURPOSE_BIT_FLAGS_ALLOWED_MASK, file_attributes};
@@ -30,6 +31,7 @@ pub(crate) enum DecompressAlgorithm {
     Deflate(DeflateDecompress),
     Bzip2(Bzip2),
     Xz(Xz),
+    Zstd(Zstd),
 }
 
 /// A compressing algorithm, the same for compressing.
@@ -37,6 +39,7 @@ pub(crate) enum CompressAlgorithm {
     Deflate(DeflateCompress),
     Bzip2(Bzip2),
     Xz(Xz),
+    Zstd(Zstd),
 }
 
 /// The algorithms' functions, the same for both directions.
@@ -48,6 +51,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(_) => algorithm_deflate::VERSION_NEEDED,
                     Self::Bzip2(_) => algorithm_bzip2::VERSION_NEEDED,
                     Self::Xz(_) => algorithm_xz::VERSION_NEEDED,
+                    Self::Zstd(_) => algorithm_zstd::VERSION_NEEDED,
                 }
             }
 
@@ -56,6 +60,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(a) => a.general_purpose_bit_flags(),
                     Self::Bzip2(a) => a.general_purpose_bit_flags(),
                     Self::Xz(a) => a.general_purpose_bit_flags(),
+                    Self::Zstd(a) => a.general_purpose_bit_flags(),
                 }
             }
 
@@ -64,6 +69,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(a) => a.start(),
                     Self::Bzip2(a) => a.start(),
                     Self::Xz(a) => a.start(st, attributes),
+                    Self::Zstd(a) => a.start(),
                 }
             }
 
@@ -72,6 +78,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(a) => a.end(),
                     Self::Bzip2(a) => a.end(),
                     Self::Xz(a) => a.end(),
+                    Self::Zstd(a) => a.end(),
                 }
             }
 
@@ -80,6 +87,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(a) => a.input(length),
                     Self::Bzip2(a) => a.input(length),
                     Self::Xz(a) => a.input(buffer, length),
+                    Self::Zstd(a) => a.input(length),
                 }
             }
 
@@ -88,6 +96,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(a) => a.end_of_input(),
                     Self::Bzip2(a) => a.end_of_input(),
                     Self::Xz(a) => a.end_of_input(),
+                    Self::Zstd(a) => a.end_of_input(),
                 }
             }
 
@@ -96,6 +105,7 @@ macro_rules! algorithm_functions {
                     Self::Deflate(a) => a.process(buffer, data),
                     Self::Bzip2(a) => a.process(buffer, data),
                     Self::Xz(a) => a.process(buffer, data),
+                    Self::Zstd(a) => a.process(buffer, data),
                 }
             }
         }
@@ -106,14 +116,14 @@ algorithm_functions!(CompressAlgorithm);
 
 /// The decompressing algorithm for `method`, if libzip has one: port of
 /// `_zip_get_compression_algorithm`, for decompressing. Differs from
-/// libzip, which is often built with Zstandard too: that comes with its
-/// crate; and libzip has no Deflate64, which is read here.
+/// libzip, which has no Deflate64, read here.
 pub(crate) fn get_compression_algorithm(method: u16) -> Option<DecompressAlgorithm> {
     match method {
         cm::DEFLATE => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(false))),
         cm::DEFLATE64 => Some(DecompressAlgorithm::Deflate(DeflateDecompress::new(true))),
         cm::BZIP2 => Some(DecompressAlgorithm::Bzip2(Bzip2::decompressor())),
         cm::LZMA | cm::XZ => Some(DecompressAlgorithm::Xz(Xz::decompressor(method))),
+        cm::ZSTD => Some(DecompressAlgorithm::Zstd(Zstd::decompressor())),
         _ => None,
     }
 }
@@ -133,6 +143,7 @@ fn get_compressing_algorithm(method: u16, compression_flags: u32) -> Option<Comp
             method,
             compression_flags,
         ))),
+        cm::ZSTD => Some(CompressAlgorithm::Zstd(Zstd::compressor(compression_flags))),
         _ => None,
     }
 }
@@ -144,6 +155,7 @@ pub(crate) fn maximum_compressed_size(method: u16, size: u64) -> Option<u64> {
         cm::DEFLATE => Some(algorithm_deflate::maximum_compressed_size(size)),
         cm::BZIP2 => Some(algorithm_bzip2::maximum_compressed_size(size)),
         cm::LZMA | cm::XZ => Some(algorithm_xz::maximum_compressed_size(size)),
+        cm::ZSTD => Some(algorithm_zstd::maximum_compressed_size(size)),
         _ => None,
     }
 }

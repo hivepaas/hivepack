@@ -55,7 +55,7 @@ An archive's sizes are what it says, and archive bombs say what gets them past a
 | `max_entries` | 100,000 | counted before anything is read |
 | `max_entry_size` | 4 GiB | |
 | `max_total_size` | 16 GiB | |
-| `max_ratio` | 2,000 | bytes written for each compressed byte, once an entry has written `ratio_threshold` (1 MiB). Deflate tops out near 1,032 to one, which a file of zeros reaches, so this stops only methods that go further: Deflate64, and bzip2, LZMA and XZ, whose files of zeros reach far beyond it and need a higher limit |
+| `max_ratio` | 2,000 | bytes written for each compressed byte, once an entry has written `ratio_threshold` (1 MiB). Deflate tops out near 1,032 to one, which a file of zeros reaches, so this stops only methods that go further: Deflate64, and bzip2, LZMA, XZ and Zstandard, whose files of zeros reach far beyond it and need a higher limit |
 
 The sizes the archive declares are checked against the limits before anything is written, then the data is counted as it comes, and an entry stops as soon as it passes a limit or the size it declared (`SizeMismatch`). Nothing is allocated from a declared size.
 

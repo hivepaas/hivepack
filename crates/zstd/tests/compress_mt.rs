@@ -871,6 +871,8 @@ impl Side for Port {
 /// caller's thread has written out, and the jobs that are compressing or
 /// waiting for a thread are at most one more than the workers (8 here).
 fn progression_problem(side: &dyn Side, taken: usize, written: usize) -> Option<String> {
+    // In this order, for the workers go on producing between the two.
+    let to_flush_now = side.to_flush_now();
     let fp = side.progression();
     let problem = if fp.ingested != taken as u64 {
         format!("ingested {} of {taken} taken", fp.ingested)
@@ -880,11 +882,8 @@ fn progression_problem(side: &dyn Side, taken: usize, written: usize) -> Option<
         "before the first job, more produced than flushed, or more than one job".into()
     } else if fp.current_job_id > 0 && (fp.flushed != written as u64 || fp.nb_active_workers > 9) {
         format!("{written} bytes written, or too many active jobs")
-    } else if side
-        .to_flush_now()
-        .is_some_and(|now| now as u64 > fp.produced - fp.flushed)
-    {
-        format!("{:?} to flush now", side.to_flush_now())
+    } else if to_flush_now.is_some_and(|now| now as u64 > fp.produced - fp.flushed) {
+        format!("{to_flush_now:?} to flush now")
     } else {
         return None;
     };

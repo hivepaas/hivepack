@@ -8,7 +8,7 @@
 //! or CP437 and the Info-ZIP Unicode extra fields, WinZip AES headers,
 //! torrentzip, and, with [`OpenFlags::CHECKCONS`], the comparison of every
 //! local header with the central directory. It reads stored, deflated,
-//! bzip2, LZMA, XZ and Deflate64 entries, decrypts ZipCrypto and WinZip AES
+//! bzip2, LZMA, XZ, Zstandard and Deflate64 entries, decrypts ZipCrypto and WinZip AES
 //! ones with a password, and checks the CRC-32 and length of an entry read
 //! to its end, as libzip does. It edits archives as libzip does too: entries
 //! are added from a [`DataSource`], replaced, deleted, renamed, given comments,
@@ -64,6 +64,7 @@ mod add_entry;
 mod algorithm_bzip2;
 mod algorithm_deflate;
 mod algorithm_xz;
+mod algorithm_zstd;
 mod buffer;
 mod close;
 mod delete;

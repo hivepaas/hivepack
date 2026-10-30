@@ -486,6 +486,7 @@ fn get_compression_method(arg: &str) -> i32 {
         "bzip2" => i32::from(cm::BZIP2),
         "lzma" => i32::from(cm::LZMA),
         "xz" => i32::from(cm::XZ),
+        "zstd" => i32::from(cm::ZSTD),
         "unknown" => 100,
         // TODO in libzip: error handling
         _ => 0,

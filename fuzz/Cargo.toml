@@ -119,6 +119,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "zip_ppmd"
+path = "fuzz_targets/zip_ppmd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "zip_edit"
 path = "fuzz_targets/zip_edit.rs"
 test = false

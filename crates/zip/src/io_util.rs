@@ -44,6 +44,11 @@ pub(crate) fn read_string<R: ReadAt + ?Sized>(
     src: &mut Source<R>,
     len: u16,
 ) -> Result<Option<ZipString>> {
-    let raw = read_data(buffer, src, usize::from(len))?;
-    ZipString::new(&raw, Flags::ENC_GUESS)
+    match buffer {
+        Some(buffer) => match buffer.get(u64::from(len)) {
+            Some(raw) => ZipString::new(raw, Flags::ENC_GUESS),
+            None => Err(Error::new(ErrorCode::Memory, 0)),
+        },
+        None => ZipString::new(&read_data(None, src, usize::from(len))?, Flags::ENC_GUESS),
+    }
 }

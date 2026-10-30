@@ -92,24 +92,57 @@ impl core::error::Error for DecodeError {}
  *  Reading and writing into memory
  **************************************/
 
+/// How the decoder's fast loop reads and writes its pieces: with bounds
+/// checks ([`Checked`]), or, with the `unsafe-fast` feature, without
+/// (`unchecked::Unchecked`, which only an `unsafe fn` makes). The rest of
+/// the decoder is always `Checked`.
+pub(crate) trait Mode: Copy {
+    /// Whether the pieces are bounds-checked.
+    const CHECKED: bool;
+
+    /// `N` bytes of `buf` from `at`.
+    fn read<const N: usize>(self, buf: &[u8], at: usize) -> [u8; N];
+
+    /// `bytes` written to `buf` at `at`.
+    fn write<const N: usize>(self, buf: &mut [u8], at: usize, bytes: [u8; N]);
+}
+
+/// Pieces read and written with bounds checks.
+#[derive(Clone, Copy)]
+pub(crate) struct Checked;
+
+impl Mode for Checked {
+    const CHECKED: bool = true;
+
+    #[inline(always)]
+    fn read<const N: usize>(self, buf: &[u8], at: usize) -> [u8; N] {
+        let mut bytes = [0; N];
+        bytes.copy_from_slice(&buf[at..at + N]);
+        bytes
+    }
+
+    #[inline(always)]
+    fn write<const N: usize>(self, buf: &mut [u8], at: usize, bytes: [u8; N]) {
+        buf[at..at + N].copy_from_slice(&bytes);
+    }
+}
+
 #[inline(always)]
-fn read_le16(bytes: &[u8], at: usize) -> usize {
-    usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+fn read_le16<M: Mode>(m: M, bytes: &[u8], at: usize) -> usize {
+    usize::from(u16::from_le_bytes(m.read(bytes, at)))
 }
 
 /// `LZ4_memcpy(op, ip, N)` from the block's input to its output.
 #[inline(always)]
-fn copy_in<const N: usize>(out: &mut [u8], op: usize, src: &[u8], ip: usize) {
-    out[op..op + N].copy_from_slice(&src[ip..ip + N]);
+fn copy_in<M: Mode, const N: usize>(m: M, out: &mut [u8], op: usize, src: &[u8], ip: usize) {
+    m.write::<N>(out, op, m.read(src, ip));
 }
 
 /// `LZ4_memcpy(op, match, N)` within the output, where the two do not
 /// overlap or the copy reads before it writes.
 #[inline(always)]
-fn copy_within<const N: usize>(out: &mut [u8], op: usize, from: usize) {
-    let mut bytes = [0; N];
-    bytes.copy_from_slice(&out[from..from + N]);
-    out[op..op + N].copy_from_slice(&bytes);
+fn copy_within<M: Mode, const N: usize>(m: M, out: &mut [u8], op: usize, from: usize) {
+    m.write::<N>(out, op, m.read(out, from));
 }
 
 /// How much a wild copy of `step` bytes at a time from `op` until `end`
@@ -127,15 +160,21 @@ fn wild_len(op: usize, end: usize, step: usize) -> usize {
 /// of `STEP` bytes, each reading what the ones before wrote: when the
 /// source ends before the destination starts, one copy does the same.
 #[inline(always)]
-fn copy_forward<const STEP: usize>(out: &mut [u8], mut op: usize, mut from: usize, n: usize) {
-    // Short copies stay inline.
-    if n > 32 && op - from >= n {
+fn copy_forward<M: Mode, const STEP: usize>(
+    m: M,
+    out: &mut [u8],
+    mut op: usize,
+    mut from: usize,
+    n: usize,
+) {
+    // Short copies stay inline, as do unchecked ones.
+    if M::CHECKED && n > 32 && op - from >= n {
         out.copy_within(from..from + n, op);
         return;
     }
     let end = op + n;
     while op < end {
-        copy_within::<STEP>(out, op, from);
+        copy_within::<M, STEP>(m, out, op, from);
         op += STEP;
         from += STEP;
     }
@@ -144,8 +183,8 @@ fn copy_forward<const STEP: usize>(out: &mut [u8], mut op: usize, mut from: usiz
 /// `LZ4_wildCopy8`: copies 8 bytes at a time from `from` to `op` until
 /// `end`, at least once, so that up to 8 bytes past `end` are written too.
 #[inline(always)]
-fn wild_copy8(out: &mut [u8], op: usize, from: usize, end: usize) {
-    copy_forward::<8>(out, op, from, wild_len(op, end, 8));
+fn wild_copy8<M: Mode>(m: M, out: &mut [u8], op: usize, from: usize, end: usize) {
+    copy_forward::<M, 8>(m, out, op, from, wild_len(op, end, 8));
 }
 
 /// `LZ4_wildCopy8` from the input: the source is apart from the output,
@@ -159,7 +198,7 @@ fn wild_copy8_in(out: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, end: 
     }
     let end = op + n;
     while op < end {
-        copy_in::<8>(out, op, src, ip);
+        copy_in::<Checked, 8>(Checked, out, op, src, ip);
         op += 8;
         ip += 8;
     }
@@ -169,16 +208,16 @@ fn wild_copy8_in(out: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, end: 
 /// once, so that offsets of 16 or more work), writing up to 32 bytes past
 /// `end`.
 #[inline(always)]
-fn wild_copy32(out: &mut [u8], op: usize, from: usize, end: usize) {
-    copy_forward::<16>(out, op, from, wild_len(op, end, 32));
+fn wild_copy32<M: Mode>(m: M, out: &mut [u8], op: usize, from: usize, end: usize) {
+    copy_forward::<M, 16>(m, out, op, from, wild_len(op, end, 32));
 }
 
 /// `LZ4_wildCopy32` from the input, in one copy.
 #[inline(always)]
-fn wild_copy32_in(out: &mut [u8], op: usize, src: &[u8], ip: usize, end: usize) {
+fn wild_copy32_in<M: Mode>(m: M, out: &mut [u8], op: usize, src: &[u8], ip: usize, end: usize) {
     let n = wild_len(op, end, 32);
     if n == 32 {
-        copy_in::<32>(out, op, src, ip);
+        copy_in::<M, 32>(m, out, op, src, ip);
     } else {
         out[op..op + n].copy_from_slice(&src[ip..ip + n]);
     }
@@ -192,21 +231,28 @@ const DEC64TABLE: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 /// (`inc32table`), and the copy goes on from `dec64table` further on, 8
 /// bytes or more behind. Returns where the copy goes on from.
 #[inline(always)]
-fn copy_short_offset(out: &mut [u8], op: usize, mut from: usize, offset: usize) -> usize {
+fn copy_short_offset<M: Mode>(
+    m: M,
+    out: &mut [u8],
+    op: usize,
+    mut from: usize,
+    offset: usize,
+) -> usize {
     // `LZ4_write32(op, 0)`: silences an msan warning when offset == 0.
-    out[op..op + 4].fill(0);
-    out[op] = out[from];
-    out[op + 1] = out[from + 1];
-    out[op + 2] = out[from + 2];
-    out[op + 3] = out[from + 3];
-    from += INC32TABLE[offset];
-    copy_within::<4>(out, op + 4, from);
-    from.wrapping_add_signed(-DEC64TABLE[offset])
+    m.write(out, op, [0u8; 4]);
+    for i in 0..4 {
+        let [byte] = m.read::<1>(out, from + i);
+        m.write(out, op + i, [byte]);
+    }
+    from += INC32TABLE[offset & 7];
+    copy_within::<M, 4>(m, out, op + 4, from);
+    from.wrapping_add_signed(-DEC64TABLE[offset & 7])
 }
 
 /// `LZ4_memcpy_using_offset_base`.
 #[inline(always)]
-fn memcpy_using_offset_base(
+fn memcpy_using_offset_base<M: Mode>(
+    m: M,
     out: &mut [u8],
     mut op: usize,
     mut from: usize,
@@ -214,43 +260,50 @@ fn memcpy_using_offset_base(
     offset: usize,
 ) {
     if offset < 8 {
-        from = copy_short_offset(out, op, from, offset);
+        from = copy_short_offset(m, out, op, from, offset);
         op += 8;
     } else {
-        copy_within::<8>(out, op, from);
+        copy_within::<M, 8>(m, out, op, from);
         op += 8;
         from += 8;
     }
-    wild_copy8(out, op, from, end);
+    wild_copy8(m, out, op, from, end);
 }
 
 /// `LZ4_memcpy_using_offset`: a match closer than 16 bytes, which can
 /// write up to 12 bytes past `end`. Offsets of 1, 2 and 4 repeat a
 /// pattern of 8 bytes.
 #[inline(always)]
-fn memcpy_using_offset(out: &mut [u8], mut op: usize, from: usize, end: usize, offset: usize) {
-    let mut v = [0u8; 8];
-    match offset {
-        1 => v = [out[from]; 8],
+fn memcpy_using_offset<M: Mode>(
+    m: M,
+    out: &mut [u8],
+    mut op: usize,
+    from: usize,
+    end: usize,
+    offset: usize,
+) {
+    let v: [u8; 8] = match offset {
+        1 => {
+            let [byte] = m.read::<1>(out, from);
+            [byte; 8]
+        }
         2 => {
-            v[..2].copy_from_slice(&out[from..from + 2]);
-            v[2..4].copy_from_slice(&out[from..from + 2]);
-            let first = [v[0], v[1], v[2], v[3]];
-            v[4..].copy_from_slice(&first);
+            let [a, b] = m.read::<2>(out, from);
+            [a, b, a, b, a, b, a, b]
         }
         4 => {
-            v[..4].copy_from_slice(&out[from..from + 4]);
-            v[4..].copy_from_slice(&out[from..from + 4]);
+            let [a, b, c, d] = m.read::<4>(out, from);
+            [a, b, c, d, a, b, c, d]
         }
         _ => {
-            memcpy_using_offset_base(out, op, from, end, offset);
+            memcpy_using_offset_base(m, out, op, from, end, offset);
             return;
         }
-    }
-    out[op..op + 8].copy_from_slice(&v);
+    };
+    m.write(out, op, v);
     op += 8;
     while op < end {
-        out[op..op + 8].copy_from_slice(&v);
+        m.write(out, op, v);
         op += 8;
     }
 }
@@ -340,20 +393,21 @@ enum Resume {
 /// 8, 8 and 2 bytes, each reading what the one before wrote. 18 or more
 /// behind, the source is all before `op`, and one copy does.
 #[inline(always)]
-fn copy_match18(out: &mut [u8], op: usize, offset: usize) {
-    if offset >= 18
+fn copy_match18<M: Mode>(m: M, out: &mut [u8], op: usize, offset: usize) {
+    if M::CHECKED
+        && offset >= 18
         && let Some((hist, rest)) = out.split_at_mut_checked(op)
         && let Some(from) = hist.len().checked_sub(offset)
-        && let Some(m) = hist[from..].first_chunk::<18>()
+        && let Some(source) = hist[from..].first_chunk::<18>()
         && let Some(o) = rest.first_chunk_mut::<18>()
     {
-        *o = *m;
+        *o = *source;
         return;
     }
     let from = op - offset;
-    copy_within::<8>(out, op, from);
-    copy_within::<8>(out, op + 8, from + 8);
-    copy_within::<2>(out, op + 16, from + 16);
+    copy_within::<M, 8>(m, out, op, from);
+    copy_within::<M, 8>(m, out, op + 8, from + 8);
+    copy_within::<M, 2>(m, out, op + 16, from + 16);
 }
 
 /// The fast loop's match, past its fast path: the offset checked, then
@@ -361,7 +415,8 @@ fn copy_match18(out: &mut [u8], op: usize, offset: usize) {
 /// for an error, and moves `op` past the match.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn match_rest<const PARTIAL: bool, const DICT: u8>(
+fn match_rest<M: Mode, const PARTIAL: bool, const DICT: u8>(
+    m: M,
     out: &mut [u8],
     op: &mut usize,
     mut length: usize,
@@ -401,9 +456,9 @@ fn match_rest<const PARTIAL: bool, const DICT: u8>(
     let from = *op - offset;
     debug_assert!(oend - *op >= 32);
     if offset < 16 {
-        memcpy_using_offset(out, *op, from, cpy, offset);
+        memcpy_using_offset(m, out, *op, from, cpy, offset);
     } else {
-        wild_copy32(out, *op, from, cpy);
+        wild_copy32(m, out, *op, from, cpy);
     }
     // Wild-copy correction.
     *op = cpy;
@@ -434,18 +489,80 @@ pub(crate) fn decompress_generic(
     low_prefix: usize,
     dict: &[u8],
 ) -> Result<usize, DecodeError> {
-    // Each case its own code, as liblz4 inlines LZ4_decompress_generic
-    // into each API function with its directives as constants.
+    #[cfg(feature = "unsafe-fast")]
+    {
+        // SAFETY: the fast loop of `decode` is the only code that uses the
+        // mode, and each of its pieces is in its buffer, by the checks
+        // liblz4's fast loop makes (which the port makes too):
+        //
+        // - The loop is entered when `oend - op >= FASTLOOP_SAFE_DISTANCE`,
+        //   and goes round again only after a sequence that ends before
+        //   `oend - FASTLOOP_SAFE_DISTANCE`, so 64 bytes of output are free
+        //   from `op` at its top. The input is never empty there: the
+        //   decoder returns first for an empty block, and every sequence
+        //   that goes round again stopped at least 1 byte short of `iend`
+        //   (the checks below, and `read_variable_length`'s limits).
+        // - The token: `ip < iend`.
+        // - Literals of up to 14 bytes: 16 copied when `ip + 17 <= iend`,
+        //   into the 64 free bytes. Longer ones: in one or more pieces of 32
+        //   when `length + 32 <= oend - op` and `length + 32 <= iend - ip`
+        //   (computed so as not to wrap), so the last piece, which ends at
+        //   most 31 bytes past `length`, is in both.
+        // - The offset: 2 bytes at `ip`, which the literal checks left at
+        //   least 3 (short) or 32 (long) bytes before `iend`.
+        // - A match: copied only when `op + length < oend - 64`. Its source
+        //   starts `offset` bytes behind `op`, at `low_prefix` or later
+        //   (the offset checks, `outside` and `before_prefix`; with
+        //   `WithPrefix64k` the 64 KB before `start`), so at 0 or later,
+        //   and reads only bytes before what it writes. The 18-byte copy
+        //   (offset 8 or more) writes `op..op + 18`; the others write at most
+        //   32 bytes past `op + length` (`wild_copy32`), or 12
+        //   (`memcpy_using_offset`), all short of `oend`. Matches from the
+        //   external dictionary are copied with bounds checks.
+        //
+        // Debug builds assert each piece in bounds, and the tests and the
+        // fuzzer run with the feature (see `docs/unsafe.md`).
+        #[allow(unsafe_code)]
+        let m = unsafe { crate::unchecked::Unchecked::new() };
+        dispatch(m, src, out, start, partial, dict_mode, low_prefix, dict)
+    }
+    #[cfg(not(feature = "unsafe-fast"))]
+    dispatch(
+        Checked, src, out, start, partial, dict_mode, low_prefix, dict,
+    )
+}
+
+/// `decode` for each case, its own code, as liblz4 inlines
+/// LZ4_decompress_generic into each API function with its directives as
+/// constants.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn dispatch<M: Mode>(
+    m: M,
+    src: &[u8],
+    out: &mut [u8],
+    start: usize,
+    partial: bool,
+    dict_mode: DictDirective,
+    low_prefix: usize,
+    dict: &[u8],
+) -> Result<usize, DecodeError> {
     use DictDirective::{NoDict, UsingExtDict, WithPrefix64k};
     match (partial, dict_mode) {
-        (false, NoDict) => decode::<false, NO_DICT>(src, out, start, low_prefix, dict),
+        (false, NoDict) => decode::<M, false, NO_DICT>(m, src, out, start, low_prefix, dict),
         (false, WithPrefix64k) => {
-            decode::<false, WITH_PREFIX_64K>(src, out, start, low_prefix, dict)
+            decode::<M, false, WITH_PREFIX_64K>(m, src, out, start, low_prefix, dict)
         }
-        (false, UsingExtDict) => decode::<false, USING_EXT_DICT>(src, out, start, low_prefix, dict),
-        (true, NoDict) => decode::<true, NO_DICT>(src, out, start, low_prefix, dict),
-        (true, WithPrefix64k) => decode::<true, WITH_PREFIX_64K>(src, out, start, low_prefix, dict),
-        (true, UsingExtDict) => decode::<true, USING_EXT_DICT>(src, out, start, low_prefix, dict),
+        (false, UsingExtDict) => {
+            decode::<M, false, USING_EXT_DICT>(m, src, out, start, low_prefix, dict)
+        }
+        (true, NoDict) => decode::<M, true, NO_DICT>(m, src, out, start, low_prefix, dict),
+        (true, WithPrefix64k) => {
+            decode::<M, true, WITH_PREFIX_64K>(m, src, out, start, low_prefix, dict)
+        }
+        (true, UsingExtDict) => {
+            decode::<M, true, USING_EXT_DICT>(m, src, out, start, low_prefix, dict)
+        }
     }
 }
 
@@ -456,7 +573,8 @@ const USING_EXT_DICT: u8 = 2;
 
 /// `LZ4_decompress_generic`, for one `partialDecoding` and `dict`.
 #[inline(always)]
-fn decode<const PARTIAL: bool, const DICT: u8>(
+fn decode<M: Mode, const PARTIAL: bool, const DICT: u8>(
+    m: M,
     src: &[u8],
     out: &mut [u8],
     start: usize,
@@ -523,7 +641,8 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
             // through windows of the input and output of a known size,
             // where the compiler sees that the copies are in bounds. The
             // same reads and writes as below.
-            if let Some(w) = src.get(ip..).and_then(<[u8]>::first_chunk::<18>)
+            if M::CHECKED
+                && let Some(w) = src.get(ip..).and_then(<[u8]>::first_chunk::<18>)
                 && usize::from(w[0] >> ML_BITS) < RUN_MASK
                 && let Some(o) = out.get_mut(op..).and_then(<[u8]>::first_chunk_mut::<32>)
             {
@@ -536,16 +655,17 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                 let ml = usize::from(token) & ML_MASK;
                 if ml != ML_MASK {
                     let length = ml + MINMATCH;
-                    if op + length >= oend - FASTLOOP_SAFE_DISTANCE {
+                    if op.saturating_add(length) >= oend - FASTLOOP_SAFE_DISTANCE {
                         resume = Resume::MatchCopy { length, offset };
                         break 'fast;
                     }
                     if (DICT == WITH_PREFIX_64K || !before_prefix(op, offset)) && offset >= 8 {
-                        copy_match18(out, op, offset);
+                        copy_match18(m, out, op, offset);
                         op += length;
                         continue;
                     }
-                    if !match_rest::<PARTIAL, DICT>(
+                    if !match_rest::<M, PARTIAL, DICT>(
+                        m,
                         out,
                         &mut op,
                         length,
@@ -568,11 +688,12 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                     return Err(DecodeError::at(ip));
                 };
                 let length = ml + addl + MINMATCH;
-                if op + length >= oend - FASTLOOP_SAFE_DISTANCE {
+                if op.saturating_add(length) >= oend - FASTLOOP_SAFE_DISTANCE {
                     resume = Resume::MatchCopy { length, offset };
                     break 'fast;
                 }
-                if !match_rest::<PARTIAL, DICT>(
+                if !match_rest::<M, PARTIAL, DICT>(
+                    m,
                     out,
                     &mut op,
                     length,
@@ -586,7 +707,7 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                 continue;
             }
 
-            let token = src[ip];
+            let [token] = m.read::<1>(src, ip);
             ip += 1;
             let mut length = usize::from(token >> ML_BITS);
 
@@ -600,18 +721,20 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                 length += addl;
 
                 // Copy the literals.
-                if op + length > oend - 32 || (ip + length) as isize > iend as isize - 32 {
+                // As `op + length > oend - 32 || ip + length > iend - 32`,
+                // without wrapping around.
+                if length.saturating_add(32) > oend - op || length.saturating_add(32) > iend - ip {
                     resume = Resume::LiteralCopy { token, length };
                     break 'fast;
                 }
-                wild_copy32_in(out, op, src, ip, op + length);
+                wild_copy32_in(m, out, op, src, ip, op + length);
                 ip += length;
                 op += length;
             } else if ip as isize <= iend as isize - (16 + 1) {
                 // Literals are at most 14 bytes, but compilers optimise a
                 // copy of a register's size better. oend is checked once
                 // for each loop below.
-                copy_in::<16>(out, op, src, ip);
+                copy_in::<M, 16>(m, out, op, src, ip);
                 ip += length;
                 op += length;
             } else {
@@ -620,7 +743,7 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
             }
 
             // Get the offset.
-            let offset = read_le16(src, ip);
+            let offset = read_le16(m, src, ip);
             ip += 2;
 
             // Get the match length.
@@ -637,26 +760,27 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                 };
                 length += addl;
                 length += MINMATCH;
-                if op + length >= oend - FASTLOOP_SAFE_DISTANCE {
+                if op.saturating_add(length) >= oend - FASTLOOP_SAFE_DISTANCE {
                     resume = Resume::MatchCopy { length, offset };
                     break 'fast;
                 }
             } else {
                 length += MINMATCH;
-                if op + length >= oend - FASTLOOP_SAFE_DISTANCE {
+                if op.saturating_add(length) >= oend - FASTLOOP_SAFE_DISTANCE {
                     resume = Resume::MatchCopy { length, offset };
                     break 'fast;
                 }
 
                 // Fast path: no LZ4_wildCopy32 when true.
                 if (DICT == WITH_PREFIX_64K || !before_prefix(op, offset)) && offset >= 8 {
-                    copy_match18(out, op, offset);
+                    copy_match18(m, out, op, offset);
                     op += length;
                     continue;
                 }
             }
 
-            if !match_rest::<PARTIAL, DICT>(
+            if !match_rest::<M, PARTIAL, DICT>(
+                m,
                 out,
                 &mut op,
                 length,
@@ -694,7 +818,7 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                     && ((ip as isize) < shortiend) & ((op as isize) <= shortoend)
                 {
                     // Copy the literals.
-                    copy_in::<16>(out, op, src, ip);
+                    copy_in::<Checked, 16>(Checked, out, op, src, ip);
                     op += length;
                     ip += length;
 
@@ -702,7 +826,7 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                     // the full info. If it doesn't work out, the info
                     // won't be wasted.
                     length = usize::from(token) & ML_MASK;
-                    let offset = read_le16(src, ip);
+                    let offset = read_le16(Checked, src, ip);
                     ip += 2;
 
                     // Do not deal with overlapping matches.
@@ -712,9 +836,9 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                     {
                         // Copy the match.
                         let from = op - offset;
-                        copy_within::<8>(out, op, from);
-                        copy_within::<8>(out, op + 8, from + 8);
-                        copy_within::<2>(out, op + 16, from + 16);
+                        copy_within::<Checked, 8>(Checked, out, op, from);
+                        copy_within::<Checked, 8>(Checked, out, op + 8, from + 8);
+                        copy_within::<Checked, 2>(Checked, out, op + 16, from + 16);
                         op += length + MINMATCH;
                         // Both stages worked: load the next token.
                         continue;
@@ -788,7 +912,7 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
             }
 
             // Get the offset, and the match length.
-            let offset = read_le16(src, ip);
+            let offset = read_le16(Checked, src, ip);
             ip += 2;
             resume = Resume::CopyMatch {
                 length: usize::from(token) & ML_MASK,
@@ -875,9 +999,9 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
         }
 
         if offset < 8 {
-            from = copy_short_offset(out, op, from, offset);
+            from = copy_short_offset(Checked, out, op, from, offset);
         } else {
-            copy_within::<8>(out, op, from);
+            copy_within::<Checked, 8>(Checked, out, op, from);
             from += 8;
         }
         op += 8;
@@ -889,7 +1013,7 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                 return Err(DecodeError::at(ip));
             }
             if op < o_copy_limit {
-                wild_copy8(out, op, from, o_copy_limit);
+                wild_copy8(Checked, out, op, from, o_copy_limit);
                 from += o_copy_limit - op;
                 op = o_copy_limit;
             }
@@ -899,9 +1023,9 @@ fn decode<const PARTIAL: bool, const DICT: u8>(
                 from += 1;
             }
         } else {
-            copy_within::<8>(out, op, from);
+            copy_within::<Checked, 8>(Checked, out, op, from);
             if length > 16 {
-                wild_copy8(out, op + 8, from + 8, cpy);
+                wild_copy8(Checked, out, op + 8, from + 8, cpy);
             }
         }
         // Wild-copy correction.

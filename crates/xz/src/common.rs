@@ -26,9 +26,10 @@ pub(crate) enum Ret {
 }
 
 /// `lzma_action`, with the same numbers.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Action {
     /// `LZMA_RUN`: continue coding.
+    #[default]
     Run = 0,
     /// `LZMA_SYNC_FLUSH`: make all the input available as output.
     SyncFlush = 1,
@@ -105,7 +106,10 @@ pub(crate) fn bufcpy(
 /// (`in`, `in_pos`, `in_size`) to its output (`out`, `out_pos`,
 /// `out_size`). The input is `input[*in_pos..]` and the output
 /// `output[*out_pos..]`.
-pub(crate) trait NextCoder {
+///
+/// Differs from liblzma: `Send`, so that a [`Stream`](crate::Stream) is,
+/// as an `lzma_stream` may be used from any thread.
+pub(crate) trait NextCoder: Send {
     /// `code`.
     fn code(
         &mut self,
@@ -329,4 +333,9 @@ pub(crate) fn read64le(buf: &[u8]) -> u64 {
     u64::from_le_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ])
+}
+
+/// `write32le`.
+pub(crate) fn write32le(buf: &mut [u8], value: u32) {
+    buf[..4].copy_from_slice(&value.to_le_bytes());
 }

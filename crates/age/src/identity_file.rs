@@ -19,12 +19,14 @@ use crate::armor::{ArmoredReader, HEADER as ARMOR_HEADER, MAX_WHITESPACE, trim_s
 use crate::error::Error;
 use crate::format::Stanza;
 use crate::parse::BoxedIdentity;
-use crate::scrypt::ScryptIdentity;
+use crate::scrypt::{DEFAULT_MAX_WORK_FACTOR, ScryptIdentity};
 use crate::x25519::X25519Identity;
 
 /// What a passphrase is asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassphraseFor {
+    /// The file being decrypted, encrypted with a passphrase.
+    File,
     /// A file of keys encrypted with age and a passphrase.
     IdentityFile,
     /// An SSH private key protected by a passphrase.
@@ -175,10 +177,41 @@ fn parse_identities<R: Read>(f: R) -> Result<Vec<BoxedIdentity>, String> {
     Ok(ids)
 }
 
-/// `LazyScryptIdentity`: a passphrase asked for when the file turns out
-/// to be encrypted with one.
-struct LazyScryptIdentity {
+/// `LazyScryptIdentity` (`cmd/age/encrypted_keys.go`): a passphrase asked
+/// for only when the file turns out to be encrypted with one; nothing is
+/// asked for a file encrypted to keys.
+pub struct LazyScryptIdentity {
     passphrase: PassphrasePrompt,
+    what: PassphraseFor,
+    max_work_factor: u8,
+}
+
+impl LazyScryptIdentity {
+    /// An identity that asks `passphrase` (told [`PassphraseFor::File`])
+    /// only for a file encrypted with a passphrase, which it then unwraps;
+    /// a wrong one fails the file ("incorrect passphrase"), as
+    /// `age --decrypt` does.
+    pub fn new(passphrase: PassphrasePrompt) -> LazyScryptIdentity {
+        LazyScryptIdentity {
+            passphrase,
+            what: PassphraseFor::File,
+            max_work_factor: DEFAULT_MAX_WORK_FACTOR,
+        }
+    }
+
+    /// The largest scrypt work factor to accept, as
+    /// [`ScryptIdentity::set_max_work_factor`] takes it. As in age, the
+    /// passphrase is asked for first: a file that asks for more then fails
+    /// without the work being done.
+    pub fn set_max_work_factor(&mut self, log_n: u8) {
+        self.max_work_factor = log_n.clamp(1, 30);
+    }
+}
+
+impl std::fmt::Debug for LazyScryptIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyScryptIdentity").finish_non_exhaustive()
+    }
 }
 
 impl Identity for LazyScryptIdentity {
@@ -191,11 +224,12 @@ impl Identity for LazyScryptIdentity {
         if stanzas.len() != 1 || stanzas[0].kind != "scrypt" {
             return Err(UnwrapError::Incorrect(INCORRECT_IDENTITY.into()));
         }
-        let mut pass = (self.passphrase)(PassphraseFor::IdentityFile)
+        let mut pass = (self.passphrase)(self.what)
             .map_err(|e| UnwrapError::Invalid(format!("could not read passphrase: {e}")))?;
         let ii = ScryptIdentity::new(&pass);
         pass.fill(0);
-        let ii = ii.map_err(UnwrapError::Invalid)?;
+        let mut ii = ii.map_err(UnwrapError::Invalid)?;
+        ii.set_max_work_factor(self.max_work_factor);
         match ii.unwrap(stanzas) {
             Err(UnwrapError::Incorrect(_)) => {
                 Err(UnwrapError::Invalid("incorrect passphrase".into()))
@@ -218,6 +252,8 @@ impl EncryptedIdentity {
     fn decrypt(&self) -> Result<Vec<BoxedIdentity>, String> {
         let lazy = LazyScryptIdentity {
             passphrase: self.passphrase.clone(),
+            what: PassphraseFor::IdentityFile,
+            max_work_factor: DEFAULT_MAX_WORK_FACTOR,
         };
         let d = match decrypt(&self.contents[..], &[&lazy]) {
             Ok(d) => d,

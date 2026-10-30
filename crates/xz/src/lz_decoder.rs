@@ -277,6 +277,13 @@ impl LzCoder {
     }
 }
 
+impl LzCoder {
+    /// The next filter in the chain, made after this one.
+    pub(crate) fn set_next(&mut self, next: Option<Box<dyn NextCoder>>) {
+        self.next = next;
+    }
+}
+
 impl Dict {
     /// `lz_decoder_reset`.
     fn lz_reset(&mut self) {

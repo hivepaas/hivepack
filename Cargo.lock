@@ -201,6 +201,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "hivepack-zip",
+ "rustix",
 ]
 
 [[package]]

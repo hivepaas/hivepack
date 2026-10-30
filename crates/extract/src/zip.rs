@@ -260,6 +260,11 @@ pub fn extract_zip<R: ReadAt>(
 ) -> Result<Summary, Error> {
     let limits = &options.limits;
     let run = Run::new(options);
+    if let Some(origin) = &options.origin {
+        origin
+            .check_supported()
+            .map_err(|e| Error::global(ErrorKind::Origin(e)))?;
+    }
     let n = archive.get_num_entries(Flags::NONE);
     if n > limits.max_entries {
         return Err(Error::global(ErrorKind::TooManyEntries));
@@ -285,8 +290,8 @@ pub fn extract_zip<R: ReadAt>(
             .fold(0, u64::saturating_add),
     );
 
-    let destination =
-        Destination::open(destination).map_err(|e| Error::global(ErrorKind::Io(e)))?;
+    let destination = Destination::open(destination, options.origin.as_ref())
+        .map_err(|e| Error::global(ErrorKind::Io(e)))?;
     let mut summary = Summary {
         skipped,
         ..Summary::default()
@@ -401,6 +406,10 @@ fn write_file<R: ReadAt>(
     })?;
     if written != item.size {
         return Err(ErrorKind::SizeMismatch);
+    }
+    // The mark first: writing a stream can change the file's time.
+    if let Some(origin) = &options.origin {
+        origin.write_file(&file).map_err(ErrorKind::Origin)?;
     }
 
     if let Some(mtime) = item.mtime {

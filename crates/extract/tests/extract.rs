@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hivepack_extract::{
-    Cancel, ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Progress, Summary,
-    extract_zip,
+    Cancel, ErrorKind, Limits, Links, NameError, Names, OnRefused, Options, Origin, Progress,
+    Summary, extract_zip,
 };
 use hivepack_zip::{Archive, BufferSource, Flags, OpenFlags, cm, em, opsys};
 
@@ -263,6 +263,36 @@ fn the_same_path_twice_is_refused() {
     let data = zip(&[Entry::File(b"d/x", b"1"), Entry::Dir(b"d/")]);
     extract(&data, &scratch.out(), &Options::default()).unwrap();
     assert_eq!(listing(&scratch.out()), ["d/", "d/x"]);
+}
+
+/// One name written two ways, which macOS or a case-insensitive file
+/// system takes for one, is the same path.
+#[test]
+fn one_name_written_two_ways_is_the_same_path() {
+    for (a, b) in [
+        ("caf\u{e9}.txt", "cafe\u{301}.txt"),
+        ("\u{212a}.txt", "k.txt"),
+        ("\u{3c3}.txt", "\u{3c2}.txt"),
+        // Full case folding, as macOS folds names: it takes `fi` for the
+        // ligature, and refuses the second.
+        ("stra\u{df}e.txt", "strasse.txt"),
+        ("\u{fb01}", "fi"),
+        // A directory one way, then on the way of another entry.
+        ("caf\u{e9}/a", "cafe\u{301}/b"),
+    ] {
+        let scratch = Scratch::new();
+        let data = zip(&[
+            Entry::File(a.as_bytes(), b"1"),
+            Entry::File(b.as_bytes(), b"2"),
+        ]);
+        let error = extract(&data, &scratch.out(), &Options::default()).unwrap_err();
+        assert!(
+            matches!(error.kind, ErrorKind::Duplicate { first: 0 }),
+            "{a:?} {b:?}: {error}"
+        );
+        assert!(!scratch.out().exists());
+    }
+    assert_eq!(hivepack_extract::UNICODE_VERSION, (18, 0, 0));
 }
 
 #[test]
@@ -888,6 +918,123 @@ fn required(group: &str) -> bool {
     required.split(',').any(|g| g == "all" || g == group)
 }
 
+/// A mark this system cannot carry stops the extraction before anything is
+/// written: an extraction that drops it would hide where files came from.
+#[test]
+fn a_mark_this_system_cannot_carry_is_refused() {
+    let scratch = Scratch::new();
+    let data = zip(&[Entry::File(b"a.txt", b"a")]);
+    let foreign = if cfg!(windows) {
+        Origin::Quarantine(b"0083;6720f5a0;Safari;".to_vec())
+    } else {
+        Origin::ZoneIdentifier(b"[ZoneTransfer]\r\nZoneId=3\r\n".to_vec())
+    };
+    let error = extract(
+        &data,
+        &scratch.out(),
+        &options(|o| o.origin = Some(foreign)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error.kind, ErrorKind::Origin(e) if e.kind() == std::io::ErrorKind::Unsupported),
+        "{error}"
+    );
+    assert!(!scratch.out().exists());
+}
+
+/// Linux and the other systems have no mark.
+#[cfg(not(any(windows, target_os = "macos")))]
+#[test]
+fn other_systems_have_no_mark() {
+    let scratch = Scratch::new();
+    let path = scratch.path().join("a.zip");
+    std::fs::write(&path, zip(&[Entry::File(b"a", b"1")])).unwrap();
+    assert_eq!(Origin::of(&path).unwrap(), None);
+}
+
+/// The archive's Mark of the Web is carried to every file, as it is,
+/// written from each file's handle. One file is named `a`, which beside a
+/// colon would name drive A; the files keep their time.
+#[cfg(windows)]
+#[test]
+fn the_mark_of_the_web_is_carried() {
+    let scratch = Scratch::new();
+    let path = scratch.path().join("download.zip");
+    std::fs::write(
+        &path,
+        zip(&[Entry::File(b"a", b"1"), Entry::File(b"d/b.txt", b"2")]),
+    )
+    .unwrap();
+    assert_eq!(Origin::of(&path).unwrap(), None);
+    let mark = b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/download.zip\r\n";
+    std::fs::write(format!("{}:Zone.Identifier", path.display()), mark).unwrap();
+    let origin = Origin::of(&path).unwrap().unwrap();
+    assert_eq!(origin, Origin::ZoneIdentifier(mark.to_vec()));
+
+    let data = std::fs::read(&path).unwrap();
+    let summary = extract(&data, &scratch.out(), &options(|o| o.origin = Some(origin))).unwrap();
+    assert_eq!(summary.files, 2);
+    for file in ["a", "d/b.txt"] {
+        let file = scratch.out().join(file);
+        let stream = format!("{}:Zone.Identifier", file.display());
+        assert_eq!(std::fs::read(&stream).unwrap(), mark, "{stream}");
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            MTIME as u64
+        );
+    }
+}
+
+/// The archive's quarantine is carried to every file, and to every
+/// directory created, as an app is one, as it is.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_quarantine_is_carried() {
+    const QUARANTINE: &str = "com.apple.quarantine";
+    fn quarantine(path: &Path) -> Option<Vec<u8>> {
+        let mut value = Vec::with_capacity(1024);
+        rustix::fs::getxattr(path, QUARANTINE, rustix::buffer::spare_capacity(&mut value))
+            .ok()
+            .map(|_| value)
+    }
+    let scratch = Scratch::new();
+    let path = scratch.path().join("download.zip");
+    std::fs::write(
+        &path,
+        zip(&[
+            Entry::File(b"a", b"1"),
+            Entry::Dir(b"Some.app/"),
+            Entry::File(b"Some.app/Contents/MacOS/some", b"2"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(Origin::of(&path).unwrap(), None);
+    let mark = b"0083;6720f5a0;Safari;3A2B1C0D-0000-4000-8000-000000000000";
+    rustix::fs::setxattr(&path, QUARANTINE, mark, rustix::fs::XattrFlags::empty()).unwrap();
+    let origin = Origin::of(&path).unwrap().unwrap();
+    assert_eq!(origin, Origin::Quarantine(mark.to_vec()));
+
+    let data = std::fs::read(&path).unwrap();
+    extract(&data, &scratch.out(), &options(|o| o.origin = Some(origin))).unwrap();
+    for item in [
+        "a",
+        "Some.app",
+        "Some.app/Contents",
+        "Some.app/Contents/MacOS",
+        "Some.app/Contents/MacOS/some",
+    ] {
+        assert_eq!(
+            quarantine(&scratch.out().join(item)).as_deref(),
+            Some(&mark[..]),
+            "{item}"
+        );
+    }
+}
+
 /// The archives of libzip's tests, where the libzip sources are fetched.
 fn regress_archives() -> Vec<(String, Vec<u8>)> {
     let regress = testdata().join("libzip-1.12.1-source/libzip-1.12.1/regress");
@@ -1025,4 +1172,130 @@ fn fifield_zip_bombs_write_nothing() {
             );
         }
     }
+}
+
+/// ZipDiff's archives (`testdata/zipdiff`), which ZIP parsers read
+/// differently, read from the one archive they are kept in.
+fn zipdiff_archives() -> Vec<(String, Vec<u8>)> {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/zipdiff/constructions.zip");
+    let data = std::fs::read(path).unwrap();
+    let za = Archive::open(data.as_slice(), OpenFlags::CHECKCONS).unwrap();
+    (0..za.get_num_entries(Flags::NONE))
+        .map(|i| {
+            let name = String::from_utf8_lossy(za.get_name(i, Flags::NONE).unwrap()).into_owned();
+            let mut file = za.fopen_index(i, Flags::NONE).unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// Every archive of ZipDiff that opens extracts, or stops with its reason,
+/// and writes nothing outside the destination.
+#[test]
+fn zipdiff_archives_extract_or_stop_cleanly() {
+    let archives = zipdiff_archives();
+    assert_eq!(archives.len(), 5927);
+    let mut outcomes = std::collections::BTreeMap::<(String, &str, String), usize>::new();
+    for ((name, data), (flags, opened)) in archives.iter().flat_map(|archive| {
+        [
+            (OpenFlags::CHECKCONS, "checked"),
+            (OpenFlags(0), "unchecked"),
+        ]
+        .map(|flags| (archive, flags))
+    }) {
+        let group = name.split('/').next().unwrap().to_string();
+        let Ok(archive) = Archive::open(data.as_slice(), flags) else {
+            *outcomes
+                .entry((group, opened, "not opened".into()))
+                .or_default() += 1;
+            continue;
+        };
+        let scratch = Scratch::new();
+        std::fs::write(scratch.path().join("sentinel"), b"untouched").unwrap();
+        let outcome = match extract_zip(&archive, &scratch.out(), &Options::default()) {
+            Ok(summary) => {
+                let files = listing(&scratch.out())
+                    .iter()
+                    .filter(|path| !path.ends_with('/'))
+                    .count();
+                assert_eq!(files as u64, summary.files, "{name}");
+                "extracted".to_string()
+            }
+            Err(error) => {
+                let kind = format!("{:?}", error.kind);
+                kind.split(['(', ' ', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        let mut around = listing(scratch.path());
+        around.retain(|path| !path.starts_with("out/") && path != "out/");
+        assert_eq!(around, ["sentinel"], "{name}");
+        *outcomes.entry((group, opened, outcome)).or_default() += 1;
+    }
+    let found: Vec<String> = outcomes
+        .iter()
+        .map(|((group, opened, outcome), n)| format!("{group} {opened} {outcome}: {n}"))
+        .collect();
+    // What each folder holds is in testdata/zipdiff/README.md, and what
+    // these say in docs/extract.md.
+    let expected = [
+        "a1 checked not opened: 2",
+        "a1 unchecked Archive: 1",
+        "a1 unchecked extracted: 1",
+        "a2 checked Archive: 8",
+        "a2 checked SizeMismatch: 80",
+        "a2 checked extracted: 273",
+        "a2 checked not opened: 4248",
+        "a2 unchecked Archive: 1152",
+        "a2 unchecked SizeMismatch: 576",
+        "a2 unchecked extracted: 2881",
+        "a3 checked extracted: 2",
+        "a3 checked not opened: 5",
+        "a3 unchecked extracted: 7",
+        "a4 checked Name: 1",
+        "a4 checked extracted: 8",
+        "a4 unchecked Name: 1",
+        "a4 unchecked extracted: 8",
+        "a5 checked extracted: 1",
+        "a5 checked not opened: 2",
+        "a5 unchecked Archive: 2",
+        "a5 unchecked extracted: 1",
+        "b1 checked not opened: 1",
+        "b1 unchecked Duplicate: 1",
+        "b2 checked Duplicate: 1",
+        "b2 checked Name: 275",
+        "b2 checked extracted: 685",
+        "b2 checked not opened: 221",
+        "b2 unchecked Duplicate: 154",
+        "b2 unchecked Name: 343",
+        "b2 unchecked extracted: 685",
+        "b3 checked Name: 20",
+        "b3 unchecked Name: 20",
+        "b4 checked Duplicate: 1",
+        "b4 unchecked Duplicate: 1",
+        "c1 checked Overlap: 1",
+        "c1 checked extracted: 4",
+        "c1 checked not opened: 2",
+        "c1 unchecked Overlap: 1",
+        "c1 unchecked extracted: 5",
+        "c1 unchecked not opened: 1",
+        "c2 checked not opened: 3",
+        "c2 unchecked extracted: 3",
+        "c3 checked extracted: 1",
+        "c3 checked not opened: 7",
+        "c3 unchecked extracted: 2",
+        "c3 unchecked not opened: 6",
+        "c4 checked not opened: 1",
+        "c4 unchecked extracted: 1",
+        "c5 checked extracted: 7",
+        "c5 checked not opened: 67",
+        "c5 unchecked extracted: 9",
+        "c5 unchecked not opened: 65",
+    ];
+    assert_eq!(found, expected);
 }

@@ -270,6 +270,13 @@
       "kind": "tool"
     },
     {
+      "name": "zipdiff-constructions",
+      "path": "zipdiff",
+      "source": "https://github.com/ouuan/ZipDiff at commit 7c427ed254bb3a5985d54870c12f97db78118e67: the archives its construction program writes, packed into constructions.zip (see zipdiff/README.md)",
+      "license": "Apache-2.0",
+      "kind": "archives"
+    },
+    {
       "name": "fifield-zipbombs",
       "fetch": { "group": "core", "files": [{ "url": "https://www.bamsoftware.com/hacks/zipbomb/zbsm.zip", "sha256": "fb4ff972d21189beec11e05109c4354d0cd6d3b629263d6c950cf8cc3f78bd99" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zblg.zip", "sha256": "f1dc920869794df3e258f42f9b99157104cd3f8c14394c1b9d043d6fcda14c0a" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zbxl.zip", "sha256": "eafd8f574ea7fd0f345eaa19eae8d0d78d5323c8154592c850a2d78a86817744" }] },
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",
@@ -282,6 +289,13 @@
       "source": "https://github.com/C2SP/CCTV/tree/4448f2097b2d/age (the Go module c2sp.org/CCTV/age, which age v1.3.2 tests with), from Go's module proxy",
       "license": "0BSD OR CC0-1.0 OR Unlicense (the vectors)",
       "kind": "vectors"
+    },
+    {
+      "name": "unicode-18.0.0",
+      "fetch": { "group": "core", "files": [{ "url": "https://www.unicode.org/Public/18.0.0/ucd/UnicodeData.txt", "sha256": "0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950" }, { "url": "https://www.unicode.org/Public/18.0.0/ucd/CaseFolding.txt", "sha256": "a004797658a457bec4dc11683e39f69249ea3b595b752dbea6721c4c9f587b0d" }, { "url": "https://www.unicode.org/Public/18.0.0/ucd/NormalizationTest.txt", "sha256": "25a50d816764b04abfb4a646d3eb2b2a803284c3873d9a06757b94fe4513dde3" }] },
+      "source": "https://www.unicode.org/Public/18.0.0/ucd/ (the Unicode Character Database 18.0.0)",
+      "license": "Unicode-3.0",
+      "kind": "source"
     },
     {
       "name": "decodecorpus",

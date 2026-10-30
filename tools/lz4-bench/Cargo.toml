@@ -1,0 +1,22 @@
+[package]
+name = "lz4-bench"
+version = "0.0.0"
+description = "Times hivepack-lz4 against liblz4 and lz4_flex on the same inputs"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# lz4_flex's safe code, its default. Without it (`--no-default-features`),
+# lz4_flex's unsafe code, which is faster.
+default = ["flex-safe"]
+flex-safe = ["lz4_flex/safe-decode", "lz4_flex/safe-encode"]
+
+[dependencies]
+hivepack-lz4.workspace = true
+lz4.workspace = true
+lz4_flex = { workspace = true, features = ["std", "frame"] }

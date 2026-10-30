@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
+members = ["crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/lz4", "crates/tar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/xz-bench", "tools/ziptool", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,7 @@ hivepack-bzip2 = { path = "crates/bzip2" }
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-extract = { path = "crates/extract" }
+hivepack-lz4 = { path = "crates/lz4" }
 hivepack-tar = { path = "crates/tar" }
 hivepack-xz = { path = "crates/xz" }
 hivepack-zip = { path = "crates/zip" }
@@ -38,6 +39,13 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 # interface to it, with its default backend, libbz2-rs-sys (a translation
 # of the same C), left out.
 bzip2 = { version = "0.6.1", default-features = false, features = ["bzip2-sys", "static"] }
+# lz4-sys 1.11.1 bundles liblz4 1.10.0, the release hivepack-lz4 ports,
+# and builds it rather than linking the system's liblz4. The lz4 crate is
+# the safe interface to it.
+lz4 = "=1.28.1"
+lz4-sys = "=1.11.1"
+# lz4_flex, another LZ4 in Rust, only for tools/lz4-bench to compare with.
+lz4_flex = { version = "=0.14.0", default-features = false }
 # liblzma-sys 0.4.9 bundles liblzma 5.8.4, the release hivepack-xz ports,
 # and its `static` feature builds that rather than linking the system's
 # liblzma, which may be another version. The liblzma crate is the safe
@@ -77,6 +85,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bzip2-sys]
+opt-level = 3
+
+[profile.dev.package.lz4-sys]
 opt-level = 3
 
 [profile.dev.package.liblzma-sys]

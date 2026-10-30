@@ -596,6 +596,17 @@ fn generating_sequences_fails_as_libzstd_fails() {
         code(p.generate_sequences(&mut seqs, &src[..1000])),
         Err(ErrorCode::ParameterUnsupported)
     );
+    // Nor with a target size for compressed blocks.
+    p.set_parameter(P::NbWorkers(0)).expect("the port sets it");
+    p.set_parameter(P::TargetCBlockSize(1340))
+        .expect("the port sets it");
+    assert_eq!(
+        code(p.generate_sequences(&mut seqs, &src[..1000])),
+        Err(ErrorCode::ParameterUnsupported)
+    );
+    p.set_parameter(P::TargetCBlockSize(0))
+        .expect("the port sets it");
+    assert!(p.generate_sequences(&mut seqs, &src[..1000]).is_ok());
 }
 
 #[test]

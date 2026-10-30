@@ -5,7 +5,8 @@
 //! ([`decompress`], [`DCtx::decompress`]) or streaming
 //! ([`DCtx::decompress_stream`]), with dictionaries through [`DDict`].
 //! Compression works at every level, with every strategy, the block
-//! splitter after the sequences and long distance matching, in one call
+//! splitter after the sequences, long distance matching and a target size
+//! for compressed blocks ([`CParameter::TargetCBlockSize`]), in one call
 //! ([`compress`], [`CCtx::compress`], [`CCtx::compress2`]) or streaming
 //! ([`CCtx::compress_stream2`]), with libzstd's parameters
 //! ([`CCtx::set_parameter`]), giving the frames libzstd gives; with

@@ -41,6 +41,7 @@ use crate::compress::zstd_compress_sequences::{
     DefaultPolicy, zstd_build_ctable, zstd_cross_entropy_cost, zstd_encode_sequences,
     zstd_fse_bit_cost, zstd_select_encoding_type,
 };
+use crate::compress::zstd_compress_superblock::zstd_compress_super_block;
 use crate::compress::zstd_double_fast::{
     zstd_compress_block_double_fast, zstd_compress_block_double_fast_dict_match_state,
     zstd_compress_block_double_fast_ext_dict,
@@ -469,37 +470,38 @@ const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300;
 const ZSTD_MAX_NB_BLOCK_SPLITS: usize = 196;
 
 /// `ZSTD_hufCTablesMetadata_t`: how the literals would be encoded, and the
-/// size of a new table's description.
-///
-/// Differs from libzstd: without the description itself, which libzstd
-/// keeps for its superblocks (`ZSTD_c_targetCBlockSize`). The port writes
-/// it into a buffer as large, so that it fails where libzstd's does, and
-/// keeps only its size. The estimates read nothing else.
+/// description of a new table, which the superblocks of
+/// `ZSTD_c_targetCBlockSize` write.
 #[derive(Clone, Copy, Debug)]
-struct HufCTablesMetadata {
-    h_type: SymbolEncodingType,
-    huf_des_size: usize,
+pub(crate) struct HufCTablesMetadata {
+    pub(crate) h_type: SymbolEncodingType,
+    /// `hufDesBuffer`: the new table's description, its first
+    /// `huf_des_size` bytes, for `h_type` `Compressed`.
+    pub(crate) huf_des_buffer: [u8; ZSTD_MAX_HUF_HEADER_SIZE],
+    pub(crate) huf_des_size: usize,
 }
 
 /// `ZSTD_fseCTablesMetadata_t`: how each kind of code would be encoded,
-/// and the size of the new tables' descriptions.
-///
-/// Differs from libzstd: without the descriptions themselves, nor the
-/// size of the last one, which only its superblocks read. The port writes
-/// them into a buffer as large, as libzstd does.
+/// and the descriptions of the new tables.
 #[derive(Clone, Copy, Debug)]
-struct FseCTablesMetadata {
-    ll_type: SymbolEncodingType,
-    of_type: SymbolEncodingType,
-    ml_type: SymbolEncodingType,
-    fse_tables_size: usize,
+pub(crate) struct FseCTablesMetadata {
+    pub(crate) ll_type: SymbolEncodingType,
+    pub(crate) of_type: SymbolEncodingType,
+    pub(crate) ml_type: SymbolEncodingType,
+    /// `fseTablesBuffer`: the new tables' descriptions, their first
+    /// `fse_tables_size` bytes.
+    pub(crate) fse_tables_buffer: [u8; ZSTD_MAX_FSE_HEADERS_SIZE],
+    pub(crate) fse_tables_size: usize,
+    /// The size of the last new table's description: see
+    /// [`zstd_entropy_compress_seq_store_internal`].
+    pub(crate) last_count_size: usize,
 }
 
 /// `ZSTD_entropyCTablesMetadata_t`
 #[derive(Clone, Copy, Debug)]
-struct EntropyCTablesMetadata {
-    huf: HufCTablesMetadata,
-    fse: FseCTablesMetadata,
+pub(crate) struct EntropyCTablesMetadata {
+    pub(crate) huf: HufCTablesMetadata,
+    pub(crate) fse: FseCTablesMetadata,
 }
 
 /// libzstd's `size_t` for `result`: the size, or the error's code, as
@@ -527,8 +529,10 @@ fn zstd_build_block_entropy_stats_literals(
     let mut max_symbol_value = HUF_SYMBOLVALUE_MAX;
     let mut huff_log = LIT_HUF_LOG;
     let mut repeat = prev_huf.repeat_mode;
-    let metadata = |h_type, huf_des_size| HufCTablesMetadata {
+    let mut huf_des_buffer = [0u8; ZSTD_MAX_HUF_HEADER_SIZE];
+    let metadata = |h_type, huf_des_buffer, huf_des_size| HufCTablesMetadata {
         h_type,
+        huf_des_buffer,
         huf_des_size,
     };
 
@@ -536,7 +540,7 @@ fn zstd_build_block_entropy_stats_literals(
     next_huf.clone_from(prev_huf);
 
     if literals_compression_is_disabled {
-        return Ok(metadata(SymbolEncodingType::Basic, 0));
+        return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
     }
 
     // Too few to try compressing (a speed optimization).
@@ -546,7 +550,7 @@ fn zstd_build_block_entropy_stats_literals(
         COMPRESS_LITERALS_SIZE_MIN
     };
     if src_size <= min_lit_size {
-        return Ok(metadata(SymbolEncodingType::Basic, 0));
+        return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
     }
 
     // The symbol statistics.
@@ -554,11 +558,11 @@ fn zstd_build_block_entropy_stats_literals(
         let largest = hist_count_wksp(&mut count, &mut max_symbol_value, src, &mut hist_wksp)?;
         if largest == src_size {
             // A single symbol.
-            return Ok(metadata(SymbolEncodingType::Rle, 0));
+            return Ok(metadata(SymbolEncodingType::Rle, huf_des_buffer, 0));
         }
         if largest <= (src_size >> 7) + 4 {
             // A heuristic: probably not compressible.
-            return Ok(metadata(SymbolEncodingType::Basic, 0));
+            return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
         }
     }
 
@@ -584,7 +588,6 @@ fn zstd_build_block_entropy_stats_literals(
 
     // The table's description; or the previous table, or none, if better.
     let new_c_size = huf_estimate_compressed_size(&next_huf.ctable, &count, max_symbol_value);
-    let mut huf_des_buffer = [0u8; ZSTD_MAX_HUF_HEADER_SIZE];
     let h_size = huf_write_ctable_wksp(
         &mut huf_des_buffer,
         &next_huf.ctable,
@@ -602,16 +605,20 @@ fn zstd_build_block_entropy_stats_literals(
                 || h_size_or_code.wrapping_add(12) >= src_size)
         {
             next_huf.clone_from(prev_huf);
-            return Ok(metadata(SymbolEncodingType::Repeat, 0));
+            return Ok(metadata(SymbolEncodingType::Repeat, huf_des_buffer, 0));
         }
     }
     if new_c_size.wrapping_add(h_size_or_code) >= src_size {
         // No gain.
         next_huf.clone_from(prev_huf);
-        return Ok(metadata(SymbolEncodingType::Basic, 0));
+        return Ok(metadata(SymbolEncodingType::Basic, huf_des_buffer, 0));
     }
     next_huf.repeat_mode = HufRepeat::Check;
-    Ok(metadata(SymbolEncodingType::Compressed, h_size?))
+    Ok(metadata(
+        SymbolEncodingType::Compressed,
+        huf_des_buffer,
+        h_size?,
+    ))
 }
 
 /// `ZSTD_buildDummySequencesStatistics`: the encodings of no sequences;
@@ -660,13 +667,17 @@ fn zstd_build_block_entropy_stats_sequences(
         ll_type: stats.ll_type,
         of_type: stats.off_type,
         ml_type: stats.ml_type,
+        fse_tables_buffer,
         fse_tables_size: stats.size,
+        last_count_size: stats.last_count_size,
     })
 }
 
 /// `ZSTD_buildBlockEntropyStats`: how the literals and the sequences of
-/// `seqs` would be encoded, and the tables, into `next_entropy`.
-fn zstd_build_block_entropy_stats(
+/// `seqs` would be encoded, and the tables, into `next_entropy`. The block
+/// splitter's estimates and the superblocks of `ZSTD_c_targetCBlockSize`
+/// start from them.
+pub(crate) fn zstd_build_block_entropy_stats(
     seqs: &mut SeqStoreView<'_>,
     prev_entropy: &EntropyCTables,
     next_entropy: &mut EntropyCTables,
@@ -939,7 +950,7 @@ fn offbase_is_repcode(off_base: u32) -> bool {
 
 /// `ZSTD_updateRep`: the repeat offsets `rep` after a sequence of
 /// `off_base`, its literal length 0 if `ll0` is 1.
-fn zstd_update_rep(rep: &mut [u32; ZSTD_REP_NUM], off_base: u32, ll0: u32) {
+pub(crate) fn zstd_update_rep(rep: &mut [u32; ZSTD_REP_NUM], off_base: u32, ll0: u32) {
     if off_base > ZSTD_REP_NUM as u32 {
         // An offset.
         rep[2] = rep[1];
@@ -1045,6 +1056,12 @@ fn write_block_header(dst: &mut [u8], c_size: usize, block_size: usize, last_blo
     dst[..3].copy_from_slice(&c_block_header.to_le_bytes()[..3]);
 }
 
+/// `ZSTD_useTargetCBlockSize`: whether a frame with `params` cuts its
+/// blocks to a target size, compressed (`ZSTD_c_targetCBlockSize`).
+fn zstd_use_target_cblock_size(params: &CCtxParams) -> bool {
+    params.target_cblock_size != 0
+}
+
 /// `ZSTD_blockSplitterEnabled`: whether a frame with `params` splits its
 /// blocks after finding their sequences.
 fn zstd_block_splitter_enabled(params: &CCtxParams) -> bool {
@@ -1080,6 +1097,11 @@ const ZSTD_MINMATCH_MAX: u32 = 7;
 const ZSTD_TARGETLENGTH_MIN: u32 = 0;
 /// `ZSTD_TARGETLENGTH_MAX`
 const ZSTD_TARGETLENGTH_MAX: u32 = ZSTD_BLOCKSIZE_MAX as u32;
+/// `ZSTD_TARGETCBLOCKSIZE_MIN`: the smallest target for compressed blocks,
+/// to fit an Ethernet, Wi-Fi or 4G transport frame.
+pub(crate) const ZSTD_TARGETCBLOCKSIZE_MIN: u32 = 1340;
+/// `ZSTD_TARGETCBLOCKSIZE_MAX`
+const ZSTD_TARGETCBLOCKSIZE_MAX: u32 = ZSTD_BLOCKSIZE_MAX as u32;
 /// `ZSTD_SRCSIZEHINT_MIN`
 const ZSTD_SRCSIZEHINT_MIN: u32 = 0;
 /// `ZSTD_SRCSIZEHINT_MAX`
@@ -1683,6 +1705,10 @@ pub(crate) struct CCtxParams {
     pub(crate) c_params: CompressionParameters,
     pub(crate) f_params: FrameParameters,
     pub(crate) compression_level: i32,
+    /// `targetCBlockSize`: about how large to make compressed blocks
+    /// (`ZSTD_c_targetCBlockSize`), cutting each block into several; 0
+    /// for no target.
+    pub(crate) target_cblock_size: usize,
     /// The input size to choose the parameters for when it is not known;
     /// 0 for none.
     pub(crate) src_size_hint: u32,
@@ -1774,6 +1800,7 @@ impl CCtxParams {
             c_params,
             f_params,
             compression_level,
+            target_cblock_size: 0,
             src_size_hint: 0,
             literal_compression_mode: ParamSwitch::Auto,
             in_buffer_mode: BufferMode::Buffered,
@@ -2194,6 +2221,16 @@ pub enum CParameter {
     TargetLength(u32),
     /// The match finder.
     Strategy(Option<Strategy>),
+    /// About how large to make compressed blocks
+    /// (`ZSTD_c_targetCBlockSize`): each block is cut into several of
+    /// about this size, compressed, that a decoder can use as each arrives,
+    /// which helps streaming over slow links, at some cost in compression
+    /// and speed. A target, not a limit: blocks can come out larger, and
+    /// what does not compress is stored as it is. With a target, blocks are
+    /// not split after their sequences ([`CParameter::SplitAfterSequences`]
+    /// is not used). 1340 to 131072; smaller values but 0 are raised to
+    /// 1340, larger ones refused; 0, the default, for none.
+    TargetCBlockSize(u32),
     /// Write the content size in the frame header when it is known: when
     /// compressing in one call, or after [`CCtx::set_pledged_src_size`].
     /// On by default.
@@ -2373,6 +2410,7 @@ pub enum CParameterKind {
     MinMatch,
     TargetLength,
     Strategy,
+    TargetCBlockSize,
     ContentSizeFlag,
     ChecksumFlag,
     DictIdFlag,
@@ -2417,6 +2455,7 @@ impl CParameter {
             CParameter::MinMatch(_) => CParameterKind::MinMatch,
             CParameter::TargetLength(_) => CParameterKind::TargetLength,
             CParameter::Strategy(_) => CParameterKind::Strategy,
+            CParameter::TargetCBlockSize(_) => CParameterKind::TargetCBlockSize,
             CParameter::ContentSizeFlag(_) => CParameterKind::ContentSizeFlag,
             CParameter::ChecksumFlag(_) => CParameterKind::ChecksumFlag,
             CParameter::DictIdFlag(_) => CParameterKind::DictIdFlag,
@@ -2528,6 +2567,18 @@ pub(crate) fn set_cctx_parameter(
             c_params.target_length = value;
         }
         CParameter::Strategy(strategy) => c_params.strategy = strategy,
+        CParameter::TargetCBlockSize(mut value) => {
+            if value != 0 {
+                // Raised to the smallest target, but 0. Differs from
+                // libzstd: libzstd takes an int, so values past i32::MAX
+                // would be negative there, and raised to the smallest
+                // target too; the port takes them as large ones, and
+                // refuses them as it refuses those up to i32::MAX.
+                value = value.max(ZSTD_TARGETCBLOCKSIZE_MIN);
+                bound_check(value, ZSTD_TARGETCBLOCKSIZE_MIN..=ZSTD_TARGETCBLOCKSIZE_MAX)?;
+            }
+            params.target_cblock_size = value as usize;
+        }
         CParameter::ContentSizeFlag(flag) => params.f_params.content_size_flag = flag,
         CParameter::ChecksumFlag(flag) => params.f_params.checksum_flag = flag,
         CParameter::DictIdFlag(flag) => params.f_params.no_dict_id_flag = !flag,
@@ -3431,6 +3482,79 @@ impl CCtx {
         Ok(c_size)
     }
 
+    /// `ZSTD_compressBlock_targetCBlockSize_body`: the block `src`, its
+    /// sequences found if `compress` (`bss`), into `dst` with its headers:
+    /// as superblocks of the target size, one byte repeated, or raw.
+    /// Returns their size.
+    fn compress_block_target_cblock_size_body(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        compress: bool,
+        last_block: bool,
+    ) -> Result<usize> {
+        if compress {
+            // The first block is never RLE, though it may qualify: zstd
+            // 1.4.3 and earlier (the command line) then report that not all
+            // input was consumed.
+            if !self.is_first_block && zstd_maybe_rle(&self.seq_store) && zstd_is_rle(src) {
+                return zstd_rle_compress_block(dst, src[0], src.len(), last_block);
+            }
+            // The superblocks are not bound by ZSTD_compressBound(): even
+            // with room now, a byte more here could leave too little for
+            // the frame later. So the block is stored raw when they fail
+            // (0), may have run past blockBound(srcSize), the block plus
+            // its header (DstSizeTooSmall; storing it raw then fails if
+            // there is really no room), or come out that large or larger.
+            let c_size = zstd_compress_super_block(
+                &mut self.seq_store,
+                &self.prev_cblock,
+                &mut self.next_cblock,
+                &self.applied_params,
+                dst,
+                src,
+                last_block,
+            );
+            if !c_size
+                .as_ref()
+                .is_err_and(|error| error.code() == ErrorCode::DstSizeTooSmall)
+            {
+                let max_c_size =
+                    src.len() - zstd_min_gain(src.len(), self.applied_params.c_params.strategy);
+                let c_size = c_size?;
+                if c_size != 0 && c_size < max_c_size + ZSTD_BLOCKHEADERSIZE {
+                    self.confirm_repcodes_and_entropy_tables();
+                    return Ok(c_size);
+                }
+            }
+        }
+        // As one raw block, which a decoder can stream too.
+        zstd_no_compress_block(dst, src, last_block)
+    }
+
+    /// `ZSTD_compressBlock_targetCBlockSize`: the block `istart..iend` of
+    /// the window's prefix, its sequences found, into `dst` with its
+    /// headers, as superblocks of about the target size compressed
+    /// (`ZSTD_c_targetCBlockSize`). Returns their size.
+    fn compress_block_target_cblock_size(
+        &mut self,
+        dst: &mut [u8],
+        bufs: Buffers<'_>,
+        istart: usize,
+        iend: usize,
+        last_block: bool,
+    ) -> Result<usize> {
+        let src = &bufs.get(self.match_state.window.buffer)[istart..iend];
+        let compress = self.build_seq_store(bufs, istart, iend)?;
+        let c_size = self.compress_block_target_cblock_size_body(dst, src, compress, last_block)?;
+        // A dictionary's offset codes are checked for the first block; after
+        // it the table might not have codes far enough for the data.
+        if self.prev_cblock.entropy.fse.offcode_repeat_mode == FseRepeat::Valid {
+            self.prev_cblock.entropy.fse.offcode_repeat_mode = FseRepeat::Check;
+        }
+        Ok(c_size)
+    }
+
     /// `ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize`: the size
     /// `chunk` of the block's sequences would take as a block of its own,
     /// estimated with the tables it would get. They go into the next block
@@ -3823,7 +3947,22 @@ impl CCtx {
                 ms.next_to_update = ms.window.low_limit;
             }
 
-            let c_size = if zstd_block_splitter_enabled(&self.applied_params) {
+            // A target size for compressed blocks takes precedence over the
+            // block splitter.
+            let c_size = if zstd_use_target_cblock_size(&self.applied_params) {
+                // In blocks of about the target size, their headers
+                // included.
+                let c_size = self.compress_block_target_cblock_size(
+                    &mut dst[op..op + dst_capacity],
+                    bufs,
+                    ip,
+                    ip + block_size,
+                    last_block,
+                )?;
+                debug_assert!(c_size > 0);
+                debug_assert!(c_size <= block_size + ZSTD_BLOCKHEADERSIZE);
+                c_size
+            } else if zstd_block_splitter_enabled(&self.applied_params) {
                 // Perhaps in several blocks, their headers included.
                 let c_size = self.compress_block_split_block(
                     &mut dst[op..op + dst_capacity],
@@ -4321,6 +4460,7 @@ impl CCtx {
             CParameterKind::MinMatch => c_params.min_match as i32,
             CParameterKind::TargetLength => c_params.target_length as i32,
             CParameterKind::Strategy => c_params.strategy.map_or(0, |strategy| strategy as i32),
+            CParameterKind::TargetCBlockSize => params.target_cblock_size as i32,
             CParameterKind::ContentSizeFlag => i32::from(params.f_params.content_size_flag),
             CParameterKind::ChecksumFlag => i32::from(params.f_params.checksum_flag),
             CParameterKind::DictIdFlag => i32::from(!params.f_params.no_dict_id_flag),
@@ -5285,6 +5425,15 @@ impl CCtx {
 /// `ZSTD_isRLE`: whether `src` is one byte repeated.
 fn zstd_is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
+}
+
+/// `ZSTD_maybeRLE`: whether the block of these sequences and literals may
+/// be one byte repeated, from how well it compresses (a heuristic, wrong
+/// either way at times): fewer than 4 sequences and 10 literals.
+pub(crate) fn zstd_maybe_rle(seq_store: &SeqStore) -> bool {
+    let nb_seqs = seq_store.sequences.len();
+    let nb_lits = seq_store.whole().lit_end;
+    nb_seqs < 4 && nb_lits < 10
 }
 
 impl Default for CCtx {

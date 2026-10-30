@@ -1465,7 +1465,8 @@ impl CCtx {
     /// room enough; with less, it fails with
     /// [`ErrorCode::DstSizeTooSmall`], the sequences of the blocks before
     /// in `out_seqs`. Fails with [`ErrorCode::ParameterUnsupported`] with
-    /// workers, and with [`ErrorCode::SequenceProducerFailed`] when a block
+    /// a target size for compressed blocks
+    /// ([`CParameter::TargetCBlockSize`]) or workers, and with [`ErrorCode::SequenceProducerFailed`] when a block
     /// is too small to have sequences (under 7 bytes, the last of an input
     /// that ends with one included).
     ///
@@ -1473,6 +1474,7 @@ impl CCtx {
     /// will remove it, for `ZSTD_extractSequences`.
     ///
     /// [`CParameter::SplitAfterSequences`]: super::CParameter::SplitAfterSequences
+    /// [`CParameter::TargetCBlockSize`]: super::CParameter::TargetCBlockSize
     /// [`ErrorCode::DstSizeTooSmall`]: crate::ErrorCode::DstSizeTooSmall
     /// [`ErrorCode::ParameterUnsupported`]: crate::ErrorCode::ParameterUnsupported
     /// [`ErrorCode::SequenceProducerFailed`]: crate::ErrorCode::SequenceProducerFailed
@@ -1484,8 +1486,10 @@ impl CCtx {
             // libzstd allocates the bound: that fails.
             return error!(MemoryAllocation);
         };
-        // libzstd also refuses ZSTD_c_targetCBlockSize here, which the port
-        // does not have.
+        if self.get_parameter(CParameterKind::TargetCBlockSize) != 0 {
+            // Not with a target size for compressed blocks.
+            return error!(ParameterUnsupported);
+        }
         if self.get_parameter(CParameterKind::NbWorkers) != 0 {
             // Not with workers.
             return error!(ParameterUnsupported);

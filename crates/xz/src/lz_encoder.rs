@@ -1122,10 +1122,16 @@ fn lz_encoder_init(mf: &mut Mf, lz_options: &LzEncOptions) -> Result<(), Ret> {
     let mut son = Vec::new();
     son.try_reserve_exact(mf.sons_count as usize)
         .map_err(|_| Ret::MemError)?;
-    let mut hash = Vec::new();
-    hash.try_reserve_exact(mf.hash_count as usize)
-        .map_err(|_| Ret::MemError)?;
-    hash.resize(mf.hash_count as usize, EMPTY_HASH_VALUE);
+    // The hash table is asked of the allocator as zeroed memory, as
+    // liblzma's lzma_alloc_zero() asks calloc(): a big one comes as pages
+    // the system zeroes when they are first touched, so that a short input
+    // does not pay for a big dictionary.
+    //
+    // Differs from liblzma: if that fails, the process aborts, where
+    // liblzma returns LZMA_MEM_ERROR, as safe Rust has no zeroed allocation
+    // that can fail. The table is at most 64 MiB (hs is capped at 2^24),
+    // and the bigger buffers before it are reserved with that check.
+    let hash = vec![EMPTY_HASH_VALUE; mf.hash_count as usize];
     mf.buffer = buffer;
     mf.son = son;
     mf.hash = hash;

@@ -199,7 +199,7 @@ LZ4_FLAGS = ["-DXXH_NAMESPACE=LZ4_"]
 # the programs that write tables. delta/ and simple/ are left out with
 # their filters (see tools/xz-oracle/config.h); only their headers, which
 # the filter tables include, are on the include path.
-LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder"]
+LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder", "delta", "simple"]
 LIBLZMA_LEFT_OUT = ["stream_encoder_mt", "stream_decoder_mt", "outqueue", "hardware_",
                     "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
 
@@ -321,7 +321,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         files += sorted(str(f) for d in dirs for f in d.glob("*.c")
                         if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
         config = ROOT / Path(sources[0]).parent
-        headers = [xz / "api", *dirs, xz / "delta", xz / "simple", xz.parent / "common"]
+        headers = [xz / "api", *dirs, xz.parent / "common"]
         includes = [f"-I{d}" for d in [config, *headers]]
         subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", *includes, *files,
                         "-o", str(folder / "oracle")], check=True)

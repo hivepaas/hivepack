@@ -88,13 +88,6 @@ fn succeeds(name: &str, outcome: &Outcome) -> bool {
     outcome.end == Ok(Status::StreamEnd) && (outcome.unread == 0 || name.ends_with(".lz"))
 }
 
-/// Files with filters the decoder does not have yet: delta and BCJ.
-fn needs_more_filters(name: &str) -> bool {
-    ["delta", "arm64", "bcj", "x86", "sparc", "riscv", "powerpc"]
-        .iter()
-        .any(|f| name.contains(f))
-}
-
 #[test]
 fn xz_utils_test_files() {
     let folder = cache().join("xz-5.8.4-source/xz-5.8.4/tests/files");
@@ -129,9 +122,7 @@ fn xz_utils_test_files() {
         } else {
             assert_eq!(bytes, whole, "{name} a byte at a time");
         }
-        if name.starts_with("good-") && needs_more_filters(name) {
-            assert_eq!(whole.end, Err(Error::Options), "{name}");
-        } else if name.starts_with("good-") {
+        if name.starts_with("good-") {
             assert!(succeeds(name, &whole), "{name}: {whole:?}");
             assert!(!whole.unsupported_check, "{name}");
         } else if name == "unsupported-check.xz" {

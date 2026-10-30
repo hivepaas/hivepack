@@ -1164,6 +1164,11 @@ fn lz_encoder_init(mf: &mut Mf, lz_options: &LzEncOptions) -> Result<(), Ret> {
 /// which its memory usage counts.
 const LZ_ENCODER_CODER_SIZE: u64 = 240;
 
+/// More than the filters before an LZ encoder can hold back between calls:
+/// a BCJ filter holds less than `2 * unfiltered_max` bytes (32 for IA-64),
+/// delta none, and a chain has three of them at most.
+const FILTERS_HELD_BACK: usize = 4096;
+
 /// `lzma_lz_encoder_memusage`.
 pub(crate) fn lz_encoder_memusage(lz_options: &LzEncOptions) -> u64 {
     let mut mf = Mf::default();
@@ -1201,6 +1206,8 @@ pub(crate) struct LzEncCoder {
     lz: LzEnc,
     /// History buffer and match finder
     mf: Mf,
+    /// Next coder in the chain
+    next: Option<Box<dyn NextCoder>>,
 }
 
 impl LzEncCoder {
@@ -1217,7 +1224,13 @@ impl LzEncCoder {
         // Allocate the buffers and do the rest of the initialization.
         lz_encoder_init(&mut mf, lz_options)?;
 
-        Ok(LzEncCoder { lz, mf })
+        Ok(LzEncCoder { lz, mf, next: None })
+    }
+
+    /// The next filter in the chain, made after this one: the encoder
+    /// reads its input from it.
+    pub(crate) fn set_next(&mut self, next: Option<Box<dyn NextCoder>>) {
+        self.next = next;
     }
 
     /// `fill_window`: tries to fill the input window (mf->buffer).
@@ -1232,22 +1245,45 @@ impl LzEncCoder {
             mf.move_window();
         }
 
-        // Not using a filter, simply memcpy() as much as possible.
         let mut write_pos = mf.write_pos as usize;
-        let want = (input.len() - *in_pos).min(mf.size as usize - write_pos);
-        if mf.buffer.len() < write_pos + want {
-            mf.buffer.resize(write_pos + want, 0);
-        }
-        bufcpy(
-            input,
-            in_pos,
-            &mut mf.buffer[..write_pos + want],
-            &mut write_pos,
-        );
-        let mut ret = if action != Action::Run && *in_pos == input.len() {
-            Ret::StreamEnd
-        } else {
-            Ret::Ok
+        let mut ret = match self.next.as_mut() {
+            None => {
+                // Not using a filter, simply memcpy() as much as possible.
+                let want = (input.len() - *in_pos).min(mf.size as usize - write_pos);
+                if mf.buffer.len() < write_pos + want {
+                    mf.buffer.resize(write_pos + want, 0);
+                }
+                bufcpy(
+                    input,
+                    in_pos,
+                    &mut mf.buffer[..write_pos + want],
+                    &mut write_pos,
+                );
+                if action != Action::Run && *in_pos == input.len() {
+                    Ret::StreamEnd
+                } else {
+                    Ret::Ok
+                }
+            }
+            Some(next) => {
+                // Differs from liblzma, without a difference to see:
+                // liblzma gives the filters room to the end of the buffer.
+                // They write at most the input left and what they held
+                // back, so the buffer grows to that and a margin, as it
+                // does without them.
+                let want =
+                    (input.len() - *in_pos + FILTERS_HELD_BACK).min(mf.size as usize - write_pos);
+                if mf.buffer.len() < write_pos + want {
+                    mf.buffer.resize(write_pos + want, 0);
+                }
+                next.code(
+                    input,
+                    in_pos,
+                    &mut mf.buffer[..write_pos + want],
+                    &mut write_pos,
+                    action,
+                )
+            }
         };
 
         mf.write_pos = write_pos as u32;

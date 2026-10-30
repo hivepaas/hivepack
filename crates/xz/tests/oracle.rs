@@ -31,9 +31,11 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hivepack_xz::{
-    Action, CONCATENATED, Check, FAIL_FAST, FILTER_LZMA1, FILTER_LZMA1EXT, FILTER_LZMA2, Filter,
-    IGNORE_CHECK, InBuffer, LzmaOptions, MatchFinder, Mode, OutBuffer, Result, Status, Stream,
-    TELL_ANY_CHECK, TELL_NO_CHECK, TELL_UNSUPPORTED_CHECK,
+    Action, BcjOptions, CONCATENATED, Check, DeltaOptions, FAIL_FAST, FILTER_ARM, FILTER_ARM64,
+    FILTER_ARMTHUMB, FILTER_DELTA, FILTER_IA64, FILTER_LZMA1, FILTER_LZMA1EXT, FILTER_LZMA2,
+    FILTER_POWERPC, FILTER_RISCV, FILTER_SPARC, Filter, FilterOptions, IGNORE_CHECK, InBuffer,
+    LzmaOptions, MatchFinder, Mode, OutBuffer, Result, Status, Stream, TELL_ANY_CHECK,
+    TELL_NO_CHECK, TELL_UNSUPPORTED_CHECK,
 };
 use support::{Oracle, Rng, cache, damage, fnv64, hex, input, recorded_form, repository, unhex};
 
@@ -59,20 +61,27 @@ fn action(number: u32) -> Action {
     }
 }
 
-/// A filter from the oracle's text: `<id>:<dict>:<lc>:<lp>:<pb>:<ext_flags>:
-/// <ext_size>:<preset>`.
-fn parse_filter(text: &str) -> Filter {
+/// The Filter ID of an LZMA filter's `<id>` in the oracle's text: 1, 2 or
+/// 21 for LZMA1, LZMA1EXT or LZMA2, or the ID itself.
+fn lzma_id(id: u64) -> u64 {
+    match id {
+        1 => FILTER_LZMA1,
+        2 => FILTER_LZMA1EXT,
+        21 => FILTER_LZMA2,
+        id => id,
+    }
+}
+
+/// A decoder's LZMA filter from the oracle's text: `<id>:<dict>:<lc>:<lp>:
+/// <pb>:<ext_flags>:<ext_size>:<preset>`.
+fn parse_lzma(text: &str) -> Filter {
     let f: Vec<&str> = text.split(':').collect();
     let n = |i: usize| f[i].parse::<u64>().unwrap();
     let ext_size = n(6);
     let preset = unhex(f[7]);
     Filter {
-        id: match n(0) {
-            1 => FILTER_LZMA1,
-            2 => FILTER_LZMA1EXT,
-            _ => FILTER_LZMA2,
-        },
-        options: Some(LzmaOptions {
+        id: lzma_id(n(0)),
+        options: Some(FilterOptions::Lzma(LzmaOptions {
             dict_size: n(1) as u32,
             preset_dict: (!preset.is_empty()).then_some(preset),
             lc: n(2) as u32,
@@ -82,26 +91,20 @@ fn parse_filter(text: &str) -> Filter {
             ext_size_low: ext_size as u32,
             ext_size_high: (ext_size >> 32) as u32,
             ..LzmaOptions::default()
-        }),
+        })),
     }
 }
 
-/// An encoder's filter from the oracle's text: `<id>:<dict>:<lc>:<lp>:
-/// <pb>:<mode>:<nice_len>:<mf>:<depth>:<ext_flags>:<ext_size>:<preset>`,
-/// `<id>` 1, 2 or 21 for LZMA1, LZMA1EXT or LZMA2, or the ID itself.
-fn parse_efilter(text: &str) -> Filter {
+/// An encoder's LZMA filter from the oracle's text: `<id>:<dict>:<lc>:<lp>:
+/// <pb>:<mode>:<nice_len>:<mf>:<depth>:<ext_flags>:<ext_size>:<preset>`.
+fn parse_elzma(text: &str) -> Filter {
     let f: Vec<&str> = text.split(':').collect();
     let n = |i: usize| f[i].parse::<u64>().unwrap();
     let ext_size = n(10);
     let preset = unhex(f[11]);
     Filter {
-        id: match n(0) {
-            1 => FILTER_LZMA1,
-            2 => FILTER_LZMA1EXT,
-            21 => FILTER_LZMA2,
-            id => id,
-        },
-        options: Some(LzmaOptions {
+        id: lzma_id(n(0)),
+        options: Some(FilterOptions::Lzma(LzmaOptions {
             dict_size: n(1) as u32,
             preset_dict: (!preset.is_empty()).then_some(preset),
             lc: n(2) as u32,
@@ -114,8 +117,40 @@ fn parse_efilter(text: &str) -> Filter {
             ext_flags: n(9) as u32,
             ext_size_low: ext_size as u32,
             ext_size_high: (ext_size >> 32) as u32,
-        }),
+        })),
     }
+}
+
+/// A delta or BCJ filter from the oracle's text, without its `f`:
+/// `<id>:n` without options, `3:<type>:<dist>` for delta and
+/// `<id>:<start_offset>` for the others.
+fn parse_simple(text: &str) -> Filter {
+    let f: Vec<&str> = text.split(':').collect();
+    let id: u64 = f[0].parse().unwrap();
+    let n = |i: usize| f[i].parse::<u32>().unwrap();
+    let options = if f[1] == "n" {
+        None
+    } else if id == FILTER_DELTA {
+        Some(FilterOptions::Delta(DeltaOptions {
+            delta_type: n(1),
+            dist: n(2),
+        }))
+    } else {
+        Some(FilterOptions::Bcj(BcjOptions { start_offset: n(1) }))
+    };
+    Filter { id, options }
+}
+
+/// A chain from the oracle's text: its filters joined by `+`, the LZMA ones
+/// as a decoder's or, with `encoder`, an encoder's.
+fn parse_chain(text: &str, encoder: bool) -> Vec<Filter> {
+    text.split('+')
+        .map(|element| match element.strip_prefix('f') {
+            Some(simple) => parse_simple(simple),
+            None if encoder => parse_elzma(element),
+            None => parse_lzma(element),
+        })
+        .collect()
 }
 
 /// The output space all the steps can ask for.
@@ -140,14 +175,17 @@ fn answer(request: &str) -> String {
         "auto" => Stream::auto_decoder(args_n[0], args_n[1] as u32),
         "lzip" => Stream::lzip_decoder(args_n[0], args_n[1] as u32),
         "alone" => Stream::alone_decoder(args_n[0]),
-        "raw" => Stream::raw_decoder(&[parse_filter(args)]),
+        "raw" => Stream::raw_decoder(&parse_chain(args, false)),
         "easyenc" => Stream::easy_encoder(args_n[0] as u32, Check(args_n[1] as u32)),
         "streamenc" => {
-            let (check, filter) = args.split_once(':').unwrap();
-            Stream::stream_encoder(&[parse_efilter(filter)], Check(check.parse().unwrap()))
+            let (check, chain) = args.split_once(':').unwrap();
+            Stream::stream_encoder(&parse_chain(chain, true), Check(check.parse().unwrap()))
         }
-        "aloneenc" => Stream::alone_encoder(parse_efilter(args).options.as_ref().unwrap()),
-        "rawenc" => Stream::raw_encoder(&[parse_efilter(args)]),
+        "aloneenc" => match &parse_chain(args, true)[0].options {
+            Some(FilterOptions::Lzma(options)) => Stream::alone_encoder(options),
+            _ => panic!("not LZMA options: {args}"),
+        },
+        "rawenc" => Stream::raw_encoder(&parse_chain(args, true)),
         _ => panic!("no such coder: {decoder}"),
     };
     let mut strm = match made {
@@ -403,6 +441,137 @@ fn length(rng: &mut Rng, max: usize) -> usize {
     }
 }
 
+/// The alignment of a BCJ filter's start offset.
+fn bcj_alignment(id: u64) -> u32 {
+    match id {
+        FILTER_POWERPC | FILTER_ARM | FILTER_ARM64 | FILTER_SPARC => 4,
+        FILTER_IA64 => 16,
+        FILTER_ARMTHUMB | FILTER_RISCV => 2,
+        _ => 1,
+    }
+}
+
+/// A delta or BCJ filter as the oracle reads it, with options its coders
+/// take: a delta distance, or a BCJ filter's start offset (near the top
+/// too, where positions wrap around) or none.
+fn simple_filter(rng: &mut Rng) -> String {
+    if rng.below(3) == 0 {
+        let dist = match rng.below(3) {
+            0 => rng.pick(&[1, 2, 4, 256]),
+            _ => 1 + rng.below(256),
+        };
+        return format!("f3:0:{dist}");
+    }
+    let id = 4 + rng.below(8);
+    let align = bcj_alignment(id);
+    match rng.below(5) {
+        0 => format!("f{id}:n"),
+        1 => format!("f{id}:0"),
+        2 => format!(
+            "f{id}:{}",
+            u32::MAX / align * align - align * rng.below(8) as u32
+        ),
+        _ => format!("f{id}:{}", align * rng.below(1 << 20) as u32),
+    }
+}
+
+/// A delta or BCJ filter that the coders refuse: options out of range,
+/// none for delta, a start offset out of alignment, or a filter liblzma
+/// does not have.
+fn refused_filter(rng: &mut Rng) -> String {
+    match rng.below(5) {
+        0 => format!("f3:0:{}", rng.pick(&[0, 257, 1 << 20])),
+        1 => "f3:1:1".to_string(),
+        2 => "f3:n".to_string(),
+        3 => {
+            let id = rng.pick(&[
+                FILTER_POWERPC,
+                FILTER_IA64,
+                FILTER_ARM,
+                FILTER_ARMTHUMB,
+                FILTER_ARM64,
+                FILTER_SPARC,
+                FILTER_RISCV,
+            ]);
+            format!(
+                "f{id}:{}",
+                bcj_alignment(id) * (1 + rng.below(1000) as u32) - 1
+            )
+        }
+        _ => format!(
+            "f{}:n",
+            rng.pick(&[0x02, 0x0C, 0x7F, 0x4000_0000_0000_0003u64])
+        ),
+    }
+}
+
+/// The filters before LZMA in a chain, one to three, each followed by `+`;
+/// with `refused`, now and then one that the coders refuse.
+fn filters_before(rng: &mut Rng, refused: bool) -> String {
+    let mut text = String::new();
+    for _ in 0..1 + rng.below(3) {
+        let filter = if refused && rng.below(3) == 0 {
+            refused_filter(rng)
+        } else {
+            simple_filter(rng)
+        };
+        text.push_str(&filter);
+        text.push('+');
+    }
+    text
+}
+
+/// A chain that liblzma refuses for its order or length, with `lzma` as
+/// its LZMA filter: LZMA before another filter, five filters, or no LZMA.
+fn refused_chain(rng: &mut Rng, lzma: &str) -> String {
+    match rng.below(4) {
+        0 => format!("{lzma}+{}", simple_filter(rng)),
+        1 => format!("{}{lzma}+{lzma}", filters_before(rng, false)),
+        2 => {
+            let before: String = (0..4).map(|_| simple_filter(rng) + "+").collect();
+            format!("{before}{lzma}")
+        }
+        _ => filters_before(rng, false).trim_end_matches('+').to_string(),
+    }
+}
+
+/// Input with instructions that the BCJ filters convert, in other input:
+/// x86 CALL and JMP, PowerPC, ARM and ARM64 BL, ARM-Thumb BL, SPARC CALL,
+/// ARM64 ADRP, RISC-V JAL, and RISC-V AUIPC with an instruction whose rs1
+/// is its rd. (IA-64's come up in random input.)
+fn code_input(rng: &mut Rng, len: usize) -> Vec<u8> {
+    let mut data = input(rng, len);
+    for _ in 0..len / 12 {
+        let at = rng.below(len as u64) as usize;
+        let r = rng.next().to_le_bytes();
+        let pattern = match rng.below(10) {
+            0 => vec![0xE8 | (r[0] & 1), r[1], r[2], r[3], rng.pick(&[0, 0xFF])],
+            1 => vec![0x48 | (r[0] & 3), r[1], r[2], (r[3] & 0xFC) | 1],
+            2 => vec![r[0], r[1], r[2], 0xEB],
+            3 => vec![r[0], 0xF0 | (r[1] & 7), r[2], 0xF8 | (r[3] & 7)],
+            4 if r[0] & 1 == 0 => vec![0x40, r[1] & 0x3F, r[2], r[3]],
+            4 => vec![0x7F, 0xC0 | r[1], r[2], r[3]],
+            5 => vec![r[0], r[1], r[2], 0x94 | (r[3] & 3)],
+            6 => vec![
+                r[0],
+                r[1],
+                (r[2] & 0x0F) | rng.pick(&[0, 0xF0]),
+                0x90 | (r[3] & 0x60),
+            ],
+            7 => vec![0xEF, r[1] & 0xF2, r[2], r[3]],
+            _ => {
+                let rd = rng.pick(&[1u32, 3, 5, 10, 31]);
+                let auipc = 0x17 | rd << 7 | u32::from_le_bytes([r[0], r[1], r[2], r[3]]) & !0xFFF;
+                let inst2 = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) & !0xF_8003 | rd << 15 | 3;
+                [auipc.to_le_bytes(), inst2.to_le_bytes()].concat()
+            }
+        };
+        let end = (at + pattern.len()).min(len);
+        data[at..end].copy_from_slice(&pattern[..end - at]);
+    }
+    data
+}
+
 /// Generated requests: `count` streams of each kind, with inputs up to
 /// `max` bytes, and the test files.
 fn requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
@@ -583,16 +752,68 @@ fn requests(oracle: &mut Oracle, rng: &mut Rng, count: usize, max: usize) -> Vec
             requests.push(format!("decode {decoder} {steps} {}", hex(&data)));
         }
     }
+
+    // Chains of delta and BCJ filters before LZMA2 or LZMA1, which
+    // liblzma's encoders wrote as .xz and raw, and chains refused.
+    let lzma = "21:4096:0:0:0:0:0:-";
+    for _ in 0..count / 6 {
+        let chain = if rng.below(2) == 0 {
+            refused_chain(rng, lzma)
+        } else {
+            format!("{}{lzma}", filters_before(rng, true))
+        };
+        requests.push(format!("decode raw:{chain} c0/10/3 -"));
+        requests.push(format!("memusage {chain}"));
+    }
+    for _ in 0..count / 2 {
+        let len = length(rng, max.min(100_000));
+        let data = code_input(rng, len);
+        let before = filters_before(rng, false);
+        let o = LzmaOptions::preset(rng.below(7) as u32).unwrap();
+        let dict = o.dict_size.min(1 << 20);
+        let xz = rng.below(2) == 0;
+        let id = if xz || rng.below(2) == 0 { 21 } else { 1 };
+        let lzma = format!(
+            "{id}:{dict}:{}:{}:{}:{}:{}:{}:{}:0:0:-",
+            o.lc, o.lp, o.pb, o.mode.0, o.nice_len, o.mf.0, o.depth
+        );
+        // Room for LZMA1, which can grow incompressible input more than
+        // LZMA2.
+        let out_size = len + len / 4 + 1024;
+        let check = rng.pick(&[0, 1, 4, 10]);
+        let reply = oracle.ask(&if xz {
+            format!("sbuf {check}:{out_size}:{before}{lzma} {}", hex(&data))
+        } else {
+            format!("rbuf {out_size}:{before}{lzma} {}", hex(&data))
+        });
+        let mut stream = unhex(reply.strip_prefix("ok ").unwrap());
+        match rng.below(8) {
+            0 | 1 => stream = damage(rng, &stream),
+            2 => {
+                let at = rng.below(stream.len() as u64 + 1) as usize;
+                stream.truncate(at);
+            }
+            _ => {}
+        }
+        let decoder = if xz {
+            let kind = if rng.below(3) == 0 { "auto" } else { "stream" };
+            format!("{kind}:{}:{}", memlimit(rng), flags(rng))
+        } else {
+            format!("raw:{before}{id}:{dict}:{}:{}:{}:0:0:-", o.lc, o.lp, o.pb)
+        };
+        let steps = steps(rng, stream.len(), len);
+        requests.push(format!("decode {decoder} {steps} {}", hex(&stream)));
+    }
     requests
 }
 
 /// The port's answer to any request.
 fn port_answer(request: &str) -> String {
-    if let Some(filter) = request.strip_prefix("memusage ") {
-        return hivepack_xz::raw_decoder_memusage(&[parse_filter(filter)]).to_string();
+    if let Some(chain) = request.strip_prefix("memusage ") {
+        return hivepack_xz::raw_decoder_memusage(&parse_chain(chain, false)).to_string();
     }
-    if let Some(filter) = request.strip_prefix("encmem ") {
-        return hivepack_xz::raw_encoder_memusage(&[parse_efilter(filter)]).to_string();
+    if let Some(chain) = request.strip_prefix("encmem ") {
+        return hivepack_xz::raw_encoder_memusage(&parse_chain(chain, true)).to_string();
     }
     if let Some(preset) = request.strip_prefix("easymem ") {
         let preset = preset.parse().unwrap();
@@ -606,6 +827,20 @@ fn port_answer(request: &str) -> String {
         return hivepack_xz::stream_buffer_bound(size.parse().unwrap()).to_string();
     }
     let words: Vec<&str> = request.split(' ').collect();
+    if let ["bcj", arch, direction, start, data] = words[..] {
+        let mut buf = unhex(data);
+        let start = start.parse().unwrap();
+        let filter = match (arch, direction) {
+            ("x86", "enc") => hivepack_xz::bcj_x86_encode,
+            ("x86", _) => hivepack_xz::bcj_x86_decode,
+            ("arm64", "enc") => hivepack_xz::bcj_arm64_encode,
+            ("arm64", _) => hivepack_xz::bcj_arm64_decode,
+            ("riscv", "enc") => hivepack_xz::bcj_riscv_encode,
+            _ => hivepack_xz::bcj_riscv_decode,
+        };
+        let done = filter(start, &mut buf);
+        return format!("{done} {}", hex(&buf));
+    }
     if let [kind @ ("ebuf" | "sbuf" | "rbuf"), args, data] = words[..] {
         let data = unhex(data);
         let a: Vec<&str> = args.splitn(3, ':').collect();
@@ -628,7 +863,7 @@ fn port_answer(request: &str) -> String {
                 let mut out = vec![0; out_size];
                 let mut pos = 0;
                 let r = hivepack_xz::stream_buffer_encode(
-                    &[parse_efilter(a[2])],
+                    &parse_chain(a[2], true),
                     Check(a[0].parse().unwrap()),
                     &data,
                     &mut out,
@@ -637,12 +872,12 @@ fn port_answer(request: &str) -> String {
                 (out_size, r.map(|()| out[..pos].to_vec()))
             }
             _ => {
-                let (out_size, filter) = args.split_once(':').unwrap();
+                let (out_size, chain) = args.split_once(':').unwrap();
                 let out_size: usize = out_size.parse().unwrap();
                 let mut out = vec![0; out_size];
                 let mut pos = 0;
                 let r = hivepack_xz::raw_buffer_encode(
-                    &[parse_efilter(filter)],
+                    &parse_chain(chain, true),
                     &data,
                     &mut out,
                     &mut pos,
@@ -667,7 +902,7 @@ fn port_matches_liblzma() {
     let mut rng = Rng(0x5eed_c201);
     let requests = requests(&mut oracle, &mut rng, 300, 300_000);
     let mut seen = [0usize; 12];
-    let mut ends = 0;
+    let (mut ends, mut chain_ends) = (0, 0);
     for request in &requests {
         let want = oracle.ask(request);
         assert_eq!(port_answer(request), want, "{request:.300}");
@@ -675,11 +910,15 @@ fn port_matches_liblzma() {
             seen[ret] += 1;
         }
         ends += usize::from(returned(&want).contains(&1));
+        chain_ends +=
+            usize::from(request.starts_with("decode raw:f") && returned(&want).contains(&1));
     }
     eprintln!(
-        "{} requests, {ends} reach LZMA_STREAM_END, return codes seen {seen:?}",
+        "{} requests, {ends} reach LZMA_STREAM_END ({chain_ends} raw with delta or BCJ), \
+         return codes seen {seen:?}",
         requests.len()
     );
+    assert!(chain_ends > 20, "only {chain_ends} raw chains end");
     // Every return code from LZMA_OK to LZMA_PROG_ERROR came up, but
     // LZMA_MEM_ERROR, for which an allocation must fail.
     for (ret, count) in seen.iter().enumerate().filter(|&(ret, _)| ret != 5) {
@@ -963,13 +1202,16 @@ fn encoder_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
             let data = input(rng, len);
             // Options the encoder takes, so that it gets through.
             let mut filter = efilter(rng, FILTER_LZMA2, 1 << 16);
-            while hivepack_xz::raw_encoder_memusage(&[parse_efilter(&filter)]) == u64::MAX {
+            while hivepack_xz::raw_encoder_memusage(&parse_chain(&filter, true)) == u64::MAX {
                 filter = efilter(rng, FILTER_LZMA2, 1 << 16);
             }
             if rng.below(2) == 0 {
                 // A dictionary of 4 KiB to 64 KiB.
                 let rest = filter.split_once(':').unwrap().1.split_once(':').unwrap().1;
                 filter = format!("21:{}:{rest}", 4096 << rng.below(5));
+            }
+            if rng.below(3) == 0 {
+                filter = format!("{}{filter}", filters_before(rng, false));
             }
             let coder = if rng.below(2) == 0 {
                 format!("streamenc:{}:{filter}", check(rng))
@@ -1046,6 +1288,72 @@ fn encoder_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
     ] {
         requests.push(format!("bound {size}"));
     }
+
+    // Chains of delta and BCJ filters before LZMA, now and then refused.
+    for _ in 0..count / 2 {
+        let len = length(rng, max);
+        let data = code_input(rng, len);
+        let id = if rng.below(4) == 0 {
+            encoder_id(rng)
+        } else {
+            FILTER_LZMA2
+        };
+        let lzma = efilter(rng, id, max_dict);
+        let chain = match rng.below(12) {
+            0 => refused_chain(rng, &lzma),
+            1 => format!("{}{lzma}", filters_before(rng, true)),
+            _ => format!("{}{lzma}", filters_before(rng, false)),
+        };
+        let (coder, flushes): (String, &[u32]) = if rng.below(2) == 0 {
+            (format!("streamenc:{}:{chain}", check(rng)), &[1, 2, 4])
+        } else {
+            (format!("rawenc:{chain}"), &[1, 2])
+        };
+        let steps = encoder_steps(rng, len, flushes);
+        requests.push(format!("code {coder} {steps} {}", hex(&data)));
+    }
+    for _ in 0..count / 6 {
+        let len = length(rng, max.min(100_000));
+        let data = code_input(rng, len);
+        let bound = hivepack_xz::stream_buffer_bound(len);
+        let out_size = match rng.below(4) {
+            0 => rng.below(80) as usize,
+            _ => bound,
+        };
+        let lzma = efilter(rng, FILTER_LZMA2, max_dict);
+        let refused = rng.below(4) == 0;
+        let chain = format!("{}{lzma}", filters_before(rng, refused));
+        requests.push(if rng.below(2) == 0 {
+            format!("sbuf {}:{out_size}:{chain} {}", check(rng), hex(&data))
+        } else {
+            format!("rbuf {out_size}:{chain} {}", hex(&data))
+        });
+        let id = encoder_id(rng);
+        let lzma = efilter(rng, id, u32::MAX);
+        let chain = if rng.below(3) == 0 {
+            refused_chain(rng, &lzma)
+        } else {
+            format!("{}{lzma}", filters_before(rng, true))
+        };
+        requests.push(format!("encmem {chain}"));
+    }
+
+    // The single-call BCJ filters.
+    for _ in 0..count / 3 {
+        let len = length(rng, max.min(30_000));
+        let data = code_input(rng, len);
+        let start = match rng.below(3) {
+            0 => 0,
+            1 => rng.next() as u32,
+            _ => u32::MAX - rng.below(64) as u32,
+        };
+        requests.push(format!(
+            "bcj {} {} {start} {}",
+            rng.pick(&["x86", "arm64", "riscv"]),
+            rng.pick(&["enc", "dec"]),
+            hex(&data)
+        ));
+    }
     requests
 }
 
@@ -1057,7 +1365,7 @@ fn port_encoders_match_liblzma() {
     let mut rng = Rng(0x5eed_e201);
     let requests = encoder_requests(&mut rng, 300, 300_000);
     let mut seen = [0usize; 12];
-    let mut ends = 0;
+    let (mut ends, mut chain_ends) = (0, 0);
     let (mut big, mut big_ends) = (0, 0);
     for request in &requests {
         let want = oracle.ask(request);
@@ -1066,6 +1374,13 @@ fn port_encoders_match_liblzma() {
             seen[ret] += 1;
         }
         ends += usize::from(returned(&want).contains(&1));
+        let coder = request.split(' ').nth(1).unwrap_or("");
+        let chain = coder.strip_prefix("rawenc:").or_else(|| {
+            let rest = coder.strip_prefix("streamenc:")?;
+            Some(rest.split_once(':')?.1)
+        });
+        chain_ends +=
+            usize::from(chain.is_some_and(|c| c.starts_with('f')) && returned(&want).contains(&1));
         if request.len() > 2_000_000 {
             big += 1;
             let total_in = want
@@ -1078,9 +1393,11 @@ fn port_encoders_match_liblzma() {
         }
     }
     eprintln!(
-        "{} requests, {ends} reach LZMA_STREAM_END, return codes seen {seen:?}",
+        "{} requests, {ends} reach LZMA_STREAM_END ({chain_ends} with delta or BCJ), \
+         return codes seen {seen:?}",
         requests.len()
     );
+    assert!(chain_ends > 20, "only {chain_ends} chains end");
     assert!(
         big_ends * 3 >= big,
         "only {big_ends} of {big} big inputs are read"

@@ -222,7 +222,7 @@
     },
     {
       "name": "age-oracle",
-      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
+      "generate": { "group": "generated", "tool": "go", "sources": ["tools/age-oracle/main.go", "tools/age-oracle/identities.go", "tools/age-oracle/go.mod", "tools/age-oracle/go.sum"] },
       "source": "tools/age-oracle/main.go, built with Go and the modules tools/age-oracle/go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0, the release age requires",
       "license": "MIT (the program) and BSD-3-Clause (age, golang.org/x/crypto)",
       "kind": "tool"

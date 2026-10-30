@@ -26,7 +26,7 @@ mod support;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use hivepack_crypto::{Aes, Hmac, HmacKey, Sha1, pbkdf2_hmac_sha1};
+use hivepack_crypto::{Aes, Hmac, HmacKey, Sha1, pbkdf2};
 use support::{Oracle, Rng, hex, repository, unhex};
 
 fn recorded_path() -> PathBuf {
@@ -75,7 +75,7 @@ fn answer(request: &str, rng: &mut Rng) -> String {
         }
         ["hmac", key, data] => {
             let data = unhex(data);
-            let mut hmac = Hmac::new(&HmacKey::new(&unhex(key)));
+            let mut hmac = Hmac::new(&HmacKey::<Sha1>::new(&unhex(key)));
             for piece in pieces(rng, &data) {
                 hmac.update(piece);
             }
@@ -83,7 +83,7 @@ fn answer(request: &str, rng: &mut Rng) -> String {
         }
         ["pbkdf2", iterations, length, password, salt] => {
             let mut out = vec![0; length.parse().unwrap()];
-            pbkdf2_hmac_sha1(
+            pbkdf2::<Sha1>(
                 &unhex(password),
                 &unhex(salt),
                 iterations.parse().unwrap(),
@@ -181,7 +181,7 @@ fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
 
 #[test]
 fn port_matches_nettle() {
-    let Some(mut oracle) = Oracle::spawn() else {
+    let Some(mut oracle) = Oracle::spawn("nettle-oracle") else {
         return;
     };
     let mut rng = Rng(0x5eed_c001);
@@ -211,7 +211,7 @@ fn port_matches_recorded_answers() {
 #[test]
 #[ignore = "rewrites testdata/oracle/crypto.txt from the oracle"]
 fn record_oracle_answers() {
-    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut oracle = Oracle::spawn("nettle-oracle").expect("the oracle is built");
     let mut rng = Rng(0x5eed_c002);
     let mut text = String::from(
         "# Answers from nettle 3.10.2 (tools/nettle-oracle), replayed by crates/crypto/tests/oracle.rs.\n\

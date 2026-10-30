@@ -168,6 +168,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-age"
+version = "0.0.0"
+dependencies = [
+ "hivepack-crypto",
+ "hivepack-deflate",
+]
+
+[[package]]
 name = "hivepack-bzip2"
 version = "0.0.0"
 dependencies = [
@@ -197,9 +205,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-xz"
+version = "0.0.0"
+
+[[package]]
 name = "hivepack-zip"
 version = "0.0.0"
 dependencies = [
+ "hivepack-bzip2",
  "hivepack-crypto",
  "hivepack-deflate",
 ]
@@ -262,6 +275,26 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "liblzma"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa980ea6744074a5b5e0ac6b164aca94fc970121869b3e78ae12a2b0097dbea7"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c7e3581f367a78d7b7e7ae948d023310556f0cfc13156c2e4e00e25616492b9"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "libz-sys"
@@ -594,6 +627,15 @@ checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "xz-bench"
+version = "0.0.0"
+dependencies = [
+ "hivepack-xz",
+ "liblzma",
+ "liblzma-sys",
 ]
 
 [[package]]

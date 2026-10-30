@@ -275,6 +275,7 @@ LIBZIP_CRYPTO_SOURCES = [
 ]
 LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
 LIBZIP_XZ_SOURCES = ["zip_algorithm_xz.c"]
+LIBZIP_ZSTD_SOURCES = ["zip_algorithm_zstd.c"]
 
 
 # libarchive: the reader and writer of ISO 9660 images, what they call, and
@@ -417,12 +418,13 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         nettle = next(extra[1].glob("nettle-*"))
         bzip2 = next(extra[2].glob("bzip2-*"))
         xz = next(extra[3].glob("xz-*/src/liblzma"))
+        zstd = next(extra[4].glob("zstd-*/lib"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
         files += [str(lib / name) for name in
                   libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES
-                  + LIBZIP_XZ_SOURCES]
+                  + LIBZIP_XZ_SOURCES + LIBZIP_ZSTD_SOURCES]
         files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(nettle / name) for name in NETTLE_SOURCES]
@@ -439,8 +441,16 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *xz_includes, "-c", *xz_files],
                        check=True, cwd=objects)
         files += sorted(str(f) for f in objects.glob("*.o"))
+        # So is libzstd, whose headers have common names.
+        objects = folder / "libzstd"
+        objects.mkdir()
+        zstd_files = sorted(str(f) for part in ("common", "compress", "decompress")
+                            for f in (zstd / part).glob("*.c"))
+        subprocess.run([compiler, "-O2", "-w", "-DZSTD_DISABLE_ASM", "-c", *zstd_files],
+                       check=True, cwd=objects)
+        files += sorted(str(f) for f in objects.glob("*.o"))
         subprocess.run([compiler, "-O2", "-w", "-pthread", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
-                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", f"-I{xz / 'api'}", *files,
+                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", f"-I{xz / 'api'}", f"-I{zstd}", *files,
                         "-o", str(folder / "oracle")],
                        check=True)
         return

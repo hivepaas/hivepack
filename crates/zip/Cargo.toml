@@ -24,5 +24,7 @@ hivepack-deflate.workspace = true
 hivepack-bzip2.workspace = true
 # LZMA and XZ, ported from liblzma.
 hivepack-xz.workspace = true
+# Zstandard, ported from libzstd.
+hivepack-zstd.workspace = true
 # AES, HMAC-SHA1 and PBKDF2 for WinZip AES, ported from BearSSL.
 hivepack-crypto.workspace = true

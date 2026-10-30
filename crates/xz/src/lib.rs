@@ -3,7 +3,8 @@
 //! [XZ Utils](https://tukaani.org/xz/) 5.8.4.
 //!
 //! A [`Stream`] codes as an `lzma_stream` does, with the coder it was made
-//! with. The decoders: `.xz` ([`Stream::stream_decoder`]), `.lzma`
+//! with. The decoders: `.xz` ([`Stream::stream_decoder`]), the same in threads
+//! ([`Stream::stream_decoder_mt`]), `.lzma`
 //! ([`Stream::alone_decoder`]), `.lz` ([`Stream::lzip_decoder`]), any of
 //! them by their first byte ([`Stream::auto_decoder`]), or raw LZMA1 and
 //! LZMA2 ([`Stream::raw_decoder`]). The encoders: `.xz` of a preset
@@ -114,6 +115,7 @@ mod range_decoder;
 mod range_encoder;
 mod simple;
 mod stream_decoder;
+mod stream_decoder_mt;
 mod stream_encoder;
 mod stream_encoder_mt;
 mod stream_flags;
@@ -354,6 +356,20 @@ impl Stream {
                 Action::FullBarrier,
                 Action::Finish,
             ],
+        ))
+    }
+
+    /// `lzma_stream_decoder_mt`: a .xz decoder that decodes Blocks in up to
+    /// `options.threads` threads, as far as their sizes are in their headers
+    /// (as the threaded encoder writes them) and `options.memlimit_threading`
+    /// allows, and the others without threads. It takes [`Action::Run`] and
+    /// [`Action::Finish`]. With [`FAIL_FAST`], an error is returned as soon
+    /// as it is found, else after all the output before it.
+    pub fn stream_decoder_mt(options: &MtOptions) -> Result<Stream> {
+        let decoder = stream_decoder_mt::StreamDecoderMt::new(options).map_err(init_error)?;
+        Ok(Stream::with_actions(
+            Box::new(decoder),
+            &[Action::Run, Action::Finish],
         ))
     }
 

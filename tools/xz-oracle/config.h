@@ -2,7 +2,7 @@
  * config.h for building liblzma 5.8.4 into the oracle on 64-bit Linux and
  * macOS, in place of the one XZ Utils' configure or CMake build writes:
  * the decoders and encoders hivepack-xz has (LZMA1, LZMA2, delta, the BCJ
- * filters, lzip's decoder, and the threaded encoder, with POSIX threads as
+ * filters, lzip's decoder, and the threaded coders, with POSIX threads as
  * configure sets them up on Linux and macOS), the three checks, and no
  * assembly or CPU-specific code. Without HAVE_IMMINTRIN_H and
  * TUKLIB_FAST_UNALIGNED_ACCESS, the LZ decoder copies exactly what it

@@ -10,7 +10,8 @@
 //! Differs from liblzma, without a difference to see: liblzma's main
 //! thread writes the input of a Block into the worker's buffer while the
 //! worker reads the part before it; here the main thread appends it to
-//! [`WorkerShared::pending`], which the worker moves to its own buffer.
+//! [`WorkerShared::pending`], which the worker moves to its own buffer
+//! ([`take_pending`]).
 //! The worker writes its output to a buffer it has taken from the output
 //! queue and gives back when it has finished, as liblzma's main thread
 //! reads only finished Blocks.
@@ -44,10 +45,11 @@ const WORKER_THREAD_SIZE: u64 = 544;
 /// or exit.
 const IN_CHUNK_MAX: usize = 16384;
 
-/// `lzma_mt`: the options of the threaded encoder.
+/// `lzma_mt`: the options of the threaded encoder and decoder.
 #[derive(Clone, Debug)]
 pub struct MtOptions {
-    /// Set this to zero if no flags are wanted. The encoder takes none.
+    /// Set this to zero if no flags are wanted. The encoder takes none; the
+    /// decoder takes those of [`Stream::stream_decoder`](crate::Stream::stream_decoder).
     pub flags: u32,
     /// Number of worker threads to use, from 1 to 16384.
     pub threads: u32,
@@ -64,6 +66,13 @@ pub struct MtOptions {
     pub filters: Option<Vec<Filter>>,
     /// Encoder only: the integrity check of the Blocks.
     pub check: Check,
+    /// Decoder only: the memory usage above which the decoder does not start
+    /// another Block in a thread, and decodes a Block that would need more
+    /// than this alone without threads. It is at most `memlimit_stop`.
+    pub memlimit_threading: u64,
+    /// Decoder only: the memory usage that decoding never goes over; a
+    /// Block that would need more gives [`Error::Memlimit`](crate::Error::Memlimit).
+    pub memlimit_stop: u64,
 }
 
 impl Default for MtOptions {
@@ -76,6 +85,8 @@ impl Default for MtOptions {
             preset: crate::PRESET_DEFAULT,
             filters: None,
             check: Check::CRC64,
+            memlimit_threading: u64::MAX,
+            memlimit_stop: u64::MAX,
         }
     }
 }
@@ -155,11 +166,11 @@ struct Coder {
 
 /// A mutex's data. A thread that panicked while holding it cannot leave it
 /// inconsistent in a way that matters here, as no code panics.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn wait<'a, T>(cond: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+pub(crate) fn wait<'a, T>(cond: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     cond.wait(guard).unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -238,9 +249,22 @@ struct WorkerLocal {
     /// What the main thread has given for the Block.
     outbuf: Option<WorkerOutBuf>,
     filters: Vec<Filter>,
+    /// Block encoder, kept from one Block to the next.
+    block_encoder: Option<BlockEncoder>,
     /// The Block's sizes, for the Index, once it has been encoded.
     unpadded_size: u64,
     uncompressed_size: u64,
+}
+
+/// The input the main thread has given, moved to the worker's buffer: by
+/// exchanging the two if the worker's is empty, as it is when a Block comes
+/// in one piece, else by copying.
+pub(crate) fn take_pending(input: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    if input.is_empty() {
+        core::mem::swap(input, pending);
+    } else {
+        input.append(pending);
+    }
 }
 
 /// Room in `buf` to write at `out_pos`, up to `out_size` bytes in all.
@@ -249,7 +273,7 @@ struct WorkerLocal {
 /// allocated at its full size and written as it goes; here it grows as it
 /// is written, and the Block encoder is called again when it has filled
 /// what there was, as with an output buffer of the full size.
-fn ensure_room(buf: &mut Vec<u8>, out_pos: usize, out_size: usize) {
+pub(crate) fn ensure_room(buf: &mut Vec<u8>, out_pos: usize, out_size: usize) {
     if buf.len() <= out_pos && buf.len() < out_size {
         let len = (out_pos + (1 << 16)).max(buf.len() * 2).min(out_size);
         buf.resize(len, 0);
@@ -295,13 +319,14 @@ impl WorkerLocal {
         }
 
         // Initialize the Block encoder.
-        let mut block_encoder = match BlockEncoder::new(block_options.clone()) {
-            Ok(encoder) => encoder,
-            Err(ret) => {
-                worker_error(&self.coder, ret);
-                return WorkerState::Stop;
-            }
-        };
+        let block_encoder =
+            match BlockEncoder::new(block_options.clone(), self.block_encoder.take()) {
+                Ok(encoder) => self.block_encoder.insert(encoder),
+                Err(ret) => {
+                    worker_error(&self.coder, ret);
+                    return WorkerState::Stop;
+                }
+            };
 
         let mut in_pos = 0;
         let mut in_size = 0;
@@ -326,7 +351,7 @@ impl WorkerLocal {
 
                 *state = shared.state;
                 in_size = shared.in_size;
-                self.input.append(&mut shared.pending);
+                take_pending(&mut self.input, &mut shared.pending);
             }
 
             // Return if we were asked to stop or exit.
@@ -372,7 +397,7 @@ impl WorkerLocal {
                 // Encode the Block Header. By doing it after the
                 // compression, we can store the Compressed Size and
                 // Uncompressed Size fields.
-                block_options = block_encoder.block;
+                block_options.clone_from(&block_encoder.block);
                 let ret = block_options.header_encode(&mut outbuf.buf);
                 if ret != Ret::Ok {
                     worker_error(&self.coder, ret);
@@ -393,7 +418,7 @@ impl WorkerLocal {
 
                     *state = shared.state;
                     in_size = shared.in_size;
-                    self.input.append(&mut shared.pending);
+                    take_pending(&mut self.input, &mut shared.pending);
                 }
 
                 if *state >= WorkerState::Stop {
@@ -568,8 +593,8 @@ impl StreamEncoderMt {
 
     /// `initialize_new_thread`: a new worker and its thread.
     fn initialize_new_thread(&mut self) -> Ret {
-        let mut input = Vec::new();
-        if input.try_reserve_exact(self.block_size).is_err() {
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(self.block_size).is_err() {
             return Ret::MemError;
         }
 
@@ -577,7 +602,7 @@ impl StreamEncoderMt {
             mutex: Mutex::new(WorkerShared {
                 state: WorkerState::Idle,
                 in_size: 0,
-                pending: Vec::new(),
+                pending,
                 outbuf: None,
                 filters: Vec::new(),
                 progress_in: 0,
@@ -592,9 +617,10 @@ impl StreamEncoderMt {
             index: self.threads.len(),
             check: self.stream_flags.check,
             block_size: self.block_size,
-            input,
+            input: Vec::new(),
             outbuf: None,
             filters: Vec::new(),
+            block_encoder: None,
             unpadded_size: 0,
             uncompressed_size: 0,
         };
@@ -660,7 +686,7 @@ impl StreamEncoderMt {
         // The output buffer for the Block.
         let outbuf = {
             let mut shared = lock(&self.coder.mutex);
-            let id = shared.outq.get_buf();
+            let id = shared.outq.get_buf(None);
             match shared.outq.buf_mut(id) {
                 Some(buf) => WorkerOutBuf {
                     id,

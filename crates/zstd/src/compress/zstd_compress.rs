@@ -65,8 +65,8 @@ use crate::compress::zstd_opt::{
 };
 use crate::compress::zstd_pre_split::zstd_split_block;
 use crate::compress::zstdmt_compress::{
-    MtCCtx, ZSTD_OVERLAPLOG_MAX, ZSTD_OVERLAPLOG_MIN, ZSTDMT_JOBSIZE_MAX, ZSTDMT_JOBSIZE_MIN,
-    ZSTDMT_NBWORKERS_MAX,
+    MtCCtx, ThreadPool, ZSTD_OVERLAPLOG_MAX, ZSTD_OVERLAPLOG_MIN, ZSTDMT_JOBSIZE_MAX,
+    ZSTDMT_JOBSIZE_MIN, ZSTDMT_NBWORKERS_MAX,
 };
 use crate::decompress::zstd_ddict::DictContentType;
 use crate::decompress::zstd_decompress::{InBuffer, OutBuffer, ResetDirective};
@@ -2721,6 +2721,25 @@ struct LocalDict {
     cdict: Option<Arc<CDict>>,
 }
 
+/// `ZSTD_frameProgression`: how far a frame being compressed has got
+/// ([`CCtx::get_frame_progression`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameProgression {
+    /// The input taken, whether compressed yet or not.
+    pub ingested: u64,
+    /// The input compressed.
+    pub consumed: u64,
+    /// The output produced.
+    pub produced: u64,
+    /// The output written out to the caller.
+    pub flushed: u64,
+    /// With workers, the jobs handed over to threads so far: the number
+    /// of the next (`nextJobID`).
+    pub current_job_id: u32,
+    /// With workers, the jobs compressing, or waiting for a thread.
+    pub nb_active_workers: u32,
+}
+
 /// `ZSTD_CCtx`: a compression context, reused across frames.
 ///
 /// Create one with [`CCtx::new`] and keep it: it holds tables and buffers
@@ -2736,7 +2755,9 @@ struct LocalDict {
 /// jobs, side by side. The frames then depend on whether there are workers,
 /// not on how many: they are those libzstd writes with workers, for any
 /// number. The threads end when the context is dropped, once their jobs
-/// are done. The context can move between threads.
+/// are done; or the context runs its jobs on threads it shares with other
+/// contexts ([`CCtx::ref_thread_pool`]). The context can move between
+/// threads.
 ///
 /// A [`CDict`] is attached, its tables searched where they are
 /// (`dictMatchState`), for small inputs and inputs of unknown size, and
@@ -2818,6 +2839,9 @@ pub struct CCtx {
     /// `mtctx`: the worker threads and their jobs, made by the first frame
     /// with workers.
     mtctx: Option<Box<MtCCtx>>,
+    /// `pool`: the threads shared with other contexts that `mtctx`, when
+    /// made, takes for its own.
+    pool: Option<ThreadPool>,
     /// `cParamsChanged`: compression parameters were set while a frame was
     /// streamed; a frame with workers takes them for its next jobs.
     c_params_changed: bool,
@@ -2888,6 +2912,7 @@ impl CCtx {
             expected_out_buffer_size: 0,
             stable_in_not_consumed: 0,
             mtctx: None,
+            pool: None,
             c_params_changed: false,
             extern_seq_store: RawSeqStore::default(),
             seq_producer: None,
@@ -5090,6 +5115,69 @@ impl CCtx {
         Ok(remaining_to_flush + last_block_size + checksum_size)
     }
 
+    /// `ZSTD_getFrameProgression`: how far the frame being compressed has
+    /// got, or the last one, once ended (until the next starts).
+    ///
+    /// With workers, it counts the input of the jobs and of the input
+    /// taken for the next, and what each job has produced and written
+    /// out; at the end of the frame, its whole input and output. How far
+    /// it has got in between depends on the threads. Without workers,
+    /// `flushed` is `produced`, though a block may be waiting in the
+    /// context's own output buffer, and `current_job_id` and
+    /// `nb_active_workers` are 0.
+    pub fn get_frame_progression(&self) -> FrameProgression {
+        if self.applied_params.nb_workers > 0
+            && let Some(mtctx) = &self.mtctx
+        {
+            return mtctx.frame_progression();
+        }
+        let buffered = if self.in_buff.is_empty() {
+            0
+        } else {
+            self.in_buff_pos - self.in_to_compress
+        };
+        FrameProgression {
+            ingested: self.consumed_src_size + buffered as u64,
+            consumed: self.consumed_src_size,
+            produced: self.produced_csize,
+            flushed: self.produced_csize,
+            current_job_id: 0,
+            nb_active_workers: 0,
+        }
+    }
+
+    /// `ZSTD_toFlushNow`: with workers, what the oldest job not all written
+    /// out has produced and not written out yet, which the next call can
+    /// write out without waiting for the threads; 0 without workers, as in
+    /// libzstd, though a block may be waiting in the context's own output
+    /// buffer.
+    pub fn to_flush_now(&self) -> usize {
+        if self.applied_params.nb_workers > 0
+            && let Some(mtctx) = &self.mtctx
+        {
+            return mtctx.to_flush_now();
+        }
+        0
+    }
+
+    /// `ZSTD_CCtx_refThreadPool`: `pool`'s threads for the jobs of the
+    /// frames with workers, rather than threads of the context's own;
+    /// `None` for its own. Only between frames (or fails with
+    /// [`ErrorCode::StageWrong`]).
+    ///
+    /// As in libzstd, the pool counts from the first frame the context
+    /// compresses with workers, which sets up their threads: from then on
+    /// the context keeps those, its own or the pool's, whatever pool is
+    /// referred to later.
+    pub fn ref_thread_pool(&mut self, pool: Option<&ThreadPool>) -> Result<()> {
+        if self.stream_stage != StreamStage::Init {
+            // Only in the init stage.
+            return error!(StageWrong);
+        }
+        self.pool = pool.cloned();
+        Ok(())
+    }
+
     /// `ZSTD_CCtx_init_compressStream2`: starts a frame, with the parameters
     /// set. With [`EndDirective::End`], `in_size` is its size.
     fn init_compress_stream2(&mut self, end_op: EndDirective, in_size: usize) -> Result<()> {
@@ -5158,7 +5246,10 @@ impl CCtx {
             // The workers' context, made by the first frame with them.
             let mtctx = match &mut self.mtctx {
                 Some(mtctx) => mtctx,
-                None => self.mtctx.insert(Box::new(MtCCtx::new(params.nb_workers)?)),
+                None => self.mtctx.insert(Box::new(MtCCtx::new(
+                    params.nb_workers,
+                    self.pool.as_ref(),
+                )?)),
             };
             mtctx.init_cstream_internal(prefix_dict, cdict.clone(), &params, pledged_src_size)?;
             self.dict_id = cdict.as_ref().map_or(0, |cdict| cdict.dict_id);

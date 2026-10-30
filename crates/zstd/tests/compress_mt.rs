@@ -13,6 +13,11 @@
 //! ended. `ZSTD_compress2` is one call either way. Each side gets its own
 //! number of workers, from 1 to 8: the frames must not depend on it.
 //!
+//! `ZSTD_getFrameProgression` depends on the threads too, but for what
+//! each side has taken and written out; once a flush or the end has all
+//! been written out, it is the same on both sides. Contexts that share a
+//! pool of threads (`ZSTD_CCtx_refThreadPool`) write the same frames.
+//!
 //! Inputs are smaller in debug builds, and smaller still on the machines CI
 //! emulates (32-bit and big-endian). On big-endian machines the frames
 //! leave out the strategies from `greedy` up: libzstd's block splitter
@@ -27,7 +32,8 @@ use std::sync::Arc;
 
 use hivepack_zstd::{
     CCtx, CDict, CParameter as P, CParameterKind as K, DCtx, DictAttachPref, EndDirective,
-    ErrorCode, InBuffer, OutBuffer, ParamSwitch, ResetDirective, Strategy,
+    ErrorCode, FrameProgression, InBuffer, OutBuffer, ParamSwitch, ResetDirective, Strategy,
+    ThreadPool,
 };
 use support::{Problems, Rng};
 use zstd::zstd_safe::{self, CParameter as C, zstd_sys::ZSTD_EndDirective};
@@ -736,8 +742,10 @@ struct Step {
 /// How a step ended, and the frame's output so far.
 #[derive(PartialEq, Eq, Debug)]
 enum Ended {
-    /// Done: its input taken, or all of it written out.
-    Done,
+    /// Done: its input taken, or all of it written out; then, after a
+    /// flush or the end, how far the frame has got, the same on both
+    /// sides whatever the threads did.
+    Done(Option<FrameProgression>),
     /// No progress with all the room given: a stable output buffer full.
     Stalled,
     Failed(String),
@@ -754,6 +762,11 @@ trait Side {
         helper: bool,
     ) -> (Result<usize, String>, usize, usize);
     fn set(&mut self, param: Param) -> Result<(), String>;
+    fn name(&self) -> &'static str;
+    /// `ZSTD_getFrameProgression`.
+    fn progression(&self) -> FrameProgression;
+    /// `ZSTD_toFlushNow`, which zstd-safe does not offer.
+    fn to_flush_now(&self) -> Option<usize>;
 }
 
 struct Libzstd<'a>(zstd_safe::CCtx<'a>);
@@ -791,6 +804,26 @@ impl Side for Libzstd<'_> {
     fn set(&mut self, (_, cp): Param) -> Result<(), String> {
         self.0.set_parameter(cp).map(|_| ()).map_err(name)
     }
+
+    fn name(&self) -> &'static str {
+        "libzstd"
+    }
+
+    fn progression(&self) -> FrameProgression {
+        let fp = self.0.get_frame_progression();
+        FrameProgression {
+            ingested: fp.ingested,
+            consumed: fp.consumed,
+            produced: fp.produced,
+            flushed: fp.flushed,
+            current_job_id: fp.currentJobID,
+            nb_active_workers: fp.nbActiveWorkers,
+        }
+    }
+
+    fn to_flush_now(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl Side for Port {
@@ -817,6 +850,48 @@ impl Side for Port {
     fn set(&mut self, (pp, _): Param) -> Result<(), String> {
         self.0.set_parameter(pp).map_err(message)
     }
+
+    fn name(&self) -> &'static str {
+        "port"
+    }
+
+    fn progression(&self) -> FrameProgression {
+        self.0.get_frame_progression()
+    }
+
+    fn to_flush_now(&self) -> Option<usize> {
+        Some(self.0.to_flush_now())
+    }
+}
+
+/// What `ZSTD_getFrameProgression` must say after any call, `taken` and
+/// `written` so far in the frame. Without workers, or before the first job
+/// is handed over, the output written out counts as produced; with
+/// workers, the output written out is what the jobs have produced and the
+/// caller's thread has written out, and the jobs that are compressing or
+/// waiting for a thread are at most one more than the workers (8 here).
+fn progression_problem(side: &dyn Side, taken: usize, written: usize) -> Option<String> {
+    let fp = side.progression();
+    let problem = if fp.ingested != taken as u64 {
+        format!("ingested {} of {taken} taken", fp.ingested)
+    } else if fp.consumed > fp.ingested || fp.flushed > fp.produced {
+        "more consumed than ingested, or flushed than produced".into()
+    } else if fp.current_job_id == 0 && (fp.flushed != fp.produced || fp.nb_active_workers > 1) {
+        "before the first job, more produced than flushed, or more than one job".into()
+    } else if fp.current_job_id > 0 && (fp.flushed != written as u64 || fp.nb_active_workers > 9) {
+        format!("{written} bytes written, or too many active jobs")
+    } else if side
+        .to_flush_now()
+        .is_some_and(|now| now as u64 > fp.produced - fp.flushed)
+    {
+        format!("{:?} to flush now", side.to_flush_now())
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{}: frame progression {fp:?}: {problem}",
+        side.name()
+    ))
 }
 
 /// One frame of `data` through `side`, step by step. Returns the frame
@@ -857,12 +932,18 @@ fn stream_frame(
                     break 'steps;
                 }
             };
+            if let Some(problem) = progression_problem(side, taken, frame.len()) {
+                ends.push(Ended::Failed(problem));
+                break 'steps;
+            }
             let done = match step.directive {
                 EndDirective::Continue => taken == step.end,
                 _ => taken == step.end && remaining == 0,
             };
             if done {
-                ends.push(Ended::Done);
+                let progression =
+                    (step.directive != EndDirective::Continue).then(|| side.progression());
+                ends.push(Ended::Done(progression));
                 if let Some(param) = step.then {
                     sets.push(side.set(param));
                 }
@@ -1072,7 +1153,7 @@ fn compare_streams(problems: &mut Problems, seed: u64, dicts: &Dicts) -> usize {
             ));
             return frames;
         }
-        let complete = want_ends.iter().all(|end| *end == Ended::Done);
+        let complete = want_ends.iter().all(|end| matches!(end, Ended::Done(_)));
         if complete {
             frames += 1;
             // A frame pledged wrong, but complete, says the wrong size.
@@ -1229,7 +1310,7 @@ fn stable_input_buffers_with_workers() {
             );
         }
         let (want, want_ends, _) = stream_frame(&mut c, &src, &steps, None);
-        if !want_ends.iter().all(|end| *end == Ended::Done) {
+        if !want_ends.iter().all(|end| matches!(end, Ended::Done(_))) {
             problems.add(format!("{tag}: libzstd ended {want_ends:?}"));
             continue;
         }
@@ -1432,11 +1513,154 @@ fn parameters_follow_libzstd_rules() {
     decodes(&frame, b"some input", Active::None).expect("decodes");
 }
 
-/// The contexts move between threads.
+/// The contexts move between threads; pools of threads are shared
+/// between them.
 #[test]
 fn contexts_are_send() {
     fn send<T: Send>() {}
+    fn sync<T: Send + Sync>() {}
     send::<CCtx>();
+    sync::<ThreadPool>();
+}
+
+/// Contexts on threads of their own that share a pool of threads
+/// (`ZSTD_CCtx_refThreadPool`) write libzstd's frames, in one call and
+/// streaming: pools of fewer threads than the contexts have workers, one
+/// thread for all of them; contexts that change their number of workers
+/// between frames, and so resize the pool for all; one that refers to the
+/// pool once its workers' context is made, which keeps its own threads as
+/// in libzstd; and one dropped in the middle of a frame, whose jobs end on
+/// the pool while the others go on.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn contexts_share_a_thread_pool() {
+    let mut rng = Rng(0x4D54_0700);
+    let len = scaled(2_000_000);
+    let levels = [1, 3, 7, 19];
+    let inputs: Vec<Vec<u8>> = levels.iter().map(|_| data(&mut rng, len)).collect();
+    let steps: Vec<Vec<Step>> = levels.iter().map(|_| steps(&mut rng, len)).collect();
+    // libzstd's frames, with threads of its own: in each of two rounds, one
+    // in one call, and one streamed, whose steps set parameters for the
+    // frames after too.
+    let want: Vec<Vec<Vec<u8>>> = inputs
+        .iter()
+        .zip(&steps)
+        .zip(levels)
+        .map(|((input, steps), level)| {
+            let mut c = zstd_safe::CCtx::create();
+            c.set_parameter(C::CompressionLevel(level))
+                .expect("a level");
+            c.set_parameter(C::NbWorkers(2)).expect("workers");
+            let mut frames = Vec::new();
+            for _ in 0..2 {
+                frames.push(libzstd_compress2(&mut c, input).expect("libzstd compresses"));
+                let mut side = Libzstd(c);
+                let (streamed, ends, _) = stream_frame(&mut side, input, steps, None);
+                c = side.0;
+                assert!(
+                    ends.iter().all(|end| matches!(end, Ended::Done(_))),
+                    "libzstd ended {ends:?}"
+                );
+                frames.push(streamed);
+            }
+            frames
+        })
+        .collect();
+
+    // The pool is refused while a frame is streamed, as in libzstd.
+    {
+        let pool = ThreadPool::new(2).expect("a pool");
+        let c_pool = zstd_safe::ThreadPool::new(2);
+        let mut c = zstd_safe::CCtx::create();
+        let mut p = CCtx::new();
+        set_both(&mut c, &mut p, (P::NbWorkers(2), C::NbWorkers(2))).expect("workers");
+        let mut out = vec![0u8; 1000];
+        let mut output = zstd_safe::OutBuffer::around(&mut out[..]);
+        let mut input = zstd_safe::InBuffer::around(b"some input");
+        c.compress_stream2(&mut output, &mut input, ZSTD_EndDirective::ZSTD_e_continue)
+            .expect("libzstd starts");
+        let mut output = OutBuffer::new(&mut out);
+        let mut input = InBuffer::new(b"some input");
+        p.compress_stream2(&mut output, &mut input, EndDirective::Continue)
+            .expect("the port starts");
+        let want = c.ref_thread_pool(&c_pool).map(|_| ()).map_err(name);
+        let got = p.ref_thread_pool(Some(&pool)).map_err(message);
+        assert_eq!(want, got, "a pool referred to in the middle of a frame");
+        assert!(want.is_err());
+        assert_eq!(
+            p.ref_thread_pool(None).map_err(|error| error.code()),
+            Err(ErrorCode::StageWrong)
+        );
+    }
+    assert!(zstd_safe::ThreadPool::try_new(0).is_none());
+    assert_eq!(
+        ThreadPool::new(0).map(|_| ()).map_err(|error| error.code()),
+        Err(ErrorCode::MemoryAllocation)
+    );
+
+    for threads in [1, 2, 3] {
+        let pool = ThreadPool::new(threads).expect("a pool");
+        std::thread::scope(|scope| {
+            // One dropped in the middle of a frame: its jobs go on, on the
+            // pool.
+            let pool_ = pool.clone();
+            let input = &inputs[0];
+            scope.spawn(move || {
+                let mut p = CCtx::new();
+                p.ref_thread_pool(Some(&pool_)).expect("a pool");
+                p.set_parameter(P::NbWorkers(4)).expect("workers");
+                p.set_parameter(P::JobSize(JOBSIZE_MIN as u32))
+                    .expect("jobs");
+                let mut out = vec![0u8; 1 << 16];
+                let mut output = OutBuffer::new(&mut out);
+                let mut input = InBuffer::new(input);
+                p.compress_stream2(&mut output, &mut input, EndDirective::Continue)
+                    .expect("starts");
+            });
+            for (i, (((input, steps), level), want)) in
+                inputs.iter().zip(&steps).zip(levels).zip(&want).enumerate()
+            {
+                let pool = &pool;
+                scope.spawn(move || {
+                    let tag = format!("{threads} threads, context {i}");
+                    let mut p = CCtx::new();
+                    p.set_parameter(P::CompressionLevel(level))
+                        .expect("a level");
+                    p.set_parameter(P::NbWorkers(1 + 2 * i as u32))
+                        .expect("workers");
+                    if i == 3 {
+                        // Its own threads first, then the pool, which it
+                        // does not take.
+                        let got = port_compress2(&mut p, input).expect("compresses");
+                        assert!(got == want[0], "{tag}: the frames differ");
+                    }
+                    p.ref_thread_pool(Some(pool)).expect("a pool");
+                    for round in 0..2 {
+                        if round == 1 && i == 1 {
+                            // Another number of workers: the pool resized.
+                            p.set_parameter(P::NbWorkers(5)).expect("workers");
+                        }
+                        let got = port_compress2(&mut p, input).expect("compresses");
+                        assert!(
+                            got == want[2 * round],
+                            "{tag}, round {round}: the frames differ"
+                        );
+                        let mut side = Port(p);
+                        let (got, ends, _) = stream_frame(&mut side, input, steps, None);
+                        p = side.0;
+                        assert!(
+                            ends.iter().all(|end| matches!(end, Ended::Done(_))),
+                            "{tag}, round {round}: the port ended {ends:?}"
+                        );
+                        assert!(
+                            got == want[2 * round + 1],
+                            "{tag}, round {round}: the streams differ"
+                        );
+                    }
+                });
+            }
+        });
+    }
 }
 
 /// Silesia files, when fetched (the `bench` group), at levels 1, 3, 9 and

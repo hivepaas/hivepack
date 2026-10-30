@@ -401,7 +401,7 @@ impl StreamEncoder {
         }
 
         // Initialize the actual Block encoder.
-        self.block_encoder = Some(BlockEncoder::new(block)?);
+        self.block_encoder = Some(BlockEncoder::new(block, self.block_encoder.take())?);
         Ok(())
     }
 }

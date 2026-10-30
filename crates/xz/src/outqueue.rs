@@ -5,8 +5,8 @@
 //! has finished. Here the queue is a `VecDeque` of [`OutBuf`] behind the
 //! coder's mutex, as liblzma reads it, and a worker takes the data of its
 //! buffer ([`OutBuf::buf`]) while it writes, and gives it back when it has
-//! finished: the main thread reads only finished data, as liblzma's
-//! encoder does.
+//! finished: the encoder's main thread reads only finished data. The
+//! decoder's reads what a worker has moved there so far, under the mutex.
 
 use std::collections::VecDeque;
 
@@ -25,7 +25,7 @@ const fn get_bufs_limit(threads: u32) -> u32 {
 }
 
 /// `lzma_outq_outbuf_memusage`: the memory of one buffer.
-fn outbuf_memusage(buf_size: usize) -> u64 {
+pub(crate) fn outbuf_memusage(buf_size: usize) -> u64 {
     OUTBUF_SIZE + buf_size as u64
 }
 
@@ -34,11 +34,19 @@ pub(crate) struct OutBuf {
     /// The buffer's number, from the first one, so that a worker can find
     /// its buffer again.
     pub(crate) id: u64,
+    /// The worker that writes to this buffer, for
+    /// `lzma_outq_enable_partial_output()`.
+    worker: Option<usize>,
     /// Amount of memory allocated for buf[].
     pub(crate) allocated: usize,
     /// Writing position in the worker thread or, in other words, the
     /// amount of finished data written to buf[] which can be copied out
     pub(crate) pos: usize,
+    /// Decompression: Position in the input buffer in the worker thread
+    /// that matches the output "pos" above. This is used to detect if more
+    /// output might be possible from the worker thread: if it has consumed
+    /// all its input, then more output isn't possible.
+    pub(crate) decoder_in_pos: usize,
     /// True when no more data will be written into this buffer.
     pub(crate) finished: bool,
     /// Return value for `lzma_outq_read()` when the last byte from a
@@ -127,6 +135,22 @@ impl OutQueue {
         }
     }
 
+    /// `lzma_outq_clear_cache2`: like `lzma_outq_clear_cache()` but one
+    /// buffer is not freed if its size is equal to `keep_size`.
+    pub(crate) fn clear_cache2(&mut self, keep_size: usize) {
+        if self.cache.is_empty() {
+            return;
+        }
+
+        while self.cache.len() > 1 {
+            self.free_one_cached_buffer();
+        }
+
+        if self.cache_allocated != keep_size {
+            self.free_one_cached_buffer();
+        }
+    }
+
     /// `lzma_outq_init`: ready for `threads` threads, keeping what buffers
     /// it can.
     pub(crate) fn init(&mut self, threads: u32) -> Ret {
@@ -178,8 +202,9 @@ impl OutQueue {
         Ret::Ok
     }
 
-    /// `lzma_outq_get_buf`: a new buffer at the tail; its number.
-    pub(crate) fn get_buf(&mut self) -> u64 {
+    /// `lzma_outq_get_buf`: a new buffer at the tail, for `worker`; its
+    /// number.
+    pub(crate) fn get_buf(&mut self, worker: Option<usize>) -> u64 {
         let buf = self.cache.pop().unwrap_or_default();
         let id = self.next_id;
         self.next_id += 1;
@@ -187,8 +212,10 @@ impl OutQueue {
         self.mem_in_use += outbuf_memusage(self.cache_allocated);
         self.bufs.push_back(OutBuf {
             id,
+            worker,
             allocated: self.cache_allocated,
             pos: 0,
+            decoder_in_pos: 0,
             finished: false,
             finish_ret: Ret::StreamEnd,
             unpadded_size: 0,
@@ -247,6 +274,22 @@ impl OutQueue {
         self.read_pos = 0;
 
         sizes
+    }
+
+    /// `lzma_outq_enable_partial_output`: the worker to tell to give
+    /// partial output, if the buffer at the head of the queue isn't
+    /// finished and it has not been told yet.
+    pub(crate) fn enable_partial_output(&mut self) -> Option<usize> {
+        let head = self.bufs.front_mut()?;
+        if head.finished {
+            return None;
+        }
+        head.worker.take()
+    }
+
+    /// The `decoder_in_pos` of the buffer at the head of the queue.
+    pub(crate) fn head_decoder_in_pos(&self) -> Option<usize> {
+        self.bufs.front().map(|head| head.decoder_in_pos)
     }
 
     /// `lzma_outq_has_buf`: whether a buffer can be taken.

@@ -19,9 +19,11 @@ Only the standard library is used, so any Python 3.9 or newer runs it.
 """
 
 import argparse
+import binascii
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -95,8 +97,8 @@ def unpack(archive: Path, kind: str, into: Path) -> None:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, dest.open("wb") as out:
                     shutil.copyfileobj(src, out)
-    elif kind == "tar.gz":
-        with tarfile.open(archive, "r:gz") as t:
+    elif kind in ("tar.gz", "tar.xz"):
+        with tarfile.open(archive, "r:gz" if kind == "tar.gz" else "r:xz") as t:
             for member in t.getmembers():
                 rel = safe_member(member.name)
                 if not rel.parts:
@@ -171,6 +173,25 @@ def build_tool(source: Path, tool: str) -> Path:
     return binary
 
 
+def build_7zz(source: Path, folder: Path) -> None:
+    """7-Zip's console program from the release's sources, with its own
+    makefile: what makes the archives the tests read. The makefile for GCC
+    leaves out assembly; the one for arm64 macs has it."""
+    bundle = source / "CPP" / "7zip" / "Bundles" / "Alone2"
+    print(f"  building 7zz from {source.name}")
+    makefile = "cmpl_gcc.mak"
+    if sys.platform == "darwin":
+        makefile = "cmpl_mac_arm64.mak" if platform.machine() == "arm64" else "cmpl_mac_x64.mak"
+    jobs = str(os.cpu_count() or 2)
+    build = subprocess.run(["make", "-f", f"../../{makefile}", "-j", jobs], cwd=bundle,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if build.returncode != 0:
+        # The end of what it said: it warns a lot before an error.
+        print(build.stderr[-4000:], file=sys.stderr)
+        raise SystemExit(f"building 7zz failed with {build.returncode}")
+    shutil.copy2(next(bundle.glob("b/*/7zz")), folder / "7zz")
+
+
 def libzip_sources(lib: Path) -> list:
     """The library's C files, as lib/CMakeLists.txt lists them in ZIP_SOURCES,
     with the Unix ones it adds; zip_err_str.c is generated apart."""
@@ -188,6 +209,16 @@ BZIP2_SOURCES = [
 ]
 
 
+# The LZMA SDK's 7z decoder: the files C/Util/7z/makefile.gcc builds 7zdec
+# with, without its LZMA assembly loop and with PPMd, as it builds it.
+SEVENZ_SOURCES = [
+    "Bcj2.c", "Bra.c", "Bra86.c", "BraIA64.c", "CpuArch.c", "Delta.c", "Lzma2Dec.c", "LzmaDec.c",
+    "Ppmd7.c", "Ppmd7Dec.c", "7zCrc.c", "7zCrcOpt.c", "7zAlloc.c", "7zArcIn.c", "7zBuf.c",
+    "7zBuf2.c", "7zDec.c", "7zFile.c", "7zStream.c",
+]
+SEVENZ_FLAGS = ["-DZ7_PPMD_SUPPORT", "-DZ7_EXTRACT_ONLY"]
+
+
 # liblz4: the library's files (lib/), as lz4's lib/Makefile builds them,
 # with xxHash's names prefixed as there.
 LZ4_SOURCES = ["lz4.c", "lz4frame.c", "lz4hc.c", "xxhash.c"]
@@ -200,7 +231,7 @@ LZ4_FLAGS = ["-DXXH_NAMESPACE=LZ4_"]
 # their filters (see tools/xz-oracle/config.h); only their headers, which
 # the filter tables include, are on the include path.
 LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder", "delta", "simple"]
-LIBLZMA_LEFT_OUT = ["stream_decoder_mt", "hardware_",
+LIBLZMA_LEFT_OUT = ["hardware_",
                     "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
 
 
@@ -243,6 +274,7 @@ LIBZIP_CRYPTO_SOURCES = [
     "zip_source_winzip_aes_encode.c",
 ]
 LIBZIP_BZIP2_SOURCES = ["zip_algorithm_bzip2.c"]
+LIBZIP_XZ_SOURCES = ["zip_algorithm_xz.c"]
 
 
 # libarchive: the reader and writer of ISO 9660 images, what they call, and
@@ -305,6 +337,42 @@ def zip_err_str(lib: Path) -> str:
     return "\n".join(out) + "\n"
 
 
+# UnRAR's library build (`make lib`): -DRARDLL, as its makefile defines it,
+# without RAR_SMP, the threads, which give the same output.
+# Signed chars, as on x86-64, whose UnRAR the port follows: `char` is unsigned
+# on Linux on ARM, and names that are not UTF-8 would decode differently.
+UNRAR_FLAGS = ["-DRARDLL", "-D_FILE_OFFSET_BITS=64", "-D_LARGEFILE_SOURCE", "-fsigned-char"]
+
+
+def unrar_sources(unrar: Path) -> list:
+    """The sources of UnRAR's library: its makefile's OBJECTS and LIB_OBJ."""
+    makefile = (unrar / "makefile").read_text()
+    objects = re.search(r"^OBJECTS=(.*?)(?:\n\n|\n[A-Z_]+=)", makefile, re.S | re.M).group(1)
+    lib_obj = re.search(r"^LIB_OBJ=(.*)$", makefile, re.M).group(1)
+    names = (objects + " " + lib_obj).replace("\\", " ").split()
+    return [name[:-2] + ".cpp" for name in names if name.endswith(".o")]
+
+
+def uudecode(text: str) -> bytes:
+    """A uuencoded file's bytes, as libarchive's tests keep their archives."""
+    data = bytearray()
+    started = False
+    for line in text.splitlines():
+        if line.startswith("begin "):
+            started = True
+            continue
+        if not started or not line:
+            continue
+        if line.strip() == "end":
+            break
+        count = (ord(line[0]) - 32) & 63
+        # As many characters as the count needs: some lines end in spaces
+        # that were trimmed, or in padding.
+        line = line[: 1 + (count + 2) // 3 * 4].ljust(1 + (count + 2) // 3 * 4, " ")
+        data += binascii.a2b_uu(line)[:count]
+    return bytes(data)
+
+
 def build_oracle(source: Path, sources: list, included: list, folder: Path, extra: list) -> None:
     """An oracle program, compiled with the library's own sources.
 
@@ -325,29 +393,55 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, the part of
-    GnuTLS that backend uses in gnutls/, and zlib's, nettle's and
-    libbzip2's (the `extra` sets)."""
+    GnuTLS that backend uses in gnutls/, and zlib's, nettle's, libbzip2's
+    and liblzma's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
+    if (source / "C" / "7zArcIn.c").exists():
+        sdk = source / "C"
+        files += [str(sdk / name) for name in SEVENZ_SOURCES]
+        subprocess.run([compiler, "-O2", "-w", *SEVENZ_FLAGS, f"-I{sdk}", *files,
+                        "-o", str(folder / "oracle")], check=True)
+        return
+    unrar = source / "unrar"
+    if unrar.is_dir():
+        files = [str(ROOT / s) for s in sources if s.endswith(".cpp")]
+        files += [str(unrar / name) for name in unrar_sources(unrar)]
+        subprocess.run([os.environ.get("CXX", "c++"), "-O2", "-w", "-std=c++11", *UNRAR_FLAGS,
+                        f"-I{unrar}", *files, "-o", str(folder / "oracle"), "-lpthread"], check=True)
+        return
     libzip = next(source.glob("libzip-*"), None)
     if libzip is not None:
         lib = libzip / "lib"
         zlib = next(extra[0].glob("zlib-*"))
         nettle = next(extra[1].glob("nettle-*"))
         bzip2 = next(extra[2].glob("bzip2-*"))
+        xz = next(extra[3].glob("xz-*/src/liblzma"))
         generated = folder / "generated"
         generated.mkdir()
         (generated / "zip_err_str.c").write_text(zip_err_str(lib))
         files += [str(lib / name) for name in
-                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES]
+                  libzip_sources(lib) + LIBZIP_CRYPTO_SOURCES + LIBZIP_BZIP2_SOURCES
+                  + LIBZIP_XZ_SOURCES]
         files += [str(generated / "zip_err_str.c")]
         files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
         files += [str(nettle / name) for name in NETTLE_SOURCES]
         files += [str(bzip2 / name) for name in BZIP2_SOURCES]
         include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
-        subprocess.run([compiler, "-O2", "-w", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
-                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", *files, "-o", str(folder / "oracle")],
+        # liblzma has a config.h of its own, so it is compiled apart.
+        objects = folder / "liblzma"
+        objects.mkdir()
+        dirs = [xz / d for d in LIBLZMA_DIRS]
+        xz_files = sorted(str(f) for d in dirs for f in d.glob("*.c")
+                          if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
+        xz_includes = [f"-I{d}" for d in [ROOT / "tools/xz-oracle", xz / "api", *dirs, xz.parent / "common"]]
+        subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *xz_includes, "-c", *xz_files],
+                       check=True, cwd=objects)
+        files += sorted(str(f) for f in objects.glob("*.o"))
+        subprocess.run([compiler, "-O2", "-w", "-pthread", *NETTLE_FLAGS, f"-I{config}", f"-I{lib}", f"-I{zlib}",
+                        f"-I{include}", f"-I{nettle}", f"-I{bzip2}", f"-I{xz / 'api'}", *files,
+                        "-o", str(folder / "oracle")],
                        check=True)
         return
     libarchive = next(source.glob("libarchive-*/libarchive"), None)
@@ -444,7 +538,15 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
-    if generate["tool"] == "oracle":
+    if generate["tool"] == "7zz":
+        build_7zz(cache / origin["name"], folder)
+    elif generate["tool"] == "uudecode":
+        # Each file the glob finds, decoded, named without its `.uu` and
+        # libarchive's `test_read_format_`.
+        for uu in sorted((cache / origin["name"]).glob(generate["glob"])):
+            name = uu.name[:-3].replace("test_read_format_", "")
+            (folder / name).write_bytes(uudecode(uu.read_text(errors="replace")))
+    elif generate["tool"] == "oracle":
         build_oracle(cache / origin["name"], generate["sources"], generate.get("included", []), folder,
                      [cache / e["name"] for e in extra])
     else:

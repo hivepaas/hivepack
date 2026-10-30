@@ -2,21 +2,23 @@
 //! bug.
 //!
 //! The first byte chooses the decoder: the .xz decoder, the auto decoder,
-//! the .lz decoder, the .lzma decoder, or a raw LZMA1 or LZMA2 decoder,
-//! with delta and BCJ filters before it now and then. The next eight seed
-//! its flags, its memory limit or its options, and the pieces. The rest is
-//! its input.
+//! the .lz decoder, the .lzma decoder, a raw LZMA1 or LZMA2 decoder, with
+//! delta and BCJ filters before it now and then, or the threaded .xz
+//! decoder. The next eight seed its flags, its memory limit or its options,
+//! and the pieces. The rest is its input.
 //!
 //! Every call must agree, up to the first error: the same result, the same
 //! bytes read and written, the same output. Now and then a memory limit is
-//! set between the calls, with the same result.
+//! set between the calls, with the same result. The threaded decoders' calls
+//! read and write as their threads let them, so for them the end and, after
+//! a Stream that ends, the output and the bytes read must be the same.
 
 #![no_main]
 
 use hivepack_xz::{
     Action, CONCATENATED, FAIL_FAST, FILTER_LZMA1, FILTER_LZMA2, Filter, FilterOptions,
-    IGNORE_CHECK, InBuffer, LzmaOptions, OutBuffer, Status, Stream, TELL_ANY_CHECK, TELL_NO_CHECK,
-    TELL_UNSUPPORTED_CHECK,
+    IGNORE_CHECK, InBuffer, LzmaOptions, MtOptions, OutBuffer, Status, Stream, TELL_ANY_CHECK,
+    TELL_NO_CHECK, TELL_UNSUPPORTED_CHECK,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -87,6 +89,115 @@ fn filters_before(
     }
 }
 
+/// A threaded decoder through `steps` (input, output room): LZMA_RUN once, and
+/// LZMA_FINISH with what is left until it is done. The output, how it ended,
+/// and the number of LZMA_*_CHECK results. `code` makes one call, giving its
+/// result and the bytes read and written.
+fn drive(
+    data: &[u8],
+    steps: &[(usize, usize)],
+    last_room: usize,
+    mut code: impl FnMut(&[u8], &mut [u8], Action) -> (i32, usize, usize),
+) -> (Vec<u8>, i32, usize, usize) {
+    let mut out = Vec::new();
+    let (mut consumed, mut tells) = (0, 0);
+    let mut call = |offered: usize, room: usize, action: Action, consumed: &mut usize| {
+        let written = out.len();
+        out.resize(written + room, 0);
+        let (ret, read, made) = code(&data[*consumed..offered], &mut out[written..], action);
+        *consumed += read;
+        out.truncate(written + made);
+        ret
+    };
+    for &(n, room) in steps {
+        let end = consumed + n.min(data.len() - consumed);
+        match call(end, room, Action::Run, &mut consumed) {
+            0 | 10 => {}
+            2..=4 => tells += 1,
+            ret => {
+                drop(call);
+                return (out, ret, tells, consumed);
+            }
+        }
+    }
+    loop {
+        match call(data.len(), last_room, Action::Finish, &mut consumed) {
+            0 => {}
+            2..=4 => tells += 1,
+            ret => {
+                drop(call);
+                return (out, ret, tells, consumed);
+            }
+        }
+    }
+}
+
+/// The threaded decoders, with one to four threads and no flags, which the
+/// `liblzma` crate's builder has no way to give (`tests/oracle.rs` gives them).
+fn mt(next: &mut impl FnMut(usize) -> usize, data: &[u8]) {
+    let threads = 1 + next(4) as u32;
+    let memlimit_threading = MEMLIMITS[next(MEMLIMITS.len())];
+    let memlimit_stop = if next(4) == 0 { MEMLIMITS[next(MEMLIMITS.len())] } else { 300 << 20 };
+    let mut builder = liblzma::stream::MtStreamBuilder::new();
+    builder
+        .threads(threads)
+        .memlimit_threading(memlimit_threading)
+        .memlimit_stop(memlimit_stop);
+    let options = MtOptions {
+        threads,
+        memlimit_threading,
+        memlimit_stop,
+        ..MtOptions::default()
+    };
+    let (mut c, mut port) = match (
+        builder.decoder(),
+        Stream::stream_decoder_mt(&options),
+    ) {
+        (Ok(c), Ok(port)) => (c, port),
+        (Err(c), Err(port)) => {
+            assert_eq!(port.number(), c_code(Err(c)));
+            return;
+        }
+        (c, port) => panic!("liblzma {:?}, the port {port:?}", c.err()),
+    };
+
+    let mut steps = Vec::new();
+    let mut offered = 0;
+    while offered < data.len() && steps.len() < 20 {
+        let n = 1 + next((data.len() - offered).min(5000));
+        offered += n;
+        steps.push((n, 1 + next(5000)));
+    }
+    let last_room = 1 + next(5000);
+
+    let want = drive(data, &steps, last_room, |input, output, action| {
+        let (before_in, before_out) = (c.total_in(), c.total_out());
+        let c_action = match action {
+            Action::Finish => liblzma::stream::Action::Finish,
+            _ => liblzma::stream::Action::Run,
+        };
+        let ret = c_code(c.process(input, output, c_action));
+        (ret, (c.total_in() - before_in) as usize, (c.total_out() - before_out) as usize)
+    });
+    let got = drive(data, &steps, last_room, |input, output, action| {
+        let mut p_input = InBuffer::new(input);
+        let mut p_output = OutBuffer::new(output);
+        let ret = port_code(port.code(&mut p_output, &mut p_input, action));
+        (ret, p_input.pos, p_output.pos)
+    });
+
+    assert_eq!((got.1, got.2), (want.1, want.2));
+
+    // After an error, the bytes read depend on the threads, and so does the
+    // output of a BCJ coder, which leaves what it has not filtered there when
+    // the coder after it fails (`tests/oracle.rs` compares the others').
+    if want.1 == 1 {
+        assert_eq!(got.0, want.0);
+        assert_eq!(got.3, want.3);
+        assert_eq!((port.total_in(), port.total_out()), (c.total_in(), c.total_out()));
+    }
+}
+
 /// Memory limits: mostly one that keeps the dictionaries below libFuzzer's
 /// limit for a malloc (headers ask for up to 4 GiB), else ones streams
 /// reach.
@@ -127,7 +238,11 @@ fuzz_target!(|data: &[u8]| {
     .filter(|_| next(3) == 0)
     .fold(0, |flags, flag| flags | flag);
     let memlimit = MEMLIMITS[next(MEMLIMITS.len())];
-    let made = match mode % 6 {
+    if mode % 7 == 6 {
+        mt(&mut next, data);
+        return;
+    }
+    let made = match mode % 7 {
         0 => (
             liblzma::stream::Stream::new_stream_decoder(memlimit, flags),
             Stream::stream_decoder(memlimit, flags),

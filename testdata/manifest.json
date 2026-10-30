@@ -243,23 +243,9 @@
     },
     {
       "name": "zip-oracle",
-      "generate": { "group": "generated", "from": "libzip-1.12.1-source", "with": ["zlib-1.3.2-source", "nettle-3.10.2-source", "bzip2-1.0.8-source"], "tool": "oracle", "sources": ["tools/zip-oracle/oracle.c", "tools/zip-oracle/config.h", "tools/zip-oracle/zipconf.h", "tools/zip-oracle/gnutls/gnutls.h", "tools/zip-oracle/gnutls/crypto.h"] },
-      "source": "tools/zip-oracle/oracle.c, built with the libzip 1.12.1, zlib 1.3.2, nettle 3.10.2 and bzip2 1.0.8 sources",
-      "license": "MIT (the program), BSD-3-Clause (libzip), Zlib (zlib), LGPL-3.0-or-later OR GPL-2.0-or-later (nettle) and bzip2-1.0.6 (libbzip2)",
-      "kind": "tool"
-    },
-    {
-      "name": "libarchive-3.8.10-source",
-      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/libarchive/libarchive/releases/download/v3.8.10/libarchive-3.8.10.tar.gz", "sha256": "a1bffbe5152cfe869751179e7b16648c87c461cb8c46eee75062efbe164cc57c", "unpack": "tar.gz" }] },
-      "source": "https://github.com/libarchive/libarchive/releases/tag/v3.8.10",
-      "license": "BSD-2-Clause",
-      "kind": "source"
-    },
-    {
-      "name": "iso-oracle",
-      "generate": { "group": "generated", "from": "libarchive-3.8.10-source", "with": ["zlib-1.3.2-source"], "tool": "oracle", "sources": ["tools/iso-oracle/oracle.c", "tools/iso-oracle/config.h"] },
-      "source": "tools/iso-oracle/oracle.c, built with the libarchive 3.8.10 and zlib 1.3.2 sources",
-      "license": "MIT (the program), BSD-2-Clause (libarchive) and Zlib (zlib)",
+      "generate": { "group": "generated", "from": "libzip-1.12.1-source", "with": ["zlib-1.3.2-source", "nettle-3.10.2-source", "bzip2-1.0.8-source", "xz-5.8.4-source"], "tool": "oracle", "sources": ["tools/zip-oracle/oracle.c", "tools/zip-oracle/config.h", "tools/zip-oracle/zipconf.h", "tools/zip-oracle/gnutls/gnutls.h", "tools/zip-oracle/gnutls/crypto.h", "tools/xz-oracle/config.h"] },
+      "source": "tools/zip-oracle/oracle.c, built with the libzip 1.12.1, zlib 1.3.2, nettle 3.10.2, bzip2 1.0.8 and XZ Utils 5.8.4 sources",
+      "license": "MIT (the program), BSD-3-Clause (libzip), Zlib (zlib), LGPL-3.0-or-later OR GPL-2.0-or-later (nettle), bzip2-1.0.6 (libbzip2) and 0BSD (liblzma)",
       "kind": "tool"
     },
     {
@@ -312,6 +298,27 @@
       "kind": "tool"
     },
     {
+      "name": "7zip-26.05-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-src.tar.xz", "sha256": "0b6080b8c3e7a579161d2d495224c0e51c467576cb4c7048b0ab485ef44cc22e", "unpack": "tar.xz" }] },
+      "source": "https://github.com/ip7z/7zip/releases/tag/26.05, 7-Zip's source release (its releases are not signed)",
+      "license": "public domain (the LZMA SDK's files of the next set), LGPL-2.1-or-later and BSD-3-Clause (7-Zip, built as a tool)",
+      "kind": "source"
+    },
+    {
+      "name": "7z-oracle",
+      "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "oracle", "sources": ["tools/7z-oracle/oracle.c"] },
+      "source": "tools/7z-oracle/oracle.c, built with the LZMA SDK's 7z decoder from 7-Zip 26.05",
+      "license": "MIT (the program), public domain (the LZMA SDK's files)",
+      "kind": "tool"
+    },
+    {
+      "name": "7zz",
+      "generate": { "group": "generated", "from": "7zip-26.05-source", "tool": "7zz" },
+      "source": "7-Zip 26.05's console program, built from the release's sources with its makefile (CPP/7zip/Bundles/Alone2)",
+      "license": "LGPL-2.1-or-later, BSD-3-Clause, and the unRAR restriction for its RAR code",
+      "kind": "tool"
+    },
+    {
       "name": "fifield-zipbombs",
       "fetch": { "group": "core", "files": [{ "url": "https://www.bamsoftware.com/hacks/zipbomb/zbsm.zip", "sha256": "fb4ff972d21189beec11e05109c4354d0cd6d3b629263d6c950cf8cc3f78bd99" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zblg.zip", "sha256": "f1dc920869794df3e258f42f9b99157104cd3f8c14394c1b9d043d6fcda14c0a" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zbxl.zip", "sha256": "eafd8f574ea7fd0f345eaa19eae8d0d78d5323c8154592c850a2d78a86817744" }] },
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",
@@ -323,13 +330,6 @@
       "path": "go-tar",
       "source": "https://github.com/golang/go/tree/go1.27.2/src/archive/tar/testdata (Go 1.27.2's archive/tar tests), with Go's LICENSE",
       "license": "BSD-3-Clause",
-      "kind": "vectors"
-    },
-    {
-      "name": "libarchive-iso",
-      "path": "libarchive-iso",
-      "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING (as LICENSE)",
-      "license": "BSD-2-Clause",
       "kind": "vectors"
     },
     {
@@ -345,6 +345,48 @@
       "source": "https://www.unicode.org/Public/18.0.0/ucd/ (the Unicode Character Database 18.0.0)",
       "license": "Unicode-3.0",
       "kind": "source"
+    },
+    {
+      "name": "unrar-7.3.2-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://www.rarlab.com/rar/unrarsrc-7.3.2.tar.gz", "sha256": "f61a1160d6e2ebbda2ad353c8e82f62ab4312f97fde23c6c2c982d25e0014f99", "unpack": "tar.gz" }] },
+      "source": "https://www.rarlab.com/rar_add.htm (the UnRAR 7.3.2 source)",
+      "license": "UnRAR",
+      "kind": "source"
+    },
+    {
+      "name": "rar-oracle",
+      "generate": { "group": "generated", "from": "unrar-7.3.2-source", "tool": "oracle", "sources": ["tools/rar-oracle/oracle.cpp"] },
+      "source": "tools/rar-oracle/oracle.cpp, built with the UnRAR 7.3.2 sources",
+      "license": "UnRAR",
+      "kind": "tool"
+    },
+    {
+      "name": "libarchive-3.8.10-source",
+      "fetch": { "group": "core", "files": [{ "url": "https://github.com/libarchive/libarchive/releases/download/v3.8.10/libarchive-3.8.10.tar.gz", "sha256": "a1bffbe5152cfe869751179e7b16648c87c461cb8c46eee75062efbe164cc57c", "unpack": "tar.gz" }] },
+      "source": "https://github.com/libarchive/libarchive/releases/tag/v3.8.10",
+      "license": "BSD-2-Clause",
+      "kind": "source"
+    },
+    {
+      "name": "libarchive-rar",
+      "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/*rar*.uu" },
+      "source": "libarchive 3.8.10's RAR test archives (libarchive/test/*rar*.uu), decoded",
+      "license": "BSD-2-Clause",
+      "kind": "archives"
+    },
+    {
+      "name": "iso-oracle",
+      "generate": { "group": "generated", "from": "libarchive-3.8.10-source", "with": ["zlib-1.3.2-source"], "tool": "oracle", "sources": ["tools/iso-oracle/oracle.c", "tools/iso-oracle/config.h"] },
+      "source": "tools/iso-oracle/oracle.c, built with the libarchive 3.8.10 and zlib 1.3.2 sources",
+      "license": "MIT (the program), BSD-2-Clause (libarchive) and Zlib (zlib)",
+      "kind": "tool"
+    },
+    {
+      "name": "libarchive-iso",
+      "path": "libarchive-iso",
+      "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING (as LICENSE)",
+      "license": "BSD-2-Clause",
+      "kind": "vectors"
     },
     {
       "name": "decodecorpus",

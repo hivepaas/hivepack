@@ -14,6 +14,10 @@
 //	sha512 <data>
 //	    Answered "ok <digest>".
 //
+//	blake2s <key> <data>
+//	    BLAKE2s-256 (x/crypto/blake2s), for hivepack-crypto and not age's:
+//	    "ok <digest>", or "err" for a key over 32 bytes.
+//
 //	hmac256 <key> <data>
 //	hmac512 <key> <data>
 //	    HMAC-SHA256 or HMAC-SHA512. Answered "ok <mac>".
@@ -95,6 +99,7 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/agessh"
 	"filippo.io/age/armor"
+	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -140,6 +145,12 @@ func answer(words []string) string {
 		return digest(sha256.New(), unhex(words[1]))
 	case words[0] == "sha512" && len(words) == 2:
 		return digest(sha512.New(), unhex(words[1]))
+	case words[0] == "blake2s" && len(words) == 3:
+		h, err := blake2s.New256(unhex(words[1]))
+		if err != nil {
+			return "err"
+		}
+		return digest(h, unhex(words[2]))
 	case words[0] == "hmac256" && len(words) == 3:
 		return digest(hmac.New(sha256.New, unhex(words[1])), unhex(words[2]))
 	case words[0] == "hmac512" && len(words) == 3:

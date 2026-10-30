@@ -21,6 +21,11 @@ allow = [
   "Zlib",
 ]
 confidence-threshold = 0.9
+# UnRAR's own license, which OSI does not approve: for hivepack-rar, a port
+# of UnRAR, alone, so that no other crate takes its terms (docs/rar.md).
+exceptions = [
+  { name = "hivepack-rar", allow = ["UnRAR"] },
+]
 
 [advisories]
 yanked = "deny"

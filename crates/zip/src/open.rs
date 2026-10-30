@@ -237,6 +237,7 @@ impl<R: ReadAt> Archive<R> {
     fn read_cdir(&mut self, buffer: &mut Buffer<'_>, buf_offset: u64, error: &mut Error) -> Search {
         let eocd_offset = buffer.offset();
         let checkcons = self.open_flags.intersects(OpenFlags::CHECKCONS);
+        let volumes = self.src.volume_starts();
 
         let Some(mut cd) = read_eocd(buffer, buf_offset, error) else {
             return Search::Continue;
@@ -254,6 +255,7 @@ impl<R: ReadAt> Archive<R> {
                     buffer,
                     buf_offset,
                     self.open_flags,
+                    volumes.as_deref(),
                     error,
                 ) {
                     CdirStatus::Ok => {}
@@ -263,7 +265,35 @@ impl<R: ReadAt> Archive<R> {
             }
         }
 
-        if (cd.eocd_disk != 0 || cd.this_disk != 0) && !eocd64_found && cd.eocd_disk != cd.this_disk
+        // Not in libzip: the archive is on the volumes the source joins,
+        // its last disk on the last of them, and its central directory is
+        // where its disk says.
+        let split = volumes.as_deref().filter(|starts| {
+            (cd.eocd_disk != 0 || cd.this_disk != 0) && cd.this_disk as usize + 1 == starts.len()
+        });
+        if let Some(starts) = split {
+            if cd.eocd_disk > cd.this_disk {
+                *error = Error::incons(Detail::CdirInvalid);
+                return Search::Stop(None);
+            }
+            if cd.disk_entries > cd.num_entries {
+                *error = Error::incons(Detail::CdirWrongEntriesCount);
+                return Search::Stop(None);
+            }
+            match starts[cd.eocd_disk as usize].checked_add(cd.offset) {
+                Some(offset) => cd.offset = offset,
+                None => {
+                    *error = Error::new(ErrorCode::Seek, EFBIG);
+                    return Search::Stop(None);
+                }
+            }
+        } else if volumes.is_some() && (cd.eocd_disk != 0 || cd.this_disk != 0) {
+            // An archive on more disks than the volumes, or fewer.
+            *error = Error::new(ErrorCode::MultiDisk, 0);
+            return Search::Stop(None);
+        } else if (cd.eocd_disk != 0 || cd.this_disk != 0)
+            && !eocd64_found
+            && cd.eocd_disk != cd.this_disk
         {
             // If the central directory doesn't start on this disk, we can't
             // check that offset is valid. Check as much as we can instead.
@@ -277,7 +307,6 @@ impl<R: ReadAt> Archive<R> {
                 return Search::Continue;
             }
         }
-
         if !eocd64_found {
             if cd.this_disk == 0
                 && cd.eocd_disk == 0
@@ -295,7 +324,7 @@ impl<R: ReadAt> Archive<R> {
         // We accept this EOCD as valid and won't search for an earlier one
         // if it is unusable.
 
-        if !check_eocd(&cd, self.open_flags, error) {
+        if !check_eocd(&cd, self.open_flags, split.is_some(), error) {
             return Search::Stop(None);
         }
 
@@ -417,6 +446,27 @@ impl<R: ReadAt> Archive<R> {
         if i != cd.entry.len() || left > 0 {
             *error = Error::incons(Detail::CdirWrongEntriesCount);
             return Search::Stop(None);
+        }
+
+        // Not in libzip: each local header is on the disk its entry says,
+        // at an offset from the disk's start, which becomes one from the
+        // start of the first; the entry is then as on a single disk.
+        if let Some(starts) = split {
+            for (i, entry) in cd.entry.iter_mut().enumerate() {
+                let Some(de) = entry.orig.as_mut() else {
+                    continue;
+                };
+                let Some(&start) = starts.get(de.disk_number as usize) else {
+                    *error = Error::incons_at(Detail::CdirInvalid, i as u64);
+                    return Search::Stop(None);
+                };
+                let Some(offset) = start.checked_add(de.offset) else {
+                    *error = Error::new(ErrorCode::Seek, EFBIG);
+                    return Search::Stop(None);
+                };
+                de.offset = offset;
+                de.disk_number = 0;
+            }
         }
 
         if checkcons {
@@ -669,9 +719,10 @@ fn read_eocd(buffer: &mut Buffer<'_>, buf_offset: u64, error: &mut Error) -> Opt
     })
 }
 
-/// Port of `check_eocd`.
-fn check_eocd(cd: &Cdir, flags: OpenFlags, error: &mut Error) -> bool {
-    if cd.disk_entries != cd.num_entries || cd.this_disk != 0 || cd.eocd_disk != 0 {
+/// Port of `check_eocd`. Differs from libzip: the archive may be on
+/// several disks if it is `split` (read from the volumes it is on).
+fn check_eocd(cd: &Cdir, flags: OpenFlags, split: bool, error: &mut Error) -> bool {
+    if !split && (cd.disk_entries != cd.num_entries || cd.this_disk != 0 || cd.eocd_disk != 0) {
         *error = Error::new(ErrorCode::MultiDisk, 0);
         return false;
     }
@@ -690,13 +741,16 @@ fn check_eocd(cd: &Cdir, flags: OpenFlags, error: &mut Error) -> bool {
 }
 
 /// The Zip64 end of central directory record, through the locator at
-/// `buffer`'s position: port of `_zip_read_eocd64`.
+/// `buffer`'s position: port of `_zip_read_eocd64`. Differs from libzip:
+/// the archive may be on as many disks as there are `volumes`, where each
+/// starts, and the record on any of them.
 fn read_eocd64<R: ReadAt + ?Sized>(
     cdir: &mut Cdir,
     src: &mut Source<R>,
     buffer: &mut Buffer<'_>,
     buf_offset: u64,
     flags: OpenFlags,
+    volumes: Option<&[u64]>,
     error: &mut Error,
 ) -> CdirStatus {
     // The offset of the end of the buffer is less than ZIP_UINT64_MAX, so
@@ -706,14 +760,31 @@ fn read_eocd64<R: ReadAt + ?Sized>(
     buffer.get(4); // magic already verified
 
     let eocd_disk = buffer.get_32();
-    let eocd_offset = buffer.get_64();
+    let mut eocd_offset = buffer.get_64();
     let num_disks = buffer.get_32();
+
+    // Not in libzip: on the disk the locator says, of the volumes.
+    let split = volumes.filter(|starts| num_disks != 1 && num_disks as usize == starts.len());
+    if let Some(starts) = split {
+        match starts
+            .get(eocd_disk as usize)
+            .and_then(|start| start.checked_add(eocd_offset))
+        {
+            Some(offset) => eocd_offset = offset,
+            None => return CdirStatus::NotFound,
+        }
+    }
+    if num_disks != 1 && volumes.is_some() && split.is_none() {
+        // An archive on more disks than the volumes, or fewer.
+        *error = Error::new(ErrorCode::MultiDisk, 0);
+        return CdirStatus::Invalid;
+    }
 
     if !check_magic(eocd_offset, buffer, buf_offset, src, EOCD64_MAGIC) {
         return CdirStatus::NotFound;
     }
 
-    if num_disks != 1 {
+    if num_disks != 1 && split.is_none() {
         *error = Error::new(ErrorCode::MultiDisk, 0);
         return CdirStatus::Invalid;
     }
@@ -781,7 +852,7 @@ fn read_eocd64<R: ReadAt + ?Sized>(
     let i = eocd.get_64();
     let nentry = eocd.get_64();
 
-    if nentry != i {
+    if nentry != i && split.is_none() {
         *error = Error::new(ErrorCode::MultiDisk, 0);
         return CdirStatus::Invalid;
     }

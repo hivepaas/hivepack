@@ -403,6 +403,13 @@
       "kind": "tool"
     },
     {
+      "name": "zip-split",
+      "path": "zip-split",
+      "source": "Made for hivepack with Info-ZIP's zip 3.0 (macOS's): zip -s 64k -r, plain, with -fz (Zip64) and with -P secret (ZipCrypto), of the generated files contents.txt lists",
+      "license": "MIT",
+      "kind": "archives"
+    },
+    {
       "name": "libarchive-iso",
       "path": "libarchive-iso",
       "source": "https://github.com/libarchive/libarchive/tree/v3.8.10/libarchive/test (the ISO 9660 test images of libarchive 3.8.10, uudecoded and uncompressed, then compressed with xz), with libarchive's COPYING (as LICENSE)",

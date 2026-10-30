@@ -92,73 +92,95 @@ impl core::error::Error for DecodeError {}
  *  Reading and writing into memory
  **************************************/
 
+#[inline(always)]
 fn read_le16(bytes: &[u8], at: usize) -> usize {
     usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
 }
 
 /// `LZ4_memcpy(op, ip, N)` from the block's input to its output.
+#[inline(always)]
 fn copy_in<const N: usize>(out: &mut [u8], op: usize, src: &[u8], ip: usize) {
     out[op..op + N].copy_from_slice(&src[ip..ip + N]);
 }
 
 /// `LZ4_memcpy(op, match, N)` within the output, where the two do not
 /// overlap or the copy reads before it writes.
+#[inline(always)]
 fn copy_within<const N: usize>(out: &mut [u8], op: usize, from: usize) {
     let mut bytes = [0; N];
     bytes.copy_from_slice(&out[from..from + N]);
     out[op..op + N].copy_from_slice(&bytes);
 }
 
-/// `LZ4_wildCopy8`: copies 8 bytes at a time from `from` to `op` until
-/// `end`, at least once, so that up to 8 bytes past `end` are written too.
-fn wild_copy8(out: &mut [u8], mut op: usize, mut from: usize, end: usize) {
-    loop {
-        copy_within::<8>(out, op, from);
-        op += 8;
-        from += 8;
-        if op >= end {
-            break;
-        }
+/// How much a wild copy of `step` bytes at a time from `op` until `end`
+/// writes: at least once, and up to `step` bytes past `end`.
+#[inline(always)]
+fn wild_len(op: usize, end: usize, step: usize) -> usize {
+    if end > op {
+        (end - op).div_ceil(step) * step
+    } else {
+        step
     }
 }
 
-/// `LZ4_wildCopy8` from the input.
+/// A copy of `n` bytes within the output from `from` to `op`, in pieces
+/// of `STEP` bytes, each reading what the ones before wrote: when the
+/// source ends before the destination starts, one copy does the same.
+#[inline(always)]
+fn copy_forward<const STEP: usize>(out: &mut [u8], mut op: usize, mut from: usize, n: usize) {
+    // Short copies stay inline.
+    if n > 32 && op - from >= n {
+        out.copy_within(from..from + n, op);
+        return;
+    }
+    let end = op + n;
+    while op < end {
+        copy_within::<STEP>(out, op, from);
+        op += STEP;
+        from += STEP;
+    }
+}
+
+/// `LZ4_wildCopy8`: copies 8 bytes at a time from `from` to `op` until
+/// `end`, at least once, so that up to 8 bytes past `end` are written too.
+#[inline(always)]
+fn wild_copy8(out: &mut [u8], op: usize, from: usize, end: usize) {
+    copy_forward::<8>(out, op, from, wild_len(op, end, 8));
+}
+
+/// `LZ4_wildCopy8` from the input: the source is apart from the output,
+/// so one copy does.
+#[inline(always)]
 fn wild_copy8_in(out: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, end: usize) {
-    loop {
+    let n = wild_len(op, end, 8);
+    if n > 32 {
+        out[op..op + n].copy_from_slice(&src[ip..ip + n]);
+        return;
+    }
+    let end = op + n;
+    while op < end {
         copy_in::<8>(out, op, src, ip);
         op += 8;
         ip += 8;
-        if op >= end {
-            break;
-        }
     }
 }
 
 /// `LZ4_wildCopy32`: two times 16 bytes at a time (rather than 32 at
 /// once, so that offsets of 16 or more work), writing up to 32 bytes past
 /// `end`.
-fn wild_copy32(out: &mut [u8], mut op: usize, mut from: usize, end: usize) {
-    loop {
-        copy_within::<16>(out, op, from);
-        copy_within::<16>(out, op + 16, from + 16);
-        op += 32;
-        from += 32;
-        if op >= end {
-            break;
-        }
-    }
+#[inline(always)]
+fn wild_copy32(out: &mut [u8], op: usize, from: usize, end: usize) {
+    copy_forward::<16>(out, op, from, wild_len(op, end, 32));
 }
 
-/// `LZ4_wildCopy32` from the input.
-fn wild_copy32_in(out: &mut [u8], mut op: usize, src: &[u8], mut ip: usize, end: usize) {
-    loop {
-        copy_in::<16>(out, op, src, ip);
-        copy_in::<16>(out, op + 16, src, ip + 16);
-        op += 32;
-        ip += 32;
-        if op >= end {
-            break;
-        }
+/// `LZ4_wildCopy32` from the input, in one copy.
+#[inline(always)]
+fn wild_copy32_in(out: &mut [u8], op: usize, src: &[u8], ip: usize, end: usize) {
+    let n = wild_len(op, end, 32);
+    if n == 32 {
+        copy_in::<32>(out, op, src, ip);
+    } else {
+        out[op..op + n].copy_from_slice(&src[ip..ip + n]);
     }
 }
 
@@ -169,6 +191,7 @@ const DEC64TABLE: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 /// then 4 from where the first 4 make a period of the offset
 /// (`inc32table`), and the copy goes on from `dec64table` further on, 8
 /// bytes or more behind. Returns where the copy goes on from.
+#[inline(always)]
 fn copy_short_offset(out: &mut [u8], op: usize, mut from: usize, offset: usize) -> usize {
     // `LZ4_write32(op, 0)`: silences an msan warning when offset == 0.
     out[op..op + 4].fill(0);
@@ -182,6 +205,7 @@ fn copy_short_offset(out: &mut [u8], op: usize, mut from: usize, offset: usize) 
 }
 
 /// `LZ4_memcpy_using_offset_base`.
+#[inline(always)]
 fn memcpy_using_offset_base(
     out: &mut [u8],
     mut op: usize,
@@ -203,6 +227,7 @@ fn memcpy_using_offset_base(
 /// `LZ4_memcpy_using_offset`: a match closer than 16 bytes, which can
 /// write up to 12 bytes past `end`. Offsets of 1, 2 and 4 repeat a
 /// pattern of 8 bytes.
+#[inline(always)]
 fn memcpy_using_offset(out: &mut [u8], mut op: usize, from: usize, end: usize, offset: usize) {
     let mut v = [0u8; 8];
     match offset {
@@ -311,6 +336,80 @@ enum Resume {
     },
 }
 
+/// The fast loop's copy of a match of up to 18 bytes, 8 or more behind:
+/// 8, 8 and 2 bytes, each reading what the one before wrote. 18 or more
+/// behind, the source is all before `op`, and one copy does.
+#[inline(always)]
+fn copy_match18(out: &mut [u8], op: usize, offset: usize) {
+    if offset >= 18
+        && let Some((hist, rest)) = out.split_at_mut_checked(op)
+        && let Some(from) = hist.len().checked_sub(offset)
+        && let Some(m) = hist[from..].first_chunk::<18>()
+        && let Some(o) = rest.first_chunk_mut::<18>()
+    {
+        *o = *m;
+        return;
+    }
+    let from = op - offset;
+    copy_within::<8>(out, op, from);
+    copy_within::<8>(out, op + 8, from + 8);
+    copy_within::<2>(out, op + 16, from + 16);
+}
+
+/// The fast loop's match, past its fast path: the offset checked, then
+/// copied from the external dictionary or from the block. Returns `false`
+/// for an error, and moves `op` past the match.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn match_rest<const PARTIAL: bool, const DICT: u8>(
+    out: &mut [u8],
+    op: &mut usize,
+    mut length: usize,
+    offset: usize,
+    low_prefix: usize,
+    dict: &[u8],
+    check_offset: bool,
+) -> bool {
+    let oend = out.len();
+    if check_offset && offset > *op - low_prefix + dict.len() {
+        // Offset outside the buffers.
+        return false;
+    }
+    // A match starting within the external dictionary.
+    if DICT == USING_EXT_DICT && offset > *op - low_prefix {
+        if *op + length > oend - LASTLITERALS {
+            if PARTIAL {
+                length = length.min(oend - *op);
+            } else {
+                // End-of-block condition violated.
+                return false;
+            }
+        }
+        *op = copy_from_dict(
+            out,
+            *op,
+            length,
+            offset - (*op - low_prefix),
+            low_prefix,
+            dict,
+        );
+        return true;
+    }
+
+    // Copy a match within the block.
+    let cpy = *op + length;
+    let from = *op - offset;
+    debug_assert!(oend - *op >= 32);
+    if offset < 16 {
+        memcpy_using_offset(out, *op, from, cpy, offset);
+    } else {
+        wild_copy32(out, *op, from, cpy);
+    }
+    // Wild-copy correction.
+    *op = cpy;
+    true
+}
+
 /// `LZ4_decompress_generic`: the block `src` decoded into `out[start..]`.
 ///
 /// Differs from liblz4: the output and what comes before it are one slice
@@ -335,6 +434,36 @@ pub(crate) fn decompress_generic(
     low_prefix: usize,
     dict: &[u8],
 ) -> Result<usize, DecodeError> {
+    // Each case its own code, as liblz4 inlines LZ4_decompress_generic
+    // into each API function with its directives as constants.
+    use DictDirective::{NoDict, UsingExtDict, WithPrefix64k};
+    match (partial, dict_mode) {
+        (false, NoDict) => decode::<false, NO_DICT>(src, out, start, low_prefix, dict),
+        (false, WithPrefix64k) => {
+            decode::<false, WITH_PREFIX_64K>(src, out, start, low_prefix, dict)
+        }
+        (false, UsingExtDict) => decode::<false, USING_EXT_DICT>(src, out, start, low_prefix, dict),
+        (true, NoDict) => decode::<true, NO_DICT>(src, out, start, low_prefix, dict),
+        (true, WithPrefix64k) => decode::<true, WITH_PREFIX_64K>(src, out, start, low_prefix, dict),
+        (true, UsingExtDict) => decode::<true, USING_EXT_DICT>(src, out, start, low_prefix, dict),
+    }
+}
+
+/// `DictDirective` as constants, for `decode`'s parameter.
+const NO_DICT: u8 = 0;
+const WITH_PREFIX_64K: u8 = 1;
+const USING_EXT_DICT: u8 = 2;
+
+/// `LZ4_decompress_generic`, for one `partialDecoding` and `dict`.
+#[inline(always)]
+fn decode<const PARTIAL: bool, const DICT: u8>(
+    src: &[u8],
+    out: &mut [u8],
+    start: usize,
+    low_prefix: usize,
+    dict: &[u8],
+) -> Result<usize, DecodeError> {
+    let partial = PARTIAL;
     let src_size = src.len();
     let output_size = out.len() - start;
     let iend = src_size;
@@ -388,6 +517,75 @@ pub(crate) fn decompress_generic(
             // be wild-copied.
             debug_assert!(oend - op >= FASTLOOP_SAFE_DISTANCE);
             debug_assert!(ip < iend);
+
+            // Differs from liblz4: the most common sequence, a token, up to
+            // 14 literals and an offset in the next 18 bytes of input,
+            // through windows of the input and output of a known size,
+            // where the compiler sees that the copies are in bounds. The
+            // same reads and writes as below.
+            if let Some(w) = src.get(ip..).and_then(<[u8]>::first_chunk::<18>)
+                && usize::from(w[0] >> ML_BITS) < RUN_MASK
+                && let Some(o) = out.get_mut(op..).and_then(<[u8]>::first_chunk_mut::<32>)
+            {
+                let token = w[0];
+                let lit = usize::from(token >> ML_BITS);
+                o[..16].copy_from_slice(&w[1..17]);
+                let offset = usize::from(u16::from_le_bytes([w[1 + lit], w[2 + lit]]));
+                ip += 1 + lit + 2;
+                op += lit;
+                let ml = usize::from(token) & ML_MASK;
+                if ml != ML_MASK {
+                    let length = ml + MINMATCH;
+                    if op + length >= oend - FASTLOOP_SAFE_DISTANCE {
+                        resume = Resume::MatchCopy { length, offset };
+                        break 'fast;
+                    }
+                    if (DICT == WITH_PREFIX_64K || !before_prefix(op, offset)) && offset >= 8 {
+                        copy_match18(out, op, offset);
+                        op += length;
+                        continue;
+                    }
+                    if !match_rest::<PARTIAL, DICT>(
+                        out,
+                        &mut op,
+                        length,
+                        offset,
+                        low_prefix,
+                        dict,
+                        check_offset,
+                    ) {
+                        return Err(DecodeError::at(ip));
+                    }
+                    continue;
+                }
+                // A long match length: as below.
+                let Some(addl) = read_variable_length(
+                    src,
+                    &mut ip,
+                    iend as isize - LASTLITERALS as isize + 1,
+                    false,
+                ) else {
+                    return Err(DecodeError::at(ip));
+                };
+                let length = ml + addl + MINMATCH;
+                if op + length >= oend - FASTLOOP_SAFE_DISTANCE {
+                    resume = Resume::MatchCopy { length, offset };
+                    break 'fast;
+                }
+                if !match_rest::<PARTIAL, DICT>(
+                    out,
+                    &mut op,
+                    length,
+                    offset,
+                    low_prefix,
+                    dict,
+                    check_offset,
+                ) {
+                    return Err(DecodeError::at(ip));
+                }
+                continue;
+            }
+
             let token = src[ip];
             ip += 1;
             let mut length = usize::from(token >> ML_BITS);
@@ -451,54 +649,24 @@ pub(crate) fn decompress_generic(
                 }
 
                 // Fast path: no LZ4_wildCopy32 when true.
-                if (dict_mode == DictDirective::WithPrefix64k || !before_prefix(op, offset))
-                    && offset >= 8
-                {
-                    let from = op - offset;
-                    copy_within::<8>(out, op, from);
-                    copy_within::<8>(out, op + 8, from + 8);
-                    copy_within::<2>(out, op + 16, from + 16);
+                if (DICT == WITH_PREFIX_64K || !before_prefix(op, offset)) && offset >= 8 {
+                    copy_match18(out, op, offset);
                     op += length;
                     continue;
                 }
             }
 
-            if check_offset && outside(op, offset) {
-                // Offset outside the buffers.
+            if !match_rest::<PARTIAL, DICT>(
+                out,
+                &mut op,
+                length,
+                offset,
+                low_prefix,
+                dict,
+                check_offset,
+            ) {
                 return Err(DecodeError::at(ip));
             }
-            // A match starting within the external dictionary.
-            if dict_mode == DictDirective::UsingExtDict && before_prefix(op, offset) {
-                if op + length > oend - LASTLITERALS {
-                    if partial {
-                        length = length.min(oend - op);
-                    } else {
-                        // End-of-block condition violated.
-                        return Err(DecodeError::at(ip));
-                    }
-                }
-                op = copy_from_dict(
-                    out,
-                    op,
-                    length,
-                    offset - (op - low_prefix),
-                    low_prefix,
-                    dict,
-                );
-                continue;
-            }
-
-            // Copy a match within the block.
-            let cpy = op + length;
-            let from = op - offset;
-            debug_assert!(oend - op >= 32);
-            if offset < 16 {
-                memcpy_using_offset(out, op, from, cpy, offset);
-            } else {
-                wild_copy32(out, op, from, cpy);
-            }
-            // Wild-copy correction.
-            op = cpy;
         }
     }
 
@@ -540,7 +708,7 @@ pub(crate) fn decompress_generic(
                     // Do not deal with overlapping matches.
                     if length != ML_MASK
                         && offset >= 8
-                        && (dict_mode == DictDirective::WithPrefix64k || !before_prefix(op, offset))
+                        && (DICT == WITH_PREFIX_64K || !before_prefix(op, offset))
                     {
                         // Copy the match.
                         let from = op - offset;
@@ -660,7 +828,7 @@ pub(crate) fn decompress_generic(
             return Err(DecodeError::at(ip));
         }
         // A match starting within the external dictionary.
-        if dict_mode == DictDirective::UsingExtDict && before_prefix(op, offset) {
+        if DICT == USING_EXT_DICT && before_prefix(op, offset) {
             if (op + length) as isize > oend as isize - LASTLITERALS as isize {
                 if partial {
                     length = length.min(oend - op);
@@ -747,6 +915,7 @@ pub(crate) fn decompress_generic(
 /// A match that starts `back` bytes before the end of the external
 /// dictionary: copied from it, and on into the prefix when it is longer.
 /// Returns the output position after it.
+#[inline(always)]
 fn copy_from_dict(
     out: &mut [u8],
     mut op: usize,

@@ -29,8 +29,8 @@ use crate::compress::zstd_compress_internal::{
     Buffers, CompressedBlockState, CompressionParameters, DictAttachPref, DictMatchState,
     EntropyCTables, FrameParameters, FseCTables, FseRepeat, HufCTables, LdmEntry, LdmParams,
     LdmState, LongLengthType, MatchState, OptState, ParamSwitch, RawSeqStore, SeqDef, SeqStore,
-    SeqStoreChunk, SeqStoreView, Strategy, Window, WindowBuffer, ZSTD_HASHLOG_MIN,
-    ZSTD_SHORT_CACHE_TAG_BITS, ZSTD_WINDOWLOG_MAX, offset_to_offbase,
+    SeqStoreChunk, SeqStoreView, Strategy, Window, WindowBuffer, ZSTD_CURRENT_MAX,
+    ZSTD_HASHLOG_MIN, ZSTD_SHORT_CACHE_TAG_BITS, ZSTD_WINDOWLOG_MAX, offset_to_offbase,
     zstd_literals_compression_is_disabled, zstd_ll_code, zstd_min_gain, zstd_ml_code,
     zstd_no_compress_block, zstd_reduce_table, zstd_reduce_table_btlazy2,
 };
@@ -2842,6 +2842,10 @@ pub struct CCtx {
     /// `seqCollector`: with [`CCtx::generate_sequences`], the sequences of
     /// each block, gathered instead of compressing it.
     seq_collector: Option<SeqCollector>,
+    /// For the dictionary builder's statistics only: the next reset goes on
+    /// with the indices of the frame before, its tables as they are
+    /// (libzstd's `ZSTDirp_continue`); see [`CCtx::compress_block_using_cdict`].
+    continue_indices: bool,
 }
 
 impl CCtx {
@@ -2890,13 +2894,15 @@ impl CCtx {
             pending_seq_producer: None,
             ext_seq_buf: Vec::new(),
             seq_collector: None,
+            continue_indices: false,
         }
     }
 
     /// `ZSTD_resetCCtx_internal`, for a frame of `pledged_src_size` bytes,
     /// with clean tables (or tables a `CDict`'s copy will write over), and
     /// the streaming buffers if `buffered`. The indices start again at
-    /// `ZSTD_WINDOW_START_INDEX`.
+    /// `ZSTD_WINDOW_START_INDEX`, but for the dictionary builder's
+    /// statistics (`continue_indices`), where they go on, as in libzstd.
     ///
     /// Differs from libzstd: libzstd goes on with the indices of the frame
     /// before in a context used again (`ZSTDirp_continue`), and starts them
@@ -2922,6 +2928,27 @@ impl CCtx {
         if !zstd_frame_ported(params) {
             return error!(ParameterUnsupported);
         }
+        // For the dictionary builder's statistics (`continue_indices`), as
+        // libzstd does for every context used again: the indices go on from
+        // the frame before, and the tables stay as they are, their entries
+        // all below the new window, where no search takes them; unless the
+        // parameters change (libzstd's workspace is then made again), long
+        // distance matching is on, or the indices near ZSTD_CURRENT_MAX
+        // (ZSTD_indexTooCloseToMax). It saves clearing the tables for each
+        // sample, a block of a few hundred bytes, often.
+        const ZSTD_INDEXOVERFLOW_MARGIN: u32 = 16 << 20;
+        let continue_from = (self.continue_indices
+            && params.ldm_enable != ParamSwitch::Enable
+            && self.applied_params.c_params == params.c_params
+            && self.applied_params.use_row_match_finder == params.use_row_match_finder
+            && self.match_state.window.next_src
+                <= i64::from(ZSTD_CURRENT_MAX - ZSTD_INDEXOVERFLOW_MARGIN))
+        .then_some(self.match_state.window.next_src);
+        let crp = if continue_from.is_some() {
+            TableReset::LeaveDirty
+        } else {
+            crp
+        };
         self.is_first_block = true;
         self.applied_params = *params;
         self.applied_params.max_block_size = zstd_resolve_max_block_size(params.max_block_size);
@@ -2972,6 +2999,13 @@ impl CCtx {
             crp,
             ResetTarget::CCtx,
         );
+        if let Some(next_src) = continue_from {
+            // ZSTD_invalidateMatchState, past the frame before.
+            let ms = &mut self.match_state;
+            ms.window.next_src = next_src;
+            ms.window.clear();
+            ms.next_to_update = ms.window.dict_limit;
+        }
 
         self.seq_store.reset_for(block_size, max_nb_seq);
 
@@ -4371,6 +4405,96 @@ impl CCtx {
         bufs.dict = &cdict.content;
         bufs.cdict = Some(cdict);
         self.compress_end(dst, bufs, WindowBuffer::Input, 0, src.len())
+    }
+
+    /// `ZSTD_compressBegin_usingCDict_deprecated`, then
+    /// `ZSTD_compressBlock_deprecated` of `src`: the context reset for a
+    /// frame of unknown size with `cdict` (attached, unless it is empty),
+    /// without frame parameters, and `src` compressed into `dst` as one
+    /// block in block mode (`ZSTD_compressContinue_internal` with `frame`
+    /// 0): no frame header, no block header, never an RLE block. Returns
+    /// the size of the block's content, 0 when it does not compress; its
+    /// sequences and literals stay in the store ([`CCtx::seq_store`]), as
+    /// `ZDICT_countEStats` reads them. Fails with `SrcSizeWrong` for more
+    /// than a block (`ZSTD_getBlockSize_deprecated`).
+    ///
+    /// For the dictionary builder's statistics only: the port has no
+    /// public block API (see `docs/porting.md`).
+    pub(crate) fn compress_block_using_cdict(
+        &mut self,
+        dst: &mut [u8],
+        src: &[u8],
+        cdict: &CDict,
+    ) -> Result<usize> {
+        // The window's dictionary is the CDict's content, for this call only.
+        self.frame_dict = FrameDict::None;
+        let f_params = FrameParameters {
+            content_size_flag: false,
+            checksum_flag: false,
+            no_dict_id_flag: false,
+        };
+        // The indices go on from the block before, as in libzstd, rather
+        // than start again with clean tables (see reset_cctx_internal).
+        self.continue_indices = true;
+        let begun =
+            self.compress_begin_using_cdict_internal(cdict, f_params, ZSTD_CONTENTSIZE_UNKNOWN);
+        self.continue_indices = false;
+        begun?;
+
+        // ZSTD_compressBlock_deprecated
+        let block_size_max = self
+            .applied_params
+            .max_block_size
+            .min(1usize << self.applied_params.c_params.window_log);
+        if src.len() > block_size_max {
+            // Larger than a block.
+            return error!(SrcSizeWrong);
+        }
+
+        // ZSTD_compressContinue_internal, in block mode: no frame header,
+        // and the indices lowered here rather than in the frame's chunks.
+        let mut bufs = Buffers::new(src, &[]);
+        bufs.dict = &cdict.content;
+        bufs.cdict = Some(cdict);
+        if self.stage == CompressionStage::Created {
+            return error!(StageWrong);
+        }
+        if src.is_empty() {
+            return Ok(0);
+        }
+        let ms = &mut self.match_state;
+        if !ms
+            .window
+            .update(WindowBuffer::Input, 0, src.len(), ms.force_non_contiguous)
+        {
+            ms.force_non_contiguous = false;
+            ms.next_to_update = ms.window.dict_limit;
+        }
+        if !zstd_window_in_buffers(&ms.window, &bufs) {
+            return error!(SrcBufferWrong);
+        }
+        if self.applied_params.ldm_enable == ParamSwitch::Enable {
+            let window = &mut self.ldm_state.window;
+            window.update(WindowBuffer::Input, 0, src.len(), false);
+            if !zstd_window_in_buffers(window, &bufs) {
+                return error!(SrcBufferWrong);
+            }
+        }
+        zstd_overflow_correct_if_needed(&mut self.match_state, &self.applied_params, 0, src.len());
+        // In block mode the first block stays the first
+        // (ZSTD_compress_frameChunk alone clears `isFirstBlock`), which
+        // keeps ZSTD_compressBlock_internal from making it an RLE block, as
+        // libzstd's `frame` 0 does.
+        debug_assert!(self.is_first_block);
+        let c_size = self.compress_block_internal(dst, bufs, 0, src.len())?;
+        self.consumed_src_size += src.len() as u64;
+        self.produced_csize += c_size as u64;
+        Ok(c_size)
+    }
+
+    /// `ZSTD_getSeqStore`: the sequences and literals of the last block.
+    pub(crate) fn seq_store(&mut self) -> &mut SeqStore {
+        &mut self.seq_store
     }
 
     /// `ZSTD_compressBegin_usingCDict_internal`: the context reset for a

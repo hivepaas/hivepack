@@ -128,6 +128,68 @@
  *                                     Huffman table up to its largest symbol (see
  *                                     hufcompress)
  *
+ * The dictionary builder (lib/dictBuilder), on samples given as their sizes
+ * <sizes> and their bytes one after the other <hex>, its dictionaries
+ * answered "ok <hex>". Its parameters are lists: <zparams> is
+ * compressionLevel,notificationLevel,dictID (ZDICT_params_t); <cover> is
+ * k,d,steps,nbThreads,splitPoint,shrinkDict,shrinkDictMaxRegression and
+ * <zparams> (ZDICT_cover_params_t); <fastcover> is
+ * k,d,f,steps,nbThreads,splitPoint,accel,shrinkDict,shrinkDictMaxRegression
+ * and <zparams> (ZDICT_fastCover_params_t). Given, splitPoint is in
+ * thousandths; answered, it is the bits of the double, in hex:
+ *   zdcover <capacity> <cover> <sizes> <hex>
+ *                                     ZDICT_trainFromBuffer_cover
+ *   zdcoveropt <capacity> <cover> <sizes> <hex>
+ *                                     ZDICT_optimizeTrainFromBuffer_cover, answered
+ *                                     "ok <hex> <cover>" with the parameters it chose
+ *   zdfast <capacity> <fastcover> <sizes> <hex>
+ *                                     ZDICT_trainFromBuffer_fastCover
+ *   zdfastopt <capacity> <fastcover> <sizes> <hex>
+ *                                     ZDICT_optimizeTrainFromBuffer_fastCover, answered
+ *                                     "ok <hex> <fastcover>"
+ *   zdfinalize <capacity> <zparams> <content> <sizes> <hex>
+ *                                     ZDICT_finalizeDictionary, the content in a buffer of
+ *                                     its own
+ *   zdadd <contentSize> <zparams> <buffer> <sizes> <hex>
+ *                                     ZDICT_addEntropyTablesFromBuffer_advanced, on a copy
+ *                                     of <buffer>, whose last <contentSize> bytes are the
+ *                                     content
+ *   zdentropy <dstCapacity> <level> <content> <sizes> <hex>
+ *                                     ZDICT_analyzeEntropy, answered "ok <tables>"
+ *   zdselect <capacity> <cover> <content> <nbFinalize> <nbCheck> <sizes> <hex>
+ *                                     COVER_selectDict, with the content at the end of a
+ *                                     buffer of <capacity> bytes, zeros before it, answered
+ *                                     "ok <totalCompressedSize> <hex>"
+ *   zdheader <hex>                    ZDICT_getDictHeaderSize, answered "ok <size>"
+ *   zdlegacy <capacity> <selectivity> <zparams> <sizes> <hex>
+ *                                     ZDICT_trainFromBuffer_legacy, whole: answered "ok "
+ *                                     and nothing where the samples are too few
+ *   zdepochs <maxDictSize> <nbDmers> <k> <passes>
+ *                                     COVER_computeEpochs, answered "ok <num> <size>"
+ * cover.c sorts its suffix array with the C library's qsort_r, breaking ties
+ * by the elements' addresses: only a stable sort, as glibc's merge sort is,
+ * gives the order cover.c counts on. On macOS the oracle has a qsort_r of its
+ * own, glibc's merge sort, so that its answers are libzstd's on Linux.
+ * The dictionary builder. A source of bytes, <src>, is hexadecimal or
+ * "file:<offset>:<length>:<path>", that piece of a file:
+ *   divsufsort <src>                  divsufsort, answered "ok <suffix array>" for up to
+ *                                     4096 bytes, "ok <n>:<FNV-1a of the suffix array as
+ *                                     little-endian 32-bit words>" for more
+ *   legacy <maxDictSize> <selectivity> <notificationLevel> <sampleSizes> <src>
+ *                                     ZDICT_trainFromBuffer_legacy up to the entropy
+ *                                     tables: the samples, the first bytes of <src>, are
+ *                                     copied with the guard band after them, then as
+ *                                     ZDICT_trainFromBuffer_unsafe_legacy does, its checks,
+ *                                     ZDICT_trainBuffer_legacy, the segments it keeps and
+ *                                     the content. Answered "none" for too few samples,
+ *                                     "err <code>" for a failure before the list, otherwise
+ *                                     "ok <pos:length:savings of every segment> <content>",
+ *                                     the content "<segments kept> <size> <hex>", or
+ *                                     "e<code>" for a failure. The whole of
+ *                                     ZDICT_trainFromBuffer_legacy runs too, and the answer
+ *                                     is "bad" if its result does not agree: the same
+ *                                     failure, or the same content after its tables
+ *
  * Copyright (c) 2026 HivePaaS. MIT license.
  */
 
@@ -136,9 +198,11 @@
 #define ZSTD_STATIC_LINKING_ONLY
 #define ZSTD_DISABLE_DEPRECATE_WARNINGS
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "common/bitstream.h"
 #include "common/cpu.h"
@@ -151,6 +215,11 @@
 /* Included rather than linked (scripts/testdata.py leaves it out), to reach
  * its static functions: ZSTD_entropyCompressSeqStore. */
 #include "compress/zstd_compress.c"
+/* The same for the dictionary builder's ZDICT_analyzeEntropy and
+ * ZDICT_addEntropyTablesFromBuffer_advanced; cover.c and fastcover.c are
+ * linked. */
+#include "dictBuilder/zdict.c"
+#include "dictBuilder/cover.h"
 
 /* Large enough for every request the tests send. */
 #define MAX_BYTES (1 << 20)
@@ -1535,6 +1604,531 @@ static void stream(char** args, int nargs)
     puts(line_out);
 }
 
+/* ---- The dictionary builder ---- */
+
+#if defined(__APPLE__)
+/* glibc's merge sort (msort_with_tmp), which cover.c's stableSort gets on
+ * Linux: the halves sorted in place, then merged through `tmp`, comparing
+ * elements where they lie in `base`, the left one first on ties. */
+static void oracle_msort(char* b, size_t n, size_t s, char* tmp, void* thunk,
+                         int (*compar)(void*, const void*, const void*))
+{
+    size_t n1, n2;
+    char *b1, *b2, *t = tmp;
+    if (n <= 1) return;
+    n1 = n / 2;
+    n2 = n - n1;
+    b1 = b;
+    b2 = b + n1 * s;
+    oracle_msort(b1, n1, s, tmp, thunk, compar);
+    oracle_msort(b2, n2, s, tmp, thunk, compar);
+    while (n1 > 0 && n2 > 0) {
+        if (compar(thunk, b1, b2) <= 0) { memcpy(t, b1, s); b1 += s; n1--; }
+        else { memcpy(t, b2, s); b2 += s; n2--; }
+        t += s;
+    }
+    if (n1 > 0) memcpy(t, b1, n1 * s);
+    memcpy(b, tmp, (n - n2) * s);
+}
+
+/* In place of Apple's (FreeBSD's quicksort), for cover.c: see the comment
+ * at the top. */
+void qsort_r(void* base, size_t nel, size_t width, void* thunk,
+             int (*compar)(void*, const void*, const void*))
+{
+    char* tmp = (char*)malloc(nel * width + 1);
+    if (!tmp) abort();
+    oracle_msort((char*)base, nel, width, tmp, thunk, compar);
+    free(tmp);
+}
+#endif
+
+/* libzstd's notifications on stderr (notificationLevel), silenced while the
+ * dictionary builder runs. */
+static int zd_stderr = -1;
+
+static void zd_quiet(void)
+{
+    int null = open("/dev/null", O_WRONLY);
+    fflush(stderr);
+    if (zd_stderr < 0) zd_stderr = dup(2);
+    if (null >= 0) { dup2(null, 2); close(null); }
+}
+
+static void zd_loud(void)
+{
+    fflush(stderr);
+    if (zd_stderr >= 0) dup2(zd_stderr, 2);
+}
+
+#define ZD_MAX_SAMPLES (1 << 16)
+static size_t zd_sizes[ZD_MAX_SAMPLES];
+static long long zd_values[ZD_MAX_SAMPLES];
+static unsigned char zd_content[MAX_BYTES];
+static unsigned char zd_dict[MAX_BYTES];
+
+/* The samples' sizes and bytes; their number, or -1 when they do not add
+ * up. */
+static long zd_samples(const char* sizes, const char* hex)
+{
+    long n = parse_list(sizes, zd_values, ZD_MAX_SAMPLES), i, bytes = parse_hex(hex);
+    size_t total = 0;
+    if (n < 0 || bytes < 0) return -1;
+    for (i = 0; i < n; i++) {
+        if (zd_values[i] < 0) return -1;
+        zd_sizes[i] = (size_t)zd_values[i];
+        total += zd_sizes[i];
+    }
+    if (total != (size_t)bytes) return -1;
+    return n;
+}
+
+static int zd_zparams(const long long* v, ZDICT_params_t* p)
+{
+    memset(p, 0, sizeof(*p));
+    p->compressionLevel = (int)v[0];
+    p->notificationLevel = (unsigned)v[1];
+    p->dictID = (unsigned)v[2];
+    return 1;
+}
+
+static int zd_cover(const char* text, ZDICT_cover_params_t* p)
+{
+    long long v[10];
+    if (parse_list(text, v, 10) != 10) return 0;
+    memset(p, 0, sizeof(*p));
+    p->k = (unsigned)v[0];
+    p->d = (unsigned)v[1];
+    p->steps = (unsigned)v[2];
+    p->nbThreads = (unsigned)v[3];
+    p->splitPoint = (double)v[4] / 1000.0;
+    p->shrinkDict = (unsigned)v[5];
+    p->shrinkDictMaxRegression = (unsigned)v[6];
+    return zd_zparams(v + 7, &p->zParams);
+}
+
+static int zd_fastcover(const char* text, ZDICT_fastCover_params_t* p)
+{
+    long long v[12];
+    if (parse_list(text, v, 12) != 12) return 0;
+    memset(p, 0, sizeof(*p));
+    p->k = (unsigned)v[0];
+    p->d = (unsigned)v[1];
+    p->f = (unsigned)v[2];
+    p->steps = (unsigned)v[3];
+    p->nbThreads = (unsigned)v[4];
+    p->splitPoint = (double)v[5] / 1000.0;
+    p->accel = (unsigned)v[6];
+    p->shrinkDict = (unsigned)v[7];
+    p->shrinkDictMaxRegression = (unsigned)v[8];
+    return zd_zparams(v + 9, &p->zParams);
+}
+
+static unsigned long long zd_bits(double d)
+{
+    unsigned long long bits;
+    memcpy(&bits, &d, sizeof(bits));
+    return bits;
+}
+
+/* "ok <hex>" of the dictionary in `zd_dict`, with `tail` after it. */
+static void zd_answer(size_t r, const char* tail)
+{
+    if (ZDICT_isError(r)) { answer_error(r); return; }
+    line_reset();
+    line_append("ok ", 3);
+    line_append_hex(zd_dict, r);
+    line_append(tail, strlen(tail));
+    puts(line_out);
+}
+
+static void zdtrain(char** args, int nargs, int fast, int optimize)
+{
+    char tail[512] = "";
+    size_t capacity, r;
+    long n;
+    if (nargs != 4 || (n = zd_samples(args[2], args[3])) < 0) { puts("bad"); return; }
+    capacity = strtoul(args[0], NULL, 10);
+    if (capacity > MAX_BYTES) { puts("bad"); return; }
+    if (fast) {
+        ZDICT_fastCover_params_t p;
+        if (!zd_fastcover(args[1], &p)) { puts("bad"); return; }
+        zd_quiet();
+        if (optimize) {
+            r = ZDICT_optimizeTrainFromBuffer_fastCover(zd_dict, capacity, input, zd_sizes, (unsigned)n, &p);
+            snprintf(tail, sizeof(tail), " %u,%u,%u,%u,%u,%016llx,%u,%u,%u,%d,%u,%u",
+                     p.k, p.d, p.f, p.steps, p.nbThreads, zd_bits(p.splitPoint), p.accel,
+                     p.shrinkDict, p.shrinkDictMaxRegression, p.zParams.compressionLevel,
+                     p.zParams.notificationLevel, p.zParams.dictID);
+        } else {
+            r = ZDICT_trainFromBuffer_fastCover(zd_dict, capacity, input, zd_sizes, (unsigned)n, p);
+        }
+    } else {
+        ZDICT_cover_params_t p;
+        if (!zd_cover(args[1], &p)) { puts("bad"); return; }
+        zd_quiet();
+        if (optimize) {
+            r = ZDICT_optimizeTrainFromBuffer_cover(zd_dict, capacity, input, zd_sizes, (unsigned)n, &p);
+            snprintf(tail, sizeof(tail), " %u,%u,%u,%u,%016llx,%u,%u,%d,%u,%u",
+                     p.k, p.d, p.steps, p.nbThreads, zd_bits(p.splitPoint), p.shrinkDict,
+                     p.shrinkDictMaxRegression, p.zParams.compressionLevel,
+                     p.zParams.notificationLevel, p.zParams.dictID);
+        } else {
+            r = ZDICT_trainFromBuffer_cover(zd_dict, capacity, input, zd_sizes, (unsigned)n, p);
+        }
+    }
+    zd_loud();
+    zd_answer(r, tail);
+}
+
+static void zdfinalize(char** args, int nargs)
+{
+    long long v[3];
+    ZDICT_params_t p;
+    size_t capacity, r;
+    long n, contentSize;
+    if (nargs != 5 || parse_list(args[1], v, 3) != 3
+        || (contentSize = parse_hex_into(args[2], zd_content)) < 0
+        || (n = zd_samples(args[3], args[4])) < 0) { puts("bad"); return; }
+    capacity = strtoul(args[0], NULL, 10);
+    if (capacity > MAX_BYTES) { puts("bad"); return; }
+    zd_zparams(v, &p);
+    zd_quiet();
+    r = ZDICT_finalizeDictionary(zd_dict, capacity, zd_content, (size_t)contentSize, input,
+                                 zd_sizes, (unsigned)n, p);
+    zd_loud();
+    zd_answer(r, "");
+}
+
+static void zdadd(char** args, int nargs)
+{
+    long long v[3];
+    ZDICT_params_t p;
+    size_t contentSize, r;
+    long n, capacity;
+    if (nargs != 5 || parse_list(args[1], v, 3) != 3
+        || (capacity = parse_hex_into(args[2], zd_dict)) < 8
+        || (n = zd_samples(args[3], args[4])) < 0) { puts("bad"); return; }
+    contentSize = strtoul(args[0], NULL, 10);
+    if (contentSize > (size_t)capacity) { puts("bad"); return; }
+    zd_zparams(v, &p);
+    zd_quiet();
+    r = ZDICT_addEntropyTablesFromBuffer_advanced(zd_dict, contentSize, (size_t)capacity, input,
+                                                  zd_sizes, (unsigned)n, p);
+    zd_loud();
+    zd_answer(r, "");
+}
+
+static void zdentropy(char** args, int nargs)
+{
+    size_t capacity;
+    long n, contentSize;
+    if (nargs != 5 || (contentSize = parse_hex_into(args[2], zd_content)) < 0
+        || (n = zd_samples(args[3], args[4])) < 0) { puts("bad"); return; }
+    capacity = strtoul(args[0], NULL, 10);
+    if (capacity > MAX_BYTES) { puts("bad"); return; }
+    zd_answer(ZDICT_analyzeEntropy(zd_dict, capacity, atoi(args[1]), input, zd_sizes,
+                                   (unsigned)n, zd_content, (size_t)contentSize, 0), "");
+}
+
+static void zdselect(char** args, int nargs)
+{
+    static size_t offsets[ZD_MAX_SAMPLES + 1];
+    ZDICT_cover_params_t p;
+    COVER_dictSelection_t s;
+    size_t capacity, nbFinalize, nbCheck, i;
+    long n, contentSize;
+    char tail[32];
+    if (nargs != 7 || !zd_cover(args[1], &p)
+        || (contentSize = parse_hex_into(args[2], zd_content)) < 0
+        || (n = zd_samples(args[5], args[6])) < 0) { puts("bad"); return; }
+    capacity = strtoul(args[0], NULL, 10);
+    nbFinalize = strtoul(args[3], NULL, 10);
+    nbCheck = strtoul(args[4], NULL, 10);
+    if (capacity > MAX_BYTES || (size_t)contentSize > capacity || nbFinalize > (size_t)n
+        || nbCheck > (size_t)n) { puts("bad"); return; }
+    offsets[0] = 0;
+    for (i = 0; i < (size_t)n; i++) offsets[i + 1] = offsets[i] + zd_sizes[i];
+    /* The content at the end of the buffer, zeros before it, where
+     * shrinking may reach. */
+    memset(zd_dict, 0, capacity);
+    memcpy(zd_dict + capacity - contentSize, zd_content, (size_t)contentSize);
+    zd_quiet();
+    s = COVER_selectDict(zd_dict + capacity - contentSize, capacity, (size_t)contentSize, input,
+                         zd_sizes, (unsigned)nbFinalize, nbCheck, (size_t)n, p, offsets, 0);
+    zd_loud();
+    if (COVER_dictSelectionIsError(s)) {
+        if (ZSTD_isError(s.totalCompressedSize)) answer_error(s.totalCompressedSize);
+        else puts("err 64");
+        return;
+    }
+    memcpy(zd_dict, s.dictContent, s.dictSize);
+    snprintf(tail, sizeof(tail), "ok %u ", (unsigned)s.totalCompressedSize);
+    line_reset();
+    line_append(tail, strlen(tail));
+    line_append_hex(zd_dict, s.dictSize);
+    puts(line_out);
+    COVER_dictSelectionFree(s);
+}
+
+static void zdlegacy(char** args, int nargs)
+{
+    ZDICT_legacy_params_t p;
+    long long v[3];
+    size_t capacity, r;
+    long n;
+    if (nargs != 5 || (n = zd_samples(args[3], args[4])) < 0) { puts("bad"); return; }
+    capacity = strtoul(args[0], NULL, 10);
+    if (capacity > MAX_BYTES || parse_list(args[2], v, 3) != 3) { puts("bad"); return; }
+    memset(&p, 0, sizeof(p));
+    p.selectivityLevel = (unsigned)strtoul(args[1], NULL, 10);
+    zd_zparams(v, &p.zParams);
+    zd_quiet();
+    r = ZDICT_trainFromBuffer_legacy(zd_dict, capacity, input, zd_sizes, (unsigned)n, p);
+    zd_loud();
+    zd_answer(r, "");
+}
+
+static void zdheader(char** args, int nargs)
+{
+    size_t r;
+    long n;
+    if (nargs != 1 || (n = parse_hex(args[0])) < 0) { puts("bad"); return; }
+    r = ZDICT_getDictHeaderSize(input, (size_t)n);
+    if (ZDICT_isError(r)) { answer_error(r); return; }
+    printf("ok %u\n", (unsigned)r);
+}
+
+static void zdepochs(char** args, int nargs)
+{
+    COVER_epoch_info_t e;
+    if (nargs != 4) { puts("bad"); return; }
+    e = COVER_computeEpochs((U32)strtoul(args[0], NULL, 10), (U32)strtoul(args[1], NULL, 10),
+                            (U32)strtoul(args[2], NULL, 10), (U32)strtoul(args[3], NULL, 10));
+    printf("ok %u %u\n", e.num, e.size);
+}
+
+/* Included rather than linked (scripts/testdata.py leaves it out), to reach
+ * its static functions: ZDICT_trainBuffer_legacy and the ones it calls. */
+
+#include <fcntl.h>
+#include <limits.h>
+#include <unistd.h>
+
+/* The bytes of a source (see the top), in a buffer to free, or NULL. */
+static unsigned char* read_source(const char* text, size_t* size)
+{
+    unsigned char* bytes;
+    if (!strncmp(text, "file:", 5)) {
+        char* end;
+        unsigned long long offset = strtoull(text + 5, &end, 10), length;
+        FILE* f;
+        if (*end != ':') return NULL;
+        length = strtoull(end + 1, &end, 10);
+        if (*end != ':') return NULL;
+        bytes = (unsigned char*)malloc(length ? (size_t)length : 1);
+        f = fopen(end + 1, "rb");
+        if (!bytes || !f || fseek(f, (long)offset, SEEK_SET) != 0
+            || fread(bytes, 1, (size_t)length, f) != (size_t)length) {
+            if (f) fclose(f);
+            free(bytes);
+            return NULL;
+        }
+        fclose(f);
+        *size = (size_t)length;
+        return bytes;
+    } else {
+        size_t n = strlen(text), i;
+        if (!strcmp(text, "-")) n = 0;
+        if (n % 2) return NULL;
+        bytes = (unsigned char*)malloc(n ? n / 2 : 1);
+        if (!bytes) return NULL;
+        for (i = 0; i < n / 2; i++) {
+            int hi = hex_value(text[2 * i]), lo = hex_value(text[2 * i + 1]);
+            if (hi < 0 || lo < 0) { free(bytes); return NULL; }
+            bytes[i] = (unsigned char)(hi * 16 + lo);
+        }
+        *size = n / 2;
+        return bytes;
+    }
+}
+
+static void dss(char** args, int nargs)
+{
+    unsigned char* text;
+    int* sa;
+    size_t n, i;
+    int r;
+    char number[32];
+    if (nargs != 1 || !(text = read_source(args[0], &n))) { puts("bad"); return; }
+    sa = (int*)malloc((n ? n : 1) * sizeof(int));
+    if (!sa || n > INT_MAX) { free(text); free(sa); puts("bad"); return; }
+    r = divsufsort(text, sa, (int)n, 0);
+    if (r != 0) {
+        printf("err %d\n", r);
+    } else if (n <= 4096) {
+        line_reset();
+        line_append("ok ", 3);
+        if (n == 0) line_append("-", 1);
+        for (i = 0; i < n; i++) {
+            snprintf(number, sizeof(number), i ? ",%d" : "%d", sa[i]);
+            line_append(number, strlen(number));
+        }
+        puts(line_out);
+    } else {
+        unsigned long long hash = 0xcbf29ce484222325ULL;
+        for (i = 0; i < n; i++) {
+            unsigned char b[4];
+            MEM_writeLE32(b, (U32)sa[i]);
+            hash = fnv64_from(hash, b, 4);
+        }
+        printf("ok %u:%016llx\n", (unsigned)n, hash);
+    }
+    free(text);
+    free(sa);
+}
+
+/* Sends stderr to /dev/null, for ZDICT's messages; returns what it was. */
+static int quiet_stderr(void)
+{
+    int saved, null;
+    fflush(stderr);
+    saved = dup(2);
+    null = open("/dev/null", O_WRONLY);
+    if (null >= 0) { dup2(null, 2); close(null); }
+    return saved;
+}
+
+static void loud_stderr(int saved)
+{
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, 2); close(saved); }
+}
+
+#define LEGACY_MAX_SAMPLES (1 << 16)
+
+static void legacy(char** args, int nargs)
+{
+    static long long values[LEGACY_MAX_SAMPLES];
+    static size_t sizes[LEGACY_MAX_SAMPLES];
+    ZDICT_legacy_params_t params;
+    unsigned char *src, *samples = NULL, *dict = NULL, *real = NULL;
+    dictItem* dictList = NULL;
+    size_t maxDictSize, srcSize, total = 0, failure = 0, contentFailure = 0, contentSize = 0, r;
+    unsigned nbSamples, u;
+    long n;
+    int saved, agrees = 1;
+    char text[64];
+    if (nargs != 5 || (n = parse_list(args[3], values, LEGACY_MAX_SAMPLES)) < 0) { puts("bad"); return; }
+    if (!(src = read_source(args[4], &srcSize))) { puts("bad"); return; }
+    maxDictSize = strtoull(args[0], NULL, 10);
+    memset(&params, 0, sizeof(params));
+    params.selectivityLevel = (unsigned)strtoul(args[1], NULL, 10);
+    params.zParams.notificationLevel = (unsigned)strtoul(args[2], NULL, 10);
+    nbSamples = (unsigned)n;
+    for (u = 0; u < nbSamples; u++) { sizes[u] = (size_t)values[u]; total += sizes[u]; }
+    if (total > srcSize || maxDictSize > (1u << 30)) { free(src); puts("bad"); return; }
+    saved = quiet_stderr();
+    /* The whole of it, to check the answer against. */
+    real = (unsigned char*)malloc(maxDictSize ? maxDictSize : 1);
+    r = ZDICT_trainFromBuffer_legacy(real, maxDictSize, src, sizes, nbSamples, params);
+    if (total < ZDICT_MIN_SAMPLES_SIZE) {
+        loud_stderr(saved);
+        puts(r == 0 ? "none" : "bad");
+        free(src);
+        free(real);
+        return;
+    }
+    /* ZDICT_trainFromBuffer_legacy */
+    samples = (unsigned char*)malloc(total + NOISELENGTH);
+    memcpy(samples, src, total);
+    ZDICT_fillNoise(samples + total, NOISELENGTH);
+    /* ZDICT_trainFromBuffer_unsafe_legacy, up to
+     * ZDICT_addEntropyTablesFromBuffer_advanced */
+    {   U32 const dictListSize = MAX(MAX(DICTLISTSIZE_DEFAULT, nbSamples), (U32)(maxDictSize/16));
+        unsigned const selectivity = params.selectivityLevel == 0 ? g_selectivity_default : params.selectivityLevel;
+        unsigned const minRep = (selectivity > 30) ? MINRATIO : nbSamples >> selectivity;
+        U32 const notificationLevel = params.zParams.notificationLevel;
+        dictList = (dictItem*)malloc(dictListSize * sizeof(*dictList));
+        if (maxDictSize < ZDICT_DICTSIZE_MIN) failure = ERROR(dstSize_tooSmall);
+        else if (total < ZDICT_MIN_SAMPLES_SIZE) failure = ERROR(dictionaryCreation_failed);
+        else {
+            ZDICT_initDictItem(dictList);
+            ZDICT_trainBuffer_legacy(dictList, dictListSize, samples, total, sizes, nbSamples,
+                                     minRep, notificationLevel);
+            if (notificationLevel >= 3) {
+                unsigned const nb = MIN(25, dictList[0].pos);
+                for (u = 1; u < nb; u++) {
+                    if ((dictList[u].pos > total) || ((dictList[u].pos + dictList[u].length) > total)) {
+                        failure = ERROR(GENERIC);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    loud_stderr(saved);
+    if (ZSTD_isError(failure)) {
+        agrees = ZSTD_isError(r) && ERR_getErrorCode(r) == ERR_getErrorCode(failure);
+        if (agrees) answer_error(failure);
+        else puts("bad");
+    } else {
+        line_reset();
+        line_append("ok ", 3);
+        if (dictList[0].pos <= 1) line_append("-", 1);
+        for (u = 1; u < dictList[0].pos; u++) {
+            snprintf(text, sizeof(text), u > 1 ? ",%u:%u:%u" : "%u:%u:%u",
+                     dictList[u].pos, dictList[u].length, dictList[u].savings);
+            line_append(text, strlen(text));
+        }
+        /* The content, as ZDICT_trainFromBuffer_unsafe_legacy makes it. */
+        dict = (unsigned char*)malloc(maxDictSize);
+        memset(dict, 0x5a, maxDictSize);
+        {   unsigned dictContentSize = ZDICT_dictSize(dictList);
+            if (dictContentSize < ZDICT_CONTENTSIZE_MIN) contentFailure = ERROR(dictionaryCreation_failed);
+            else {
+                U32 const max = dictList->pos;
+                U32 currentSize = 0;
+                U32 m;
+                for (m = 1; m < max; m++) {
+                    currentSize += dictList[m].length;
+                    if (currentSize > maxDictSize) { currentSize -= dictList[m].length; break; }
+                }
+                dictList->pos = m;
+                dictContentSize = currentSize;
+                {   BYTE* ptr = dict + maxDictSize;
+                    for (u = 1; u < dictList->pos; u++) {
+                        U32 const l = dictList[u].length;
+                        ptr -= l;
+                        if (ptr < dict) { contentFailure = ERROR(GENERIC); break; }
+                        memcpy(ptr, samples + dictList[u].pos, l);
+                }   }
+                contentSize = dictContentSize;
+            }
+        }
+        if (ZSTD_isError(contentFailure)) {
+            snprintf(text, sizeof(text), " e%d", (int)ERR_getErrorCode(contentFailure));
+            line_append(text, strlen(text));
+            agrees = ZSTD_isError(r) && ERR_getErrorCode(r) == ERR_getErrorCode(contentFailure);
+        } else {
+            snprintf(text, sizeof(text), " %u %u ", dictList->pos, (unsigned)contentSize);
+            line_append(text, strlen(text));
+            if (contentSize == 0) line_append("-", 1);
+            line_append_hex(dict + maxDictSize - contentSize, contentSize);
+            /* The content follows the tables, unless they overlap. */
+            if (!ZSTD_isError(r) && r < maxDictSize)
+                agrees = r >= contentSize
+                    && !memcmp(real + r - contentSize, dict + maxDictSize - contentSize, contentSize);
+        }
+        puts(agrees ? line_out : "bad");
+    }
+    free(src);
+    free(samples);
+    free(dict);
+    free(real);
+    free(dictList);
+}
+
 int main(void)
 {
     static char line[4 * MAX_BYTES];
@@ -1579,6 +2173,19 @@ int main(void)
         else if (!strcmp(command, "cstream")) cstream(args, nargs);
         else if (!strcmp(command, "zstdmt")) zstdmt();
         else if (!strcmp(command, "seqblock")) seqblock(args, nargs);
+        else if (!strcmp(command, "zdcover")) zdtrain(args, nargs, 0, 0);
+        else if (!strcmp(command, "zdcoveropt")) zdtrain(args, nargs, 0, 1);
+        else if (!strcmp(command, "zdfast")) zdtrain(args, nargs, 1, 0);
+        else if (!strcmp(command, "zdfastopt")) zdtrain(args, nargs, 1, 1);
+        else if (!strcmp(command, "zdfinalize")) zdfinalize(args, nargs);
+        else if (!strcmp(command, "zdadd")) zdadd(args, nargs);
+        else if (!strcmp(command, "zdentropy")) zdentropy(args, nargs);
+        else if (!strcmp(command, "zdselect")) zdselect(args, nargs);
+        else if (!strcmp(command, "zdheader")) zdheader(args, nargs);
+        else if (!strcmp(command, "zdlegacy")) zdlegacy(args, nargs);
+        else if (!strcmp(command, "zdepochs")) zdepochs(args, nargs);
+        else if (!strcmp(command, "divsufsort")) dss(args, nargs);
+        else if (!strcmp(command, "legacy")) legacy(args, nargs);
         else puts("bad");
         fflush(stdout);
     }

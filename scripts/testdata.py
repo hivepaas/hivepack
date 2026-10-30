@@ -200,7 +200,7 @@ LZ4_FLAGS = ["-DXXH_NAMESPACE=LZ4_"]
 # their filters (see tools/xz-oracle/config.h); only their headers, which
 # the filter tables include, are on the include path.
 LIBLZMA_DIRS = ["common", "check", "lz", "lzma", "rangecoder", "delta", "simple"]
-LIBLZMA_LEFT_OUT = ["stream_encoder_mt", "stream_decoder_mt", "outqueue", "hardware_",
+LIBLZMA_LEFT_OUT = ["stream_decoder_mt", "hardware_",
                     "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
 
 
@@ -269,10 +269,11 @@ def zip_err_str(lib: Path) -> str:
 def build_oracle(source: Path, sources: list, included: list, folder: Path, extra: list) -> None:
     """An oracle program, compiled with the library's own sources.
 
-    tools/zstd-oracle is built with libzstd's (without the assembly loop,
-    which the port does not have either, and with its threads); the
-    `included` files are left out, as the oracle includes them itself to
-    reach their static functions.
+    tools/zstd-oracle is built with libzstd's, its dictionary builder
+    (lib/dictBuilder) among them (without the assembly loop, which the port
+    does not have either, and with its threads, which cover.c's pool needs
+    for its trials to run on several); the `included` files are left out,
+    as the oracle includes them itself to reach their static functions.
     tools/zlib-oracle is built with zlib's, without the gzip file functions
     (gz*.c), which it does not use, and with contrib/infback9 for
     Deflate64. tools/bzip2-oracle is built with libbzip2's BZIP2_SOURCES,
@@ -323,7 +324,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         config = ROOT / Path(sources[0]).parent
         headers = [xz / "api", *dirs, xz.parent / "common"]
         includes = [f"-I{d}" for d in [config, *headers]]
-        subprocess.run([compiler, "-O2", "-w", "-DHAVE_CONFIG_H", *includes, *files,
+        subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *includes, *files,
                         "-o", str(folder / "oracle")], check=True)
         return
     bzip2 = next(source.glob("bzip2-*"), None)
@@ -346,7 +347,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                         "-o", str(folder / "oracle")], check=True)
         return
     lib = next(source.glob("zstd-*/lib"))
-    for part in ("common", "compress", "decompress"):
+    for part in ("common", "compress", "decompress", "dictBuilder"):
         files += sorted(str(f) for f in (lib / part).glob("*.c")
                         if f"{part}/{f.name}" not in included)
     subprocess.run([compiler, "-O2", "-DZSTD_DISABLE_ASM", "-DZSTD_MULTITHREAD", "-pthread",

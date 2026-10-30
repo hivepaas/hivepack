@@ -8,7 +8,8 @@
 //! them by their first byte ([`Stream::auto_decoder`]), or raw LZMA1 and
 //! LZMA2 ([`Stream::raw_decoder`]). The encoders: `.xz` of a preset
 //! ([`Stream::easy_encoder`]) or of a filter chain
-//! ([`Stream::stream_encoder`]), `.lzma` ([`Stream::alone_encoder`]), or
+//! ([`Stream::stream_encoder`]), the same in threads
+//! ([`Stream::stream_encoder_mt`]), `.lzma` ([`Stream::alone_encoder`]), or
 //! raw ([`Stream::raw_encoder`]); and in one call, [`easy_buffer_encode`],
 //! [`stream_buffer_encode`] and [`raw_buffer_encode`]. Each call gives
 //! liblzma's result and reads and writes what liblzma reads and writes: the
@@ -108,11 +109,13 @@ mod lzma2_encoder;
 mod lzma_common;
 mod lzma_decoder;
 mod lzma_encoder;
+mod outqueue;
 mod range_decoder;
 mod range_encoder;
 mod simple;
 mod stream_decoder;
 mod stream_encoder;
+mod stream_encoder_mt;
 mod stream_flags;
 mod vli;
 
@@ -139,6 +142,7 @@ pub use simple::{
     bcj_arm64_decode, bcj_arm64_encode, bcj_riscv_decode, bcj_riscv_encode, bcj_x86_decode,
     bcj_x86_encode,
 };
+pub use stream_encoder_mt::MtOptions;
 
 use common::{Internal, Ret};
 
@@ -291,6 +295,8 @@ fn result(ret: Ret) -> Result<Status> {
         Ret::DataError => Err(Error::Data),
         Ret::BufError => Err(Error::Buf),
         Ret::ProgError => Err(Error::Prog),
+        // lzma_code returns it as LZMA_OK.
+        Ret::TimedOut => Ok(Status::Ok),
     }
 }
 
@@ -344,6 +350,26 @@ impl Stream {
             &[
                 Action::Run,
                 Action::SyncFlush,
+                Action::FullFlush,
+                Action::FullBarrier,
+                Action::Finish,
+            ],
+        ))
+    }
+
+    /// `lzma_stream_encoder_mt`: a .xz encoder that compresses Blocks of
+    /// `options.block_size` bytes in up to `options.threads` threads, and
+    /// writes the Blocks' sizes in their headers (which the single-threaded
+    /// encoder does not). It takes [`Action::Run`], [`Action::FullFlush`],
+    /// [`Action::FullBarrier`] and [`Action::Finish`]; with a timeout,
+    /// [`Stream::code`] may return before it has used all the input or
+    /// filled the output.
+    pub fn stream_encoder_mt(options: &MtOptions) -> Result<Stream> {
+        let encoder = stream_encoder_mt::StreamEncoderMt::new(options).map_err(init_error)?;
+        Ok(Stream::with_actions(
+            Box::new(encoder),
+            &[
+                Action::Run,
                 Action::FullFlush,
                 Action::FullBarrier,
                 Action::Finish,
@@ -477,8 +503,20 @@ impl fmt::Debug for Stream {
 }
 
 /// `lzma_easy_preset`: the filter chain of a preset, LZMA2 alone.
-fn easy_preset(preset: u32) -> Option<Vec<Filter>> {
+pub(crate) fn easy_preset(preset: u32) -> Option<Vec<Filter>> {
     Some(vec![Filter::lzma2(LzmaOptions::preset(preset)?)])
+}
+
+/// `lzma_stream_encoder_mt_memusage`: the memory the threaded encoder
+/// needs, or u64::MAX if the options are invalid.
+pub fn stream_encoder_mt_memusage(options: &MtOptions) -> u64 {
+    stream_encoder_mt::stream_encoder_mt_memusage(options)
+}
+
+/// `lzma_cputhreads`: the number of hardware threads, or 0 if it cannot
+/// be told.
+pub fn cputhreads() -> u32 {
+    std::thread::available_parallelism().map_or(0, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
 }
 
 /// `lzma_easy_encoder_memusage`: the memory the encoder of a preset needs,

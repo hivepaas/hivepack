@@ -187,7 +187,7 @@
     },
     {
       "name": "zstd-oracle",
-      "generate": { "group": "generated", "from": "zstd-1.5.7-source", "tool": "oracle", "sources": ["tools/zstd-oracle/oracle.c"], "included": ["compress/zstd_compress.c"] },
+      "generate": { "group": "generated", "from": "zstd-1.5.7-source", "tool": "oracle", "sources": ["tools/zstd-oracle/oracle.c"], "included": ["compress/zstd_compress.c", "dictBuilder/zdict.c"] },
       "source": "tools/zstd-oracle/oracle.c, built with the zstd 1.5.7 sources",
       "license": "MIT (the program) and BSD-3-Clause (libzstd)",
       "kind": "tool"

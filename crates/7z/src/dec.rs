@@ -1394,7 +1394,10 @@ impl FolderDecoder {
             // The coders ended before the folder's size.
             return Err(Error::Data);
         }
-        self.crc = hivepack_deflate::crc32(self.crc, &out[..n]);
+        // Most folders have none: 7-Zip gives each file a CRC instead.
+        if self.expected_crc.is_some() {
+            self.crc = hivepack_deflate::crc32(self.crc, &out[..n]);
+        }
         self.pos += n as u64;
         Ok(n)
     }

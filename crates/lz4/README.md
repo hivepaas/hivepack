@@ -32,6 +32,22 @@ The goals:
 
 How the port follows liblz4, how it is checked, and what is left are in [docs/lz4.md](../../docs/lz4.md).
 
+## Speed
+
+Against liblz4 1.10.0, with `tools/lz4-bench`, on the 12 Silesia files. Above 1× the port is faster.
+
+| | Mean | Range |
+|---|---|---|
+| Decoding blocks | 0.75× | 0.70–0.83× |
+| Decoding blocks, with the `unsafe-fast` feature | 0.96× | 0.92–0.99× |
+| Compressing blocks, level 1 | 0.95× | 0.92–0.98× |
+| Compressing blocks, acceleration 9 | | 0.81–0.95× |
+| Compressing blocks, high compression, levels 2, 9 and 12 | | 0.74–0.98× |
+| Writing frames, level 1 | | 0.87–1.30× |
+| Writing frames, level 9 | | 0.76–0.91× |
+
+**Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of three or five rounds taken in turn. More, with lz4_flex beside it, is in [docs/lz4.md](../../docs/lz4.md#the-speed-target).
+
 ## License
 
 BSD-2-Clause, the license of the code it is ported from, liblz4's `lib/` (lz4's programs and tests are under the GPL, and are not ported). See [LICENSE](LICENSE). Copyright (c) 2011-2020 Yann Collet, and (c) 2026 HivePaaS.

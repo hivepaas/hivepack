@@ -30,9 +30,29 @@ The goals:
 
 - **No unsafe code.** The crate forbids it; see [docs/safety.md](../../docs/safety.md).
 - **The same answers as the SDK**, error numbers included.
-- **The same speed**: LZMA and LZMA2 go through [`hivepack-xz`](../xz), which is faster than the SDK's C decoder without its assembly; PPMd takes 0.89× the SDK's speed.
+- **The same speed**: LZMA and LZMA2 go through [`hivepack-xz`](../xz), which is faster than the SDK's C decoder without its assembly; PPMd takes 0.92× the SDK's speed.
 
 How the port follows the SDK, how it is checked, and what is left are in [docs/7z.md](../../docs/7z.md).
+
+## Speed
+
+Against the LZMA SDK 26.05's C decoder and, for what that does not read, `7zz t -mmt=1` from the same release, with `tools/7z-bench`. Above 1× the port is faster.
+
+| | hivepack-7z / the reference |
+|---|---|
+| LZMA, LZMA2 and their filters, against the SDK | 1.10–1.24× |
+| PPMd, against the SDK | 0.88–0.92× |
+| LZMA with `lc + lp` above 4, against the SDK | 0.77× |
+| Copy, against the SDK | 0.59× |
+| Opening 100,000 files, against the SDK | 0.66–0.81× |
+| Deflate and Deflate64, against `7zz` | 1.00–1.39× |
+| BZip2 and Swap4, against `7zz` | 0.62–0.64× |
+| AES-256 behind a compressor, against `7zz` | 0.87–0.93× |
+| AES-256 with Copy, against `7zz` | 0.08× |
+
+**Measured on:** AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, in October 2026. The SDK and `7zz` are built with GCC 15.2 and their makefile's flags, without the assembly decoders that 7-Zip's releases use. The data is the Silesia corpus cut to 64 MiB, the best of five rounds taken in turn.
+
+The LZMA figures are against C only. AES with Copy is the processor's AES instructions in 7-Zip against constant-time AES in safe Rust. The whole table and the reasons are in [docs/7z.md](../../docs/7z.md#the-speed).
 
 ## License
 

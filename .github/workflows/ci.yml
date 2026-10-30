@@ -293,6 +293,21 @@ jobs:
               pathlib.Path(f"fuzz/corpus/zip_open/d{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_open -- -max_total_time=120
+      - name: Seed the PPMd corpus with the recorded streams
+        run: |
+          mkdir -p fuzz/corpus/zip_ppmd
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/ppmd8.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              _, order, mem, restore, _, data = line.split("\t")[0].split(" ")
+              # ZIP's parameters: the order, memory in MiB and restore method.
+              if int(mem) % (1 << 20) == 0:
+                  params = (int(order) - 1) | ((int(mem) >> 20) - 1) << 4 | int(restore) << 12
+                  stream = b"" if data == "-" else bytes.fromhex(data)
+                  pathlib.Path(f"fuzz/corpus/zip_ppmd/s{i}").write_bytes(params.to_bytes(2, "little") + stream)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_ppmd -- -max_total_time=60
       - name: Seed the editing corpus with the same archives, behind a few edits
         run: |
           mkdir -p fuzz/corpus/zip_edit

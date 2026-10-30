@@ -185,6 +185,60 @@ fn answer(request: &str) -> String {
             let _ = write!(text, " {:016x}", fnv64(&out[..written]));
             text
         }
+        ["compress", accel, capacity, blocks] => {
+            let accel: i32 = accel.parse().unwrap();
+            let capacity: usize = capacity.parse().unwrap();
+            let mut state = block::State::new();
+            let mut text = String::from("ok");
+            for (i, data) in blocks.split(',').enumerate() {
+                let data = unhex(data);
+                let mut out = pattern(capacity);
+                let ret = if i == 0 {
+                    state.compress_fast_ext_state(&data, &mut out, accel)
+                } else {
+                    state.compress_fast_ext_state_fast_reset(&data, &mut out, accel)
+                };
+                let _ = write!(text, " {ret}/{:016x}", fnv64(&out));
+            }
+            text
+        }
+        ["destsize", accel, capacity, data] => {
+            let capacity: usize = capacity.parse().unwrap();
+            let mut out = pattern(capacity);
+            let (ret, src_size) = block::State::new().compress_dest_size_ext_state(
+                &unhex(data),
+                &mut out,
+                accel.parse().unwrap(),
+            );
+            format!("{ret} {src_size} {:016x}", fnv64(&out))
+        }
+        ["cstream", dict, how, accel, capacity, blocks] => {
+            let dict = unhex(dict);
+            let accel: i32 = accel.parse().unwrap();
+            let capacity: usize = capacity.parse().unwrap();
+            let mut stream = block::Stream::new();
+            let mut dict_stream = block::Stream::new();
+            match how {
+                "l" => {
+                    stream.load_dict(&dict);
+                }
+                "s" => {
+                    stream.load_dict_slow(&dict);
+                }
+                _ => {
+                    dict_stream.load_dict_slow(&dict);
+                    stream.reset_fast();
+                    stream.attach_dictionary(&dict_stream);
+                }
+            }
+            let mut text = String::from("ok");
+            for data in blocks.split(',') {
+                let mut out = pattern(capacity);
+                let ret = stream.compress_fast_continue(&unhex(data), &mut out, accel);
+                let _ = write!(text, " {ret}/{:016x}", fnv64(&out));
+            }
+            text
+        }
         ["header", data] => match hivepack_lz4::frame::header_size(&unhex(data)) {
             Ok(size) => size.to_string(),
             Err(e) => e.name().to_string(),
@@ -778,6 +832,96 @@ fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
         let skip = u32::from(rng.below(4) == 0);
         let steps = frame_steps(rng, frame.len(), len, false);
         requests.push(format!("frame - {skip} {steps} {}", hex(&frame)));
+    }
+
+    // Blocks compressed alone, one state for several, into outputs of
+    // every size: enough, too small, or just about right.
+    let accels = [-3, 0, 1, 1, 1, 2, 9, 70, 65537, 70_000];
+    for _ in 0..count {
+        let accel = rng.pick(&accels);
+        let n = 1 + rng.below(4) as usize;
+        let mut lens = Vec::new();
+        let blocks: Vec<String> = (0..n)
+            .map(|_| {
+                let len = match rng.below(6) {
+                    0 => rng.below(20) as usize,
+                    1 => 65536 + rng.below(30) as usize - 15,
+                    _ => length(rng, max),
+                };
+                lens.push(len);
+                hex(&input(rng, len))
+            })
+            .collect();
+        let biggest = lens.iter().copied().max().unwrap_or(0);
+        let bound = block::compress_bound(biggest);
+        let capacity = match rng.below(4) {
+            0 => bound,
+            1 => bound - rng.below(bound as u64 / 4 + 1) as usize,
+            2 => rng.below(biggest as u64 + 20) as usize,
+            _ => biggest / 2,
+        };
+        requests.push(format!("compress {accel} {capacity} {}", blocks.join(",")));
+    }
+
+    // As much as fits.
+    for _ in 0..count / 2 {
+        let len = length(rng, max);
+        let data = input(rng, len);
+        let capacity = match rng.below(4) {
+            0 => rng.below(20) as usize,
+            1 => block::compress_bound(len),
+            _ => rng.below(len as u64 + 50) as usize,
+        };
+        // liblz4 does not clamp the acceleration here: below 1 its search
+        // goes backwards (undefined behaviour), so only 1 and up.
+        let accel = rng.pick(&[1, 1, 2, 9, 70, 65537, 70_000]);
+        requests.push(format!("destsize {accel} {capacity} {}", hex(&data)));
+    }
+
+    // Streams of blocks, after a dictionary loaded or attached.
+    for _ in 0..count / 2 {
+        let dict_len = match rng.below(5) {
+            0 => rng.below(10) as usize,
+            1 => 70_000.min(max + 1000),
+            _ => rng.below(max.min(70_000) as u64) as usize,
+        };
+        let dict = input(rng, dict_len);
+        let how = rng.pick(&["l", "s", "a"]);
+        let n = 1 + rng.below(5) as usize;
+        let mut lens = Vec::new();
+        let blocks: Vec<String> = (0..n)
+            .map(|_| {
+                let len = match rng.below(5) {
+                    0 => rng.below(10) as usize,
+                    1 => 4096 + rng.below(4) as usize,
+                    _ => rng.below(max.min(70_000) as u64) as usize,
+                };
+                lens.push(len);
+                // Blocks like the dictionary, to find matches in it.
+                let mut data = input(rng, len);
+                if !dict.is_empty() && rng.below(2) == 0 {
+                    for chunk in data.chunks_mut(97) {
+                        let at = rng.below(dict.len() as u64) as usize;
+                        let take = chunk.len().min(dict.len() - at);
+                        chunk[..take].copy_from_slice(&dict[at..at + take]);
+                    }
+                }
+                hex(&data)
+            })
+            .collect();
+        let biggest = lens.iter().copied().max().unwrap_or(0);
+        let bound = block::compress_bound(biggest);
+        let capacity = if rng.below(4) == 0 {
+            biggest / 2 + 1
+        } else {
+            bound
+        };
+        let accel = rng.pick(&accels);
+        requests.push(format!(
+            "cstream {} {how} {accel} {capacity} {}",
+            hex(&dict),
+            blocks.join(",")
+        ));
     }
 
     // Header sizes.

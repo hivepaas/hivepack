@@ -68,8 +68,8 @@ pub mod block {
         decompress_safe_with_prefix, version_number, version_string,
     };
     pub use crate::lz4_compress::{
-        ACCELERATION_DEFAULT, ACCELERATION_MAX, State, compress_default, compress_dest_size,
-        compress_fast,
+        ACCELERATION_DEFAULT, ACCELERATION_MAX, State, Stream, compress_default,
+        compress_dest_size, compress_fast,
     };
 }
 

@@ -1047,7 +1047,11 @@ impl StreamState {
             *src_size = src.len();
             return self.compress_fast_ext_state(src, dst, acceleration);
         }
-        let acceleration = clamp_acceleration(acceleration);
+        // Differs from liblz4: liblz4 passes the acceleration on as it is
+        // here, where the other functions clamp it. One below 1 makes its
+        // search step negative, which is undefined; the port takes it as 1.
+        // One higher than ACCELERATION_MAX is kept, as liblz4 keeps it.
+        let acceleration = acceleration.clamp(1, 1 << 24) as u32;
         let input = Input {
             buf: src,
             src: 0,
@@ -1150,5 +1154,398 @@ impl State {
             .compress_dest_size(src, dst, &mut src_size, acceleration);
         self.state.init();
         (written, src_size)
+    }
+}
+
+/*-******************************
+ *  Streaming functions
+ ********************************/
+
+/// `HASH_UNIT`: `sizeof(reg_t)`.
+const HASH_UNIT: usize = if REG_IS_64 { 8 } else { 4 };
+
+/// Where the history of a block given to `compress_fast_continue` is.
+pub(crate) enum History<'a> {
+    /// Right before the source, in the same buffer: `dictEnd == source`
+    /// (`withPrefix64k`), the state's `dictSize` bytes.
+    Prefix,
+    /// Apart from the source (`usingExtDict`): the state's `dictSize`
+    /// bytes.
+    Ext(&'a [u8]),
+}
+
+/// `LZ4_loadDict_internal`'s two ways.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadDictMode {
+    Fast,
+    Slow,
+}
+
+impl StreamState {
+    /// The size of the history, `dictSize`.
+    pub(crate) fn dict_size(&self) -> usize {
+        self.dict_size as usize
+    }
+
+    /// `LZ4_resetStream_fast`.
+    pub(crate) fn reset_fast(&mut self) {
+        self.prepare_table(0, TableType::ByU32);
+    }
+
+    /// `LZ4_loadDict_internal`: the state reset, and the last 64 KB of
+    /// `dictionary` loaded as its history. Returns their size, which is also
+    /// how many bytes of `dictionary`'s end the history is (0 for less than
+    /// `HASH_UNIT`).
+    pub(crate) fn load_dict(&mut self, dictionary: &[u8], mode: LoadDictMode) -> usize {
+        let table_type = TableType::ByU32;
+        // It's necessary to reset the context, and not just continue it
+        // with prepareTable(), to avoid any risk of generating overflowing
+        // matchIndex when compressing using this dictionary.
+        self.init();
+
+        // We always increment the offset by 64 KB, since, if the dict is
+        // longer, we truncate it to the last 64k, and if it's shorter, we
+        // still want to advance by a whole window length so we can provide
+        // the guarantee that there are only valid offsets in the window.
+        self.current_offset += 64 * KB as u32;
+
+        if dictionary.len() < HASH_UNIT {
+            return 0;
+        }
+
+        let dict = &dictionary[dictionary.len() - dictionary.len().min(64 * KB)..];
+        self.dict_size = dict.len() as u32;
+        self.table_type = table_type;
+        let start = self.current_offset - self.dict_size;
+
+        let mut p = 0;
+        while p + HASH_UNIT <= dict.len() {
+            let h = hash_position(dict, p, table_type);
+            // Overwriting favors the positions at the end of the dictionary.
+            self.put_index_on_hash(start + p as u32, h, table_type);
+            p += 3;
+        }
+
+        if mode == LoadDictMode::Slow {
+            // Fill the hash table with additional references, to improve
+            // compression.
+            let mut p = 0;
+            while p + HASH_UNIT <= dict.len() {
+                let h = hash_position(dict, p, table_type);
+                let limit = self.current_offset - 64 * KB as u32;
+                if self.get_index_on_hash(h, table_type) <= limit {
+                    // Not overwriting favors the positions at the beginning
+                    // of the dictionary.
+                    self.put_index_on_hash(start + p as u32, h, table_type);
+                }
+                p += 1;
+            }
+        }
+        self.dict_size as usize
+    }
+
+    /// `LZ4_renormDictT`: rescales the hash table before the indexes could
+    /// overflow. Returns whether it did, the history then cut to 64 KB.
+    fn renorm_dict(&mut self, next_size: usize) -> bool {
+        if u64::from(self.current_offset) + next_size as u64 > 0x8000_0000 {
+            // Rescale the hash table.
+            let delta = self.current_offset - 64 * KB as u32;
+            for entry in self.hash_table.iter_mut() {
+                *entry = entry.saturating_sub(delta);
+            }
+            self.current_offset = 64 * KB as u32;
+            if self.dict_size > 64 * KB as u32 {
+                self.dict_size = 64 * KB as u32;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// `LZ4_compress_fast_continue`: `input`'s source compressed with the
+    /// history `history`, the state's `dictSize` bytes there, or, with a
+    /// dictionary attached (`dict_ctx`, its state and content), with that.
+    /// After it, the history is the source itself, or (with a prefix) the
+    /// history and the source.
+    ///
+    /// Differs from liblz4: liblz4 finds the prefix case by comparing
+    /// pointers (`dictEnd == source`); the caller says it. The case of a
+    /// source that overlaps the end of its history is not taken.
+    pub(crate) fn compress_fast_continue(
+        &mut self,
+        input: &Input<'_>,
+        history: History<'_>,
+        dst: &mut [u8],
+        acceleration: i32,
+        dict_ctx: &mut Option<std::sync::Arc<(StreamState, Vec<u8>)>>,
+    ) -> usize {
+        let table_type = TableType::ByU32;
+        // Fix index overflow.
+        self.renorm_dict(input.len);
+        let acceleration = clamp_acceleration(acceleration);
+        let mut history = history;
+
+        // Invalidate tiny dictionaries: not enough for a hash. In prefix mode
+        // they stay, in case a later call would use them; with no input,
+        // too.
+        if self.dict_size < 4
+            && !matches!(history, History::Prefix)
+            && input.len > 0
+            && dict_ctx.is_none()
+        {
+            // Remove the dictionary from the history, to employ the faster
+            // prefix mode.
+            self.dict_size = 0;
+            history = History::Prefix;
+        }
+
+        let capacity = dst.len();
+        let mut unused = 0;
+        let dict_small = self.dict_size < 64 * KB as u32 && self.dict_size < self.current_offset;
+        match history {
+            // Prefix mode: the source follows the dictionary.
+            History::Prefix => {
+                let issue = if dict_small {
+                    DictIssue::DictSmall
+                } else {
+                    DictIssue::NoDictIssue
+                };
+                compress_generic(
+                    self,
+                    input,
+                    dst,
+                    &mut unused,
+                    capacity,
+                    OutputDirective::LimitedOutput,
+                    table_type,
+                    DictDirective::WithPrefix64k,
+                    issue,
+                    acceleration,
+                    None,
+                )
+            }
+            // External dictionary mode.
+            History::Ext(dict) => {
+                let result = if let Some(ctx) = dict_ctx.take() {
+                    // dictCtx'es (from LZ4_loadDict) guarantee that their
+                    // tables contain no references to offsets between
+                    // dictCtx->currentOffset - 64 KB and
+                    // dictCtx->currentOffset - dictCtx->dictSize, so
+                    // noDictIssue is safe even when the dict isn't a full 64
+                    // KB.
+                    if input.len > 4 * KB {
+                        // For large blobs, it is faster to copy the
+                        // dictionary's tables into the active context, so
+                        // that the loop looks into one table.
+                        *self = ctx.0.clone();
+                        let with_dict = Input {
+                            buf: input.buf,
+                            src: input.src,
+                            len: input.len,
+                            dict: &ctx.1,
+                        };
+                        compress_generic(
+                            self,
+                            &with_dict,
+                            dst,
+                            &mut unused,
+                            capacity,
+                            OutputDirective::LimitedOutput,
+                            table_type,
+                            DictDirective::UsingExtDict,
+                            DictIssue::NoDictIssue,
+                            acceleration,
+                            None,
+                        )
+                    } else {
+                        compress_generic(
+                            self,
+                            input,
+                            dst,
+                            &mut unused,
+                            capacity,
+                            OutputDirective::LimitedOutput,
+                            table_type,
+                            DictDirective::UsingDictCtx,
+                            DictIssue::NoDictIssue,
+                            acceleration,
+                            Some((&ctx.0, &ctx.1)),
+                        )
+                    }
+                } else {
+                    let with_dict = Input {
+                        buf: input.buf,
+                        src: input.src,
+                        len: input.len,
+                        dict,
+                    };
+                    let issue = if dict_small {
+                        DictIssue::DictSmall
+                    } else {
+                        DictIssue::NoDictIssue
+                    };
+                    compress_generic(
+                        self,
+                        &with_dict,
+                        dst,
+                        &mut unused,
+                        capacity,
+                        OutputDirective::LimitedOutput,
+                        table_type,
+                        DictDirective::UsingExtDict,
+                        issue,
+                        acceleration,
+                        None,
+                    )
+                };
+                // The history is now the source.
+                self.dict_size = input.len as u32;
+                result
+            }
+        }
+    }
+
+    /// `LZ4_attach_dictionary`, for the state: the offset bumped so that a
+    /// miss can be told from a dictionary entry.
+    pub(crate) fn attach(&mut self, dictionary: &StreamState) -> bool {
+        // If the current offset is zero, we will never look in the external
+        // dictionary context, since there is no value a table entry can take
+        // that indicates a miss. In that case, we need to bump the offset to
+        // something non-zero.
+        if self.current_offset == 0 {
+            self.current_offset = 64 * KB as u32;
+        }
+        // Don't actually attach an empty dictionary.
+        dictionary.dict_size != 0
+    }
+
+    /// `LZ4_saveDict`'s effect on the state: the history is its last
+    /// `dict_size` bytes, at most 64 KB and at most what it was. Returns the
+    /// size kept.
+    pub(crate) fn save_dict(&mut self, dict_size: usize) -> usize {
+        let size = dict_size.min(64 * KB).min(self.dict_size as usize);
+        self.dict_size = size as u32;
+        size
+    }
+}
+
+/// `LZ4_stream_t`, streaming: blocks compressed one after another, each
+/// with the ones before (up to 64 KB) as its history
+/// (`LZ4_compress_fast_continue`), and dictionaries (`LZ4_loadDict`,
+/// `LZ4_attach_dictionary`).
+///
+/// Differs from liblz4: liblz4 refers to the history where the caller keeps
+/// it, the blocks given before or a dictionary; the stream keeps a copy of
+/// it instead, as liblz4 does when the caller saves it after each block
+/// (`LZ4_saveDict`, with 64 KB). The blocks are liblz4's in that case.
+#[derive(Clone, Debug, Default)]
+pub struct Stream {
+    state: StreamState,
+    /// The history: the state's `dictSize` bytes.
+    history: Vec<u8>,
+    dict_ctx: Option<std::sync::Arc<(StreamState, Vec<u8>)>>,
+}
+
+impl Stream {
+    /// `LZ4_createStream`: a stream with no history.
+    pub fn new() -> Self {
+        Stream::default()
+    }
+
+    /// `LZ4_resetStream_fast`: the history forgotten, the hash table reset
+    /// only where it has to be.
+    pub fn reset_fast(&mut self) {
+        self.state.reset_fast();
+        self.history.clear();
+        self.dict_ctx = None;
+    }
+
+    /// `LZ4_loadDict`: the stream reset, with the last 64 KB of
+    /// `dictionary` as the history of the next block. Returns their size (0
+    /// for less than 8 bytes, 4 on 32-bit machines).
+    pub fn load_dict(&mut self, dictionary: &[u8]) -> usize {
+        self.load(dictionary, LoadDictMode::Fast)
+    }
+
+    /// `LZ4_loadDictSlow`: as `load_dict`, with more of the dictionary's
+    /// positions in the table, which compresses better.
+    pub fn load_dict_slow(&mut self, dictionary: &[u8]) -> usize {
+        self.load(dictionary, LoadDictMode::Slow)
+    }
+
+    fn load(&mut self, dictionary: &[u8], mode: LoadDictMode) -> usize {
+        self.dict_ctx = None;
+        let size = self.state.load_dict(dictionary, mode);
+        self.history.clear();
+        self.history
+            .extend_from_slice(&dictionary[dictionary.len() - size..]);
+        size
+    }
+
+    /// `LZ4_attach_dictionary`: `dictionary`, a stream a dictionary was
+    /// loaded into, as the history of the next block, without copying its
+    /// table now (for the blocks of 4 KB or less; larger ones copy it). The
+    /// stream must have been reset (`reset_fast`) or be new. Only the next
+    /// block uses it.
+    pub fn attach_dictionary(&mut self, dictionary: &Stream) {
+        if self.state.attach(&dictionary.state) {
+            self.dict_ctx = Some(std::sync::Arc::new((
+                dictionary.state.clone(),
+                dictionary.history.clone(),
+            )));
+        } else {
+            self.dict_ctx = None;
+        }
+    }
+
+    /// `LZ4_compress_fast_continue`: the next block, with the ones before as
+    /// its history. Returns its compressed size, or 0 if it does not fit in
+    /// `dst` (then the stream must be reset before it is used again).
+    pub fn compress_fast_continue(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        acceleration: i32,
+    ) -> usize {
+        let input = Input {
+            buf: src,
+            src: 0,
+            len: src.len(),
+            dict: &[],
+        };
+        let history = core::mem::take(&mut self.history);
+        let result = self.state.compress_fast_continue(
+            &input,
+            History::Ext(&history),
+            dst,
+            acceleration,
+            &mut self.dict_ctx,
+        );
+        // `LZ4_saveDict(stream, safeBuffer, 64 KB)`: the last 64 KB of the
+        // history and the block.
+        let mut kept = history;
+        if src.len() >= 64 * KB || self.state.dict_size() == 0 {
+            kept.clear();
+        }
+        kept.extend_from_slice(src);
+        let size = self.state.save_dict(64 * KB);
+        kept.drain(..kept.len() - size.min(kept.len()));
+        self.history = kept;
+        result
+    }
+
+    /// `LZ4_saveDict`: the history cut to its last `dict_size` bytes (at
+    /// most 64 KB), which are copied into `safe_buffer` when it is given.
+    /// Returns the size kept.
+    pub fn save_dict(&mut self, dict_size: usize) -> usize {
+        let size = self.state.save_dict(dict_size);
+        let len = self.history.len();
+        self.history.drain(..len - size.min(len));
+        size
+    }
+
+    /// The history: what the next block may refer to.
+    pub fn history(&self) -> &[u8] {
+        &self.history
     }
 }

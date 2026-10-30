@@ -50,6 +50,27 @@
  *       blockChecksumFlag. After an error, which leaves the context in an
  *       undefined state, the steps that follow are not run.
  *
+ *   compress <accel> <capacity> <blocks>
+ *       One state, then for each block of the comma-separated <blocks>,
+ *       compressed alone into a buffer of <capacity> bytes filled with the
+ *       pattern above: LZ4_compress_fast_extState for the first, and
+ *       LZ4_compress_fast_extState_fastReset with the same state for the
+ *       others, with acceleration <accel>. Answered "ok", then
+ *       " <ret>/<hash>" for each, the hash of the whole buffer.
+ *
+ *   destsize <accel> <capacity> <hex>
+ *       LZ4_compress_destSize_extState into <capacity> bytes. Answered
+ *       "<ret> <srcSize> <hash>".
+ *
+ *   cstream <dict> <how> <accel> <capacity> <blocks>
+ *       A stream, and the dictionary <dict> loaded into it (<how> l:
+ *       LZ4_loadDict, s: LZ4_loadDictSlow, a: loaded into another stream
+ *       with LZ4_loadDictSlow and attached with LZ4_attach_dictionary to
+ *       this one, reset with LZ4_resetStream_fast), then for each block,
+ *       each in its own buffer, LZ4_compress_fast_continue into <capacity>
+ *       bytes, then LZ4_saveDict of 64 KB into a buffer apart. Answered as
+ *       compress.
+ *
  *   header <hex>
  *       LZ4F_headerSize. Answered with the size or the error's name.
  *
@@ -63,6 +84,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define LZ4_STATIC_LINKING_ONLY
 #define LZ4F_STATIC_LINKING_ONLY
 #define XXH_STATIC_LINKING_ONLY
 #include "lz4.h"
@@ -297,6 +319,101 @@ static void do_frame(const char *dict_hex, int skip, const char *steps, const ch
     free(out);
 }
 
+/* The comma-separated hex strings of `list`, one by one: returns the next,
+ * cut out of the list, or NULL. */
+static char *next_item(char **list) {
+    char *item = *list, *comma;
+    if (!item)
+        return NULL;
+    comma = strchr(item, ',');
+    if (comma) {
+        *comma = 0;
+        *list = comma + 1;
+    } else {
+        *list = NULL;
+    }
+    return item;
+}
+
+static void do_compress(int accel, int capacity, char *blocks) {
+    LZ4_stream_t *state = LZ4_createStream();
+    unsigned char *out = malloc((size_t)capacity + 1);
+    char *item;
+    int first = 1;
+    printf("ok");
+    while ((item = next_item(&blocks)) != NULL) {
+        size_t len;
+        unsigned char *data = unhex(item, &len);
+        int ret;
+        fill_pattern(out, (size_t)capacity);
+        if (first)
+            ret = LZ4_compress_fast_extState(state, (const char *)data, (char *)out, (int)len,
+                                             capacity, accel);
+        else
+            ret = LZ4_compress_fast_extState_fastReset(state, (const char *)data, (char *)out,
+                                                       (int)len, capacity, accel);
+        first = 0;
+        printf(" %d/%016llx", ret, fnv64(out, (size_t)capacity));
+        free(data);
+    }
+    printf("\n");
+    LZ4_freeStream(state);
+    free(out);
+}
+
+static void do_destsize(int accel, int capacity, const char *data_hex) {
+    size_t len;
+    unsigned char *data = unhex(data_hex, &len);
+    unsigned char *out = malloc((size_t)capacity + 1);
+    LZ4_stream_t *state = LZ4_createStream();
+    int src_size = (int)len, ret;
+    fill_pattern(out, (size_t)capacity);
+    ret = LZ4_compress_destSize_extState(state, (const char *)data, (char *)out, &src_size,
+                                         capacity, accel);
+    printf("%d %d %016llx\n", ret, src_size, fnv64(out, (size_t)capacity));
+    LZ4_freeStream(state);
+    free(data);
+    free(out);
+}
+
+static void do_cstream(const char *dict_hex, const char *how, int accel, int capacity,
+                       char *blocks) {
+    size_t dict_len;
+    unsigned char *dict = unhex(dict_hex, &dict_len);
+    LZ4_stream_t *stream = LZ4_createStream();
+    LZ4_stream_t *dict_stream = LZ4_createStream();
+    unsigned char *out = malloc((size_t)capacity + 1);
+    char *safe = malloc(64 * 1024);
+    char *item;
+    if (how[0] == 'l')
+        LZ4_loadDict(stream, (const char *)dict, (int)dict_len);
+    else if (how[0] == 's')
+        LZ4_loadDictSlow(stream, (const char *)dict, (int)dict_len);
+    else {
+        LZ4_loadDictSlow(dict_stream, (const char *)dict, (int)dict_len);
+        LZ4_resetStream_fast(stream);
+        LZ4_attach_dictionary(stream, dict_stream);
+    }
+    printf("ok");
+    while ((item = next_item(&blocks)) != NULL) {
+        size_t len;
+        unsigned char *data = unhex(item, &len);
+        int ret;
+        fill_pattern(out, (size_t)capacity);
+        ret = LZ4_compress_fast_continue(stream, (const char *)data, (char *)out, (int)len,
+                                         capacity, accel);
+        printf(" %d/%016llx", ret, fnv64(out, (size_t)capacity));
+        LZ4_saveDict(stream, safe, 64 * 1024);
+        free(data);
+    }
+    printf("\n");
+    LZ4_freeStream(stream);
+    LZ4_freeStream(dict_stream);
+    free(dict);
+    free(out);
+    free(safe);
+}
+
 static void do_header(const char *data_hex) {
     size_t len;
     unsigned char *data = unhex(data_hex, &len);
@@ -340,6 +457,12 @@ int main(void) {
             do_stream(words[1], atoi(words[2]), words[3]);
         else if (n == 5 && strcmp(words[0], "frame") == 0)
             do_frame(words[1], atoi(words[2]), words[3], words[4]);
+        else if (n == 4 && strcmp(words[0], "compress") == 0)
+            do_compress(atoi(words[1]), atoi(words[2]), words[3]);
+        else if (n == 4 && strcmp(words[0], "destsize") == 0)
+            do_destsize(atoi(words[1]), atoi(words[2]), words[3]);
+        else if (n == 6 && strcmp(words[0], "cstream") == 0)
+            do_cstream(words[1], words[2], atoi(words[3]), atoi(words[4]), words[5]);
         else if (n == 2 && strcmp(words[0], "header") == 0)
             do_header(words[1]);
         else if (n == 4 && strcmp(words[0], "xxh32") == 0)

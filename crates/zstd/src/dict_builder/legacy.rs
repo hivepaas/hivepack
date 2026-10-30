@@ -883,7 +883,7 @@ mod tests {
         let mut dict = vec![0u8; 1024];
         let params = LegacyParams::default();
         let size = train_from_buffer_legacy(&mut dict, &samples, &sizes, params).expect("trains");
-        assert_eq!(crate::get_dict_id(&dict[..size]) != 0, true);
+        assert!(crate::get_dict_id(&dict[..size]) != 0);
         assert_eq!(
             train_from_buffer_legacy(&mut dict, &samples[..100], &[100], params),
             Ok(0)

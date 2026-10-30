@@ -140,10 +140,14 @@ fn fast_cover_params_text(p: &FastCoverParams) -> String {
     )
 }
 
-/// "ok <dictionary>" and `tail`, or the error.
+/// "ok <dictionary>" and `tail`, or the error; "ok" alone for no
+/// dictionary (the legacy trainer's for too few samples), as the oracle's
+/// line, trimmed, reads.
 fn dict_answer(dict: &[u8], result: Result<usize>, tail: &str) -> String {
     match result {
-        Ok(size) => format!("ok {}{tail}", hex_answer(&dict[..size])),
+        Ok(size) => format!("ok {}{tail}", hex_answer(&dict[..size]))
+            .trim_end()
+            .to_string(),
         Err(error) => failed(error),
     }
 }

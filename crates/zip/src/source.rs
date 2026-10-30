@@ -125,7 +125,7 @@ const READ_AHEAD_MAX: usize = 1 << 20;
 /// Differs from libzip, which leaves this to `stdio`: without it, each central
 /// directory entry would be a system call or two, as `ReadAt` is `pread`.
 #[derive(Clone)]
-struct ReadAhead {
+pub(crate) struct ReadAhead {
     buf: Vec<u8>,
     start: u64,
     /// How much of `buf` is the source's, from `start`.
@@ -183,6 +183,26 @@ impl<R: ReadAt + ?Sized> Source<R> {
             ahead: None,
             inner: &self.inner,
         }
+    }
+
+    /// [`Source::view`], which goes on with what another view read ahead, so
+    /// that what is read in order across entries is a read now and then.
+    pub(crate) fn view_with(&self, ahead: Option<ReadAhead>) -> Source<&R> {
+        let mut view = self.view();
+        view.ahead = ahead;
+        view
+    }
+
+    /// Reads ahead from now on, if it does not yet.
+    pub(crate) fn ensure_read_ahead(&mut self) {
+        if self.ahead.is_none() {
+            self.start_read_ahead();
+        }
+    }
+
+    /// What was read ahead, for the next view.
+    pub(crate) fn take_read_ahead(&mut self) -> Option<ReadAhead> {
+        self.ahead.take()
     }
 
     /// Reads ahead from now on, until [`Source::stop_read_ahead`].

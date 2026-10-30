@@ -37,7 +37,7 @@ Each port is timed against the library it comes from, on the same data, and ever
 | [`hivepack-xz`](crates/xz#speed) | liblzma 5.8.4 | compression 1.02×, decompression 1.18× against its C | decompression 0.81× against its x86-64 assembly |
 | [`hivepack-lz4`](crates/lz4#speed) | liblz4 1.10.0 | decoding 0.96× with `unsafe-fast`, compression 0.95× at level 1 | decoding 0.75× without it, high compression 0.74–0.98× |
 | [`hivepack-zstd`](crates/zstd#speed) | libzstd 1.5.7 | levels 13 and 15, 0.94–1.05× | decompression 0.72–0.92× (0.78–0.96× with `unsafe-fast`), levels 5 to 12 0.49–0.84× (0.69–0.87×) |
-| [`hivepack-zip`](crates/zip#speed) | libzip 1.12.1 | stored data 1.21–1.37×, compression 0.96–1.05×, finding entries 1.16–2.67× | opening 200,000 entries 0.78×, editing each of them 0.48–0.61×, WinZip AES 0.57–0.66× |
+| [`hivepack-zip`](crates/zip#speed) | libzip 1.12.1 | stored data 1.21–1.37×, compression 0.96–1.05×, finding entries 1.16–2.67×, editing many entries 1.46–1.99× | opening 200,000 entries 0.78×, WinZip AES 0.57–0.66× |
 | [`hivepack-7z`](crates/7z#speed) | LZMA SDK 26.05, 7-Zip | LZMA and LZMA2 1.10–1.24× against C, Deflate 1.39× | PPMd 0.88–0.92×, BZip2 0.62×, AES-256 with Copy 0.08× |
 | [`hivepack-tar`](crates/tar#speed) | Go 1.27.2's `archive/tar` | going through entries 1.48–2.61×, reading data 1.02–2.00× | skipping data in a file, which Go seeks past, 0.01× |
 | [`hivepack-crypto`](crates/crypto#speed) | BearSSL 0.6 | 1.01–1.94× | Go's assembly, by up to 5.7×, on SHA-256 and ChaCha20-Poly1305 |

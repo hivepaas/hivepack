@@ -270,6 +270,20 @@
       "kind": "tool"
     },
     {
+      "name": "lz4-1.10.0-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz", "sha256": "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b", "unpack": "tar.gz" }] },
+      "source": "https://github.com/lz4/lz4/releases/tag/v1.10.0 (commit ebb370ca83af193212df4dcbadcc5d87bc0de2f0), the SHA-256 the release gives",
+      "license": "BSD-2-Clause (lib/), GPL-2.0-or-later (the rest)",
+      "kind": "source"
+    },
+    {
+      "name": "lz4-oracle",
+      "generate": { "group": "generated", "from": "lz4-1.10.0-source", "tool": "oracle", "sources": ["tools/lz4-oracle/oracle.c"] },
+      "source": "tools/lz4-oracle/oracle.c, built with the lz4 1.10.0 library sources",
+      "license": "MIT (the program) and BSD-2-Clause (liblz4)",
+      "kind": "tool"
+    },
+    {
       "name": "fifield-zipbombs",
       "fetch": { "group": "core", "files": [{ "url": "https://www.bamsoftware.com/hacks/zipbomb/zbsm.zip", "sha256": "fb4ff972d21189beec11e05109c4354d0cd6d3b629263d6c950cf8cc3f78bd99" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zblg.zip", "sha256": "f1dc920869794df3e258f42f9b99157104cd3f8c14394c1b9d043d6fcda14c0a" }, { "url": "https://www.bamsoftware.com/hacks/zipbomb/zbxl.zip", "sha256": "eafd8f574ea7fd0f345eaa19eae8d0d78d5323c8154592c850a2d78a86817744" }] },
       "source": "https://www.bamsoftware.com/hacks/zipbomb/ (David Fifield, \"A better zip bomb\", WOOT 2019)",

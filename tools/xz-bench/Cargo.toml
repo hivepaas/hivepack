@@ -1,0 +1,16 @@
+[package]
+name = "xz-bench"
+version = "0.0.0"
+description = "Times hivepack-xz against liblzma on the same inputs"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hivepack-xz.workspace = true
+liblzma.workspace = true
+liblzma-sys.workspace = true

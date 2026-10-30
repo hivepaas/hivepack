@@ -2,7 +2,7 @@
 
 .xz, .lzma and .lz decompression in safe Rust, ported from the official library, liblzma of [XZ Utils](https://tukaani.org/xz/) 5.8.4.
 
-> **Status:** the decoders of `.xz`, `.lzma` and `.lz`, the automatic one, and raw LZMA1 and LZMA2 give liblzma's results, call by call, whatever pieces the input and output come in, with its memory limits and flags. The encoders, the delta and BCJ filters, and threads come next. This crate is not on crates.io.
+> **Status:** the decoders of `.xz`, `.lzma` and `.lz`, the automatic one, and raw LZMA1 and LZMA2 give liblzma's results, call by call, whatever pieces the input and output come in, with its memory limits and flags. They run at 1.06–1.34× liblzma's speed where liblzma is C, and at 0.74–0.89× on x86-64, where liblzma's range decoder is assembly (Silesia). The encoders, the delta and BCJ filters, and threads come next. This crate is not on crates.io.
 
 ```rust
 use hivepack_xz::{Action, InBuffer, OutBuffer, Status, Stream};

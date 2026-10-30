@@ -102,8 +102,10 @@ impl Codec for Liblz4 {
     }
 
     fn write_frame(&mut self, input: &[u8], level: i32, output: &mut Vec<u8>) -> Result<()> {
+        output.clear();
         let mut encoder = lz4::EncoderBuilder::new()
             .block_size(lz4::BlockSize::Max4MB)
+            .block_checksum(lz4::liblz4::BlockChecksum::NoBlockChecksum)
             .checksum(lz4::ContentChecksum::ChecksumEnabled)
             .level(level.max(0) as u32)
             .build(std::mem::take(output))
@@ -251,10 +253,13 @@ impl Codec for Flex {
     }
 
     fn write_frame(&mut self, input: &[u8], _level: i32, output: &mut Vec<u8>) -> Result<()> {
-        use lz4_flex::frame::{BlockSize, FrameEncoder, FrameInfo};
+        use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
         output.clear();
+        // Linked blocks, as liblz4's: lz4_flex's default is independent
+        // ones.
         let info = FrameInfo::new()
             .block_size(BlockSize::Max4MB)
+            .block_mode(BlockMode::Linked)
             .content_checksum(true);
         let mut encoder = FrameEncoder::with_frame_info(info, std::mem::take(output));
         std::io::Write::write_all(&mut encoder, input).map_err(|e| e.to_string())?;
@@ -274,6 +279,7 @@ fn c_compress(data: &[u8], level: i32, frame: bool) -> Result<Vec<u8>> {
     if frame {
         let mut encoder = lz4::EncoderBuilder::new()
             .block_size(lz4::BlockSize::Max4MB)
+            .block_checksum(lz4::liblz4::BlockChecksum::NoBlockChecksum)
             .checksum(lz4::ContentChecksum::ChecksumEnabled)
             .level(level.max(0) as u32)
             .build(Vec::new())

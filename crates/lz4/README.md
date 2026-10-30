@@ -27,9 +27,9 @@ Three layers, as in liblz4:
 
 The goals:
 
-- **No unsafe code.** The crate forbids it; see [docs/safety.md](../../docs/safety.md).
+- **No unsafe code.** The crate forbids it, unless the `unsafe-fast` feature is on; see [docs/safety.md](../../docs/safety.md).
 - **The same results as liblz4**, call by call.
-- **The same speed as liblz4**, on x86-64 and arm64.
+- **The same speed as liblz4**, on x86-64 and arm64: 0.75× so far with safe code, 0.96× with the `unsafe-fast` feature, off by default, which drops the bounds checks of the decoder's fast loop (see [docs/unsafe.md](../../docs/unsafe.md)).
 
 How the port follows liblz4, how it is checked, and what is left are in [docs/lz4.md](../../docs/lz4.md).
 

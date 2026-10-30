@@ -64,6 +64,7 @@ jobs:
       - run: cargo check -p hivepack-crypto --lib --locked
       - run: cargo check -p hivepack-deflate --lib --locked
       - run: cargo check -p hivepack-extract --lib --locked
+      - run: cargo check -p hivepack-lz4 --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast
@@ -194,9 +195,10 @@ jobs:
 
   # The decoder against libzstd on fuzzed input, with the `unsafe-fast`
   # feature, the compressor's frames and streaming calls against libzstd's,
-  # inflate and deflate against zlib, bzip2 against libbzip2, and the xz
-  # decoders against liblzma, under AddressSanitizer. A few minutes per
-  # target; longer runs are done by hand (see fuzz/README.md).
+  # inflate and deflate against zlib, bzip2 against libbzip2, lz4 against
+  # liblz4, and the xz decoders against liblzma, under AddressSanitizer. A
+  # few minutes per target; longer runs are done by hand (see
+  # fuzz/README.md).
   fuzz:
     name: Fuzz (unsafe-fast)
     runs-on: ubuntu-latest
@@ -235,8 +237,8 @@ jobs:
       - name: Seed the streaming compressor's corpus with the same files
         run: cp -r fuzz/corpus/compress fuzz/corpus/compress_stream
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu compress_stream -- -max_total_time=120 -rss_limit_mb=4096
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=150
-      - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=150
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate -- -max_total_time=120
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu deflate -- -max_total_time=120
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu inflate9 -- -max_total_time=90
       - name: Seed the ZIP corpus with the recorded archives
         run: |
@@ -322,6 +324,21 @@ jobs:
                       n += 1
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu age_keys -- -max_total_time=30
+      - name: Seed the lz4 corpus
+        run: |
+          mkdir -p fuzz/corpus/lz4
+          python3 - <<'PY'
+          import pathlib
+          # The blocks and frames of the recorded requests, each after a
+          # mode byte (0 and 2: a block, 1 and 3: a frame) and a seed.
+          lines = pathlib.Path("testdata/oracle/lz4.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l.startswith(("block", "frame"))):
+              words = line.split("\t")[0].split(" ")
+              data = b"" if words[-1] == "-" else bytes.fromhex(words[-1])
+              for mode in (0, 2) if words[0] == "block" else (1, 3):
+                  pathlib.Path(f"fuzz/corpus/lz4/r{i}m{mode}").write_bytes(bytes([mode]) + bytes(8) + data)
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu lz4 -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

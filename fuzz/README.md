@@ -1,9 +1,9 @@
 # Fuzzing
 
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd,
-hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, and hivepack-xz with
-liblzma, and that feed hivepack-zip, hivepack-extract and hivepack-age any
-input. They need
+hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with
+liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip,
+hivepack-extract and hivepack-age any input. They need
 nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 (`NIGHTLY` in `.github/workflows/ci.yml`), chosen for the shell with
 `export RUSTUP_TOOLCHAIN=<that nightly>`, and
@@ -20,6 +20,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `extract` | Extracting the input as a ZIP archive with hivepack-extract, with options its first byte picks, cancelled after some progress if it says so: nothing written beside the destination, every link created staying inside it, the summary counting what is there, and no file left cut off |
 | `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick (encrypting among them) and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data, read with the passwords the edits set (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
+| `lz4` | After a mode byte and eight bytes of seed: decoding the rest as a block with `LZ4_decompress_safe` into an output of a size the seed picks, with the same result and every byte of the output the same, past what is decoded too, as liblz4; reading it as a frame in reads of sizes the seed picks, through the lz4 crate's `Decoder` and the same loop over the port's context, with the same bytes from every read; decoding it partially, with dictionaries, after a prefix and in a stream, and reading it with the port's `Decoder`: no panic (`crates/lz4/tests/oracle.rs` compares those with liblz4) |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
 | `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). Where the port refuses a Block's filters and liblzma, which has the delta and BCJ filters, goes on, the comparison stops; and the automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
 | `age` | Decrypting the input as an age file, armored or not, with CCTV's usual X25519 key and the passphrase `password` (work factors up to 2^4), twice, in pieces of different sizes its first eight bytes pick: the same plaintext and the same end both times, and no panic (`crates/age/tests/oracle.rs` compares the outcomes with age) |
@@ -50,6 +51,13 @@ cargo fuzz run deflate -- -max_total_time=3600
 cargo fuzz run inflate9 -- -max_total_time=3600
 cargo fuzz run bzip2 -- -max_total_time=3600
 cargo fuzz run xz -- -max_total_time=3600 -rss_limit_mb=4096
+```
+
+CI seeds `lz4` with the blocks and frames of `testdata/oracle/lz4.txt`, each
+behind the mode bytes that decode it as a block and as a frame:
+
+```sh
+cargo fuzz run lz4 -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and

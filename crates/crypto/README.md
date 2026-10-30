@@ -2,7 +2,7 @@
 
 AES, SHA-1, HMAC and PBKDF2 in safe Rust, ported from [BearSSL](https://bearssl.org) 0.6: what ZIP's encryption needs.
 
-> **Status:** AES-128, AES-192 and AES-256 encryption (constant-time, BearSSL's `aes_ct64`), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, checked against the published vectors, BearSSL's own tests and nettle. `hivepack-zip` encrypts and decrypts WinZip AES with it. This crate is not on crates.io.
+> **Status:** AES-128, AES-192 and AES-256 encryption, and decryption in CBC mode (constant-time, BearSSL's `aes_ct64`), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, checked against the published vectors, BearSSL's own tests and nettle. `hivepack-zip` encrypts and decrypts WinZip AES with it, and `hivepack-7z` decrypts 7zAES. This crate is not on crates.io.
 
 ```rust
 use hivepack_crypto::{Aes, Hmac, HmacKey, pbkdf2_hmac_sha1};
@@ -22,7 +22,7 @@ The goals:
 
 - **No unsafe code.** The crate forbids it; see [docs/safety.md](../../docs/safety.md).
 - **Constant time.** AES indexes no table with secret data, as BearSSL's `aes_ct64` does not.
-- **Only what ZIP needs.** AES encrypts only: WinZip AES runs it in counter mode, both ways.
+- **Only what is needed.** AES encrypts for ZIP, as WinZip AES runs it in counter mode both ways, and decrypts in CBC mode for 7z.
 
 How the port follows BearSSL, how it is checked, and its speed are in [docs/crypto.md](../../docs/crypto.md).
 

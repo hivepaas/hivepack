@@ -82,7 +82,9 @@
 //!
 //! Compressing on worker threads: the frames depend on whether there are
 //! workers, not on how many, and are those libzstd writes with workers. A
-//! frame of a known size of 512 KB or less takes none.
+//! frame of a known size of 512 KB or less takes none. Contexts can share
+//! a pool of threads ([`ThreadPool`], [`CCtx::ref_thread_pool`]), and
+//! [`CCtx::get_frame_progression`] tells how far a frame has got.
 //!
 //! ```
 //! # fn main() -> Result<(), hivepack_zstd::Error> {
@@ -246,11 +248,13 @@ mod oracle_zdict;
 pub use common::error_private::{Error, ErrorCode, Result};
 pub use compress::zstd_cdict::CDict;
 pub use compress::zstd_compress::{
-    CCtx, CParameter, CParameterKind, EndDirective, SEQUENCE_PRODUCER_ERROR, Sequence,
-    SequenceFormat, SequenceProducer, compress, compress_bound, cstream_in_size, cstream_out_size,
-    default_c_level, max_c_level, merge_block_delimiters, min_c_level, sequence_bound,
+    CCtx, CParameter, CParameterKind, EndDirective, FrameProgression, SEQUENCE_PRODUCER_ERROR,
+    Sequence, SequenceFormat, SequenceProducer, compress, compress_bound, cstream_in_size,
+    cstream_out_size, default_c_level, max_c_level, merge_block_delimiters, min_c_level,
+    sequence_bound,
 };
 pub use compress::zstd_compress_internal::{DictAttachPref, ParamSwitch, Strategy};
+pub use compress::zstdmt_compress::ThreadPool;
 pub use decompress::zstd_ddict::{DDict, DictContentType};
 pub use decompress::zstd_decompress::{
     BLOCKSIZE_MAX_MIN, ContentSize, DParameter, DParameterKind, FRAMEHEADER_SIZE_MAX,

@@ -15,6 +15,8 @@ The port follows [BearSSL](https://bearssl.org) **0.6** (August 2018, the latest
 | `src/symcipher/aes_ct64.c` | `aes_ct64.rs` | the S-box, as Boyar and Peralta's circuit; the bitsliced representation; the key schedule |
 | `src/symcipher/aes_ct64_enc.c` | `aes_ct64_enc.rs` | the rounds |
 | `src/symcipher/aes_ct64_ctr.c` | `aes_ct64_ctr.rs` (`Aes`) | four blocks encrypted at once, without the counter |
+| `src/symcipher/aes_ct64_dec.c` | `aes_ct64_dec.rs` | the rounds of decryption, and the inverse S-box |
+| `src/symcipher/aes_ct64_cbcdec.c` | `aes_ct64_ctr.rs` (`Aes::decrypt4`, `Aes::cbc_decrypt`) | four blocks decrypted at once, and CBC, for 7z |
 | `src/hash/sha1.c` | `sha1.rs` (`Sha1`) | SHA-1 |
 | `src/hash/sha2small.c` | `sha2small.rs` (`Sha256`) | SHA-256 |
 | `src/hash/sha2big.c` | `sha2big.rs` (`Sha512`) | SHA-512 |
@@ -31,7 +33,7 @@ The port follows [BearSSL](https://bearssl.org) **0.6** (August 2018, the latest
 
 The rules are those of [porting.md](porting.md): a module for each C file, the C name in each doc comment, and `Differs from BearSSL:` comments where the port departs. The differences:
 
-- **AES without its modes.** BearSSL offers AES with CBC, CTR, CCM and GCM. WinZip AES uses a counter of its own (libzip increments the first eight bytes, little-endian), so `Aes` encrypts blocks, one or four at a time, and the caller XORs them into the data. Only encryption: a counter mode decrypts by encrypting.
+- **AES without its modes.** BearSSL offers AES with CBC, CTR, CCM and GCM. WinZip AES uses a counter of its own (libzip increments the first eight bytes, little-endian), so `Aes` encrypts blocks, one or four at a time, and the caller XORs them into the data: a counter mode decrypts by encrypting. 7z uses CBC, so `Aes` decrypts in that mode too; it does not encrypt in it, as nothing here writes 7z yet. Decryption is checked against NIST SP 800-38A's CBC vectors, and by undoing encryption, whose answers are compared with nettle.
 - **The subkeys stay expanded.** BearSSL keeps them compressed and expands them at each call; `Aes` expands them once.
 - **HMAC's whole output**; libzip cuts HMAC-SHA1 to 10 bytes itself. BearSSL's hashes are a vtable (`br_hash_class`) that HMAC takes at run time; here they are a trait, `Digest`, that HMAC, HKDF and PBKDF2 are generic over. Only SHA-1, SHA-256 and SHA-512: not SHA-224, SHA-384 or MD5, which nothing here uses.
 - **HKDF's two steps are two types**: `Hkdf` takes the input key material, and `flip` turns it into `HkdfExpand`, which produces the output; BearSSL keeps a union of the two. Once 255 blocks are produced, later calls produce nothing, where BearSSL's counter would go on and start the block numbers again.

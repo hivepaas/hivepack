@@ -27,7 +27,9 @@
 //!   fails.
 //! - Everywhere, including where the oracle cannot be built (Windows, and
 //!   the emulated i686 and s390x jobs), `testdata/oracle/lz4.txt` replays
-//!   answers liblz4 gave earlier. `cargo test -p hivepack-lz4 --test oracle
+//!   answers liblz4 gave earlier: the compressors' only on 64-bit
+//!   little-endian machines, where they were recorded, as liblz4's output
+//!   depends on the machine. `cargo test -p hivepack-lz4 --test oracle
 //!   record_oracle_answers -- --ignored` rewrites that file.
 
 // Helpers outside #[test] functions unwrap too: a failure there is a test
@@ -1402,7 +1404,25 @@ fn port_matches_liblz4() {
 fn port_matches_recorded_answers() {
     let text = std::fs::read_to_string(recorded_path()).expect("testdata/oracle/lz4.txt");
     let mut checked = 0;
+    // The compressors' output depends on the machine, as liblz4's does
+    // (5-byte hashes on 64-bit machines, 4-byte ones on 32-bit, read in the
+    // machine's byte order): their answers were recorded on a 64-bit
+    // little-endian one. tests/compress.rs compares them with the liblz4
+    // of every machine.
+    let same_machine = cfg!(target_pointer_width = "64") && cfg!(target_endian = "little");
+    let compression = [
+        "compress ",
+        "destsize ",
+        "cstream ",
+        "hc ",
+        "hcdest ",
+        "hcstream ",
+        "fcompress ",
+    ];
     for line in text.lines().filter(|line| !line.starts_with('#')) {
+        if !same_machine && compression.iter().any(|kind| line.starts_with(kind)) {
+            continue;
+        }
         let (request, want) = line.split_once('\t').expect("request and answer");
         assert_eq!(recorded_form(&answer(request)), want, "{request:.300}");
         checked += 1;

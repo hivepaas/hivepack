@@ -118,15 +118,21 @@ static int nibble(char c) {
     return c - 'A' + 10;
 }
 
+/* Room after every buffer: liblz4's streams take a block that starts where
+ * their history ends as its continuation (they compare pointers), which an
+ * allocator that puts buffers side by side (macOS's) would make happen by
+ * chance. No buffer can start in another's slack. */
+#define SLACK 64
+
 static unsigned char *unhex(const char *text, size_t *len) {
     size_t n, i;
     unsigned char *bytes;
     if (strcmp(text, "-") == 0) {
         *len = 0;
-        return malloc(1);
+        return malloc(SLACK);
     }
     n = strlen(text) / 2;
-    bytes = malloc(n + 1);
+    bytes = malloc(n + SLACK);
     for (i = 0; i < n; i++)
         bytes[i] = (unsigned char)(nibble(text[2 * i]) << 4 | nibble(text[2 * i + 1]));
     *len = n;
@@ -400,7 +406,7 @@ static void do_cstream(const char *dict_hex, const char *how, int accel, int cap
     LZ4_stream_t *stream = LZ4_createStream();
     LZ4_stream_t *dict_stream = LZ4_createStream();
     unsigned char *out = malloc((size_t)capacity + 1);
-    char *safe = malloc(64 * 1024);
+    char *safe = malloc(64 * 1024 + SLACK);
     char *item;
     if (how[0] == 'l')
         LZ4_loadDict(stream, (const char *)dict, (int)dict_len);
@@ -479,7 +485,7 @@ static void do_hcstream(const char *dict_hex, const char *how, int level, int ca
     LZ4_streamHC_t *stream = LZ4_createStreamHC();
     LZ4_streamHC_t *dict_stream = LZ4_createStreamHC();
     unsigned char *out = malloc((size_t)capacity + 1);
-    char *safe = malloc(64 * 1024);
+    char *safe = malloc(64 * 1024 + SLACK);
     char *item;
     LZ4_resetStreamHC(stream, level);
     if (how[0] == 'a') {

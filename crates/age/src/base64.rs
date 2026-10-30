@@ -25,6 +25,22 @@ fn value(c: u8) -> Option<u32> {
 /// `padded`, without padding otherwise. `None` if it is not the strict
 /// encoding of anything.
 pub(crate) fn decode(input: &[u8], padded: bool) -> Option<Vec<u8>> {
+    decode_with(input, padded, true)
+}
+
+/// `StdEncoding.Decode`, as Go's PEM decoder calls it: padded, not
+/// strict (the last character's unused bits may be anything), and with
+/// the CR and LF it skips.
+pub(crate) fn decode_lenient(input: &[u8]) -> Option<Vec<u8>> {
+    let data: Vec<u8> = input
+        .iter()
+        .copied()
+        .filter(|&c| c != b'\r' && c != b'\n')
+        .collect();
+    decode_with(&data, true, false)
+}
+
+fn decode_with(input: &[u8], padded: bool, strict: bool) -> Option<Vec<u8>> {
     let mut data = input;
     if padded {
         if !data.len().is_multiple_of(4) {
@@ -58,14 +74,14 @@ pub(crate) fn decode(input: &[u8], padded: bool) -> Option<Vec<u8>> {
         [] => {}
         [a, b] => {
             let (a, b) = (value(a)?, value(b)?);
-            if b & 0x0F != 0 {
+            if strict && b & 0x0F != 0 {
                 return None;
             }
             out.push((a << 2 | b >> 4) as u8);
         }
         [a, b, c] => {
             let (a, b, c) = (value(a)?, value(b)?, value(c)?);
-            if c & 0x03 != 0 {
+            if strict && c & 0x03 != 0 {
                 return None;
             }
             let n = a << 12 | b << 6 | c;
@@ -123,7 +139,10 @@ mod tests {
                 assert_eq!(decode(raw.as_bytes(), true), None, "{raw}");
             }
         }
-        // Bits past the data, which Strict refuses.
+        // Bits past the data, which Strict refuses, and Go's PEM does not.
+        assert_eq!(decode_lenient(b"Zh=="), decode_lenient(b"Zg=="));
+        assert_eq!(decode_lenient(b"Zm9v\r\nYg=="), Some(b"foob".to_vec()));
+        assert_eq!(decode_lenient(b"Zg"), None);
         assert_eq!(decode(b"Zh", false), None);
         assert_eq!(decode(b"Zm9", false), None);
         assert_eq!(decode(b"Zh==", true), None);

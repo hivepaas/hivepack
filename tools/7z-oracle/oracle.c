@@ -16,6 +16,27 @@
  *   x:I:RES:SIZE:HASH  is SzArEx_Extract's for file I, with the hash of the
  *     file's data. The folder it keeps is forgotten after an error, as what
  *     it holds then is not the folder.
+ *
+ * And PPMd var.I (Ppmd8.c), which ZIP's method 98 is, for hivepack-zip:
+ *
+ *   ppmd8enc ORDER MEM RESTORE HEX
+ *
+ * encodes the bytes HEX (- for none), then the end marker, with a model of
+ * ORDER, MEM bytes and the RESTORE method, and answers the stream in
+ * hexadecimal;
+ *
+ *   ppmd8dec ORDER MEM RESTORE MAX HEX
+ *
+ * decodes the stream HEX with such a model, up to MAX symbols or a result
+ * below 0, and answers
+ *
+ *   INIT SYM EXTRA FINISHED USED OUT
+ *
+ * where INIT is what Ppmd8_Init_RangeDec returned (decoding goes on either
+ * way), SYM the last result of Ppmd8_DecodeSymbol (256 if MAX were
+ * decoded), EXTRA whether a byte was read past the stream's end, FINISHED
+ * whether Ppmd8_RangeDec_IsFinishedOK, USED the bytes of the stream read,
+ * and OUT the bytes decoded in hexadecimal (- for none).
  */
 
 #include <stdio.h>
@@ -27,6 +48,7 @@
 #include "7zBuf.h"
 #include "7zCrc.h"
 #include "7zFile.h"
+#include "Ppmd8.h"
 
 #define BUF_SIZE ((size_t)1 << 18)
 
@@ -146,13 +168,148 @@ end:
     File_Close(&file.file);
 }
 
+/* An input of bytes for the range decoder: 0 past its end, remembered. */
+typedef struct {
+    IByteIn vt;
+    const Byte *buf;
+    size_t size, pos;
+    int extra;
+} ByteIn;
+
+static Byte byte_in_read(IByteInPtr pp) {
+    ByteIn *p = (ByteIn *)(void *)pp;
+    if (p->pos < p->size)
+        return p->buf[p->pos++];
+    p->extra = 1;
+    return 0;
+}
+
+typedef struct {
+    IByteOut vt;
+    Byte *buf;
+    size_t size, cap;
+} ByteOut;
+
+static void byte_out_write(IByteOutPtr pp, Byte b) {
+    ByteOut *p = (ByteOut *)(void *)pp;
+    if (p->size == p->cap) {
+        p->cap = p->cap ? 2 * p->cap : 1 << 12;
+        p->buf = (Byte *)realloc(p->buf, p->cap);
+    }
+    p->buf[p->size++] = b;
+}
+
+/* The bytes of HEX into a new buffer, its length in *len; "-" is none. */
+static Byte *unhex(const char *hex, size_t *len) {
+    size_t n = strcmp(hex, "-") == 0 ? 0 : strlen(hex) / 2, i;
+    Byte *out = (Byte *)malloc(n + 1);
+    for (i = 0; i < n; i++) {
+        unsigned v;
+        sscanf(hex + 2 * i, "%2x", &v);
+        out[i] = (Byte)v;
+    }
+    *len = n;
+    return out;
+}
+
+static void print_hex(const Byte *bytes, size_t len) {
+    size_t i;
+    if (len == 0)
+        printf("-");
+    for (i = 0; i < len; i++)
+        printf("%02x", bytes[i]);
+}
+
+static void do_ppmd8enc(char *args) {
+    unsigned order, restore;
+    unsigned long mem;
+    char *data = NULL;
+    size_t len, i;
+    Byte *in;
+    CPpmd8 ppmd;
+    ByteOut out = {{byte_out_write}, NULL, 0, 0};
+    if (sscanf(args, "%u %lu %u", &order, &mem, &restore) != 3 || (data = strrchr(args, ' ')) == NULL) {
+        printf("bad\n");
+        return;
+    }
+    in = unhex(data + 1, &len);
+    Ppmd8_Construct(&ppmd);
+    if (!Ppmd8_Alloc(&ppmd, (UInt32)mem, &g_alloc)) {
+        printf("mem\n");
+        free(in);
+        return;
+    }
+    ppmd.Stream.Out = &out.vt;
+    Ppmd8_Init_RangeEnc(&ppmd);
+    Ppmd8_Init(&ppmd, order, restore);
+    for (i = 0; i < len; i++)
+        Ppmd8_EncodeSymbol(&ppmd, in[i]);
+    Ppmd8_EncodeSymbol(&ppmd, -1);
+    Ppmd8_Flush_RangeEnc(&ppmd);
+    print_hex(out.buf, out.size);
+    printf("\n");
+    Ppmd8_Free(&ppmd, &g_alloc);
+    free(out.buf);
+    free(in);
+}
+
+static void do_ppmd8dec(char *args) {
+    unsigned order, restore;
+    unsigned long mem, max, n = 0;
+    char *data;
+    size_t len;
+    int init, sym = 256;
+    Byte *in, *dec;
+    CPpmd8 ppmd;
+    ByteIn bin;
+    if (sscanf(args, "%u %lu %u %lu", &order, &mem, &restore, &max) != 4 || (data = strrchr(args, ' ')) == NULL) {
+        printf("bad\n");
+        return;
+    }
+    in = unhex(data + 1, &len);
+    dec = (Byte *)malloc(max + 1);
+    bin.vt.Read = byte_in_read;
+    bin.buf = in;
+    bin.size = len;
+    bin.pos = 0;
+    bin.extra = 0;
+    Ppmd8_Construct(&ppmd);
+    if (!Ppmd8_Alloc(&ppmd, (UInt32)mem, &g_alloc)) {
+        printf("mem\n");
+        free(in);
+        free(dec);
+        return;
+    }
+    ppmd.Stream.In = &bin.vt;
+    init = Ppmd8_Init_RangeDec(&ppmd);
+    Ppmd8_Init(&ppmd, order, restore);
+    while (n < max) {
+        sym = Ppmd8_DecodeSymbol(&ppmd);
+        if (sym < 0)
+            break;
+        dec[n++] = (Byte)sym;
+        sym = 256;
+    }
+    printf("%d %d %d %d %lu ", init, sym, bin.extra, Ppmd8_RangeDec_IsFinishedOK(&ppmd) ? 1 : 0,
+           (unsigned long)bin.pos);
+    print_hex(dec, n);
+    printf("\n");
+    Ppmd8_Free(&ppmd, &g_alloc);
+    free(in);
+    free(dec);
+}
+
 int main(void) {
-    static char line[1 << 16];
+    static char line[1 << 24];
     CrcGenerateTable();
     while (fgets(line, sizeof(line), stdin)) {
         line[strcspn(line, "\r\n")] = 0;
         if (strncmp(line, "archive ", 8) == 0)
             do_archive(line + 8);
+        else if (strncmp(line, "ppmd8enc ", 9) == 0)
+            do_ppmd8enc(line + 9);
+        else if (strncmp(line, "ppmd8dec ", 9) == 0)
+            do_ppmd8dec(line + 9);
         else
             printf("bad\n");
         fflush(stdout);

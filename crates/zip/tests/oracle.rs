@@ -205,16 +205,13 @@ fn read_entries<R: ReadAt>(
     let mut buffer = vec![0u8; 1 << 20];
     for i in 0..n {
         text.push_str(" |");
-        // libzip has no Deflate64: where the port decodes it, libzip refuses
-        // to open the entry, once it has checked the password and sizes and
-        // before it reads the local header. tests/deflate64.rs checks what
-        // the port reads.
+        // libzip has no Deflate64 nor PPMd: where the port decodes them,
+        // libzip refuses to open the entry, once it has checked the password
+        // and sizes and before it reads the local header. tests/deflate64.rs
+        // and tests/ppmd.rs check what the port reads.
         let raw = Flags(fflags).intersects(Flags::COMPRESSED | Flags::ENCRYPTED);
         let st = za.stat_index(i, Flags::NONE).ok();
-        let deflate64 = !raw
-            && st
-                .as_ref()
-                .is_some_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
+        let unread = !raw && st.as_ref().is_some_and(|st| libzip_lacks(st.comp_method));
         let opened = match how {
             "e" => za.fopen_index_encrypted(i, Flags(fflags), Some(password)),
             "x" => za.fopen_index_encrypted(i, Flags(fflags), Some(b"")),
@@ -222,7 +219,7 @@ fn read_entries<R: ReadAt>(
         };
         let mut zf = match opened {
             Ok(zf) => zf,
-            Err(e) if deflate64 && past_libzip_refusal(&e, st.as_ref(), 0, None) => {
+            Err(e) if unread && past_libzip_refusal(&e, st.as_ref(), 0, None) => {
                 text.push_str("e16/0");
                 continue;
             }
@@ -265,7 +262,7 @@ fn read_entries<R: ReadAt>(
             Ok(()) => 0,
             Err(e) => e.code().number(),
         };
-        if deflate64 {
+        if unread {
             text.push_str("e16/0");
             continue;
         }
@@ -295,22 +292,21 @@ fn range_entries<R: ReadAt>(
     for i in 0..n {
         text.push_str(" |");
         let st = za.stat_index(i, Flags::NONE).ok();
-        let deflate64 = st
-            .as_ref()
-            .is_some_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64);
+        let unread = st.as_ref().is_some_and(|st| libzip_lacks(st.comp_method));
         // zip_source_zip_file_create sets ZIP_ER_COMPNOTSUPP on the archive's
         // error, not on the one it is given, which stays ZIP_ER_OK; the port
-        // returns the error. libzip has no Deflate64 (see read_entries).
+        // returns the error. libzip has no Deflate64 nor PPMd (see
+        // read_entries).
         let mut zf = match za.fopen_index_range(i, Flags::NONE, start, len) {
             Err(e) if e.code() == ErrorCode::CompNotSupp => {
                 text.push_str("e0/0");
                 continue;
             }
-            Err(e) if deflate64 && past_libzip_refusal(&e, st.as_ref(), start, len) => {
+            Err(e) if unread && past_libzip_refusal(&e, st.as_ref(), start, len) => {
                 text.push_str("e0/0");
                 continue;
             }
-            Ok(_) if deflate64 => {
+            Ok(_) if unread => {
                 text.push_str("e0/0");
                 continue;
             }
@@ -613,7 +609,8 @@ fn writes_invalid_zip64(want: &str) -> bool {
     })
 }
 
-/// Whether the port's error opening a Deflate64 entry comes from past the
+/// Whether the port's error opening an entry of a method libzip lacks
+/// comes from past the
 /// point where libzip refuses the method: not the password, nor the sizes
 /// of the entry and the part asked for, which it checks first (with no
 /// compressed data, the window on the empty buffer has no room for a size).
@@ -638,13 +635,19 @@ fn past_libzip_refusal(
     }
 }
 
-/// Whether the archive of a request has a Deflate64 entry.
-fn has_deflate64(request: &str) -> bool {
+/// Whether the port reads `method` where libzip refuses it as
+/// `ZIP_ER_COMPNOTSUPP`: Deflate64 and PPMd.
+fn libzip_lacks(method: u16) -> bool {
+    method == hivepack_zip::cm::DEFLATE64 || method == hivepack_zip::cm::PPMD
+}
+
+/// Whether the archive of a request has an entry of a method libzip lacks.
+fn has_method_libzip_lacks(request: &str) -> bool {
     let data = unhex(request.rsplit(' ').next().unwrap_or("-"));
     Archive::open(data.as_slice(), OpenFlags(0)).is_ok_and(|za| {
         (0..za.get_num_entries(Flags::NONE)).any(|i| {
             za.stat_index(i, Flags::NONE)
-                .is_ok_and(|st| st.comp_method == hivepack_zip::cm::DEFLATE64)
+                .is_ok_and(|st| libzip_lacks(st.comp_method))
         })
     })
 }
@@ -664,9 +667,9 @@ fn written_part(answer: &str) -> Option<(&str, &str)> {
 /// [`writes_invalid_zip64`]); the port's is checked by [`check_written`].
 fn assert_edit(request: &str, want: &str, context: &str) {
     let got = checked_answer(request, want);
-    // libzip has no Deflate64: where it refuses to recompress such an
-    // entry, the port recompresses it, or fails on its data.
-    if got != want && want.ends_with(" |e16/0") && has_deflate64(request) {
+    // libzip has no Deflate64 nor PPMd: where it refuses to recompress such
+    // an entry, the port recompresses it, or fails on its data.
+    if got != want && want.ends_with(" |e16/0") && has_method_libzip_lacks(request) {
         let head = |answer: &str| answer.rsplit_once(" |").map(|(head, _)| head.to_string());
         assert_eq!(head(&got), head(want), "{context}");
         return;
@@ -1393,7 +1396,7 @@ fn zstded(rng: &mut Rng, plain: &[u8]) -> Vec<u8> {
 
 fn spec(rng: &mut Rng, earlier: &[Spec]) -> Spec {
     let name = name(rng, earlier);
-    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 14, 95, 93, 99, 98]);
+    let method = rng.pick(&[0u16, 0, 0, 8, 8, 8, 9, 12, 14, 95, 93, 99, 97]);
     let plain = plain(rng);
     let mut lzma_eos = false;
     let data = match method {
@@ -2872,15 +2875,16 @@ fn port_edits_as_recorded() {
 fn record_edit_answers() {
     let mut oracle = Oracle::spawn().expect("the oracle is built");
     let mut rng = Rng(0x3000_0003);
-    // Not those where the port writes differently, or reads Deflate64
-    // where libzip refuses it, as the recorded answer may be a hash.
+    // Not those where the port writes differently, or reads Deflate64 or
+    // PPMd where libzip refuses them, as the recorded answer may be a hash.
     let mut requests = edit_requests(&mut rng, 700);
     requests.extend(editb_requests(&mut rng, 400));
     let requests = requests
         .into_iter()
         .filter(|request| {
             let want = oracle.ask(request);
-            !writes_invalid_zip64(&want) && !(want.ends_with(" |e16/0") && has_deflate64(request))
+            !writes_invalid_zip64(&want)
+                && !(want.ends_with(" |e16/0") && has_method_libzip_lacks(request))
         })
         .collect();
     record(
@@ -2893,9 +2897,9 @@ fn record_edit_answers() {
     );
 }
 
-/// The port's answer as it is on Linux, where the answers are recorded:
-/// `zip_file_set_mtime` fails with the platform's `EOVERFLOW`, which is
-/// 75 there.
+/// The port's answer, or the oracle's on the same system, as it is on
+/// Linux, the form the answers are recorded in: `zip_file_set_mtime` fails
+/// with the platform's `EOVERFLOW`, which is 75 there.
 fn as_on_linux(answer: String) -> String {
     let empty: &[u8] = &[];
     let mut za = Archive::open(empty, OpenFlags(0)).unwrap();
@@ -2956,7 +2960,7 @@ fn record(
                 continue;
             }
         }
-        let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
+        let _ = writeln!(text, "{request}\t{}", recorded_form(&as_on_linux(reply)));
     }
     std::fs::write(path, text).expect("written");
 }

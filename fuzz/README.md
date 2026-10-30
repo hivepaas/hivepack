@@ -20,6 +20,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `inflate` | Inflating the input (raw, zlib or gzip, chosen by its first byte) in pieces chosen by its next eight: every call gives the same result, message, bytes read and written, and output as zlib |
 | `deflate` | Compressing the input at a level and with a wrapper its first byte picks, in pieces and with flushes its next eight pick: every call gives the same result, bytes read and written, and bytes as zlib |
 | `zip_open` | Opening the input as a ZIP archive, leniently and with `ZIP_CHECKCONS`, asking the reading API about every entry, and reading every entry's data, decompressed, raw, and decrypted with the password "foo": no panic (`crates/zip/tests/oracle.rs` compares the answers with libzip) |
+| `zip_ppmd` | Reading the input as the data of a PPMd entry (ZIP's method 98) in an archive of that one entry, leniently and with `ZIP_CHECKCONS`, in pieces of one byte and of growing sizes: the same bytes and error both ways (libzip has no PPMd: `crates/zip/src/ppmd8_oracle.rs` compares the model with 7-Zip's `Ppmd8.c`) |
 | `extract` | Extracting the input as a ZIP archive with hivepack-extract, with options its first byte picks, cancelled after some progress if it says so: nothing written beside the destination, every link created staying inside it, the summary counting what is there, and no file left cut off |
 | `zip_edit` | Opening the input as a ZIP archive, making the edits its first bytes pick (encrypting among them) and writing it: the archive written opens with the entries as edited, their names, comments, attributes, times, sizes and data, read with the passwords the edits set (`crates/zip/tests/oracle.rs` compares the edits and the bytes written with libzip) |
 | `inflate9` | Decoding the input as Deflate64 all at once and in pieces its first eight bytes pick: the same result, message, input used and output calls both ways, and with `Inflate9` in pieces of input and output the same end, message and output (zlib's Deflate64 decoder is not in libz-sys; `crates/deflate/tests/deflate64.rs` compares with it) |
@@ -93,6 +94,9 @@ CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and
 those libzip encrypted in `testdata/oracle/zip-decrypt.txt` (some with
 "foo"), and `zip_edit` with the same archives behind two edits (encrypting, for
 the encrypted ones).
+
+CI seeds `zip_ppmd` with the streams of `testdata/oracle/ppmd8.txt` made
+with a whole number of MiB, behind ZIP's two bytes of parameters.
 
 CI seeds `iso` with libarchive's test images, uncompressed, and
 `extract_iso` with the same images behind a byte of options:

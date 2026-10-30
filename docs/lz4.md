@@ -84,10 +84,17 @@ The same machine and corpus, blocks compressed in one call each with room for al
 
 | | Level 1 | Acceleration 9 | Level 2 | Level 9 | Level 12 |
 |---|---|---|---|---|---|
-| hivepack-lz4 | 0.92–0.98× liblz4 (mean 0.95×) | 0.81–0.95× | 0.77–0.92× | 0.78–0.90× | 0.81–0.97× |
+| hivepack-lz4 | 0.92–0.98× liblz4 (mean 0.95×) | 0.81–0.95× | 0.81–0.95× | 0.74–0.90× | 0.81–0.98× |
 | lz4_flex 0.14.0, its safe code | 0.91–0.96×, 1.23× on `x-ray` | | | | |
 
-lz4_flex makes its own blocks, not liblz4's. As first ported, the fast compressor was at 0.49–0.90×: `LZ4_compress_generic` is now inlined at each call, as liblz4's, each with its directives constant, and its search reads through a window of the input whose end is the search's own limit. High compression is next.
+Frames of 4 MB linked blocks with a content checksum, written through each library's writer (`--compress --frame`), best of three rounds:
+
+| | Level 1 | Level 9 |
+|---|---|---|
+| hivepack-lz4 | 0.87–1.30× liblz4 | 0.76–0.91× |
+| lz4_flex 0.14.0, its safe code | 1.09–1.92× | |
+
+liblz4 compresses frames more slowly than blocks (its linked blocks go through `LZ4_compress_fast_continue`, then `LZ4_saveDict`); the port, whose stream functions are specialised as its block functions are, is faster on four files. lz4_flex makes its own blocks, not liblz4's. As first ported, the fast compressor was at 0.49–0.90×: `LZ4_compress_generic` is now inlined at each call, as liblz4's, each with its directives constant, and its search reads through a window of the input whose end is the search's own limit. High compression's strategies are inlined as liblz4's are, which made level 2 about 5% faster; reading the chains without bounds checks, tried in a scratch copy, gained 4–7% at level 9, and the safe ways to get there tried so far moved the speed by as much in either direction as the code's layout does.
 
 ## Progress
 

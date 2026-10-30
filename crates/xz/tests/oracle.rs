@@ -167,6 +167,7 @@ fn parse_mt(text: &str) -> MtOptions {
         check: Check(n(4) as u32),
         flags: n(5) as u32,
         filters: (f[6] != "-").then(|| parse_chain(f[6], true)),
+        ..MtOptions::default()
     }
 }
 
@@ -216,6 +217,82 @@ fn mt_answer(args: &str, steps: &str, data: &str) -> String {
     format!(
         "ok {last} {}/{} {:016x}",
         strm.total_in(),
+        strm.total_out(),
+        fnv64(&out)
+    )
+}
+
+/// The port's answer to an `mtdec` request: the threaded decoder driven by
+/// the steps, as the oracle does.
+fn mt_decoder_answer(args: &str, steps: &str, data: &str) -> String {
+    let n: Vec<u64> = args.split(':').map(|a| a.parse().unwrap()).collect();
+    let options = MtOptions {
+        threads: n[0] as u32,
+        timeout: n[1] as u32,
+        flags: n[2] as u32,
+        memlimit_threading: n[3],
+        memlimit_stop: n[4],
+        ..MtOptions::default()
+    };
+    let mut strm = match Stream::stream_decoder_mt(&options) {
+        Ok(strm) => strm,
+        Err(e) => return format!("err {}", e.number()),
+    };
+    let data = unhex(data);
+    let mut out = Vec::new();
+    let (mut consumed, mut end) = (0, 0);
+    let (mut last, mut tells) = (0, 0);
+    'steps: for step in steps.split(',') {
+        let Some(rest) = step.strip_prefix('c') else {
+            break;
+        };
+        let args: Vec<&str> = rest.split('/').collect();
+        if args[0] != "=" {
+            let n: usize = args[0].parse().unwrap();
+            end = consumed + n.min(data.len() - consumed);
+        }
+        let room: usize = args[1].parse().unwrap();
+        let action = action(args[2].parse().unwrap());
+        loop {
+            let written = out.len();
+            out.resize(written + room, 0);
+            let mut input = InBuffer {
+                src: &data[..end],
+                pos: consumed,
+            };
+            let mut output = OutBuffer::new(&mut out[written..]);
+            last = code(strm.code(&mut output, &mut input, action));
+            let made = output.pos;
+            consumed = input.pos;
+            out.truncate(written + made);
+            if (2..=4).contains(&last) {
+                tells += 1;
+                last = 0;
+            } else if last == 10 && action == Action::Run {
+                last = 0;
+            }
+            if last != 0 {
+                break 'steps;
+            }
+            if action == Action::Run {
+                break;
+            }
+        }
+    }
+    if last != 0 && last != 1 && options.flags & FAIL_FAST != 0 {
+        return "fail".to_string();
+    }
+    // What the BCJ coder had not filtered when the coder after it failed.
+    if last != 0 && last != 1 && n[5] != 0 {
+        return format!("{last} {tells}");
+    }
+    let total_in = if last == 1 {
+        format!(" {}", strm.total_in())
+    } else {
+        String::new()
+    };
+    format!(
+        "{last} {tells} {} {:016x}{total_in}",
         strm.total_out(),
         fnv64(&out)
     )
@@ -900,6 +977,9 @@ fn port_answer(request: &str) -> String {
     let words: Vec<&str> = request.split(' ').collect();
     if let ["mtcode", args, steps, data] = words[..] {
         return mt_answer(args, steps, data);
+    }
+    if let ["mtdec", args, steps, data] = words[..] {
+        return mt_decoder_answer(args, steps, data);
     }
     if let ["bcj", arch, direction, start, data] = words[..] {
         let mut buf = unhex(data);
@@ -1648,4 +1728,186 @@ fn record_encoder_answers() {
         let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
     }
     std::fs::write(recorded_encoder_path(), text).expect("written");
+}
+
+// The threaded decoder.
+
+fn recorded_mt_path() -> PathBuf {
+    repository().join("testdata/oracle/xz-mt.txt")
+}
+
+/// `data` as a .xz Stream: the threaded encoder's, with the sizes in its
+/// Block Headers that the threaded decoder needs, or the single-threaded
+/// one's, without them. `bcj` is set if it has a BCJ filter.
+fn mt_stream(rng: &mut Rng, data: &[u8], bcj: &mut bool) -> Vec<u8> {
+    let check = Check(rng.pick(&[0, 1, 4, 10]));
+    let preset = rng.below(4) as u32;
+    let mut out = vec![0; data.len() * 2 + 100_000];
+    let mut output = OutBuffer::new(&mut out);
+    let mut strm = if rng.below(4) == 0 {
+        Stream::easy_encoder(preset, check).unwrap()
+    } else {
+        let filters = (rng.below(4) == 0).then(|| {
+            let before = filters_before(rng, false);
+            *bcj |= before
+                .split('+')
+                .any(|f| f.starts_with('f') && !f.starts_with("f3:"));
+            let lzma = "21:65536:3:0:2:1:32:3:0:0:0:-";
+            parse_chain(&format!("{before}{lzma}"), true)
+        });
+        Stream::stream_encoder_mt(&MtOptions {
+            threads: 1 + rng.below(3) as u32,
+            block_size: (data.len() as u64 / 40).max(1 + rng.below(20_000)),
+            preset,
+            filters,
+            check,
+            ..MtOptions::default()
+        })
+        .unwrap()
+    };
+    let ret = strm.code(&mut output, &mut InBuffer::new(data), Action::Finish);
+    assert_eq!(ret, Ok(Status::StreamEnd));
+    let len = output.pos;
+    out.truncate(len);
+    out
+}
+
+/// The threaded decoder's options, as the oracle reads them: one to four
+/// threads, now and then refused ones, the flags, and memory limits that
+/// send Blocks to the direct mode, or stop the decoder.
+fn mt_decoder_options(rng: &mut Rng, concatenated: bool, bcj: bool) -> String {
+    let threads = match rng.below(40) {
+        0 => rng.pick(&[0, 16385]),
+        _ => 1 + rng.below(4) as u32,
+    };
+    let mut flags = flags(rng);
+    if concatenated {
+        flags |= CONCATENATED;
+    }
+    let threading = match rng.below(3) {
+        0 => rng.pick(&[0, 1, 1 << 16, 300_000, 1 << 20, 1 << 24]),
+        _ => u64::MAX,
+    };
+    let stop = match rng.below(6) {
+        0 => rng.pick(&[0, 1 << 16, 1 << 20, 9 << 20]),
+        _ => u64::MAX,
+    };
+    format!("{threads}:0:{flags}:{threading}:{stop}:{}", u8::from(bcj))
+}
+
+/// The steps of a decoding of `len` bytes: pieces with LZMA_RUN, then
+/// LZMA_FINISH with all that is left, each with some room for output.
+fn mt_decoder_steps(rng: &mut Rng, len: usize) -> String {
+    let mut steps = Vec::new();
+    let mut offered = 0;
+    while offered < len && steps.len() < 60 {
+        let n = 1 + chunk(rng, len - offered);
+        offered += n;
+        steps.push(format!("c{n}/{}/0", 1 + room(rng)));
+    }
+    steps.push(format!("c{len}/{}/3", 1 + room(rng)));
+    steps.join(",")
+}
+
+/// Requests for the threaded decoder: `count` Streams with inputs up to
+/// `max` bytes, some concatenated, damaged, cut short or followed by more,
+/// and the test files of XZ Utils.
+fn mt_decoder_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
+    let mut requests = Vec::new();
+    for _ in 0..count {
+        let len = length(rng, max);
+        let data = if rng.below(3) == 0 {
+            code_input(rng, len)
+        } else {
+            input(rng, len)
+        };
+        let mut bcj = false;
+        let mut stream = mt_stream(rng, &data, &mut bcj);
+        let mut concatenated = false;
+        match rng.below(10) {
+            0 | 1 => stream = damage(rng, &stream),
+            2 => {
+                let at = rng.below(stream.len() as u64) as usize;
+                stream.truncate(at);
+            }
+            3 | 4 => {
+                concatenated = true;
+                let padding = rng.pick(&[0, 4, 8, 3]);
+                stream.resize(stream.len() + padding, 0);
+                let more_len = rng.below(20_000) as usize;
+                let more = input(rng, more_len);
+                stream.extend(mt_stream(rng, &more, &mut bcj));
+            }
+            5 => stream.extend((0..1 + rng.below(20)).map(|_| rng.next() as u8)),
+            _ => {}
+        }
+        let options = mt_decoder_options(rng, concatenated, bcj);
+        let steps = mt_decoder_steps(rng, stream.len());
+        requests.push(format!("mtdec {options} {steps} {}", hex(&stream)));
+    }
+    for (name, data) in test_files() {
+        if name.ends_with(".xz") {
+            let options = mt_decoder_options(rng, true, name.contains("bcj"));
+            let steps = mt_decoder_steps(rng, data.len());
+            requests.push(format!("mtdec {options} {steps} {}", hex(&data)));
+        }
+    }
+    requests
+}
+
+#[test]
+fn port_mt_decoder_matches_liblzma() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let mut rng = Rng(0x5eed_d201);
+    let requests = mt_decoder_requests(&mut rng, 300, 3_000_000);
+    let mut seen = [0usize; 12];
+    for request in &requests {
+        let want = oracle.ask(request);
+        assert_eq!(port_answer(request), want, "{request:.300}");
+        if let Some(ret) = want.split(' ').next().and_then(|r| r.parse::<usize>().ok()) {
+            seen[ret] += 1;
+        }
+    }
+    eprintln!("{} requests, last results {seen:?}", requests.len());
+    assert!(seen[1] > 100, "only {} Streams end", seen[1]);
+    for ret in [6, 9, 10] {
+        assert!(seen[ret] > 0, "no decoding ended with {ret}");
+    }
+}
+
+#[test]
+fn port_mt_decoder_matches_recorded_answers() {
+    let text = std::fs::read_to_string(recorded_mt_path()).expect("testdata/oracle/xz-mt.txt");
+    let mut checked = 0;
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        assert_eq!(recorded_form(&port_answer(request)), want, "{request:.300}");
+        checked += 1;
+    }
+    assert!(checked > 100, "only {checked} recorded answers");
+}
+
+#[test]
+#[ignore = "rewrites testdata/oracle/xz-mt.txt from the oracle"]
+fn record_mt_decoder_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut rng = Rng(0x5eed_d202);
+    let mut text = String::from(
+        "# Answers from liblzma 5.8.4's threaded decoder (tools/xz-oracle), replayed by crates/xz/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-xz --test oracle record_mt_decoder_answers -- --ignored\n",
+    );
+    for request in mt_decoder_requests(&mut rng, 300, 3000) {
+        // Keep the file small: the large inputs are for the live comparison.
+        if request.len() > 6_000 {
+            continue;
+        }
+        let reply = oracle.ask(&request);
+        let _ = writeln!(text, "{request}\t{}", recorded_form(&reply));
+    }
+    std::fs::write(recorded_mt_path(), text).expect("written");
 }

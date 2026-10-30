@@ -3,7 +3,7 @@
 `cargo-fuzz` targets that compare hivepack-zstd with libzstd,
 hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with
 liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip,
-hivepack-extract, hivepack-age, hivepack-tar, hivepack-open and hivepack-7z any input. They need
+hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open and hivepack-7z any input. They need
 nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 (`NIGHTLY` in `.github/workflows/ci.yml`), chosen for the shell with
 `export RUSTUP_TOOLCHAIN=<that nightly>`, and
@@ -26,7 +26,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `sevenz` | Opening the input as a 7z archive, listing it, reading its files in pieces of all sizes, decoding its folders and extracting its files, with small limits on memory and output: no panic (`crates/7z/tests/oracle.rs` compares the results with the LZMA SDK's) |
 | `lz4` | After a mode byte and eight bytes of seed: decoding the rest as a block with `LZ4_decompress_safe` into an output of a size the seed picks, with the same result and every byte of the output the same, past what is decoded too, as liblz4; reading it as a frame in reads of sizes the seed picks, through the lz4 crate's `Decoder` and the same loop over the port's context, with the same bytes from every read; decoding it partially, with dictionaries, after a prefix and in a stream, and reading it with the port's `Decoder`: no panic (`crates/lz4/tests/oracle.rs` compares those with liblz4); compressing the rest into a block, fast or at a high-compression level, and into a frame through the lz4 crate's `Encoder` and the port's, with preferences, writes and flushes the seed picks, with the same block or frame as liblz4; and compressing it in the ways the lz4 crate cannot reach (dictionaries, digested or not, negative levels, stored blocks, outputs too small, as much as fits): no panic, and all of it decompresses to what was given |
 | `bzip2` | With an even first byte, decompressing the rest, fast or small, in pieces chosen by the next eight bytes: every call, up to the first error, gives the same result, bytes read and written, and output as libbzip2. With an odd one, compressing the rest at a block size and work factor the first byte picks, in pieces with flushes on the way: every call the same as libbzip2's, and a stream that decompresses back |
-| `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2 with up to three delta and BCJ filters before it), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). The automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
+| `xz` | Decoding the rest of the input with the decoder its first byte picks (`.xz`, automatic, `.lz`, `.lzma`, raw LZMA1 or LZMA2 with up to three delta and BCJ filters before it, or the threaded `.xz` decoder), with flags, a memory limit or options and pieces its next eight pick, and memory limits set between calls: every call, up to the first error, gives the same result, bytes read and written, and output as liblzma (built from liblzma-sys's bundled 5.8.4 sources). The threaded decoders, whose calls read and write as their threads let them, without flags, give the same end, and after the end of a Stream the same output and bytes read. The automatic decoder skips `.lz` input, which liblzma-sys's build of the automatic decoder takes for `.lzma` |
 | `xz_encode` | Encoding the rest of the input with the encoder its first byte picks (`.xz` of a preset, `.xz` of LZMA2 with options, `.lzma`, raw LZMA1 or LZMA2, all but `.lzma` and the preset with up to three delta and BCJ filters before LZMA, or the threaded `.xz` encoder), with the preset, check, options, filters, threads, pieces and flushes its next eight bytes pick: every call gives the same result, bytes read and written, and output as liblzma; the threaded encoders, whose calls read and write as their threads let them, end with the same Stream (built with liblzma-sys's `parallel` feature) |
 | `age` | Decrypting the input as an age file, armored or not, with CCTV's usual X25519 key and the passphrase `password` (work factors up to 2^4), twice, in pieces of different sizes its first eight bytes pick: the same plaintext and the same end both times, and no panic (`crates/age/tests/oracle.rs` compares the outcomes with age) |
 | `age_keys` | Reading the input as an identity file, as `age -i` does (a file of keys, an SSH key, a file of keys encrypted with age): no panic. Only the parsing, as decrypting an encrypted key file could ask scrypt for 4 GiB |
@@ -34,6 +34,7 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `rar_headers` | Opening the input as a RAR archive, its first byte choosing whether a broken main header is read past, and reading every header, twice: the same headers both times, each past the one before |
 | `rar_test` | Going through the input as UnRAR tests an archive, twice: the same data both times, no more of any entry than its header's pack and unpacked sizes |
 | `extract_tar` | Extracting the input as a tar archive with hivepack-extract, as `extract` does a ZIP archive: options from its first byte, cancelled after some progress if it says so; nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
+| `iso` | Reading the input as an ISO 9660 image, as an input that cannot seek and as one that can, every entry and up to 4 MiB of each one's data, twice each, in pieces of different sizes its first eight bytes pick: the same headers, data, warnings and end both times, and no panic (`crates/iso/tests/oracle.rs` compares the answers with libarchive) |
 | `open` | Opening the input through its layers with hivepack-open (the age key of `crates/open/tests/age.rs`'s files; a name ending in `.lzma` if its first byte is odd; small limits), three times with one opener, the later opens with the file keys kept, and reading up to 4 MiB in pieces of different sizes: the same layers, container and end each time, the same data, or after an error data of which one starts the other (libzstd gives out less before an error when its output buffer is larger), and no panic |
 
 Seed the corpus with the frames in `testdata`, then run, with the
@@ -57,7 +58,7 @@ without).
 The `inflate`, `deflate`, `inflate9` and `divsufsort` targets start from
 an empty corpus, CI seeds `bzip2` with the streams and inputs of
 `testdata/oracle/bzip2.txt`, `xz` with the inputs of
-`testdata/oracle/xz.txt`, behind the byte for their decoder, and `xz_encode`
+`testdata/oracle/xz.txt` and `testdata/oracle/xz-mt.txt`, behind the byte for their decoder, and `xz_encode`
 with those of `testdata/oracle/xz-encode.txt`, behind the byte for their
 encoder:
 
@@ -89,6 +90,14 @@ CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and
 those libzip encrypted in `testdata/oracle/zip-decrypt.txt` (some with
 "foo"), and `zip_edit` with the same archives behind two edits (encrypting, for
 the encrypted ones).
+
+CI seeds `iso` with libarchive's test images, uncompressed:
+
+```sh
+mkdir -p fuzz/corpus/iso
+for f in testdata/libarchive-iso/*.iso.xz; do xz -dc "$f" > "fuzz/corpus/iso/$(basename "$f" .xz)"; done
+cargo fuzz run iso -- -max_total_time=3600 -rss_limit_mb=4096
+```
 
 `cargo fuzz` builds with AddressSanitizer, so with the feature an access out
 of bounds in its unchecked copies stops the run as a crash, as a difference

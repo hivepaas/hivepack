@@ -37,6 +37,7 @@ fn open(archive: &[u8]) -> Result<Archive<Cursor<&[u8]>>, Error> {
     let options = Options {
         memory_limit: u64::MAX,
         decoder_memory_limit: u64::MAX,
+        ..Options::default()
     };
     Archive::open_with(Cursor::new(archive), &options)
 }

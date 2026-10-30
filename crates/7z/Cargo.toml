@@ -20,6 +20,8 @@ workspace = true
 [dependencies]
 # BZip2.
 hivepack-bzip2.workspace = true
+# AES and SHA-256, for 7zAES.
+hivepack-crypto.workspace = true
 # CRC-32, which 7z checks its headers and files with, and Deflate and
 # Deflate64.
 hivepack-deflate.workspace = true

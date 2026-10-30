@@ -8,7 +8,8 @@
 //! PPMd, Deflate, Deflate64, BZip2 or Zstandard, after a branch converter
 //! (x86 BCJ, ARM, ARM-Thumb, ARM64, PowerPC, SPARC, IA-64, RISC-V), the delta
 //! or swap filters or BCJ2, in any graph of coders. What the SDK decodes gets
-//! its answers; the rest goes as far as 7-Zip's program does:
+//! its answers; the rest goes as far as 7-Zip's program does, AES included,
+//! with a password ([`Options::password`], [`Archive::set_password`]):
 //!
 //! - [`Archive::extract`] decodes a file's whole folder, as
 //!   `SzArEx_Extract` does, and keeps it for the folder's next file;
@@ -34,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+mod aes7z;
 mod arc_in;
 mod bcj2;
 mod bra;
@@ -47,6 +49,7 @@ use std::io::{self, Read, Seek};
 pub use arc_in::SIGNATURE;
 pub use error::{Error, Result};
 
+use aes7z::{Decoding, MAX_KEY_CYCLES};
 use arc_in::ArEx;
 use dec::FolderDecoder;
 
@@ -59,7 +62,7 @@ pub(crate) fn crc(data: &[u8]) -> u32 {
 }
 
 /// How an archive is opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Options {
     /// The most the description of the archive may take in memory, its
     /// headers decoded, in bytes: past it, the archive fails to open with
@@ -72,6 +75,26 @@ pub struct Options {
     /// it needs, and the SDK has no such limit. 4 GiB by default, the most
     /// LZMA's dictionary and PPMd's model can be.
     pub decoder_memory_limit: u64,
+    /// The password of an encrypted archive; see also
+    /// [`Archive::set_password`], for one whose names can be read without it.
+    /// 7-Zip encrypts with AES, its key made by hashing the password.
+    pub password: Option<String>,
+    /// How many times a key may be hashed, as a power of 2: past it, the
+    /// data is [`Error::Unsupported`]. An archive says how many, up to about
+    /// a second for each key at 7-Zip's limit, 24, the default; 7-Zip writes
+    /// 19.
+    pub max_key_cycles: u32,
+}
+
+impl core::fmt::Debug for Options {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Options")
+            .field("memory_limit", &self.memory_limit)
+            .field("decoder_memory_limit", &self.decoder_memory_limit)
+            .field("password", &self.password.as_ref().map(|_| "(hidden)"))
+            .field("max_key_cycles", &self.max_key_cycles)
+            .finish()
+    }
 }
 
 impl Default for Options {
@@ -79,6 +102,8 @@ impl Default for Options {
         Options {
             memory_limit: 1 << 30,
             decoder_memory_limit: 1 << 32,
+            password: None,
+            max_key_cycles: MAX_KEY_CYCLES,
         }
     }
 }
@@ -110,13 +135,17 @@ pub struct Entry {
     /// The folder its data is in; none for a file without data (empty, or
     /// a directory).
     pub folder: Option<usize>,
+    /// Whether its data is encrypted.
+    pub encrypted: bool,
 }
 
 /// A 7z archive, open for reading.
 pub struct Archive<R> {
     reader: R,
     db: ArEx,
-    decoder_limit: u64,
+    decoding: Decoding,
+    /// Which folders have an AES coder.
+    encrypted: Vec<bool>,
     /// `SzArEx_Extract`'s cache: the folder last decoded, and its data.
     cache: Option<(usize, Vec<u8>)>,
 }
@@ -130,17 +159,39 @@ impl<R: Read + Seek> Archive<R> {
 
     /// `SzArEx_Open`, with `options`.
     pub fn open_with(mut reader: R, options: &Options) -> Result<Self> {
-        let db = arc_in::open(
-            &mut reader,
-            options.memory_limit,
+        let decoding = Decoding::new(
             options.decoder_memory_limit,
-        )?;
+            options.password.as_deref(),
+            options.max_key_cycles,
+        );
+        let (db, decoding) = arc_in::open(&mut reader, options.memory_limit, decoding)?;
+        let encrypted = (0..db.db.num_folders as usize)
+            .map(|fo| dec::folder_is_encrypted(&db.db, fo))
+            .collect();
         Ok(Archive {
             reader,
             db,
-            decoder_limit: options.decoder_memory_limit,
+            decoding,
+            encrypted,
             cache: None,
         })
+    }
+
+    /// The password for the encrypted files from now on. A wrong one shows as
+    /// [`Error::WrongPassword`] when they are read: 7z has nothing to check it
+    /// with but the data.
+    pub fn set_password(&mut self, password: &str) {
+        self.decoding.set_password(password);
+    }
+
+    /// The error for file `index`'s CRC not matching.
+    fn crc_error(&self, index: usize) -> Error {
+        let folder = self.db.file_to_folder[index] as usize;
+        if self.encrypted.get(folder).copied().unwrap_or(false) {
+            Error::WrongPassword
+        } else {
+            Error::Crc
+        }
     }
 
     /// The number of files.
@@ -178,6 +229,11 @@ impl<R: Read + Seek> Archive<R> {
             mtime: db.mtime.check(index).then(|| db.mtime.vals[index]),
             ctime: db.ctime.check(index).then(|| db.ctime.vals[index]),
             folder: (folder != u32::MAX).then_some(folder as usize),
+            encrypted: self
+                .encrypted
+                .get(folder as usize)
+                .copied()
+                .unwrap_or(false),
         }
     }
 
@@ -207,7 +263,7 @@ impl<R: Read + Seek> Archive<R> {
             return Err(Error::Param);
         }
         let size = self.folder_size(folder);
-        if size > usize::MAX as u64 || size > self.decoder_limit {
+        if size > usize::MAX as u64 || size > self.decoding.limit {
             return Err(Error::Mem);
         }
         // That it can be had, before the allocation that cannot fail softly.
@@ -222,7 +278,7 @@ impl<R: Read + Seek> Archive<R> {
             folder,
             &mut self.reader,
             self.db.data_pos,
-            self.decoder_limit,
+            &mut self.decoding,
             &mut out,
         )?;
         Ok(out)
@@ -257,7 +313,7 @@ impl<R: Read + Seek> Archive<R> {
         }
         let file = &data[offset as usize..(offset + size) as usize];
         if db.crcs.check(index) && crc(file) != db.crcs.vals[index] {
-            return Err(Error::Crc);
+            return Err(self.crc_error(index));
         }
         Ok(file.to_vec())
     }
@@ -316,8 +372,8 @@ impl<R: Read + Seek> Files<'_, R> {
             if self.folder.as_ref().is_none_or(|(f, _)| *f != fo) {
                 self.end_folder()?;
                 let db = &self.archive.db;
-                let limit = self.archive.decoder_limit;
-                self.folder = Some((fo, FolderDecoder::new(&db.db, fo, db.data_pos, limit)?));
+                let decoding = &mut self.archive.decoding;
+                self.folder = Some((fo, FolderDecoder::new(&db.db, fo, db.data_pos, decoding)?));
             }
             // Skip what is between: the folder's data no file holds.
             let db = &self.archive.db;
@@ -377,7 +433,7 @@ impl<R: Read + Seek> Files<'_, R> {
             if let Some(expected) = current.expected.take()
                 && current.crc != expected
             {
-                return Err(Error::Crc);
+                return Err(self.archive.crc_error(current.index));
             }
             // The folder's checks, once its last file is read.
             let is_last = self.next >= self.archive.len()

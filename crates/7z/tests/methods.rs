@@ -7,6 +7,8 @@
 //!
 //! - `SEVENZ_METHODS_SEED=<n>` makes other archives, and
 //!   `SEVENZ_METHODS_COUNT=<n>` more damaged ones of each.
+//! - Encrypted archives are read with their password, without it and with
+//!   another.
 //! - Archives put together by hand, for what `7zz` does not write, are read
 //!   everywhere: Zstandard, which 7-Zip's program does not take in 7z, a
 //!   filter alone, and what is left over after a coder's stream.
@@ -19,7 +21,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use hivepack_7z::Archive;
+use hivepack_7z::{Archive, Error, Options};
 use support::{Rng, damaged, input, make_archive, scratch, seven_zip, write_files};
 
 const OPTIONS: &[&str] = &[
@@ -46,10 +48,16 @@ const OPTIONS: &[&str] = &[
 
 /// Whether `7zz t` finds all of the archive right.
 fn tool_says_good(tool: &Path, dir: &Path, archive: &[u8]) -> bool {
+    tool_says_good_with(tool, dir, archive, "-")
+}
+
+/// Whether `7zz t` finds all of the archive right, with a password.
+fn tool_says_good_with(tool: &Path, dir: &Path, archive: &[u8], password: &str) -> bool {
     let path = dir.join("asked.7z");
     std::fs::write(&path, archive).expect("the archive written");
     Command::new(tool)
-        .args(["t", "-bd", "-bso0", "-bse0", "-bsp0", "-p-"])
+        .args(["t", "-bd", "-bso0", "-bse0", "-bsp0"])
+        .arg(format!("-p{password}"))
         .arg(&path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -60,15 +68,27 @@ fn tool_says_good(tool: &Path, dir: &Path, archive: &[u8]) -> bool {
 }
 
 /// Each file's name and data, read one after another, or the first error.
-fn read_all(archive: &[u8]) -> Result<Vec<(String, Vec<u8>)>, hivepack_7z::Error> {
-    let mut a = Archive::open(Cursor::new(archive))?;
+fn read_all(archive: &[u8]) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    read_all_with(archive, None)
+}
+
+/// [`read_all`], with a password.
+fn read_all_with(archive: &[u8], password: Option<&str>) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    let options = Options {
+        password: password.map(str::to_string),
+        ..Options::default()
+    };
+    let mut a = Archive::open_with(Cursor::new(archive), &options)?;
     let mut files = a.files();
     let mut out = Vec::new();
     while let Some(entry) = files.next()? {
         let mut data = Vec::new();
-        files
-            .read_to_end(&mut data)
-            .map_err(|_| hivepack_7z::Error::Data)?;
+        files.read_to_end(&mut data).map_err(|e| {
+            e.get_ref()
+                .and_then(|e| e.downcast_ref::<Error>())
+                .copied()
+                .unwrap_or(Error::Data)
+        })?;
         out.push((entry.name, data));
     }
     Ok(out)
@@ -120,6 +140,244 @@ fn reads_what_seven_zip_makes() {
     let _ = std::fs::remove_dir_all(&dir);
     let [[neither, only_port], [_, both]] = tallies;
     eprintln!("{both} good for both, {neither} for neither, {only_port} for the port alone");
+}
+
+const PASSWORD: &str = "mật-khẩu-🔑";
+
+/// What 7-Zip encrypts, in the shapes it makes, 8 coders for BCJ2.
+const ENCRYPTED: &[&str] = &[
+    "",
+    "-mhe=on",
+    "-mhe=on -m0=Copy",
+    "-m0=Copy -mhc=off",
+    "-ms=off",
+    "-m0=PPMd:mem=1m",
+    "-m0=Deflate -mhc=off",
+    "-m0=BZip2 -mhe=on",
+    "-m0=BCJ -m1=LZMA -mhe=on",
+    "-m0=BCJ2 -m1=LZMA:d=1m -m2=LZMA:d=64k -m3=LZMA:d=64k -mb0s0:1 -mb0s1:2 -mb0s2:3",
+];
+
+#[test]
+fn reads_what_seven_zip_encrypts() {
+    let Some(tool) = seven_zip() else {
+        return;
+    };
+    let dir = scratch("encrypted");
+    let env = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    let mut rng = Rng(env("SEVENZ_METHODS_SEED").unwrap_or(0x5eed_7a15));
+    let count = env("SEVENZ_METHODS_COUNT").unwrap_or(4);
+    for options in ENCRYPTED {
+        let files = 1 + rng.below(6) as usize;
+        write_files(&mut rng, &dir, files, 100_000);
+        let made = format!("-p{PASSWORD} {options}");
+        let archive = make_archive(&tool, &dir, "files", &made);
+        let read =
+            read_all_with(&archive, Some(PASSWORD)).unwrap_or_else(|e| panic!("{made}: {e}"));
+        assert!(!read.is_empty());
+        for (name, data) in &read {
+            let path = dir.join(name);
+            if path.is_file() {
+                assert_eq!(
+                    data,
+                    &std::fs::read(&path).expect("the file"),
+                    "{made}: {name}"
+                );
+            }
+        }
+        // The first file with data is what shows, with no password or another.
+        let has_data = read.iter().any(|(_, data)| !data.is_empty());
+        if has_data {
+            assert_eq!(
+                read_all_with(&archive, None).err(),
+                Some(Error::PasswordRequired),
+                "{made}"
+            );
+            assert_eq!(
+                read_all_with(&archive, Some("wrong")).err(),
+                Some(Error::WrongPassword),
+                "{made}"
+            );
+        }
+        for round in 0..count {
+            let bad = damaged(&mut rng, &archive);
+            if tool_says_good_with(&tool, &dir, &bad, PASSWORD) {
+                let read = read_all_with(&bad, Some(PASSWORD));
+                assert!(
+                    read.is_ok(),
+                    "{made}, round {round}: 7zz reads it: {read:?}"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A password can come after the archive opens, while its names can be read.
+#[test]
+fn a_password_can_come_later() {
+    let Some(tool) = seven_zip() else {
+        return;
+    };
+    let dir = scratch("later");
+    let mut rng = Rng(0x5eed_7a16);
+    write_files(&mut rng, &dir, 3, 50_000);
+    let archive = make_archive(&tool, &dir, "files", &format!("-p{PASSWORD}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut a = Archive::open(Cursor::new(&archive)).expect("the names are not encrypted");
+    let i = (0..a.len())
+        .find(|i| a.entry(*i).size > 0)
+        .expect("a file with data");
+    assert!(a.entry(i).encrypted);
+    assert_eq!(a.extract(i).err(), Some(Error::PasswordRequired));
+    a.set_password("wrong");
+    assert_eq!(a.extract(i).err(), Some(Error::WrongPassword));
+    a.set_password(PASSWORD);
+    assert!(a.extract(i).is_ok());
+}
+
+/// `plain` encrypted as 7zAES does, padded with zeros to whole blocks.
+fn encrypted(key: &[u8; 32], iv: [u8; 16], plain: &[u8]) -> Vec<u8> {
+    let aes = hivepack_crypto::Aes::new(key).expect("a key");
+    let mut out = plain.to_vec();
+    out.resize(plain.len().next_multiple_of(16), 0);
+    let mut last = iv;
+    for block in out.as_chunks_mut::<16>().0 {
+        for (byte, chain) in block.iter_mut().zip(last) {
+            *byte ^= chain;
+        }
+        aes.encrypt_block(block);
+        last = *block;
+    }
+    out
+}
+
+/// SHA-256 of `rounds` rounds of the salt, the password and the round's number.
+fn hashed_key(salt: &[u8], password: &[u8], rounds: u64) -> [u8; 32] {
+    let mut sha = hivepack_crypto::Sha256::new();
+    for round in 0..rounds {
+        sha.update(salt);
+        sha.update(password);
+        sha.update(&round.to_le_bytes());
+    }
+    sha.out()
+}
+
+/// The coder's properties, the key made from them, and how much input it
+/// takes. Each case either reads or fails, as in `7zz t`.
+#[test]
+fn the_aes_coder_as_seven_zip_reads_it() {
+    let mut rng = Rng(0x5eed_7a17);
+    let data = input(&mut rng, 5000);
+    let crc = hivepack_deflate::crc32(0, &data);
+    let size = data.len() as u64;
+    let password: Vec<u8> = "pw".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let no_iv = [0u8; 16];
+    let iv = [7u8; 16];
+    let mut iv_props = vec![0x44, 0x0F];
+    iv_props.extend_from_slice(&iv);
+    let good = encrypted(&hashed_key(&[], &password, 16), iv, &data);
+    let salt = [1u8, 2, 3];
+    let mut salt_props = vec![0x83, 0x20];
+    salt_props.extend_from_slice(&salt);
+    let mut unhashed = [0u8; 32];
+    unhashed[..3].copy_from_slice(&salt);
+    unhashed[3..3 + password.len()].copy_from_slice(&password);
+    let mut unhashed_props = vec![0xBF, 0x20];
+    unhashed_props.extend_from_slice(&salt);
+    let once = hashed_key(&[], &password, 1);
+
+    let with_more = |more: usize| {
+        let mut out = good.clone();
+        out.resize(good.len() + more, 0);
+        out
+    };
+    let cut = |less: usize| good[..good.len() - less].to_vec();
+    let archive = |props: &[u8], packed: &[u8]| {
+        hand_made(&[packed], &[aes_coder(props, size)], &[], &[0], crc)
+    };
+    let short = &data[..data.len() - 40];
+    let short_crc = hivepack_deflate::crc32(0, short);
+    let reads = [
+        ("plain", archive(&iv_props, &good)),
+        ("whole blocks more", archive(&iv_props, &with_more(16))),
+        (
+            "output blocks less",
+            hand_made(
+                &[&good],
+                &[aes_coder(&iv_props, short.len() as u64)],
+                &[],
+                &[0],
+                short_crc,
+            ),
+        ),
+        (
+            "no properties",
+            archive(&[], &encrypted(&once, no_iv, &data)),
+        ),
+        (
+            "no salt or IV",
+            archive(&[0], &encrypted(&once, no_iv, &data)),
+        ),
+        (
+            "a salt",
+            archive(
+                &salt_props,
+                &encrypted(&hashed_key(&salt, &password, 8), no_iv, &data),
+            ),
+        ),
+        (
+            "no hashing",
+            archive(&unhashed_props, &encrypted(&unhashed, no_iv, &data)),
+        ),
+    ];
+    for (what, bytes) in &reads {
+        let read = read_all_with(bytes, Some("pw")).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            read[0].1.len(),
+            if *what == "output blocks less" {
+                short.len()
+            } else {
+                data.len()
+            }
+        );
+        assert_ne!(ask_tool_with(bytes, what, "pw"), Some(false), "{what}");
+    }
+    let fails = [
+        ("a partial block more", archive(&iv_props, &with_more(5))),
+        ("a partial block less", archive(&iv_props, &cut(5))),
+        ("a block less", archive(&iv_props, &cut(16))),
+        ("a salt with no room", archive(&[0xC4, 0xF0], &good)),
+    ];
+    for (what, bytes) in &fails {
+        assert!(read_all_with(bytes, Some("pw")).is_err(), "{what}");
+        assert_ne!(ask_tool_with(bytes, what, "pw"), Some(true), "{what}");
+    }
+    // More rounds than 7-Zip makes: 7zz does not hash at all, and goes on with
+    // a key of zeros; the port refuses, as no one writes them.
+    let bytes = archive(&[25], &encrypted(&[0; 32], no_iv, &data));
+    assert_eq!(
+        read_all_with(&bytes, Some("pw")).err(),
+        Some(Error::Unsupported)
+    );
+    // More rounds than an application allows.
+    let options = Options {
+        password: Some("pw".into()),
+        max_key_cycles: 3,
+        ..Options::default()
+    };
+    let mut a =
+        Archive::open_with(Cursor::new(archive(&iv_props, &good)), &options).expect("it opens");
+    assert_eq!(a.extract(0).err(), Some(Error::Unsupported));
+}
+
+fn aes_coder(props: &[u8], unpack_size: u64) -> Coder<'_> {
+    Coder {
+        id: &[0x06, 0xF1, 0x07, 0x01],
+        props,
+        streams: 1,
+        unpack_size,
+    }
 }
 
 /// A coder of a hand-made folder: its ID, properties and input streams.
@@ -217,9 +475,14 @@ fn hand_made(
 
 /// What `7zz t` says about `archive`, where it is built.
 fn ask_tool(archive: &[u8], what: &str) -> Option<bool> {
+    ask_tool_with(archive, what, "-")
+}
+
+/// [`ask_tool`], with a password.
+fn ask_tool_with(archive: &[u8], what: &str, password: &str) -> Option<bool> {
     let tool = seven_zip()?;
     let dir = scratch(&format!("hand-{}", what.replace(' ', "-")));
-    let good = tool_says_good(&tool, &dir, archive);
+    let good = tool_says_good_with(&tool, &dir, archive, password);
     let _ = std::fs::remove_dir_all(&dir);
     Some(good)
 }

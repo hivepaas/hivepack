@@ -1,6 +1,7 @@
 //! hivepack-7z on any input: opened, listed, its files read one after
 //! another, its folders decoded and its files extracted, with small limits
-//! on what it may allocate and on how much is read. A panic is a bug.
+//! on what it may allocate and on how much is read, and with a password. A
+//! panic is a bug.
 //! `crates/7z/tests/oracle.rs` compares the results with the LZMA SDK's.
 
 #![no_main]
@@ -17,6 +18,9 @@ fuzz_target!(|data: &[u8]| {
     let options = Options {
         memory_limit: 1 << 26,
         decoder_memory_limit: 1 << 26,
+        // The AES coder's paths, without the time its keys can take.
+        password: Some("pw".into()),
+        max_key_cycles: 8,
     };
     let Ok(mut archive) = Archive::open_with(Cursor::new(data), &options) else {
         return;

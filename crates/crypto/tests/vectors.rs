@@ -83,6 +83,88 @@ fn aes_sp_800_38a_ecb() {
     );
 }
 
+/// NIST SP 800-38A, F.2: CBC, the same blocks with each key size.
+#[test]
+fn aes_cbc_decrypts_sp_800_38a() {
+    let plain = unhex(
+        "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51\
+         30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
+    );
+    let iv: [u8; 16] = unhex("000102030405060708090a0b0c0d0e0f")
+        .try_into()
+        .expect("16 bytes");
+    for (key, cipher) in [
+        (
+            "2b7e151628aed2a6abf7158809cf4f3c",
+            "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2\
+             73bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7",
+        ),
+        (
+            "8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b",
+            "4f021db243bc633d7178183a9fa071e8b4d9ada9ad7dedf4e5e738763f69145a\
+             571b242012fb7ae07fa9baac3df102e008b0e27988598881d920a9e64f5615cd",
+        ),
+        (
+            "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+            "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d\
+             39f23369a9d9bacfa530e26304231461b2eb05e2c39be9fcda6c19078c6a9d1b",
+        ),
+    ] {
+        let aes = Aes::new(&unhex(key)).expect("key length");
+        let cipher = unhex(cipher);
+        // In one call, and in pieces, which go on from the IV the last left.
+        let mut data = cipher.clone();
+        let mut next = iv;
+        aes.cbc_decrypt(&mut next, &mut data);
+        assert_eq!(data, plain, "{key}");
+        assert_eq!(next[..], cipher[cipher.len() - 16..], "{key}");
+        let mut data = cipher.clone();
+        let mut next = iv;
+        for block in data.chunks_mut(16) {
+            aes.cbc_decrypt(&mut next, block);
+        }
+        assert_eq!(data, plain, "{key}");
+    }
+}
+
+/// `decrypt4` undoes `encrypt4`, whose answers are checked against other
+/// implementations; every key size, and blocks that differ in each position.
+#[test]
+fn aes_decrypts_what_it_encrypts() {
+    for len in [16, 24, 32] {
+        let mut key = vec![0u8; len];
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        for _ in 0..200 {
+            key.iter_mut().for_each(|b| *b = next());
+            let aes = Aes::new(&key).expect("key length");
+            let mut blocks = [0u8; 64];
+            blocks.iter_mut().for_each(|b| *b = next());
+            let plain = blocks;
+            aes.encrypt4(&mut blocks);
+            assert_ne!(blocks, plain);
+            aes.decrypt4(&mut blocks);
+            assert_eq!(blocks, plain, "a key of {len} bytes");
+        }
+    }
+}
+
+/// A partial block at the end is left as it is.
+#[test]
+fn aes_cbc_leaves_a_partial_block() {
+    let aes = Aes::new(&[7; 32]).expect("key length");
+    let mut iv = [0; 16];
+    let mut data = [0xAA; 15];
+    aes.cbc_decrypt(&mut iv, &mut data);
+    assert_eq!(data, [0xAA; 15]);
+    assert_eq!(iv, [0; 16]);
+}
+
 #[test]
 fn aes_refuses_other_key_lengths() {
     for len in [0, 1, 8, 15, 17, 20, 23, 25, 31, 33, 64] {

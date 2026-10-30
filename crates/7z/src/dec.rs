@@ -19,12 +19,14 @@
 use std::io::{Read, Seek};
 
 use hivepack_bzip2::Decompress;
+use hivepack_crypto::AES_BLOCK_LENGTH;
 use hivepack_deflate::{Flush, Inflate, Inflate9};
 use hivepack_xz::{
     Action, FILTER_LZMA1EXT, Filter, FilterOptions, InBuffer, LZMA1EXT_ALLOW_EOPM, LzmaOptions,
     OutBuffer, Status, Stream,
 };
 
+use crate::aes7z::{AesCoder, Decoding, K_AES};
 use crate::arc_in::{self, Ar, Folder, Sd};
 use crate::bcj2::{self, Bcj2Dec, Delta};
 use crate::bra;
@@ -248,6 +250,8 @@ enum Main {
     Inflate9(Box<Inflate9>),
     /// BZip2: one stream after another, as 7-Zip reads them.
     Bzip2(Box<Decompress>),
+    /// `7zAES`.
+    Aes(Box<AesCoder>),
     /// Zstandard, which 7-Zip's program does not take in 7z, and forks of it
     /// write: one frame after another.
     Zstd(Box<hivepack_zstd::DCtx>),
@@ -544,6 +548,29 @@ impl MainCoder {
                 self.out_pos += n as u64;
                 Ok(n)
             }
+            Main::Aes(aes) => loop {
+                let n = aes.take(out);
+                if n > 0 {
+                    self.out_pos += n as u64;
+                    return Ok(n);
+                }
+                // As many whole blocks as there are, across the reads of a
+                // source that gives less than it is asked for.
+                let space = aes.space();
+                let mut filled = 0;
+                while filled < space.len() && self.input.remaining() > 0 {
+                    let buf = self.input.fill(r, Error::Data)?;
+                    let n = buf.len().min(space.len() - filled);
+                    space[filled..filled + n].copy_from_slice(&buf[..n]);
+                    self.input.consume(n);
+                    filled += n;
+                }
+                let whole = filled / AES_BLOCK_LENGTH * AES_BLOCK_LENGTH;
+                if whole == 0 {
+                    return Err(Error::Data);
+                }
+                aes.decrypt(whole);
+            },
             Main::Inflate(_) | Main::Inflate9(_) | Main::Bzip2(_) | Main::Zstd(_) => loop {
                 let buf = if self.input.remaining() == 0 {
                     &[][..]
@@ -619,6 +646,13 @@ impl MainCoder {
     /// The checks at the end of the output: all of the input read, and, for
     /// LZMA, the end of its stream.
     fn finish<R: Read + Seek>(&mut self, r: &mut R) -> Result<()> {
+        if matches!(self.method, Main::Aes(_)) {
+            // Whole blocks past the output are not looked at.
+            while self.input.remaining() > 0 {
+                let n = self.input.fill(r, Error::Data)?.len();
+                self.input.consume(n);
+            }
+        }
         if matches!(
             self.method,
             Main::Inflate(_) | Main::Inflate9(_) | Main::Bzip2(_) | Main::Zstd(_)
@@ -1026,6 +1060,7 @@ fn is_filter(id: u32) -> bool {
 /// A folder the SDK does not decode, as a graph of coders from the unpacked
 /// stream back to the packed ones.
 struct Graph<'a> {
+    decoding: &'a mut Decoding,
     folder: &'a Folder,
     data: &'a [u8],
     unpack_sizes: &'a [u64],
@@ -1120,6 +1155,21 @@ impl Graph<'_> {
             return Err(Error::Unsupported);
         }
         let input = self.input(first)?;
+        if c.method_id == K_AES {
+            // The input is whole blocks, the last of them padded, and `7zz`
+            // takes more of them than the output needs.
+            let in_size = input.remaining();
+            if !in_size.is_multiple_of(AES_BLOCK_LENGTH as u64) || in_size < out_size {
+                return Err(Error::Data);
+            }
+            return Ok(Node::Main(Box::new(MainCoder {
+                method: Main::Aes(Box::new(AesCoder::new(props, self.decoding)?)),
+                input,
+                out_size,
+                out_pos: 0,
+                ended: false,
+            })));
+        }
         if is_filter(c.method_id) {
             let filter = FilterCoder::new(c.method_id, props)?;
             // Only a size the filter's input has: it changes none.
@@ -1146,13 +1196,26 @@ pub(crate) struct FolderDecoder {
     crc: u32,
     expected_crc: Option<u32>,
     failed: Option<Error>,
+    /// Bad data then may be a wrong password.
+    encrypted: bool,
+}
+
+/// Whether folder `fo` of `p` has an AES coder.
+pub(crate) fn folder_is_encrypted(p: &Ar, fo: usize) -> bool {
+    let data = &p.coders_data[p.fo_coders_offsets[fo]..p.fo_coders_offsets[fo + 1]];
+    arc_in::get_next_folder_item(&mut Sd::new(data)).is_ok_and(|f| {
+        f.coders[..f.num_coders as usize]
+            .iter()
+            .any(|c| c.method_id == K_AES)
+    })
 }
 
 impl FolderDecoder {
     /// The decoder of folder `fo` of `p`, whose packed streams start at
     /// `start_pos` in the archive. Its coders' dictionaries and models take
-    /// no more than `limit` bytes.
-    pub(crate) fn new(p: &Ar, fo: usize, start_pos: u64, mut limit: u64) -> Result<Self> {
+    /// no more than `decoding.limit` bytes.
+    pub(crate) fn new(p: &Ar, fo: usize, start_pos: u64, decoding: &mut Decoding) -> Result<Self> {
+        let mut limit = decoding.limit;
         let start = p.fo_coders_offsets[fo];
         let data = &p.coders_data[start..p.fo_coders_offsets[fo + 1]];
         let mut sd = Sd::new(data);
@@ -1167,7 +1230,11 @@ impl FolderDecoder {
         let pack_positions = &p.pack_positions[p.fo_start_pack_stream_index[fo] as usize..];
 
         if check_supported_folder(&folder).is_err() {
+            let encrypted = folder.coders[..folder.num_coders as usize]
+                .iter()
+                .any(|c| c.method_id == K_AES);
             let mut graph = Graph {
+                decoding,
                 folder: &folder,
                 data,
                 unpack_sizes,
@@ -1187,6 +1254,7 @@ impl FolderDecoder {
                 crc: 0,
                 expected_crc: p.folder_crcs.check(fo).then(|| p.folder_crcs.vals[fo]),
                 failed: None,
+                encrypted,
             });
         }
         let props = |ci: usize| {
@@ -1272,6 +1340,7 @@ impl FolderDecoder {
             crc: 0,
             expected_crc: p.folder_crcs.check(fo).then(|| p.folder_crcs.vals[fo]),
             failed: None,
+            encrypted: false,
         })
     }
 
@@ -1290,7 +1359,10 @@ impl FolderDecoder {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        let res = self.read_inner(r, out);
+        let res = self.read_inner(r, out).map_err(|e| match e {
+            Error::Data | Error::Crc if self.encrypted => Error::WrongPassword,
+            e => e,
+        });
         if let Err(e) = res {
             self.failed = Some(e);
         }
@@ -1335,10 +1407,10 @@ pub(crate) fn decode_folder<R: Read + Seek>(
     fo: usize,
     in_stream: &mut R,
     start_pos: u64,
-    limit: u64,
+    decoding: &mut Decoding,
     out: &mut [u8],
 ) -> Result<()> {
-    let mut folder = FolderDecoder::new(p, fo, start_pos, limit)?;
+    let mut folder = FolderDecoder::new(p, fo, start_pos, decoding)?;
     if out.len() as u64 != folder.size() {
         return Err(Error::Fail);
     }

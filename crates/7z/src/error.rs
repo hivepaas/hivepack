@@ -33,6 +33,12 @@ pub enum Error {
     Archive = 16,
     /// `SZ_ERROR_NO_ARCHIVE`: not a 7z archive.
     NoArchive = 17,
+    /// Not one of the SDK's, which has no AES: the data is encrypted, and no
+    /// password was given.
+    PasswordRequired = 100,
+    /// Not one of the SDK's: encrypted data did not decode. 7z has nothing to
+    /// check a password with but the data, so it may be damaged instead.
+    WrongPassword = 101,
 }
 
 impl Error {
@@ -58,6 +64,8 @@ impl Error {
             Error::Thread => "SZ_ERROR_THREAD",
             Error::Archive => "SZ_ERROR_ARCHIVE",
             Error::NoArchive => "SZ_ERROR_NO_ARCHIVE",
+            Error::PasswordRequired => "PASSWORD_REQUIRED",
+            Error::WrongPassword => "WRONG_PASSWORD",
         }
     }
 }
@@ -79,6 +87,8 @@ impl core::fmt::Display for Error {
             Error::Thread => "thread error",
             Error::Archive => "damaged headers",
             Error::NoArchive => "not a 7z archive",
+            Error::PasswordRequired => "the data is encrypted, and needs a password",
+            Error::WrongPassword => "wrong password, or damaged data",
         };
         write!(f, "{what} ({})", self.name())
     }

@@ -1,5 +1,6 @@
 //! Lists 7z archives and extracts their files, both ways, telling what
-//! each gives: `cargo run -p hivepack-7z --example sevenz -- ARCHIVE...`.
+//! each gives: `cargo run -p hivepack-7z --example sevenz -- ARCHIVE...`,
+//! with the password of encrypted ones in `SEVENZ_PASSWORD`.
 
 use std::io::Read;
 
@@ -15,7 +16,12 @@ fn main() {
                 continue;
             }
         };
-        let mut archive = match hivepack_7z::Archive::open(std::io::BufReader::new(file)) {
+        let options = hivepack_7z::Options {
+            password: std::env::var("SEVENZ_PASSWORD").ok(),
+            ..Default::default()
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut archive = match hivepack_7z::Archive::open_with(reader, &options) {
             Ok(a) => a,
             Err(e) => {
                 println!("{name}: open {}", e.name());

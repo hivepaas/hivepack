@@ -13,12 +13,12 @@
 //! when testing an archive: each entry's data is read, given to a callback
 //! and checked against its hash, and nothing is created.
 //!
-//! So far entries not encrypted and whole in this volume: anything else is
-//! [`Error::NotYet`].
+//! So far entries whole in this volume: anything else is [`Error::NotYet`].
 
 use std::io;
 
 use crate::archive::Archive;
+use crate::crypt::{CryptData, set_crypt_keys};
 use crate::error::{Error, ExitCode};
 use crate::hash::DataHash;
 use crate::headers::{CryptMethod, Format, HEAD_ENDARC, HEAD_FILE, Redirection};
@@ -35,7 +35,7 @@ const VER_UNPACK: u32 = 29;
 /// `VER_UNPACK7`.
 const VER_UNPACK7: u32 = 70;
 
-/// `ComprDataIO`, for an entry that is not encrypted and whole in this volume.
+/// `ComprDataIO`, for an entry that is whole in this volume.
 struct DataIo<'a, 'o, R: ReadAt> {
     arc: &'a mut Archive<R>,
     packed_left: u64,
@@ -43,16 +43,26 @@ struct DataIo<'a, 'o, R: ReadAt> {
     out: &'a mut Output<'o>,
     skip_unp_crc: bool,
     cur_unp_write: &'a mut u64,
+    decrypt: Option<CryptData>,
 }
 
 impl<R: ReadAt> UnpIo for DataIo<'_, '_, R> {
     fn unp_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        let to_read = (buf.len() as u64).min(self.packed_left) as usize;
+        // Whole blocks: what reads here always asks for more than one.
+        let count = if self.decrypt.is_some() {
+            buf.len() & !15
+        } else {
+            buf.len()
+        };
+        let to_read = (count as u64).min(self.packed_left) as usize;
         if to_read == 0 {
             return Ok(0);
         }
         let read = self.arc.cursor().read(&mut buf[..to_read])?;
         self.packed_left -= read as u64;
+        if let Some(decrypt) = &mut self.decrypt {
+            decrypt.decrypt_block(buf, read);
+        }
         Ok(read)
     }
 
@@ -85,6 +95,12 @@ pub struct Extract {
     pub skip_solid: bool,
     /// Whether the last entry's hash was checked and failed.
     pub broken_file: bool,
+    /// Whether the last entry was encrypted and there was no password: the
+    /// going through stops there, as `ERAR_MISSING_PASSWORD` stops it.
+    pub missing_password: bool,
+    /// Whether RAR 5's check says the password is not the last entry's: its
+    /// data is not read, unless a solid stream needs it to go on.
+    pub bad_password: bool,
     /// `Unp`: made when first needed, and it lasts for a solid archive's sake.
     unp: Option<Box<Unpack>>,
     /// `FileCount`: the entries gone through that were to be read.
@@ -98,6 +114,8 @@ impl Default for Extract {
             cur_unp_write: 0,
             skip_solid: false,
             broken_file: false,
+            missing_password: false,
+            bad_password: false,
             unp: None,
             file_count: 0,
         }
@@ -134,6 +152,8 @@ impl Extract {
         self.cur_unp_write = 0;
         self.skip_solid = false;
         self.broken_file = false;
+        self.missing_password = false;
+        self.bad_password = false;
         if header_size == 0 {
             return Ok(false);
         }
@@ -153,9 +173,6 @@ impl Extract {
         }
 
         let head = &arc.file_head;
-        if head.encrypted {
-            return Err(Error::NotYet("encrypted data"));
-        }
         if head.split_before || head.split_after {
             return Err(Error::NotYet("data split across volumes"));
         }
@@ -187,6 +204,37 @@ impl Extract {
 
         // Also excludes names of nothing, like "/" or "../".
         let mut extr_file = named;
+
+        let mut decrypt = None;
+        let mut hash_key = None;
+        if arc.file_head.encrypted {
+            if !arc.password.is_set() {
+                self.missing_password = true;
+                return Ok(false);
+            }
+            let keys = set_crypt_keys(
+                arc.file_head.crypt_method,
+                &arc.password,
+                &mut arc.kdf_cache,
+                arc.file_head.salt_set.then_some(&arc.file_head.salt[..]),
+                &arc.file_head.init_v,
+                arc.file_head.lg2_count,
+            );
+            if let Some((crypt, checks)) = keys {
+                // A damaged header cannot be relied on for the check value.
+                if arc.file_head.use_psw_check
+                    && !arc.broken_header
+                    && arc.file_head.psw_check != checks.psw_check
+                {
+                    self.bad_password = true;
+                    arc.set_error_code(ExitCode::BadPassword);
+                    extr_file = false;
+                }
+                decrypt = Some(crypt);
+                hash_key = Some(checks.hash_key);
+            }
+        }
+
         let link_entry = redir_type != Redirection::None;
         if !link_entry || redir_type == Redirection::FileCopy {
             if dir {
@@ -223,7 +271,18 @@ impl Extract {
                 show_checksum = false;
             }
         } else if arc.file_head.method == 0 {
-            self.unstore_file(arc, &mut hash, out)?;
+            let packed_left = arc.file_head.pack_size as u64;
+            let dest_left = arc.file_head.unp_size as u64;
+            let mut io = DataIo {
+                arc: &mut *arc,
+                packed_left,
+                hash: &mut hash,
+                out,
+                skip_unp_crc: self.skip_solid,
+                cur_unp_write: &mut self.cur_unp_write,
+                decrypt,
+            };
+            unstore_file(&mut io, dest_left)?;
         } else {
             let unp = self.unp.get_or_insert_with(|| Box::new(Unpack::new()));
             unp.init(arc.file_head.win_size, arc.file_head.solid)?;
@@ -242,12 +301,18 @@ impl Extract {
                 out,
                 skip_unp_crc: self.skip_solid,
                 cur_unp_write: &mut self.cur_unp_write,
+                decrypt,
             };
             unp.do_unpack(method, solid, &mut io)?;
         }
         arc.seek_to_next();
 
-        if !self.skip_solid && show_checksum && !hash.matches(&arc.file_head.file_hash) {
+        let key = hash_key.filter(|_| arc.file_head.use_hash_key);
+        let valid = match &key {
+            Some(key) => hash.matches_keyed(&arc.file_head.file_hash, key),
+            None => hash.matches(&arc.file_head.file_hash),
+        };
+        if !self.skip_solid && show_checksum && !valid {
             self.broken_file = true;
             arc.set_error_code(ExitCode::Crc);
         }
@@ -264,36 +329,21 @@ impl Extract {
         arc.seek_to_next();
         false
     }
+}
 
-    /// `CmdExtract::UnstoreFile` with `ComprDataIO::UnpRead` and `UnpWrite`:
-    /// up to the pack size is read, and up to the unpacked size written.
-    fn unstore_file<R: ReadAt>(
-        &mut self,
-        arc: &mut Archive<R>,
-        hash: &mut DataHash,
-        out: &mut Output<'_>,
-    ) -> Result<(), Error> {
-        // Neither is negative: the header's reading sees to that.
-        let mut packed_left = arc.file_head.pack_size as u64;
-        let mut dest_left = arc.file_head.unp_size as u64;
-        let mut buffer = vec![0u8; packed_left.min(COPY_BUFFER_SIZE as u64) as usize];
-        while packed_left > 0 {
-            let to_read = packed_left.min(buffer.len() as u64) as usize;
-            let read = arc.cursor().read(&mut buffer[..to_read])?;
-            if read == 0 {
-                break;
-            }
-            packed_left -= read as u64;
-            let write = (read as u64).min(dest_left) as usize;
-            if write > 0 {
-                out(&buffer[..write])?;
-                self.cur_unp_write += write as u64;
-                dest_left -= write as u64;
-                if !self.skip_solid {
-                    hash.update(&buffer[..write]);
-                }
-            }
+/// `CmdExtract::UnstoreFile`: up to the pack size is read, and up to the
+/// unpacked size written. Neither is negative: the header's reading sees to it.
+fn unstore_file<R: ReadAt>(io: &mut DataIo<'_, '_, R>, mut dest_left: u64) -> Result<(), Error> {
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+    loop {
+        let read = io.unp_read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
         }
-        Ok(())
+        let write = (read as u64).min(dest_left) as usize;
+        if write > 0 {
+            io.unp_write(&buffer[..write])?;
+            dest_left -= write as u64;
+        }
     }
 }

@@ -305,9 +305,9 @@ fn mask_refuses(name: &[u32]) -> bool {
 }
 
 /// The port's answer to a `test` request, in the oracle's words.
-fn answer_test(archive: &[u8], limit: Option<u64>) -> String {
+fn answer_test(archive: &[u8], limit: Option<u64>, password: &str) -> String {
     let mut out = Out("test".to_string());
-    let exit = match Archive::open(archive, true) {
+    let exit = match Archive::open_with_password(archive, true, password) {
         Err(Error::NotRar { exit_code }) => {
             out.0 += " notarchive";
             exit_code
@@ -358,6 +358,8 @@ fn answer_test(archive: &[u8], limit: Option<u64>) -> String {
                         out.put("data", bytes);
                         out.put("fnv", fnv);
                         out.bool("baddata", extract.broken_file);
+                        out.bool("nopassword", extract.missing_password);
+                        out.bool("badpassword", extract.bad_password);
                         out.put("pos", arc.position());
                         out.bool("broken", arc.broken_header);
                         out.put("code", u64::from(arc.exit_code().number()));
@@ -410,16 +412,27 @@ fn answer(request: &str) -> String {
     let words: Vec<&str> = request.split(' ').collect();
     if words[0] == "test" {
         let limit = words.get(2).map(|n| n.parse().expect("a limit"));
-        return answer_test(&unhex(words.get(1).copied().unwrap_or("-")), limit);
+        return answer_test(&unhex(words.get(1).copied().unwrap_or("-")), limit, "");
+    }
+    if words[0] == "testpw" {
+        let password = String::from_utf8(unhex(words[1])).expect("a password");
+        let limit = words.get(3).map(|n| n.parse().expect("a limit"));
+        return answer_test(&unhex(words[2]), limit, &password);
     }
     if words[0] == "hash" {
         return answer_hash(&words);
     }
-    assert_eq!(words[0], "list", "{request:.80}");
+    let (password, words) = if words[0] == "listpw" {
+        let password = String::from_utf8(unhex(words[1])).expect("a password");
+        (password, &words[1..])
+    } else {
+        assert_eq!(words[0], "list", "{request:.80}");
+        (String::new(), &words[..])
+    };
     let enable_broken = words[1] == "1";
     let data = unhex(words.get(2).copied().unwrap_or("-"));
     let mut out = Out("list".to_string());
-    let exit = match Archive::open(data.as_slice(), enable_broken) {
+    let exit = match Archive::open_with_password(data.as_slice(), enable_broken, &password) {
         Err(Error::NotRar { exit_code }) => {
             // The oracle prints the state of an archive that failed
             // IsArchive; the port does not keep one, so these requests
@@ -801,7 +814,7 @@ fn other_projects_archives_test_like_unrar() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(2);
     let archives = support::other_projects_archives();
-    let mut with_data = 0;
+    let (mut with_data, mut encrypted, mut decrypted) = (0, 0, 0);
     for (name, data) in &archives {
         for request in [
             format!("list 0 {}", hex(data)),
@@ -817,6 +830,37 @@ fn other_projects_archives_test_like_unrar() {
                 .filter(|w| w.starts_with("data=") && *w != "data=0")
                 .count();
         }
+        // With the passwords those projects use, and one that is wrong.
+        let plain = oracle.ask(&format!("test {}", hex(data)));
+        if !plain.contains("nopassword=1") && !plain.contains("thrown=") {
+            continue;
+        }
+        encrypted += 1;
+        for password in [
+            "junrar",
+            "password",
+            "password222",
+            "unrar",
+            "пароль密码ü",
+            "wrong",
+        ] {
+            let pw = hex(password.as_bytes());
+            for request in [
+                format!("listpw {pw} 1 {}", hex(data)),
+                format!("testpw {pw} {}", hex(data)),
+            ] {
+                let want = oracle.ask(&request);
+                assert_same(&request, &want, &format!("{name}, password {password}"));
+                if request.starts_with("testpw") {
+                    let good = want
+                        .split(" | ")
+                        .filter(|e| e.contains(" data=") && !e.contains(" data=0 "))
+                        .filter(|e| e.contains("baddata=0"))
+                        .count();
+                    decrypted += good;
+                }
+            }
+        }
         if data.len() > 64 << 10 {
             continue;
         }
@@ -830,11 +874,73 @@ fn other_projects_archives_test_like_unrar() {
             assert_same(&request, &want, &format!("{name}, damaged {i}"));
         }
     }
-    eprintln!("{} archives: {with_data} entries with data", archives.len());
+    eprintln!(
+        "{} archives: {with_data} entries with data; {encrypted} encrypted, {decrypted} entries read",
+        archives.len()
+    );
     assert!(
         archives.is_empty() || with_data >= 200,
         "only {with_data} entries with data"
     );
+    // Encrypted entries that a password really read, of each age.
+    assert!(
+        archives.is_empty() || decrypted >= 20,
+        "only {decrypted} encrypted entries read"
+    );
+}
+
+// Encrypted archives damaged, with their password, and what the `rar_password`
+// target found. Each kind of encryption keeps its own password.
+#[cfg(target_os = "linux")]
+#[test]
+fn encrypted_archives_damaged_test_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0009);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(3);
+    let mut compared = 0;
+    for (name, data) in support::other_projects_archives() {
+        let plain = oracle.ask(&format!("test {}", hex(&data)));
+        if data.len() > 64 << 10 || !plain.contains("nopassword=1") && !plain.contains("thrown=") {
+            continue;
+        }
+        for password in ["junrar", "password"] {
+            let pw = hex(password.as_bytes());
+            for i in 0..count {
+                let mut damaged = damage(&mut rng, &data);
+                if i % 2 == 1 {
+                    support::patch::fix_header_crcs(&mut damaged);
+                }
+                let request = format!("testpw {pw} {}", hex(&damaged));
+                let want = oracle.ask(&request);
+                assert_same(&request, &want, &format!("{name}, damaged {i}"));
+                compared += 1;
+            }
+        }
+    }
+    for (input, _) in recorded_password() {
+        let request = password_request(&input);
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("recorded input {input:.40}"));
+    }
+    if let Some(folder) = std::env::var_os("HIVEPACK_RAR_PASSWORD_CORPUS") {
+        for entry in std::fs::read_dir(folder).expect("the folder") {
+            let input = std::fs::read(entry.expect("an entry").path()).expect("an input");
+            let request = password_request(&hex(&input));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("input {:.40}", hex(&input)));
+            compared += 1;
+        }
+    }
+    eprintln!("{compared} encrypted archives compared");
 }
 
 // A dictionary too large for the limit, on archives that hold what they say:
@@ -1034,6 +1140,22 @@ fn recorded_old_unpack() -> Vec<(String, String)> {
     recorded_inputs(&recorded_old_unpack_path())
 }
 
+fn recorded_password_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-password.txt")
+}
+
+/// The password the `rar_password` target goes by.
+const FUZZ_PASSWORD: &str = "password";
+
+fn password_request(input: &str) -> String {
+    format!("testpw {} {input}", hex(FUZZ_PASSWORD.as_bytes()))
+}
+
+/// The same from the `rar_password` target.
+fn recorded_password() -> Vec<(String, String)> {
+    recorded_inputs(&recorded_password_path())
+}
+
 fn recorded_inputs(path: &std::path::Path) -> Vec<(String, String)> {
     let text = std::fs::read_to_string(path).expect("the recorded inputs");
     text.lines()
@@ -1084,6 +1206,35 @@ fn port_unpacks_old_as_recorded() {
         let got = answer(&old_unpack_request(&input));
         assert_eq!(support::recorded_form(&got), want, "{input:.300}");
     }
+}
+
+#[test]
+fn port_reads_encrypted_as_recorded() {
+    let recorded = recorded_password();
+    assert!(recorded.len() > 50, "only {} inputs", recorded.len());
+    for (input, want) in recorded {
+        let got = answer(&password_request(&input));
+        if usize::BITS == 32 && got.contains(" badalloc") {
+            continue;
+        }
+        assert_eq!(support::recorded_form(&got), want, "{input:.300}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-password.txt from the oracle"]
+fn record_password_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle) for inputs the rar_password fuzz target found, as archives with the password \"password\", replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_password_answers -- --ignored\n",
+    );
+    for (input, _) in recorded_password() {
+        let reply = oracle.ask(&password_request(&input));
+        let _ = writeln!(text, "{input}\t{}", support::recorded_form(&reply));
+    }
+    std::fs::write(recorded_password_path(), text).expect("written");
 }
 
 #[cfg(target_os = "linux")]

@@ -22,7 +22,7 @@
 
 mod filters;
 #[cfg(test)]
-mod oracle_tests;
+pub(crate) mod oracle_tests;
 mod ppm;
 mod v15;
 mod v20;

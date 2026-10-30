@@ -19,7 +19,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 #[path = "../../tests/support/mod.rs"]
-mod support;
+pub(crate) mod support;
 
 use std::fmt::Write as _;
 

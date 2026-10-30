@@ -16,6 +16,7 @@ use std::io;
 
 use hivepack_crypto::Sha256;
 
+use crate::crypt::{KdfCache, Password, set_crypt_keys};
 use crate::error::{Error, ExitCode};
 use crate::headers::*;
 use crate::name::{
@@ -78,6 +79,10 @@ pub struct Archive<R> {
     /// password, as UnRAR's library opens them without a callback.
     silent_open: bool,
     exit_code: ExitCode,
+    /// `Cmd->Password`.
+    pub(crate) password: Password,
+    /// Where the derivations of keys are kept, for the headers and the data.
+    pub(crate) kdf_cache: KdfCache,
 }
 
 impl<R: ReadAt> Archive<R> {
@@ -86,6 +91,21 @@ impl<R: ReadAt> Archive<R> {
     /// then `IsArchive`). `enable_broken` reads on past a broken main
     /// header, as UnRAR's `IsArchive(true)` does.
     pub fn open(src: R, enable_broken: bool) -> Result<Archive<R>, Error> {
+        Archive::open_with(src, enable_broken, None)
+    }
+
+    /// [`Archive::open`] for an archive that may be encrypted. A password of
+    /// nothing is no password, as for UnRAR. Only the first 127 characters
+    /// count, as RAR itself takes no more.
+    pub fn open_with_password(
+        src: R,
+        enable_broken: bool,
+        password: &str,
+    ) -> Result<Archive<R>, Error> {
+        Archive::open_with(src, enable_broken, Some(password))
+    }
+
+    fn open_with(src: R, enable_broken: bool, password: Option<&str>) -> Result<Archive<R>, Error> {
         let mut archive = Archive {
             src,
             pos: 0,
@@ -119,6 +139,8 @@ impl<R: ReadAt> Archive<R> {
             sub_block_head: SubBlockHeader::default(),
             silent_open: false,
             exit_code: ExitCode::Success,
+            password: Password::new(password.unwrap_or_default()),
+            kdf_cache: KdfCache::default(),
         };
         if archive.is_archive(enable_broken)? {
             Ok(archive)
@@ -390,9 +412,12 @@ impl<R: ReadAt> Archive<R> {
         true
     }
 
-    /// The password the headers need: there is none yet, so the reading
-    /// stops as UnRAR's library stops without one.
+    /// The password the headers need: without one the reading stops, as
+    /// UnRAR's library stops without a callback that gives one.
     fn request_arc_password(&mut self) -> Result<(), Error> {
+        if self.password.is_set() {
+            return Ok(());
+        }
         // `ErrHandler.Exit(RARX_USERBREAK)`, which sets the code first.
         self.set_error_code(ExitCode::UserBreak);
         Err(Error::MissingPassword {
@@ -406,6 +431,22 @@ impl<R: ReadAt> Archive<R> {
             self.encrypted && self.cur_block_pos > (self.sfx_size + SIZEOF_MARKHEAD3 as u64) as i64;
         if decrypt {
             self.request_arc_password()?;
+            let mut salt = [0u8; SIZE_SALT30];
+            if self.read(&mut salt)? != SIZE_SALT30 {
+                self.unexp_end_arc_msg()?;
+                return Ok(0);
+            }
+            let keys = set_crypt_keys(
+                CryptMethod::Rar30,
+                &self.password,
+                &mut self.kdf_cache,
+                Some(&salt),
+                &[0; SIZE_INITV],
+                0,
+            );
+            if let Some((crypt, _)) = keys {
+                raw.set_crypt(crypt);
+            }
         }
 
         raw.read(&mut self.cursor(), SIZEOF_SHORTBLOCKHEAD)?;
@@ -781,6 +822,26 @@ impl<R: ReadAt> Archive<R> {
                 return Ok(0);
             }
             self.request_arc_password()?;
+            let keys = set_crypt_keys(
+                CryptMethod::Rar50,
+                &self.password,
+                &mut self.kdf_cache,
+                Some(&self.crypt_head.salt),
+                &init_v,
+                self.crypt_head.lg2_count,
+            );
+            if let Some((crypt, checks)) = keys {
+                // A damaged header cannot be relied on for the check value.
+                if self.crypt_head.use_psw_check
+                    && !self.broken_header
+                    && checks.psw_check != self.crypt_head.psw_check
+                {
+                    self.failed_header_decryption = true;
+                    self.set_error_code(ExitCode::BadPassword);
+                    return Ok(0);
+                }
+                raw.set_crypt(crypt);
+            }
         }
 
         // The CRC, then up to 3 bytes of size: a header is 2 MB at most.

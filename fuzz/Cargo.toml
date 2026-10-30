@@ -234,6 +234,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_password"
+path = "fuzz_targets/rar_password.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

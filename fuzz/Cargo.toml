@@ -29,6 +29,7 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 hivepack-bzip2 = { path = "../crates/bzip2" }
 hivepack-age = { path = "../crates/age" }
 hivepack-tar = { path = "../crates/tar" }
+hivepack-rar = { path = "../crates/rar" }
 hivepack-open = { path = "../crates/open" }
 # libbzip2 1.0.8, built from bzip2-sys's bundled sources, as the tests build
 # it.
@@ -179,6 +180,12 @@ bench = false
 [[bin]]
 name = "extract_tar"
 path = "fuzz_targets/extract_tar.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rar_headers"
+path = "fuzz_targets/rar_headers.rs"
 test = false
 doc = false
 

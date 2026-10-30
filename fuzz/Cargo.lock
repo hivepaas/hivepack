@@ -198,6 +198,7 @@ dependencies = [
  "hivepack-extract",
  "hivepack-lz4",
  "hivepack-open",
+ "hivepack-rar",
  "hivepack-tar",
  "hivepack-xz",
  "hivepack-zip",
@@ -225,6 +226,14 @@ dependencies = [
  "hivepack-lz4",
  "hivepack-xz",
  "hivepack-zstd",
+]
+
+[[package]]
+name = "hivepack-rar"
+version = "0.0.0"
+dependencies = [
+ "hivepack-crypto",
+ "hivepack-deflate",
 ]
 
 [[package]]

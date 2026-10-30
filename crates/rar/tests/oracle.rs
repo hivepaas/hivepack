@@ -1,0 +1,521 @@
+// hivepack-rar's tests. UnRAR's license, which they are under with the
+// crate:
+//
+// UnRAR source code may be used in any software to handle RAR archives
+// without limitations free of charge, but cannot be used to develop RAR
+// (WinRAR) compatible archiver and to re-create RAR compression algorithm,
+// which is proprietary. Distribution of modified UnRAR source code in
+// separate form or as a part of other software is permitted, provided that
+// full text of this paragraph, starting from "UnRAR source code" words, is
+// included in license, or in documentation if license is not available, and
+// in source code comments of resulting package.
+
+//! Comparison with UnRAR 7.3.2 through `tools/rar-oracle`: every header of
+//! an archive, as UnRAR reads it.
+//!
+//! The oracle is a small C++ program built with UnRAR's sources by
+//! `scripts/testdata.py`. It answers `list <enable_broken> <hex>` by
+//! opening the archive with UnRAR's `Archive`, reading every header, and
+//! printing what UnRAR keeps of each: its fields, the archive's state and
+//! the exit code. [`answer`] answers the same request with the port, and
+//! the two are compared as text, on libarchive's RAR test archives and on
+//! damaged copies of them.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Off Linux only the recorded answers are replayed, without the oracle.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
+mod support;
+
+use std::fmt::Write as _;
+
+use hivepack_rar::*;
+use support::{Oracle, Rng, damage, hex, libarchive_archives, unhex};
+
+/// The text the oracle prints, built from the port's state.
+struct Out(String);
+
+impl Out {
+    fn put(&mut self, key: &str, value: u64) {
+        let _ = write!(self.0, " {key}={value:x}");
+    }
+
+    fn bool(&mut self, key: &str, value: bool) {
+        self.put(key, u64::from(value));
+    }
+
+    fn bytes(&mut self, key: &str, data: &[u8]) {
+        let _ = write!(self.0, " {key}={}", hex(data));
+    }
+
+    fn wide(&mut self, key: &str, s: &[u32]) {
+        let _ = write!(self.0, " {key}=");
+        if s.is_empty() {
+            self.0.push('-');
+        }
+        for (i, c) in s.iter().enumerate() {
+            let _ = write!(self.0, "{}{c:x}", if i > 0 { "." } else { "" });
+        }
+    }
+
+    /// `GetUnixNS`, which is the ticks less 1601 to 1970, as UnRAR
+    /// computes it, wrapping.
+    fn time(&mut self, key: &str, t: &RarTime) {
+        self.put(key, t.ticks().wrapping_sub(11_644_473_600_000_000_000));
+    }
+
+    fn base(&mut self, b: &BaseBlock) {
+        self.put("crc", u64::from(b.head_crc));
+        self.put("type", u64::from(b.header_type));
+        self.put("flags", u64::from(b.flags));
+        self.put("size", u64::from(b.head_size));
+        self.bool("skip", b.skip_if_unknown);
+    }
+
+    /// What UnRAR does not set is left out, as the oracle leaves it out.
+    fn file(&mut self, h: &FileHeader, format: Format) {
+        if format == Format::Rar14 {
+            self.put("type", u64::from(h.base.header_type));
+            self.put("flags", u64::from(h.base.flags));
+            self.put("size", u64::from(h.base.head_size));
+        } else {
+            self.base(&h.base);
+        }
+        if format != Format::Rar50 {
+            self.put("ds", u64::from(h.data_size));
+        }
+        self.put("host", u64::from(h.host_os));
+        self.put("unpver", u64::from(h.unp_ver));
+        self.put("method", u64::from(h.method));
+        self.put("attr", u64::from(h.file_attr));
+        self.wide("name", &h.file_name);
+        self.bytes("subdata", &h.sub_data);
+        self.time("mtime", &h.mtime);
+        self.time("ctime", &h.ctime);
+        self.time("atime", &h.atime);
+        self.put("packsize", h.pack_size as u64);
+        self.put("unpsize", h.unp_size as u64);
+        if format == Format::Rar50 {
+            self.put("maxsize", h.max_size as u64);
+        }
+        // UnRAR keeps the CRC and the digest in a union: only what the
+        // type says is meaningful.
+        self.put("hashtype", u64::from(h.file_hash.kind.number()));
+        if matches!(h.file_hash.kind, HashType::Rar14 | HashType::Crc32) {
+            self.put("crc32", u64::from(h.file_hash.crc32));
+        }
+        if h.file_hash.kind == HashType::Blake2 {
+            self.bytes("digest", &h.file_hash.digest);
+        }
+        if format == Format::Rar50 {
+            self.put("fileflags", u64::from(h.file_flags));
+        }
+        self.bool("splitbefore", h.split_before);
+        self.bool("splitafter", h.split_after);
+        self.bool("unknownsize", h.unknown_unp_size);
+        self.bool("encrypted", h.encrypted);
+        self.put("cryptmethod", u64::from(h.crypt_method.number()));
+        self.bool("saltset", h.salt_set);
+        if h.salt_set {
+            let size = if format == Format::Rar50 {
+                SIZE_SALT50
+            } else {
+                SIZE_SALT30
+            };
+            self.bytes("salt", &h.salt[..size]);
+        }
+        if h.crypt_method == CryptMethod::Rar50 {
+            self.bytes("initv", &h.init_v);
+        }
+        self.bool("usepswcheck", h.use_psw_check);
+        if h.use_psw_check {
+            self.bytes("pswcheck", &h.psw_check);
+        }
+        self.bool("usehashkey", h.use_hash_key);
+        self.put("lg2count", u64::from(h.lg2_count));
+        self.bool("solid", h.solid);
+        self.bool("dir", h.dir);
+        self.bool("commentinheader", h.comment_in_header);
+        self.bool("version", h.version);
+        self.put("winsize", h.win_size);
+        self.bool("inherited", h.inherited);
+        self.bool("largefile", h.large_file);
+        self.bool("subblock", h.sub_block);
+        self.put(
+            "hstype",
+            match h.hs_type {
+                HostSystem::Windows => 0,
+                HostSystem::Unix => 1,
+                HostSystem::Unknown => 2,
+            },
+        );
+        self.put("redirtype", u64::from(h.redir_type.number()));
+        if h.redir_type != Redirection::None {
+            self.wide("redirname", &h.redir_name);
+        }
+        self.bool("dirtarget", h.dir_target);
+        self.bool("ownerset", h.unix_owner_set);
+        if h.unix_owner_set {
+            self.bool("ownernumeric", h.unix_owner_numeric);
+            self.bool("groupnumeric", h.unix_group_numeric);
+            self.bytes("owner", &h.unix_owner_name);
+            self.bytes("group", &h.unix_group_name);
+            if h.unix_owner_numeric {
+                self.put("ownerid", u64::from(h.unix_owner_id));
+            }
+            if h.unix_group_numeric {
+                self.put("groupid", u64::from(h.unix_group_id));
+            }
+        }
+    }
+
+    fn state<R: ReadAt>(&mut self, a: &Archive<R>) {
+        self.put(
+            "format",
+            match a.format {
+                Format::None => 0,
+                Format::Rar14 => 1,
+                Format::Rar15 => 2,
+                Format::Rar50 => 3,
+                Format::Future => 4,
+            },
+        );
+        self.bool("solid", a.solid);
+        self.bool("volume", a.volume);
+        self.bool("maincomment", a.main_comment);
+        self.bool("locked", a.locked);
+        self.bool("signed", a.signed);
+        self.bool("firstvolume", a.first_volume);
+        self.bool("newnumbering", a.new_numbering);
+        self.bool("protected", a.protected);
+        self.bool("encrypted", a.encrypted);
+        self.put("sfx", a.sfx_size);
+        self.bool("broken", a.broken_header);
+        self.bool("faileddecryption", a.failed_header_decryption);
+        self.put("volnumber", u64::from(a.vol_number));
+        self.put("recovery", i64::from(a.recovery_percent) as u64);
+        self.put("cur", a.cur_block_pos as u64);
+        self.put("next", a.next_block_pos as u64);
+        self.put("headertype", u64::from(a.cur_header_type));
+    }
+
+    /// Each header by its kind, for the kinds its format reads, as the
+    /// oracle prints them.
+    fn header<R: ReadAt>(&mut self, a: &Archive<R>) {
+        let kind = match a.cur_header_type {
+            t @ (HEAD_MAIN | HEAD_FILE | HEAD_SERVICE | HEAD_ENDARC) => Some(t),
+            HEAD_CRYPT if a.format == Format::Rar50 => Some(HEAD_CRYPT),
+            t @ (HEAD3_CMT | HEAD3_PROTECT | HEAD3_OLDSERVICE) if a.format == Format::Rar15 => {
+                Some(t)
+            }
+            _ => None,
+        };
+        match kind.unwrap_or(HEAD_UNKNOWN) {
+            HEAD_MAIN => {
+                let m = &a.main_head;
+                self.base(&m.base);
+                self.put("highposav", u64::from(m.high_pos_av));
+                self.put("posav", u64::from(m.pos_av));
+                self.bool("commentinheader", m.comment_in_header);
+                self.bool("packcomment", m.pack_comment);
+                self.bool("locator", m.locator);
+                self.put("qopen", m.qopen_offset);
+                self.put("rr", m.rr_offset);
+                self.wide("origname", &m.orig_name);
+                self.time("origtime", &m.orig_time);
+            }
+            HEAD_FILE => self.file(&a.file_head, a.format),
+            HEAD_SERVICE => self.file(&a.sub_head, a.format),
+            HEAD_CRYPT => {
+                let c = &a.crypt_head;
+                self.base(&c.base);
+                self.bool("usepswcheck", c.use_psw_check);
+                self.put("lg2count", u64::from(c.lg2_count));
+                self.bytes("salt", &c.salt);
+                if c.use_psw_check {
+                    self.bytes("pswcheck", &c.psw_check);
+                }
+            }
+            HEAD_ENDARC => {
+                let e = &a.end_arc_head;
+                self.base(&e.base);
+                self.bool("nextvolume", e.next_volume);
+                self.bool("datacrc", e.data_crc);
+                self.bool("revspace", e.rev_space);
+                self.bool("storevolnumber", e.store_vol_number);
+                if e.data_crc {
+                    self.put("arcdatacrc", u64::from(e.arc_data_crc));
+                }
+                if e.store_vol_number {
+                    self.put("endvolnumber", u64::from(e.vol_number));
+                }
+            }
+            HEAD3_CMT => {
+                let c = &a.comm_head;
+                self.base(&c.base);
+                self.put("unpsize", u64::from(c.unp_size));
+                self.put("unpver", u64::from(c.unp_ver));
+                self.put("method", u64::from(c.method));
+                self.put("commcrc", u64::from(c.comm_crc));
+            }
+            HEAD3_PROTECT => {
+                let p = &a.protect_head;
+                self.base(&p.base);
+                self.put("ds", u64::from(p.data_size));
+                self.put("version", u64::from(p.version));
+                self.put("recsectors", u64::from(p.rec_sectors));
+                self.put("totalblocks", u64::from(p.total_blocks));
+                self.bytes("mark", &p.mark);
+            }
+            HEAD3_OLDSERVICE => {
+                let s = &a.sub_block_head;
+                self.base(&s.base);
+                self.put("ds", u64::from(s.data_size));
+                self.put("subtype", u64::from(s.sub_type));
+                self.put("level", u64::from(s.level));
+                if s.sub_type == NTACL_HEAD || s.sub_type == STREAM_HEAD {
+                    self.put("unpsize", u64::from(s.unp_size));
+                    self.put("unpver", u64::from(s.unp_ver));
+                    self.put("method", u64::from(s.method));
+                    self.put("subcrc", u64::from(s.crc));
+                }
+                if s.sub_type == STREAM_HEAD {
+                    self.bytes("streamname", &s.stream_name);
+                }
+            }
+            _ => self.base(&a.short_block),
+        }
+    }
+}
+
+/// The port's answer to a request, in the oracle's words.
+fn answer(request: &str) -> String {
+    let words: Vec<&str> = request.split(' ').collect();
+    assert_eq!(words[0], "list", "{request:.80}");
+    let enable_broken = words[1] == "1";
+    let data = unhex(words.get(2).copied().unwrap_or("-"));
+    let mut out = Out("list".to_string());
+    let exit = match Archive::open(data.as_slice(), enable_broken) {
+        Err(Error::NotRar { exit_code }) => {
+            // The oracle prints the state of an archive that failed
+            // IsArchive; the port does not keep one, so these requests
+            // compare by their first word and the exit code.
+            out.0 += " notarchive";
+            exit_code
+        }
+        Err(Error::MissingPassword { exit_code }) => {
+            out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+            exit_code
+        }
+        Err(e) => panic!("{e}"),
+        Ok(mut archive) => {
+            out.0 += " archive";
+            out.state(&archive);
+            out.bytes(
+                "mark",
+                &archive.mark_head.mark[..archive.mark_head.head_size as usize],
+            );
+            loop {
+                match archive.read_header() {
+                    Ok(0) => {
+                        out.0 += " | end";
+                        out.state(&archive);
+                        break archive.exit_code();
+                    }
+                    Ok(size) => {
+                        out.0 += " |";
+                        out.put("read", size as u64);
+                        out.state(&archive);
+                        out.header(&archive);
+                        archive.seek_to_next();
+                    }
+                    Err(Error::MissingPassword { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                        break exit_code;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+    };
+    out.put("exit", u64::from(exit.number()));
+    out.0
+}
+
+/// An answer as the port can give it: the oracle prints the state of an
+/// archive that failed IsArchive, which the port does not keep.
+fn comparable(oracle: &str) -> String {
+    if let Some(rest) = oracle.strip_prefix("list notarchive") {
+        let exit = rest.rsplit(' ').next().unwrap_or_default();
+        return format!("list notarchive {exit}");
+    }
+    oracle.to_string()
+}
+
+fn assert_same(request: &str, want: &str, context: &str) {
+    let got = answer(request);
+    let want = comparable(want);
+    if got != want {
+        // The first word that differs, and some context.
+        let (g, w): (Vec<&str>, Vec<&str>) = (got.split(' ').collect(), want.split(' ').collect());
+        let at = g
+            .iter()
+            .zip(&w)
+            .position(|(a, b)| a != b)
+            .unwrap_or(g.len().min(w.len()));
+        let from = at.saturating_sub(8);
+        panic!(
+            "{context}: the port differs from UnRAR at word {at}\n port: {}\nunrar: {}",
+            g[from..(at + 8).min(g.len())].join(" "),
+            w[from..(at + 8).min(w.len())].join(" ")
+        );
+    }
+}
+
+// The oracle is compared with on Linux alone: the port reads names as UnRAR
+// does on Linux, and UnRAR's macOS build decodes names another way
+// (CharToWide is UtfToWide there). The recorded answers replay everywhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn libarchive_archives_list_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let archives = libarchive_archives();
+    for (name, data) in &archives {
+        for enable_broken in [0, 1] {
+            let request = format!("list {enable_broken} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, broken {enable_broken}"));
+        }
+    }
+    eprintln!("{} archives compared", archives.len());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn damaged_archives_list_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    // More with HIVEPACK_RAR_DAMAGED, and others with HIVEPACK_RAR_SEED,
+    // for longer runs by hand.
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0001);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    let mut compared = 0;
+    for (name, data) in &libarchive_archives() {
+        // The large ones take the oracle's line too long for no gain.
+        if data.len() > 64 << 10 {
+            continue;
+        }
+        for i in 0..count {
+            // Damage near the headers more often: the first kilobyte.
+            let damaged = if i % 2 == 0 {
+                let head = data.len().min(1024);
+                let mut d = damage(&mut rng, &data[..head]);
+                d.extend_from_slice(&data[head..]);
+                d
+            } else {
+                damage(&mut rng, data)
+            };
+            let request = format!("list {} {}", i % 2, hex(&damaged));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, damaged {i}"));
+            compared += 1;
+        }
+    }
+    eprintln!("{compared} damaged archives compared");
+}
+
+fn recorded_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-list.txt")
+}
+
+/// The requests whose answers are recorded: libarchive's archives of 2 KB
+/// or less, as they are both ways and six times damaged, so that they
+/// replay where neither the oracle nor the archives are, as on Windows and
+/// in the cross-compiled jobs.
+fn recorded_requests() -> Vec<String> {
+    let mut rng = Rng(0x4152_0002);
+    let mut requests = Vec::new();
+    for (_, data) in libarchive_archives() {
+        if data.len() > 2048 {
+            continue;
+        }
+        for enable_broken in [0, 1] {
+            requests.push(format!("list {enable_broken} {}", hex(&data)));
+        }
+        for i in 0..6 {
+            let damaged = damage(&mut rng, &data);
+            requests.push(format!("list {} {}", i % 2, hex(&damaged)));
+        }
+    }
+    requests
+}
+
+#[test]
+fn port_lists_as_recorded() {
+    let text = std::fs::read_to_string(recorded_path()).expect("testdata/oracle/rar-list.txt");
+    let mut checked = 0;
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (request, want) = line.split_once('\t').expect("request, tab, answer");
+        assert_eq!(
+            support::recorded_form(&answer(request)),
+            want,
+            "{request:.300}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 500, "only {checked} recorded answers");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-list.txt from the oracle"]
+fn record_list_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle), replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_list_answers -- --ignored\n",
+    );
+    for request in recorded_requests() {
+        let reply = comparable(&oracle.ask(&request));
+        let _ = writeln!(text, "{request}\t{}", support::recorded_form(&reply));
+    }
+    std::fs::write(recorded_path(), text).expect("written");
+}
+
+/// The inputs in the folder HIVEPACK_RAR_CORPUS, such as a fuzzer's
+/// corpus, their first byte choosing whether a broken main header is read
+/// past as the `rar_headers` target's does: for runs by hand.
+#[cfg(target_os = "linux")]
+#[test]
+fn corpus_lists_like_unrar() {
+    let Some(folder) = std::env::var_os("HIVEPACK_RAR_CORPUS") else {
+        return;
+    };
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut compared = 0;
+    for entry in std::fs::read_dir(folder).expect("the folder") {
+        let path = entry.expect("an entry").path();
+        let data = std::fs::read(&path).expect("an input");
+        let Some((&choice, archive)) = data.split_first() else {
+            continue;
+        };
+        let request = format!("list {} {}", choice & 1, hex(archive));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &path.display().to_string());
+        compared += 1;
+    }
+    eprintln!("{compared} inputs compared");
+}

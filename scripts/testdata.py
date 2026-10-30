@@ -19,6 +19,7 @@ Only the standard library is used, so any Python 3.9 or newer runs it.
 """
 
 import argparse
+import binascii
 import hashlib
 import json
 import os
@@ -266,6 +267,42 @@ def zip_err_str(lib: Path) -> str:
     return "\n".join(out) + "\n"
 
 
+# UnRAR's library build (`make lib`): -DRARDLL, as its makefile defines it,
+# without RAR_SMP, the threads, which give the same output.
+# Signed chars, as on x86-64, whose UnRAR the port follows: `char` is unsigned
+# on Linux on ARM, and names that are not UTF-8 would decode differently.
+UNRAR_FLAGS = ["-DRARDLL", "-D_FILE_OFFSET_BITS=64", "-D_LARGEFILE_SOURCE", "-fsigned-char"]
+
+
+def unrar_sources(unrar: Path) -> list:
+    """The sources of UnRAR's library: its makefile's OBJECTS and LIB_OBJ."""
+    makefile = (unrar / "makefile").read_text()
+    objects = re.search(r"^OBJECTS=(.*?)(?:\n\n|\n[A-Z_]+=)", makefile, re.S | re.M).group(1)
+    lib_obj = re.search(r"^LIB_OBJ=(.*)$", makefile, re.M).group(1)
+    names = (objects + " " + lib_obj).replace("\\", " ").split()
+    return [name[:-2] + ".cpp" for name in names if name.endswith(".o")]
+
+
+def uudecode(text: str) -> bytes:
+    """A uuencoded file's bytes, as libarchive's tests keep their archives."""
+    data = bytearray()
+    started = False
+    for line in text.splitlines():
+        if line.startswith("begin "):
+            started = True
+            continue
+        if not started or not line:
+            continue
+        if line.strip() == "end":
+            break
+        count = (ord(line[0]) - 32) & 63
+        # As many characters as the count needs: some lines end in spaces
+        # that were trimmed, or in padding.
+        line = line[: 1 + (count + 2) // 3 * 4].ljust(1 + (count + 2) // 3 * 4, " ")
+        data += binascii.a2b_uu(line)[:count]
+    return bytes(data)
+
+
 def build_oracle(source: Path, sources: list, included: list, folder: Path, extra: list) -> None:
     """An oracle program, compiled with the library's own sources.
 
@@ -287,6 +324,13 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     libbzip2's (the `extra` sets)."""
     files = [str(ROOT / s) for s in sources if s.endswith(".c")]
     compiler = os.environ.get("CC", "cc")
+    unrar = source / "unrar"
+    if unrar.is_dir():
+        files = [str(ROOT / s) for s in sources if s.endswith(".cpp")]
+        files += [str(unrar / name) for name in unrar_sources(unrar)]
+        subprocess.run([os.environ.get("CXX", "c++"), "-O2", "-w", "-std=c++11", *UNRAR_FLAGS,
+                        f"-I{unrar}", *files, "-o", str(folder / "oracle"), "-lpthread"], check=True)
+        return
     libzip = next(source.glob("libzip-*"), None)
     if libzip is not None:
         lib = libzip / "lib"
@@ -392,7 +436,13 @@ def generate_set(entry: dict, cache: Path, sets: dict) -> None:
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
-    if generate["tool"] == "oracle":
+    if generate["tool"] == "uudecode":
+        # Each file the glob finds, decoded, named without its `.uu` and
+        # libarchive's `test_read_format_`.
+        for uu in sorted((cache / origin["name"]).glob(generate["glob"])):
+            name = uu.name[:-3].replace("test_read_format_", "")
+            (folder / name).write_bytes(uudecode(uu.read_text(errors="replace")))
+    elif generate["tool"] == "oracle":
         build_oracle(cache / origin["name"], generate["sources"], generate.get("included", []), folder,
                      [cache / e["name"] for e in extra])
     else:

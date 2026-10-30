@@ -32,10 +32,10 @@ use crate::stream_flags::{STREAM_HEADER_SIZE, StreamFlags, footer_encode, header
 const BLOCK_SIZE_MAX: u64 = u64::MAX / THREADS_MAX as u64;
 
 /// `sizeof(lzma_stream_coder)` of `stream_encoder_mt.c` in liblzma on
-/// 64-bit Linux with glibc's POSIX threads, which its memory usage counts.
+/// x86-64 Linux with glibc's POSIX threads, which its memory usage counts.
 const STREAM_CODER_SIZE: u64 = 568;
 
-/// `sizeof(worker_thread)` of `stream_encoder_mt.c` in liblzma on 64-bit
+/// `sizeof(worker_thread)` of `stream_encoder_mt.c` in liblzma on x86-64
 /// Linux with glibc's POSIX threads.
 const WORKER_THREAD_SIZE: u64 = 544;
 

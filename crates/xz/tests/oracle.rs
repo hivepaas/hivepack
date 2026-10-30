@@ -1550,8 +1550,11 @@ fn port_encoders_match_liblzma() {
     let mut mt_ends = 0;
     for request in &requests {
         // liblzma's threads' structures, which the threaded encoder's
-        // memory usage counts, are of another size on other systems.
-        if request.starts_with("mtmem ") && !cfg!(target_os = "linux") {
+        // memory usage counts, are of another size on other systems: the
+        // port counts x86-64 Linux's (glibc's mutex has 8 bytes more on
+        // arm64).
+        if request.starts_with("mtmem ") && !cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        {
             continue;
         }
         let want = oracle.ask(request);

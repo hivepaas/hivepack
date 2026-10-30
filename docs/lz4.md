@@ -60,12 +60,12 @@ Blocks are decoded in one call each, with room for all the output. With `--frame
 
 ### Where it stands
 
-Below the target. AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files compressed by liblz4 at levels 1 and 9, decoded as blocks in one call each, best of five rounds taken in turn, on one pinned core of a machine that other jobs kept busy (so the absolute speeds are low and some files noisy; the ratios are what to read):
+Below the target. AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files compressed by liblz4 at levels 1 and 9, decoded as blocks in one call each, best of five rounds taken in turn, on one pinned core:
 
 | | Mean | Range | At 0.95× or more |
 |---|---|---|---|
-| hivepack-lz4 | 0.77× liblz4 | 0.65–0.87× | 0 of 24 |
-| lz4_flex 0.14.0, its safe code (its default) | 0.79× | 0.64–0.97× | 1 of 24 |
+| hivepack-lz4 | 0.75× liblz4 | 0.70–0.83× | 0 of 24 |
+| lz4_flex 0.14.0, its safe code (its default) | 0.77× | 0.64–0.89× | 0 of 24 |
 
 lz4_flex with its unsafe code was at 0.68–0.98× on five of the files (`dickens`, `mozilla`, `nci`, `reymont`, `x-ray`), where the port was at 0.73–0.85×.
 

@@ -4,3 +4,5 @@ testdata/** binary
 testdata/*.md -text diff
 testdata/*.json -text diff
 testdata/oracle/* -text diff
+testdata/udf/*.txt -text diff
+testdata/udf/crafted/* -text diff

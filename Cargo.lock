@@ -272,6 +272,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-udf"
+version = "0.0.0"
+dependencies = [
+ "hivepack-crypto",
+ "hivepack-xz",
+]
+
+[[package]]
 name = "hivepack-xz"
 version = "0.0.0"
 

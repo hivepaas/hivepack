@@ -333,6 +333,13 @@
       "kind": "vectors"
     },
     {
+      "name": "udf",
+      "path": "udf",
+      "source": "tools/udf-images/make.sh (mkudffs and genisoimage images filled through Linux's udf file system, with what Linux reads of them) and tools/udf-images/crafted.sh (what Linux reads of the images crates/udf/tests/crafted.rs writes)",
+      "license": "MIT",
+      "kind": "vectors"
+    },
+    {
       "name": "cctv-age",
       "fetch": { "group": "core", "files": [{ "url": "https://proxy.golang.org/c2sp.org/%21c%21c%21t%21v/age/@v/v0.0.0-20260829155415-4448f2097b2d.zip", "sha256": "6720e26a39fdea14c0f94fe1aa4d1a112b19d284996cdd0a419bd71ca7895fb1", "unpack": "zip" }] },
       "source": "https://github.com/C2SP/CCTV/tree/4448f2097b2d/age (the Go module c2sp.org/CCTV/age, which age v1.3.2 tests with), from Go's module proxy",

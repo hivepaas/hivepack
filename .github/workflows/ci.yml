@@ -329,6 +329,15 @@ jobs:
           mkdir -p fuzz/corpus/tar
           cp testdata/go-tar/*.tar fuzz/corpus/tar/
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu tar -- -max_total_time=60
+      - name: Seed the tar extraction corpus with the same archives, behind a choice of options
+        run: |
+          mkdir -p fuzz/corpus/extract_tar
+          python3 - <<'PY'
+          import pathlib
+          for i, path in enumerate(sorted(pathlib.Path("testdata/go-tar").glob("*.tar"))):
+              pathlib.Path(f"fuzz/corpus/extract_tar/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_tar -- -max_total_time=60
       - name: Seed the xz corpus
         run: |
           mkdir -p fuzz/corpus/xz

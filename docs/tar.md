@@ -19,7 +19,7 @@ The port follows **Go 1.27.2** (`src/archive/tar`), the latest release as of Oct
 - **Times are `Time`** (seconds and nanoseconds since 1970, normalised as `time.Unix` does), and `Option<Time>` where Go would leave its zero time: the access and change times when the archive has none, and a global PAX header's modification time.
 - **Errors are a type.** Go's `ErrHeader`, `ErrFieldTooLong`, `errSparseTooLong`, `errMissData`, `errUnrefData` and `io.ErrUnexpectedEOF` are `Error`'s variants; the data's errors travel inside `io::Error` and come back out with `Error::from`. A failure is kept and returned again by every later call, as Go keeps it.
 - **An error that comes with the last bytes comes after them.** Go's `Read` can return bytes and an error at once (a sparse file with more data than its map ends so); Rust's cannot, so the bytes come first and the error at the next call, which `read_to_end` sees the same way.
-- **No seeking.** Go skips the rest of an entry with `Seek` when the input can; the port reads past it. The outcome is the same; the tests give Go an input that cannot seek.
+- **Seeking is asked for.** Go skips the rest of an entry with `Seek` when it finds that its input can, by asking the value's type. Rust cannot ask, so `Reader::new` reads past the data of any `Read`, and `Reader::seekable` seeks, as Go does, up to the data's last byte, so that an archive cut short is found by the read after it. The outcome is the same, which `seeking_changes_nothing` checks on Go's archives and their damaged copies; the tests give Go an input that cannot seek.
 - **No `GODEBUG=tarinsecurepath`.** Names are checked where files are written, in hivepack-extract.
 - **The global PAX header's records are merged in key order.** Go merges them in its map's random order and ignores the error of a bad one, so a global header with both a bad record and a `path` can come out either way in Go; here the order is fixed.
 - **Not ported:** the writer (`writer.go`), `FileInfoHeader` and `Header.FileInfo`, which convert to and from the file system's `fs.FileInfo`.
@@ -27,6 +27,48 @@ The port follows **Go 1.27.2** (`src/archive/tar`), the latest release as of Oct
 ## Bounded resources
 
 As in Go: PAX records and GNU long names at most 1 MiB, sparse maps at most 1 MiB and a million entries, one header block at a time. An entry's data is read as the caller reads it, and skipped otherwise; a sparse file's holes are produced as zeros, so a reader that takes all of a terabyte of holes reads a terabyte. hivepack-extract will write holes without reading them.
+
+## The speed
+
+`tools/tar-bench` times the port against Go's `archive/tar`, in a program of its own (`tools/tar-bench/go`), on the same archives:
+
+```sh
+python3 scripts/testdata.py fetch --group bench
+cargo run --release -p tar-bench -- [--only TEXT] [--rounds 5] [--seconds 0.5]
+```
+
+AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, Go 1.27.2, October 2026. "Many" archives hold 200,000 entries of 16 bytes (200 entries and their folder for the sparse ones, files of 1 MiB with 4 KiB of data every 64 KiB, which GNU tar 1.35 makes); "big" ones the Silesia corpus cut to 64 MiB; "small" ones 20,000 pieces of 4 KiB. Each speed is the best of five rounds taken in turn. Both found the same entries and read the same bytes.
+
+| Workload | The port | Go | Port / Go |
+|---|---|---|---|
+| **Going through entries, from memory** | | | |
+| USTAR | 2108 k entries/s | 878 k entries/s | 2.40× |
+| PAX, long names and times in nanoseconds | 934 k entries/s | 358 k entries/s | 2.61× |
+| GNU, long names | 1217 k entries/s | 822 k entries/s | 1.48× |
+| GNU sparse | 812 k entries/s | 337 k entries/s | 2.41× |
+| PAX sparse 1.0 | 494 k entries/s | 209 k entries/s | 2.37× |
+| **Going through entries, from a file** | | | |
+| USTAR, through a buffer of 64 KiB | 1983 k entries/s | 817 k entries/s | 2.43× |
+| USTAR, one read at a time | 1185 k entries/s | 544 k entries/s | 2.18× |
+| **Reading data, from memory** | | | |
+| Big entries | 46.5 GB/s | 34.9 GB/s | 1.33× |
+| Small entries | 1583 k entries/s | 793 k entries/s | 2.00× |
+| GNU sparse, the holes as zeros | 168 GB/s | 141 GB/s | 1.20× |
+| PAX sparse 1.0, the holes as zeros | 149 GB/s | 115 GB/s | 1.30× |
+| **Reading data, from a file** | | | |
+| Big entries, through a buffer of 64 KiB | 41.6 GB/s | 39.6 GB/s | 1.05× |
+| Big entries, one read at a time | 41.4 GB/s | 40.5 GB/s | 1.02× |
+| **Skipping data** | | | |
+| Big entries, from memory | 4,772 GB/s | 35.5 GB/s | 134× |
+| Big entries, through a buffer of 64 KiB | 32.4 GB/s | 33.9 GB/s | 0.96× |
+| Big entries, seeking in a file (`Reader::seekable`) | 4,919 GB/s | 2,401 GB/s | 2.05× |
+| Small entries, seeking in a file | 1148 k entries/s | 518 k entries/s | 2.21× |
+
+What to read in it:
+
+- **Headers** are where a tar reader does its own work, and the port takes about half of Go's time. Neither was profiled, so why is not shown; Go's `Header` holds strings and maps, and Go has a garbage collector.
+- **Data** is mostly a copy, so it measures memory: from a file, the page cache. Compressors in front of tar will set the speed, not this.
+- **Seeking in a file** is what going through a large archive on disk needs: without it, as `Reader::new` does, all the data is read, at 32 GB/s here from the page cache and far less from a disk. From memory, the 134× is not the port's doing: its skip reads into a buffer nothing looks at, and about 14 µs for 64 MiB can only mean the compiler took the copy out, where Go's copy through a plain reader stays. A real source is a file or a decompressor, as in the rows beside it.
 
 ## How it is shown
 

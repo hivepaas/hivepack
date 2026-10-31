@@ -116,6 +116,25 @@ pub(crate) enum Whence {
     End,
 }
 
+/// The least and the most [`Source`] reads ahead at a time.
+const READ_AHEAD_MIN: usize = 1 << 12;
+const READ_AHEAD_MAX: usize = 1 << 20;
+
+/// What was read past what was asked for, while an archive is opened.
+///
+/// Differs from libzip, which leaves this to `stdio`: without it, each central
+/// directory entry would be a system call or two, as `ReadAt` is `pread`.
+#[derive(Clone)]
+pub(crate) struct ReadAhead {
+    buf: Vec<u8>,
+    start: u64,
+    /// How much of `buf` is the source's, from `start`.
+    len: usize,
+    /// How much the last read asked for: twice as much each time reads go on
+    /// from where it ended, back to the least when they go elsewhere.
+    size: usize,
+}
+
 /// An archive's source while it is read: its length when opened, the
 /// position, and whether a read has failed.
 #[derive(Clone)]
@@ -127,6 +146,7 @@ pub(crate) struct Source<R: ?Sized> {
     /// The error of a failed read: libzip's sources fail every read after
     /// one (`had_read_error`).
     read_error: Option<Error>,
+    ahead: Option<ReadAhead>,
     inner: R,
 }
 
@@ -137,6 +157,7 @@ impl<R: ReadAt> Source<R> {
             size,
             offset: 0,
             read_error: None,
+            ahead: None,
             inner,
         }
     }
@@ -159,8 +180,89 @@ impl<R: ReadAt + ?Sized> Source<R> {
             size: self.size,
             offset: 0,
             read_error: self.read_error,
+            ahead: None,
             inner: &self.inner,
         }
+    }
+
+    /// [`Source::view`], which goes on with what another view read ahead, so
+    /// that what is read in order across entries is a read now and then.
+    pub(crate) fn view_with(&self, ahead: Option<ReadAhead>) -> Source<&R> {
+        let mut view = self.view();
+        view.ahead = ahead;
+        view
+    }
+
+    /// Reads ahead from now on, if it does not yet.
+    pub(crate) fn ensure_read_ahead(&mut self) {
+        if self.ahead.is_none() {
+            self.start_read_ahead();
+        }
+    }
+
+    /// What was read ahead, for the next view.
+    pub(crate) fn take_read_ahead(&mut self) -> Option<ReadAhead> {
+        self.ahead.take()
+    }
+
+    /// Reads ahead from now on, until [`Source::stop_read_ahead`].
+    pub(crate) fn start_read_ahead(&mut self) {
+        self.ahead = Some(ReadAhead {
+            buf: Vec::new(),
+            start: 0,
+            len: 0,
+            size: READ_AHEAD_MIN,
+        });
+    }
+
+    /// Goes back to reading only what is asked for.
+    pub(crate) fn stop_read_ahead(&mut self) {
+        self.ahead = None;
+    }
+
+    /// As much as can be of `buf`, from what was read ahead or by reading
+    /// ahead. A failure is not kept: it comes again to the read that gets past
+    /// what this leaves, as it would without reading ahead.
+    fn read_through_ahead(&mut self, buf: &mut [u8]) -> usize {
+        let Some(ahead) = &mut self.ahead else {
+            return 0;
+        };
+        let mut done = 0;
+        while done < buf.len() {
+            let from = self.offset.wrapping_sub(ahead.start);
+            if self.offset >= ahead.start && from < ahead.len as u64 {
+                let from = from as usize;
+                let n = (ahead.len - from).min(buf.len() - done);
+                buf[done..done + n].copy_from_slice(&ahead.buf[from..from + n]);
+                done += n;
+                self.offset += n as u64;
+                continue;
+            }
+            ahead.size = if self.offset == ahead.start + ahead.len as u64 {
+                (ahead.size * 2).min(READ_AHEAD_MAX)
+            } else {
+                READ_AHEAD_MIN
+            };
+            let want = (ahead.size as u64).min(self.size - self.offset) as usize;
+            if buf.len() - done >= want {
+                // No use in copying it.
+                break;
+            }
+            ahead.buf.resize(want, 0);
+            ahead.start = self.offset;
+            ahead.len = 0;
+            while ahead.len < want {
+                let at = ahead.start + ahead.len as u64;
+                match self.inner.read_at(at, &mut ahead.buf[ahead.len..want]) {
+                    Ok(got) if got > 0 => ahead.len += got,
+                    _ => break,
+                }
+            }
+            if ahead.len == 0 {
+                break;
+            }
+        }
+        done
     }
 
     /// `st.size` of `zip_source_stat`.
@@ -204,7 +306,7 @@ impl<R: ReadAt + ?Sized> Source<R> {
             return Err(error);
         }
         let n = (buf.len() as u64).min(self.size - self.offset) as usize;
-        let mut done = 0;
+        let mut done = self.read_through_ahead(&mut buf[..n]);
         while done < n {
             match self.inner.read_at(self.offset, &mut buf[done..n]) {
                 Ok(0) => break,
@@ -272,5 +374,88 @@ mod tests {
         );
         assert!(src.seek(0, Whence::Set).is_ok());
         assert!(src.seek(i64::MIN, Whence::Cur).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod read_ahead_tests {
+    use super::*;
+
+    /// A source of `len` bytes that gives at most `most` at a time, and fails
+    /// at `fails_at` and past it.
+    struct Flaky {
+        len: u64,
+        most: usize,
+        fails_at: u64,
+    }
+
+    impl ReadAt for Flaky {
+        fn size(&self) -> io::Result<u64> {
+            Ok(self.len)
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            if offset >= self.fails_at {
+                return Err(io::Error::other("a failure"));
+            }
+            let n = (self.fails_at - offset)
+                .min(self.len - offset)
+                .min(self.most as u64) as usize;
+            let n = n.min(buf.len());
+            for (i, byte) in buf[..n].iter_mut().enumerate() {
+                *byte = ((offset + i as u64) % 251) as u8;
+            }
+            Ok(n)
+        }
+    }
+
+    /// Reading ahead changes nothing a reader can see: not the bytes, the
+    /// position, the end, or where a failure comes and that it stays.
+    #[test]
+    fn reading_ahead_gives_the_same_as_not() {
+        let mut state = 0x5eed_u64;
+        let mut next = move |below: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % below
+        };
+        for round in 0..200 {
+            let len = 1 + next(1 << 21);
+            let source = |fails_at| Flaky {
+                len,
+                most: 1 + (round % 7) * 1000,
+                fails_at,
+            };
+            let fails_at = if round % 3 == 0 { next(len) } else { u64::MAX };
+            let mut plain = Source::with_size(source(fails_at), len);
+            let mut ahead = Source::with_size(source(fails_at), len);
+            ahead.start_read_ahead();
+            for _ in 0..300 {
+                if next(10) == 0 {
+                    let to = next(len + 1) as i64;
+                    plain.seek(to, Whence::Set).unwrap();
+                    ahead.seek(to, Whence::Set).unwrap();
+                }
+                let size = match next(4) {
+                    0 => 46,
+                    1 => next(200) as usize,
+                    2 => next(20_000) as usize,
+                    _ => next(3 << 20) as usize,
+                };
+                let (mut a, mut b) = (vec![0; size], vec![0; size]);
+                let (got_plain, got_ahead) = (plain.read(&mut a), ahead.read(&mut b));
+                match (got_plain, got_ahead) {
+                    (Ok(x), Ok(y)) => {
+                        assert_eq!(x, y);
+                        assert_eq!(a[..x], b[..y]);
+                    }
+                    (Err(x), Err(y)) => assert_eq!(x.code(), y.code()),
+                    (x, y) => panic!("{:?} and {:?}", x.is_ok(), y.is_ok()),
+                }
+                assert_eq!(plain.tell(), ahead.tell());
+            }
+        }
     }
 }

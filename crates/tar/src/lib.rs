@@ -4,7 +4,8 @@
 //! [`Reader`] reads an archive in order: V7, USTAR, PAX (POSIX.1-2001, its
 //! records merged into the entries they describe), GNU (long names, and
 //! the sparse formats 0.0, 0.1 and 1.0 and the old one), and STAR. Sparse
-//! files' holes read as zeros. Names are bytes, as tar keeps them.
+//! files' holes read as zeros. Names are bytes, as tar keeps them. With a file
+//! that is only listed, [`Reader::seekable`] seeks past the data.
 //!
 //! The rules the port follows, and how it is checked against Go, are in
 //! the repository: `docs/tar.md`.

@@ -7,7 +7,7 @@
 //! Differs from Go: no `Seek` to skip data (the input is only `Read`); no
 //! `GODEBUG=tarinsecurepath`, as checking names is hivepack-extract's job.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::common::{
     BLOCK_SIZE, Error, Format, Header, MAX_SPARSE_FILE_ENTRIES, MAX_SPECIAL_FILE_SIZE, Records,
@@ -242,6 +242,25 @@ pub struct Reader<R> {
     curr: FileReader,
     blk: Box<Block>,
     err: Option<Stop>,
+    /// Moves the input on, from where it is, and gives where it is then, if
+    /// it can: `Reader::seekable`.
+    seek: Option<fn(&mut R, i64) -> io::Result<u64>>,
+}
+
+impl<R: Read + Seek> Reader<R> {
+    /// `NewReader`, on an input that seeks past the data of entries not read:
+    /// a file, whose data the next call to [`Reader::next`] then does not read,
+    /// so that going through a large archive takes a moment.
+    ///
+    /// Differs from Go, which finds out that its input can seek by asking it:
+    /// Rust cannot, so this is apart from [`Reader::new`]. An input that says it
+    /// can and fails is read through, as Go does. An archive cut short in data
+    /// that is skipped is found at the last byte of that data, as Go finds it.
+    pub fn seekable(r: R) -> Reader<R> {
+        let mut reader = Reader::new(r);
+        reader.seek = Some(|r, n| r.seek(SeekFrom::Current(n)));
+        reader
+    }
 }
 
 impl<R: Read> Reader<R> {
@@ -253,6 +272,7 @@ impl<R: Read> Reader<R> {
             curr: FileReader::Reg(RegFileReader { nb: 0 }),
             blk: Box::new([0; BLOCK_SIZE]),
             err: None,
+            seek: None,
         }
     }
 
@@ -692,6 +712,16 @@ impl<R: Read> Reader<R> {
     /// `discard`: `n` bytes of the input skipped.
     fn discard(&mut self, n: i64) -> Result<(), GoErr> {
         let mut left = n;
+        // Up to the last byte, as seeking is lazy about reporting errors: the
+        // read after it finds that the input was cut short. Not every input
+        // that says it seeks can: an innocent seek finds out.
+        if let Some(seek) = self.seek
+            && n > 1
+            && let Ok(before) = seek(&mut self.r, 0)
+        {
+            let after = seek(&mut self.r, n - 1).map_err(Error::from)?;
+            left = left.wrapping_sub(after.wrapping_sub(before) as i64);
+        }
         let mut chunk = [0u8; 8192];
         while left > 0 {
             let want = left.min(chunk.len() as i64) as usize;

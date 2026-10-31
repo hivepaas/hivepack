@@ -2,7 +2,7 @@
 
 `hivepack-zip` will read and write ZIP archives. Its container logic is a port of [libzip](https://libzip.org) to safe Rust; its compression and encryption come from hivepack's own crates, each ported from or checked against an official library. What libzip does not do, such as split archives, legacy file name encodings and extracting to disk, is written for hivepack and checked against other implementations.
 
-> **Status:** steps 1 to 4 are done. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard and Deflate64 entries as libzip does (libzip reads no Deflate64), compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). It edits archives, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes them as libzip does, byte for byte, and encrypts and decrypts ZipCrypto and WinZip AES entries, byte for byte as libzip with the same random bytes; 174 of libzip's own tests pass through `tools/ziptool`. What libzip does not do comes next (step 5).
+> **Status:** steps 1 to 4 are done. `hivepack-zip` opens archives, reads their central directory and local headers, and reads stored, deflated, bzip2, LZMA, XZ, Zstandard, Deflate64 and PPMd entries as libzip does (libzip reads no Deflate64 nor PPMd, which are read as zlib's `infback9` and 7-Zip read them), compared with libzip on its own test archives and on generated ones (see [Progress](#progress)). It edits archives, adds and replaces data, stored, deflated, bzip2, LZMA, XZ or Zstandard, and writes them as libzip does, byte for byte, and encrypts and decrypts ZipCrypto and WinZip AES entries, byte for byte as libzip with the same random bytes; 174 of libzip's own tests pass through `tools/ziptool`. What libzip does not do comes next (step 5).
 
 ## Why libzip
 
@@ -58,7 +58,7 @@ These are hivepack's own, and each one has its own oracles.
 | Split archives (`.z01`, `.z02`, …, `.zip`) | `check_eocd` and `_zip_read_eocd64` fail with `ZIP_ER_MULTIDISK` | A volume set that reads the segments as one byte space, and a writer that splits. A single segment on its own still fails with `ZIP_ER_MULTIDISK` | minizip-ng, Commons Compress, 7-Zip, Info-ZIP `zip -s` |
 | `.zip.001` volumes | Not a ZIP feature: 7-Zip splits the bytes | The same volume set, joined end to end | 7-Zip |
 | Legacy code pages | `zip_utf-8.c` knows only CP437 | Tables for CP932, CP936, CP949, CP950, CP866, CP1258 and others, chosen by the caller or guessed | 7-Zip `-mcp`, `unzip -O`, libarchive `hdrcharset`, Python `metadata_encoding` |
-| Deflate64 and PPMd | Not among libzip's methods | Deflate64: read with `hivepack-deflate`'s `Inflate9`, which decodes as zlib's `contrib/infback9` (done); PPMd later | .NET and Commons Compress test data, 7-Zip |
+| Deflate64 and PPMd | Not among libzip's methods | Deflate64: read with `hivepack-deflate`'s `Inflate9`, which decodes as zlib's `contrib/infback9` (done). PPMd (method 98, PPMd var.I rev. 1): read with `ppmd8.rs`, the port of 7-Zip's `Ppmd8.c` and `Ppmd8Dec.c`, as 7-Zip's ZIP handler reads it (done) | 7-Zip, libarchive's test archives |
 | Writing to a stream | `add_data` seeks back to rewrite the local header, and forces Zip64 when the size is unknown | A streaming writer with data descriptors | Every oracle reads what it writes |
 | Reading a stream | Needs a seekable source | An opt-in streaming reader that checks what it read against the central directory at the end | libarchive's streaming reader |
 | Parallel work | One thread | Entries decompressed in parallel through `ReaderAt`; compressed in parallel and written in order | The single-threaded output, byte for byte |
@@ -100,16 +100,16 @@ python3 scripts/testdata.py fetch --group bench
 cargo run --release -p zip-bench -- [--only TEXT] [--rounds 5] [--seconds 0.5]
 ```
 
-AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
+AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 MiB in all, on a nearly idle machine. Each speed is the best of five rounds taken in turn. Opening and finding were measured after the work on opening below, and editing after the work on closing, the other rows before them, as that work does not touch them. "Small" entries are 20,000 pieces of 4 KiB (2,000 for AES), and "many" 200,000 entries of 16 bytes with paths for names. Everything the two wrote without encryption was the same, byte for byte.
 
 | Workload | hivepack-zip | libzip | Port / libzip |
 |---|---|---|---|
 | **Opening many entries** | | | |
-| Open | 2114 k entries/s | 6395 k entries/s | 0.33× |
-| Open with `ZIP_CHECKCONS` | 1167 k entries/s | 3352 k entries/s | 0.35× |
+| Open | 5028 k entries/s | 6477 k entries/s | 0.78× |
+| Open with `ZIP_CHECKCONS` | 4325 k entries/s | 3327 k entries/s | 1.30× |
 | **Finding, many entries** | | | |
-| `zip_stat_index`, each entry | 51479 k entries/s | 18923 k entries/s | 2.72× |
-| `zip_name_locate`, each entry | 12519 k entries/s | 11235 k entries/s | 1.11× |
+| `zip_stat_index`, each entry | 51041 k entries/s | 19098 k entries/s | 2.67× |
+| `zip_name_locate`, each entry | 12497 k entries/s | 10783 k entries/s | 1.16× |
 | **Reading** | | | |
 | Stored | 5170 MB/s | 3773 MB/s | 1.37× |
 | Deflate | 495 MB/s | 469 MB/s | 1.06× |
@@ -142,19 +142,19 @@ AMD Ryzen 9 9950X (x86-64, Linux), October 2026, the 12 Silesia files cut to 64 
 | WinZip AES-256 | 160 MB/s | 251 MB/s | 0.64× |
 | WinZip AES-256, small entries | 1.2 k entries/s | 2.1 k entries/s | 0.57× |
 | **Editing** | | | |
-| Rename one entry, the data copied | 8652 MB/s | 5916 MB/s | 1.46× |
-| Add one entry, the data copied | 8600 MB/s | 5671 MB/s | 1.52× |
-| Rename each of many entries | 622 k entries/s | 1021 k entries/s | 0.61× |
-| Set each of many entries' comment | 796 k entries/s | 1626 k entries/s | 0.49× |
-| Delete half of many entries | 1415 k entries/s | 3036 k entries/s | 0.47× |
+| Rename one entry, the data copied | 9814 MB/s | 6174 MB/s | 1.59× |
+| Add one entry, the data copied | 9584 MB/s | 6138 MB/s | 1.56× |
+| Rename each of many entries | 1523 k entries/s | 1041 k entries/s | 1.46× |
+| Set each of many entries' comment | 3343 k entries/s | 1683 k entries/s | 1.99× |
+| Delete half of many entries | 4642 k entries/s | 3079 k entries/s | 1.51× |
 
 What to read in it:
 
 - **Compression and decompression** are the speed of hivepack's other ports, which their own documents go into: Deflate and bzip2 at their libraries' speed, and LZMA and XZ reading below liblzma's on x86-64, where its range decoder is inline assembly ([xz.md](xz.md)). Writing them, where the compressor is most of the time, is even.
-- **Opening many entries** is the widest gap. A profile puts the most time in filling the table of names (`hash::Names::add`, and hashing with the standard library's SipHash), and much of the rest in small allocations. An archive of a few hundred entries opens in well under a millisecond either way.
-- **Editing many entries** has the same cause in part, as it writes the central directory again and looks names up, with no single place standing out in the profile.
+- **Opening many entries** went from 0.33× to 0.78×, and with `ZIP_CHECKCONS` from 0.35× to 1.30×, once the port read ahead (`stdio` does that for libzip, and without it each entry was a system call or two) and stopped allocating and copying for each entry. About a quarter of what is left is hashing names. libzip hashes with SipHash and random keys too, and the port keeps them, so that an archive cannot be made to collide on purpose.
+- **Editing many entries** went from 0.48–0.61× to 1.46–1.99×. Closing was five system calls an entry: asking a `BufWriter` where it is writes out its buffer, so each entry's `tell` was a write and a seek, and each read of a local header or of data a `pread`, from a view of the source of its own. Now the writer keeps its position, and the entries share a read ahead, for about 1% of the system calls, and share one copy buffer where each had 8 KiB allocated and cleared.
 - **AES** compares two different things. libzip here uses nettle's C code, with no AES instructions and table lookups, where BearSSL's `aes_ct64`, which the port uses, runs in constant time. A profile of the AES-256 workloads, reading and writing, gives 44% to SHA-1 (WinZip AES authenticates with HMAC-SHA1, and hashes its key with PBKDF2) and about 30% to AES. A libzip that uses the processor's AES instructions, as a usual build with GnuTLS or OpenSSL does, would be further ahead than this table shows.
-- **Not compared:** Deflate64, which libzip does not have, and split archives. Files are read and written on the machine's disk, through its cache.
+- **Not compared:** Deflate64 and PPMd, which libzip does not have, and split archives. Files are read and written on the machine's disk, through its cache.
 
 ## Progress
 
@@ -177,6 +177,7 @@ What to read in it:
 | `zip_source_compress.c`, `zip_algorithm_deflate.c`, `zip_algorithm_bzip2.c`, `zip_algorithm_xz.c`, `zip_algorithm_zstd.c` | `source_compress.rs`, `algorithm_deflate.rs`, `algorithm_bzip2.rs`, `algorithm_xz.rs`, `algorithm_zstd.rs` | decompressing deflate, bzip2, LZMA, XZ and Zstandard |
 | The rules of `zip_source_read.c`, `zip_source_open.c`, `zip_source_close.c`, `zip_source_at_eof.c`, `zip_source_stat.c`, `zip_source_layered.c` for those layers | `source_stack.rs` | done |
 | Deflate64 (libzip has none) | `algorithm_deflate.rs`, with `Inflate9` | done: `tests/deflate64.rs` reads streams with long and far matches back to their data, checks the CRC and length, and refuses garbage after the stream with `ZIP_CHECKCONS` |
+| PPMd (libzip has none): 7-Zip 26.05's `Ppmd8.c` and `Ppmd8Dec.c`, built without `PPMD8_FREEZE_SUPPORT` as 7-Zip is, and `PpmdZip.cpp`'s decoder for what to do with the stream | `ppmd8.rs`, `algorithm_ppmd.rs` | done: see [PPMd](#ppmd) |
 | `zip_source_zip_file_create` with a start and a length | `source_zip_new.rs`, `source_window.rs` (`UpperWindow`) | done: `Archive::fopen_index_range`, compared through the oracle's `range` requests |
 | `src/ziptool.c`, `regress/programs/ziptool_regress.c` and `tryopen.c`; `src/zipcmp.c` and `diff_output.c` for archives | `tools/ziptool` | done: 167 of libzip's tests pass |
 | `zip_delete.c`, `zip_file_rename.c`, `zip_set_name.c`, `zip_file_set_comment.c`, `zip_set_archive_comment.c`, `zip_file_set_mtime.c`, `zip_file_set_external_attributes.c`, `zip_set_archive_flag.c`, `zip_unchange.c`, `zip_unchange_all.c`, `zip_unchange_archive.c`, `zip_unchange_data.c` | modules of the same names, `zipint.rs` | done |
@@ -198,13 +199,13 @@ Where the port differs from libzip, a `Differs from libzip:` comment says so. Th
 - An entry is read through a struct of layers (a window on the archive, then decompression, then the CRC check), each with the state libzip keeps in its `zip_source_t`, in place of a chain of callbacks. Each open entry reads through a view of the archive's source with its own position, so several can be read at once from `&Archive`; a failed read fails only that entry's later reads.
 - An archive is written by `Archive::close_to` to a `Write` and `Seek` of the caller's, from scratch, as libzip writes to a source that cannot clone the data it keeps; `Closed` says whether it wrote, or whether libzip would have left the file as it was or removed it. `Archive::close_to_cloning` writes as libzip does to a source that can clone, which keeps the start of the archive as it is: it asks the caller whether that length can be cloned, as libzip asks the source, and copies it from the archive's source. The archive stays open afterwards, where libzip discards it once written. On failure, both leave the archive as it was then.
 - New data is a `DataSource`: its stat, attributes and MS-DOS time, and reads at a position, so that it can be shared and read by several open entries and by closing at once, where libzip seeks one source before each read. `BufferSource` and `FileSource` are libzip's buffer and file sources; `ZipFileSource`, its `zip_source_zip_file`, reads the entry once, in whole, the first time its data is asked for.
-- Where an entry's method changes, a Deflate64 entry is decompressed and compressed again, where libzip, which reads no Deflate64, fails with `ZIP_ER_COMPNOTSUPP`; the comparison with the oracle expects libzip's refusal there, if the rest of the answer agrees.
+- Where an entry's method changes, a Deflate64 or PPMd entry is decompressed and compressed again, where libzip, which reads neither, fails with `ZIP_ER_COMPNOTSUPP`; the comparison with the oracle expects libzip's refusal there, if the rest of the answer agrees.
 - An archive can be cloned, with its changes, when its source can, which `ziptool` uses to open an entry with `fopen` while the archive is changed afterwards, as libzip's open entries read what they were opened on.
 - A size or offset of exactly 0xffffffff, which the header has as 0xffffffff, has its value in the Zip64 extra field too, and so has a disk number the header has as 0xffff when the field is written: libzip adds a value only when it is larger than 0xffffffff, and never the disk number, so it then refuses the archive it wrote, with `ZIP_ER_INCONS` and `ZIP_ER_DETAIL_INVALID_ZIP64_EF`. The comparison with the oracle expects a different archive there, if the rest of the answer agrees and libzip's archive does not read back; `zip64_edge_values_read_back` writes such entries and checks that the port's does, and that libzip's does not.
 - `zip_file_set_mtime` takes the time as UTC, as `_zip_u2d_time` does with `localtime_r` where the time zone is UTC, and fails as `localtime_r` does for a year past what an `int` holds, with the platform's `EOVERFLOW` (75 on Linux, 84 on macOS and the BSDs); the recorded answers, from Linux, are replayed with 75 for it.
 - A comment longer than 65,535 bytes is refused with `ZIP_ER_INVAL`, where libzip's `zip_uint16_t` length cuts it. `zip_unchange_all` and `zip_unchange_archive`, which cannot fail, return nothing.
 - The oracle clears `errno` before each request, and in edit requests before each edit, each entry's answers and `zip_close`: libzip gives it, stale, with `ZIP_ER_SEEK` when a local header's extra fields cannot be reached, where the port gives 0.
-- WinZip AES decrypts four blocks of counter at a time, as `hivepack-crypto`'s AES encrypts them, where libzip encrypts one; the data is the same. `zip_set_default_password`, which cannot fail but for memory, returns nothing. A password is taken up to its first NUL byte, as libzip takes a C string. Where `zip_source_zip_file_create` cannot make the decrypting layer because the data is shorter than its header, it sets `ZIP_ER_OPNOTSUPP` on the archive's error and not on the one it is given, as with `ZIP_ER_COMPNOTSUPP`; the port's `ziptool` prints "No error" there too. The random bytes that encrypting takes come from `/dev/urandom` on Unix, read with the standard library, as `zip_random_unix.c` reads them, or from a `RandomSource` the caller gives (`Archive::set_random_source`), which they must where the system is not Unix: libzip asks Windows' and Apple's functions, which need `unsafe` code. `ziptool_regress_nonrandom`, whose random bytes are zeros, is the port's `ziptool` with `HIVEPACK_ZIPTOOL_NONRANDOM` set. Of the compression methods, deflate and bzip2 are read and written, as the oracle's libzip is built with libbzip2 (bzip2 1.0.8's sources) and without LZMA and Zstandard, and Deflate64 is read, which libzip does not read: where libzip refuses such an entry with `ZIP_ER_COMPNOTSUPP` (once the password and sizes are checked, before the local header is read), the port reads it. The comparison with the oracle expects libzip's refusal there, and `tests/deflate64.rs` checks the data.
+- WinZip AES decrypts four blocks of counter at a time, as `hivepack-crypto`'s AES encrypts them, where libzip encrypts one; the data is the same. `zip_set_default_password`, which cannot fail but for memory, returns nothing. A password is taken up to its first NUL byte, as libzip takes a C string. Where `zip_source_zip_file_create` cannot make the decrypting layer because the data is shorter than its header, it sets `ZIP_ER_OPNOTSUPP` on the archive's error and not on the one it is given, as with `ZIP_ER_COMPNOTSUPP`; the port's `ziptool` prints "No error" there too. The random bytes that encrypting takes come from `/dev/urandom` on Unix, read with the standard library, as `zip_random_unix.c` reads them, or from a `RandomSource` the caller gives (`Archive::set_random_source`), which they must where the system is not Unix: libzip asks Windows' and Apple's functions, which need `unsafe` code. `ziptool_regress_nonrandom`, whose random bytes are zeros, is the port's `ziptool` with `HIVEPACK_ZIPTOOL_NONRANDOM` set. Of the compression methods, deflate and bzip2 are read and written, as the oracle's libzip is built with libbzip2 (bzip2 1.0.8's sources) and without LZMA and Zstandard, and Deflate64 and PPMd are read, which libzip does not read: where libzip refuses such an entry with `ZIP_ER_COMPNOTSUPP` (once the password and sizes are checked, before the local header is read), the port reads it. The comparison with the oracle expects libzip's refusal there, and `tests/deflate64.rs` and `tests/ppmd.rs` check the data. The generated archives give method 97 (WavPack), which nothing reads, to the bytes that stand for a method without a reader.
 
 libzip's ways that the port keeps, though they surprise:
 
@@ -219,6 +220,17 @@ libzip's ways that the port keeps, though they surprise:
 - ZipCrypto encrypts with an empty password, which `zip_file_set_encryption` takes, but reading takes an empty password for none, so such an entry cannot be read; WinZip AES refuses it with `ZIP_ER_INVAL` when writing.
 - An encrypted entry whose compression method is changed is decrypted with its compressed size unknown, as `zip_stat_index` leaves it out once the method changes: from a file, which does not tell it, that fails with `ZIP_ER_OPNOTSUPP`; from a buffer, which gives its own length, ZipCrypto works and WinZip AES reads past the entry and fails with `ZIP_ER_EOF`.
 
+### PPMd
+
+ZIP's method 98 is PPMd var.I rev. 1 [APPNOTE 5.10]: two bytes, little-endian, with the model's order less one (bits 0 to 3), its memory in MiB less one (bits 4 to 11) and what is done when that runs out (bits 12 to 15: restart the model, cut it off, or freeze it), then the range coder's bytes, to an end marker. libzip has no reader for it, and the reference is 7-Zip's: `ppmd8.rs` is a port of `Ppmd8.c` and `Ppmd8Dec.c` from 7-Zip 26.05 (public domain), on a byte array with 32-bit offsets as hivepack-7z's `ppmd7.rs` is, and `algorithm_ppmd.rs` reads the stream as `PpmdZip.cpp`'s decoder does in the full-file mode 7-Zip's ZIP handler sets:
+
+- An order of 1 or a restore method past 2 is a data error (`ZIP_ER_COMPRESSED_DATA`); freezing the model (2) is not supported (`ZIP_ER_COMPNOTSUPP`), as 7-Zip is built without it. The memory, up to 256 MiB, is allocated zeroed, so that the system gives pages only as the model reaches them.
+- The data must end with the marker, the range decoder there with nothing left to read (`Ppmd8_RangeDec_IsFinishedOK`), and no byte may be read past the data: otherwise a data error, after the bytes decoded before it. What follows the marker is the compressing layer's to refuse, with `ZIP_CHECKCONS` (`ZIP_ER_INCONS`, `ZIP_ER_DETAIL_COMPRESSED_DATA_TRAILING_GARBAGE`), as after the other methods' data; 7-Zip always refuses it.
+- A symbol is decoded only with 1 KiB of input waiting, or all of it: it reads at most 8 bytes in each of at most 17 contexts, so that it reads what it would from the whole data, however the data comes. Its input has then always ended before the marker is read, where libzip's algorithms end before the end of their input is known, and are asked then what they kept; the compressing layer asks PPMd what is left after the marker instead.
+- The divisions the C code makes by a context's total frequency (`CreateSuccessors`), by the escape frequency (`Rescale`) and by the range coder's total and range (`RC_GetThreshold`) cannot be by 0 in a model built from any input, though nothing in the code says so: the port divides by 1 in the first two and gives a data error in the last, where the C code would crash.
+
+`src/ppmd8_oracle.rs` compares the decoder with 7-Zip's through `tools/7z-oracle`, built with `Ppmd8.c`, `Ppmd8Dec.c` and `Ppmd8Enc.c`: streams the oracle encodes from text, noise, runs, records and small alphabets, at orders 2 to 16 and with 4 KiB to 3 MiB (so that the model runs out of memory and is restarted or cut off), decoded whole, stopped early, with bits flipped, cut short, with bytes after them and with another model than they were made with. 1,000 requests are compared on each run, every function of the port reached, and `testdata/oracle/ppmd8.txt` replays 626 where the oracle is not built. `tests/ppmd.rs` reads archives `7zz` makes at levels 1, 5 and 9 and orders 2 to 16 with 1 MiB to 256 MiB, plain, with ZipCrypto and with WinZip AES, back to their files; refuses the copies with a bit flipped where `7zz t` refuses them, and reads the others; and reads libarchive's PPMd test archives, refusing the two that crashed it. The `zip_ppmd` fuzz target reads PPMd data in pieces of one byte and of growing sizes, which must give the same bytes and errors.
+
 ## The order of work
 
 1. **CRC-32 and inflate.** The decompressor and checksums of `hivepack-deflate`, ported from zlib 1.3.2 (`crc32.c`; `inflate.c`, `inftrees.c`, `inffast.c`). Nothing compressed can be read before them. Done: see [deflate.md](deflate.md).
@@ -226,7 +238,7 @@ libzip's ways that the port keeps, though they surprise:
 3. **Writing.** Writing headers, `close.rs`, the editor; the compressor of `hivepack-deflate` (`deflate.c`, `trees.c`), with output identical to zlib's: done, see [deflate.md](deflate.md). Editing, adding data and writing archives, `ziptool`'s commands and the tests that use them: done.
 4. **Encryption.** ZipCrypto and WinZip AES, on `hivepack-crypto` (AES, SHA-1, HMAC and PBKDF2, ported from BearSSL and compared with nettle; see [crypto.md](crypto.md)): decrypting and encrypting, done.
 5. **Beyond libzip.** Legacy code pages, split archives, streaming, parallel work. `hivepack-extract` is built alongside step 2, so that nothing reads archives to disk without it.
-6. **More methods.** bzip2, with `hivepack-bzip2` (see [bzip2.md](bzip2.md)), LZMA and XZ, with `hivepack-xz` (see [xz.md](xz.md)), and Zstandard, with `hivepack-zstd`: done. libzip keeps LZMA2 (method 33) disabled, because 7-Zip cannot unpack it, and so does the port. PPMd as its crate arrives.
+6. **More methods.** bzip2, with `hivepack-bzip2` (see [bzip2.md](bzip2.md)), LZMA and XZ, with `hivepack-xz` (see [xz.md](xz.md)), and Zstandard, with `hivepack-zstd`: done. libzip keeps LZMA2 (method 33) disabled, because 7-Zip cannot unpack it, and so does the port. PPMd (method 98), read as 7-Zip reads it: done.
 
 ## Questions to settle first
 
@@ -236,6 +248,6 @@ libzip's ways that the port keeps, though they surprise:
 
 ## Licences
 
-The port is derived from libzip, which is under BSD-3-Clause (Copyright (C) Dieter Baron and Thomas Klausner). That is why `hivepack-zip` is under BSD-3-Clause, with libzip's notice in its `LICENSE`, as `hivepack-zstd` keeps Meta's. `hivepack-deflate`, which `hivepack-zip` takes CRC-32 from too, is derived from zlib and is under the zlib license, which asks that altered versions be marked as such. The rest of hivepack stays MIT.
+The port is derived from libzip, which is under BSD-3-Clause (Copyright (C) Dieter Baron and Thomas Klausner). That is why `hivepack-zip` is under BSD-3-Clause, with libzip's notice in its `LICENSE`, as `hivepack-zstd` keeps Meta's. `ppmd8.rs` is derived from 7-Zip's `Ppmd8.c` and `Ppmd8Dec.c`, which Igor Pavlov put in the public domain (from Dmitry Shkarin's PPMd var.I and Dmitry Subbotin's range coder), as hivepack-7z's `ppmd7.rs` is from `Ppmd7.c`; `PpmdZip.cpp`, under the LGPL, was read for what it does, not ported. `hivepack-deflate`, which `hivepack-zip` takes CRC-32 from too, is derived from zlib and is under the zlib license, which asks that altered versions be marked as such. The rest of hivepack stays MIT.
 
 APPNOTE.TXT may not be redistributed (its section 1.4.2), so the repository links to it and does not include it. The test archives from libzip, libarchive, Go, Commons Compress and .NET keep their own licences, listed in [testdata/README.md](../testdata/README.md).

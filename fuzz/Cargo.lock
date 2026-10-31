@@ -179,6 +179,10 @@ name = "hivepack-bzip2"
 version = "0.0.0"
 
 [[package]]
+name = "hivepack-cpio"
+version = "0.0.0"
+
+[[package]]
 name = "hivepack-crypto"
 version = "0.0.0"
 
@@ -208,6 +212,7 @@ dependencies = [
  "hivepack-7z",
  "hivepack-age",
  "hivepack-bzip2",
+ "hivepack-cpio",
  "hivepack-deflate",
  "hivepack-extract",
  "hivepack-iso",

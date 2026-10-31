@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/7z", "crates/age", "crates/bzip2", "crates/crypto", "crates/deflate", "crates/extract", "crates/iso", "crates/lz4", "crates/open", "crates/rar", "crates/tar", "crates/udf", "crates/xar", "crates/xz", "crates/zip", "crates/zstd", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/xz-bench", "tools/ziptool", "tools/zip-bench", "tools/zstd-bench"]
+members = ["crates/7z", "crates/age", "crates/bzip2", "crates/cpio", "crates/crypto", "crates/deflate", "crates/extract", "crates/iso", "crates/lz4", "crates/open", "crates/rar", "crates/tar", "crates/udf", "crates/xar", "crates/xz", "crates/zip", "crates/zstd", "tools/7z-bench", "tools/bzip2-bench", "tools/deflate-bench", "tools/lz4-bench", "tools/tar-bench", "tools/xz-bench", "tools/ziptool", "tools/zip-bench", "tools/zstd-bench"]
 
 [workspace.package]
 edition = "2024"
@@ -14,6 +14,7 @@ homepage = "https://github.com/hivepaas/hivepack-rs"
 hivepack-7z = { path = "crates/7z" }
 hivepack-age = { path = "crates/age" }
 hivepack-bzip2 = { path = "crates/bzip2" }
+hivepack-cpio = { path = "crates/cpio" }
 hivepack-crypto = { path = "crates/crypto" }
 hivepack-deflate = { path = "crates/deflate" }
 hivepack-extract = { path = "crates/extract" }

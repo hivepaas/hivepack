@@ -194,6 +194,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hivepack-cpio"
+version = "0.0.0"
+dependencies = [
+ "hivepack-bzip2",
+ "hivepack-deflate",
+]
+
+[[package]]
 name = "hivepack-crypto"
 version = "0.0.0"
 
@@ -556,6 +564,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sevenz-bench"
+version = "0.0.0"
+dependencies = [
+ "hivepack-7z",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -570,6 +585,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tar-bench"
+version = "0.0.0"
+dependencies = [
+ "hivepack-tar",
 ]
 
 [[package]]

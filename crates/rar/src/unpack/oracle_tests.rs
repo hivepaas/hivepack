@@ -231,11 +231,11 @@ impl Pieces<'_> {
 }
 
 impl UnpIo for Pieces<'_> {
-    fn unp_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    fn unp_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
         let size = self.ready;
         buf[..size].copy_from_slice(&self.data[self.at - size..self.at]);
         self.ready = 0;
-        Ok(size)
+        Ok(Some(size))
     }
 
     fn unp_write(&mut self, _data: &[u8]) -> Result<(), Error> {

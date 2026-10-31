@@ -266,12 +266,12 @@ impl Unpack {
         } else {
             data_size = self.read_top;
         }
-        let mut read_code = 0;
+        let mut read_code = Some(0);
         if BitInput::MAX_SIZE != data_size {
             let (from, to) = (data_size as usize, BitInput::MAX_SIZE as usize);
-            read_code = io.unp_read(&mut self.inp.in_buf[from..to])? as i32;
+            read_code = io.unp_read(&mut self.inp.in_buf[from..to])?;
         }
-        self.read_top += read_code;
+        self.read_top += read_code.unwrap_or(0) as i32;
         self.read_border = self.read_top - 30;
         self.block_header.block_start = self.inp.in_addr;
         if self.block_header.block_size != -1 {
@@ -284,8 +284,7 @@ impl Unpack {
                     .wrapping_sub(1),
             );
         }
-        // `UnpRead` returns -1 only for a missing volume or a closed file.
-        Ok(true)
+        Ok(read_code.is_some())
     }
 
     /// `Unpack::UnpWriteBuf`.

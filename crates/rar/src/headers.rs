@@ -272,6 +272,7 @@ pub const SUBHEAD_TYPE_CMT: &str = "CMT";
 pub const SUBHEAD_TYPE_QOPEN: &str = "QO";
 pub const SUBHEAD_TYPE_RR: &str = "RR";
 pub const SUBHEAD_FLAGS_INHERITED: u32 = 0x8000_0000;
+pub const SUBHEAD_FLAGS_CMT_UNICODE: u32 = 1;
 
 /// A string as UnRAR keeps one on Linux: `wchar_t`s, 32 bits each, which
 /// a broken name can make into values that are not characters.

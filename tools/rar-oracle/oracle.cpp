@@ -410,6 +410,9 @@ void operator delete[](void *memory) noexcept { free(memory); }
 void operator delete[](void *memory, size_t) noexcept { free(memory); }
 
 static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
+  // A next volume that is there is fine, and one that is not stays that way.
+  if ((msg == UCM_CHANGEVOLUME || msg == UCM_CHANGEVOLUMEW) && p2 == RAR_VOL_NOTIFY)
+    return 1;
   if (msg != UCM_PROCESSDATA)
     return -1;
   const byte *data = (const byte *)p1;
@@ -421,11 +424,45 @@ static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
   return 1;
 }
 
+// The volumes of a `testvol` request, each a name and its bytes: the archive is
+// the first, among real files so that UnRAR finds the next ones by their names.
+static std::vector<std::pair<std::string, std::string>> request_volumes;
+
+static std::string write_volumes() {
+  char dir[] = "/tmp/rar-oracle-XXXXXX";
+  if (!mkdtemp(dir))
+    return "";
+  for (auto &volume : request_volumes) {
+    std::vector<byte> data = unhex(volume.second.c_str());
+    std::string name = std::string(dir) + "/" + volume.first;
+    FILE *f = fopen(name.c_str(), "wb");
+    if (!f)
+      return "";
+    if (!data.empty())
+      fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+  }
+  return dir;
+}
+
+static void remove_volumes(const std::string &dir) {
+  for (auto &volume : request_volumes)
+    unlink((dir + "/" + volume.first).c_str());
+  rmdir(dir.c_str());
+}
+
 static void do_test(const char *hex, unsigned long long limit) {
-  char path[64];
-  int fd = archive_file(hex, path, sizeof(path));
-  if (fd < 0)
-    return;
+  char path[256];
+  std::string volume_dir;
+  int fd = -1;
+  if (request_volumes.empty()) {
+    fd = archive_file(hex, path, sizeof(path));
+    if (fd < 0)
+      return;
+  } else {
+    volume_dir = write_volumes();
+    snprintf(path, sizeof(path), "%s/%s", volume_dir.c_str(), request_volumes[0].first.c_str());
+  }
 
   out = "test";
   ErrHandler.Clean();
@@ -467,14 +504,12 @@ static void do_test(const char *hex, unsigned long long limit) {
         put("headertype", (unsigned)Arc.GetHeaderType());
         put("cur", (unsigned long long)Arc.CurBlockPos);
         put("next", (unsigned long long)Arc.NextBlockPos);
-        // What hivepack-rar cannot read yet is passed over on both sides, and
-        // so is what UnRAR's mask refuses: "*" does not match a name that
+        // What UnRAR's mask refuses is passed over on both sides: "*" does not match a name that
         // starts with "*" and goes on, as match() takes that "*" for a plain
         // character. That is choosing files, and hivepack-rar has no masks.
         if (size != 0 && Arc.GetHeaderType() == HEAD_FILE) {
           FileHeader &h = Arc.FileHead;
-          if (h.SplitBefore || h.SplitAfter ||
-              !Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
+          if (!Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
             out += " later";
             Arc.SeekToNext();
             continue;
@@ -492,12 +527,59 @@ static void do_test(const char *hex, unsigned long long limit) {
         put("baddata", Cmd.DllError == ERAR_BAD_DATA);
         put("nopassword", Cmd.DllError == ERAR_MISSING_PASSWORD);
         put("badpassword", Cmd.DllError == ERAR_BAD_PASSWORD);
+        put("novolume", Cmd.DllError == ERAR_EOPEN);
         put("pos", (unsigned long long)Arc.Tell());
         put("broken", Arc.BrokenHeader);
         put("code", ErrHandler.GetErrorCode());
         if (!go)
           break;
       }
+    }
+  } catch (RAR_EXIT code) {
+    put("thrown", code);
+  } catch (std::bad_alloc &) {
+    out += " badalloc";
+  }
+  put("exit", ErrHandler.GetErrorCode());
+  if (volume_dir.empty())
+    close_archive_file(fd, path);
+  else
+    remove_volumes(volume_dir);
+  printf("%s\n", out.c_str());
+}
+
+// Archive::GetComment after opening, as what comes before the first entry.
+static void do_comment(const char *hex) {
+  char path[64];
+  int fd = archive_file(hex, path, sizeof(path));
+  if (fd < 0)
+    return;
+  out = "comment";
+  ErrHandler.Clean();
+  CommandData Cmd;
+  Cmd.QOpenMode = QOPEN_NONE;
+  set_password(Cmd);
+  try {
+    Archive Arc(&Cmd);
+    std::string narrow(path);
+    std::wstring wide(narrow.begin(), narrow.end());
+    if (!Arc.Open(wide)) {
+      out += " notopened";
+    } else if (!Arc.IsArchive(true)) {
+      out += " notarchive";
+    } else {
+      std::wstring comment;
+      if (Arc.GetComment(comment)) {
+        out += " comment=";
+        for (wchar c : comment) {
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%x,", (unsigned)c);
+          out += buf;
+        }
+      } else {
+        out += " none";
+      }
+      put("pos", (unsigned long long)Arc.Tell());
     }
   } catch (RAR_EXIT code) {
     put("thrown", code);
@@ -684,11 +766,25 @@ int main() {
       line += (char)c;
     if (c == EOF && line.empty())
       break;
-    char *words[8];
+    char *words[512];
     int count = 0;
-    for (char *w = strtok(&line[0], " "); w && count < 8; w = strtok(NULL, " "))
+    for (char *w = strtok(&line[0], " "); w && count < 512; w = strtok(NULL, " "))
       words[count++] = w;
-    if (count == 8 && strcmp(words[0], "crypt") == 0)
+    if (count >= 5 && count % 2 == 1 && strcmp(words[0], "testvol") == 0) {
+      // testvol <password> <limit> <name> <bytes> ...
+      if (strcmp(words[1], "-") != 0)
+        request_password = password_from_hex(words[1]);
+      for (int i = 3; i + 1 < count; i += 2)
+        request_volumes.emplace_back(words[i], words[i + 1]);
+      do_test("", strtoull(words[2], NULL, 10));
+      request_volumes.clear();
+      request_password.clear();
+    } else if (count == 3 && strcmp(words[0], "comment") == 0) {
+      if (strcmp(words[1], "-") != 0)
+        request_password = password_from_hex(words[1]);
+      do_comment(words[2]);
+      request_password.clear();
+    } else if (count == 8 && strcmp(words[0], "crypt") == 0)
       do_crypt(atoi(words[1]), words[2], words[3], words[4], (uint)atoi(words[5]),
                strtoul(words[6], NULL, 10), words[7]);
     else if ((count == 3 || count == 4) && strcmp(words[0], "testpw") == 0) {

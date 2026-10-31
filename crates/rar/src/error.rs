@@ -101,6 +101,9 @@ pub enum Error {
     /// The headers are encrypted, and no password was given: UnRAR's
     /// library stops there, with the exit code so far.
     MissingPassword { exit_code: ExitCode },
+    /// A next volume is not an archive, or says otherwise about encrypting
+    /// its headers: UnRAR stops all reading there, with this exit code.
+    BadVolume { exit_code: ExitCode },
     /// What hivepack-rar cannot read yet, which UnRAR can.
     NotYet(&'static str),
     /// There is no memory for a dictionary, or UnRAR refuses it for one: too
@@ -123,6 +126,7 @@ impl fmt::Display for Error {
             Error::MissingPassword { .. } => {
                 f.write_str("the headers are encrypted, and no password was given")
             }
+            Error::BadVolume { .. } => f.write_str("a next volume is not of this archive"),
             Error::NotYet(what) => write!(f, "{what}: not read yet"),
             Error::NoMemory => f.write_str("no memory for this dictionary"),
             Error::Io(e) => write!(f, "{e}"),

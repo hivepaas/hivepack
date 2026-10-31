@@ -78,8 +78,9 @@ const NC30: usize = 299;
 
 /// What decompression reads from and writes to: `ComprDataIO`.
 pub(crate) trait UnpIo {
-    /// `UnpRead`: packed data, how many bytes, 0 when none is left.
-    fn unp_read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
+    /// `UnpRead`: packed data, how many bytes, 0 when none is left, and
+    /// nothing where it returns -1, for a next volume that is missing.
+    fn unp_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error>;
     /// `UnpWrite`: unpacked data.
     fn unp_write(&mut self, data: &[u8]) -> Result<(), Error>;
 }

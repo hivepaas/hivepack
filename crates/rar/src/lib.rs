@@ -67,6 +67,7 @@
 //! `docs/rar.md`.
 
 mod archive;
+mod comment;
 mod crypt;
 mod error;
 mod extract;

@@ -393,3 +393,142 @@ mod tests {
         assert_eq!(name, wide("a\\b"));
     }
 }
+
+/// `GetNamePos`, on the name of a path.
+fn name_pos(name: &[char]) -> usize {
+    let is_div = |c: char| c == '/' || cfg!(windows) && c == '\\';
+    name.iter().rposition(|&c| is_div(c)).map_or(0, |i| i + 1)
+}
+
+/// `GetExtPos`.
+fn ext_pos(name: &[char]) -> Option<usize> {
+    let dot = name.iter().rposition(|&c| c == '.')?;
+    (dot >= name_pos(name)).then_some(dot)
+}
+
+/// `GetVolNumPos`.
+fn vol_num_pos(name: &[char]) -> usize {
+    let name_at = name_pos(name);
+    if name_at == name.len() {
+        return name_at;
+    }
+    let digit = |i: usize| name[i].is_ascii_digit();
+    let mut pos = name.len() - 1;
+    while !digit(pos) && pos > name_at {
+        pos -= 1;
+    }
+    let mut num_pos = pos;
+    while digit(num_pos) && num_pos > name_at {
+        num_pos -= 1;
+    }
+    // The first number of a name like name.part##of##.rar, up to a dot.
+    while num_pos > name_at && name[num_pos] != '.' {
+        if digit(num_pos) {
+            let dot = name[name_at..].iter().position(|&c| c == '.');
+            if dot.is_some_and(|d| d + name_at < num_pos) {
+                pos = num_pos;
+            }
+            break;
+        }
+        num_pos -= 1;
+    }
+    pos
+}
+
+/// A character one up: `++ArcName[NumPos]`, which wrong names get to as well.
+fn increment(c: &mut char) {
+    *c = char::from_u32(u32::from(*c) + 1).unwrap_or('\u{e000}');
+}
+
+/// `NextVolumeName`: the name of the volume after this one, `old_numbering`
+/// for `.rar`, `.r00`, `.r01` and on.
+pub fn next_volume_name(name: &str, old_numbering: bool) -> String {
+    let mut name: Vec<char> = name.chars().collect();
+    let dot_pos = match ext_pos(&name) {
+        None => {
+            name.extend(".rar".chars());
+            name.len() - 4
+        }
+        Some(dot) => {
+            let ext: String = name[dot + 1..].iter().collect();
+            if ext.is_empty() || ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("sfx")
+            {
+                name.truncate(dot);
+                name.extend(".rar".chars());
+            }
+            dot
+        }
+    };
+
+    if !old_numbering {
+        let mut num_pos = vol_num_pos(&name);
+        if num_pos == name.len() {
+            // A name that ends in a separator: nothing there to go up by.
+            return name.into_iter().collect();
+        }
+        loop {
+            increment(&mut name[num_pos]);
+            if name[num_pos] != ':' {
+                break;
+            }
+            name[num_pos] = '0';
+            if num_pos == 0 {
+                break;
+            }
+            num_pos -= 1;
+            if !name[num_pos].is_ascii_digit() {
+                // From .part9.rar to part10.rar.
+                name.insert(num_pos + 1, '1');
+                break;
+            }
+        }
+    } else {
+        if name.len() - dot_pos < 3 {
+            name.truncate(dot_pos + 1);
+            name.extend("rar".chars());
+        }
+        let digit = |i: usize| name.get(i).is_some_and(char::is_ascii_digit);
+        if !digit(dot_pos + 2) || !digit(dot_pos + 3) {
+            name.truncate(dot_pos + 2);
+            name.extend("00".chars());
+        } else {
+            let mut num_pos = name.len() - 1;
+            loop {
+                increment(&mut name[num_pos]);
+                if name[num_pos] != ':' {
+                    break;
+                }
+                if num_pos == 0 || name[num_pos - 1] == '.' {
+                    // From .999 to .a00.
+                    name[num_pos] = 'a';
+                    break;
+                }
+                name[num_pos] = '0';
+                num_pos -= 1;
+            }
+        }
+    }
+    name.into_iter().collect()
+}
+
+#[cfg(test)]
+mod next_volume_tests {
+    use super::next_volume_name as next;
+
+    #[test]
+    fn names_go_up_as_unrar_has_them() {
+        assert_eq!(next("a.part1.rar", false), "a.part2.rar");
+        assert_eq!(next("a.part9.rar", false), "a.part10.rar");
+        assert_eq!(next("a.part09.rar", false), "a.part10.rar");
+        assert_eq!(next("a.part1of3.rar", false), "a.part2of3.rar");
+        assert_eq!(next("dir.1/a.part1.rar", false), "dir.1/a.part2.rar");
+        assert_eq!(next("a.rar", true), "a.r00");
+        assert_eq!(next("a.r00", true), "a.r01");
+        assert_eq!(next("a.r09", true), "a.r10");
+        assert_eq!(next("a.r99", true), "a.s00");
+        assert_eq!(next("a.999", true), "a.a00");
+        assert_eq!(next("a", true), "a.r00");
+        assert_eq!(next("a.exe", true), "a.r00");
+        assert_eq!(next("a.part1.sfx", false), "a.part2.rar");
+    }
+}

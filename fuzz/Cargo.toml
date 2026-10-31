@@ -241,6 +241,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_volumes"
+path = "fuzz_targets/rar_volumes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

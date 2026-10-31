@@ -568,6 +568,11 @@ pub(crate) fn digest_to_mac(digest: &[u8; 32], key: &[u8; SHA256_DIGEST_SIZE]) -
 }
 
 impl CryptData {
+    /// `CryptData::SetCmt13Encryption`: RAR 1.3 keeps its comments like this.
+    pub(crate) fn cmt13() -> CryptData {
+        CryptData::Rar13 { key: [0, 7, 77] }
+    }
+
     /// `CryptData::DecryptBlock` of the first `size` bytes of `buf`. RAR 2's
     /// cipher goes on to the end of a block, within `buf` as nothing reads an
     /// unaligned amount here unless there is room for a block.

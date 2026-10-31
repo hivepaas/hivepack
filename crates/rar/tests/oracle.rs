@@ -306,8 +306,89 @@ fn mask_refuses(name: &[u32]) -> bool {
 
 /// The port's answer to a `test` request, in the oracle's words.
 fn answer_test(archive: &[u8], limit: Option<u64>, password: &str) -> String {
+    answer_test_on(Archive::open_with_password(archive, true, password), limit)
+}
+
+/// The port's answer to a `testvol` request.
+fn answer_test_volumes(words: &[&str]) -> String {
+    let password = if words[1] == "-" {
+        String::new()
+    } else {
+        String::from_utf8(unhex(words[1])).expect("a password")
+    };
+    let limit = words[2].parse().expect("a limit");
+    let limit = (limit != 0).then_some(limit);
+    let volumes: std::collections::HashMap<String, Vec<u8>> = words[3..]
+        .chunks(2)
+        .map(|pair| (pair[0].to_string(), unhex(pair[1])))
+        .collect();
+    let first = volumes[words[3]].clone();
+    let name = words[3].to_string();
+    let opened = Archive::open_volumes(
+        first,
+        &name,
+        move |next: &str| volumes.get(next).cloned(),
+        true,
+        &password,
+    );
+    answer_test_on(opened, limit)
+}
+
+/// The port's answer to a `comment` request.
+fn answer_comment(words: &[&str]) -> String {
+    let password = if words[1] == "-" {
+        String::new()
+    } else {
+        String::from_utf8(unhex(words[1])).expect("a password")
+    };
+    let data = unhex(words[2]);
+    let mut out = Out("comment".to_string());
+    let exit = match Archive::open_with_password(data.as_slice(), true, &password) {
+        Err(Error::NotRar { exit_code }) => {
+            out.0 += " notarchive";
+            exit_code
+        }
+        Err(Error::MissingPassword { exit_code }) => {
+            out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+            exit_code
+        }
+        Err(e) => panic!("{e}"),
+        Ok(mut arc) => {
+            let mut code = None;
+            match arc.get_comment() {
+                Ok(Some(comment)) => {
+                    out.0 += " comment=";
+                    for c in comment {
+                        let _ = write!(out.0, "{c:x},");
+                    }
+                }
+                Ok(None) => out.0 += " none",
+                Err(Error::MissingPassword { exit_code }) => {
+                    out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                    code = Some(exit_code);
+                }
+                Err(Error::NoMemory) => {
+                    out.0 += " badalloc";
+                    code = Some(arc.exit_code());
+                }
+                Err(e) => panic!("{e}"),
+            }
+            if code.is_none() {
+                out.put("pos", arc.position());
+            }
+            code.unwrap_or_else(|| arc.exit_code())
+        }
+    };
+    out.put("exit", u64::from(exit.number()));
+    out.0
+}
+
+fn answer_test_on<R: hivepack_rar::ReadAt>(
+    opened: Result<Archive<R>, Error>,
+    limit: Option<u64>,
+) -> String {
     let mut out = Out("test".to_string());
-    let exit = match Archive::open_with_password(archive, true, password) {
+    let exit = match opened {
         Err(Error::NotRar { exit_code }) => {
             out.0 += " notarchive";
             exit_code
@@ -357,15 +438,33 @@ fn answer_test(archive: &[u8], limit: Option<u64>, password: &str) -> String {
                     Ok(go) => {
                         out.put("data", bytes);
                         out.put("fnv", fnv);
-                        out.bool("baddata", extract.broken_file);
+                        // One word for these in UnRAR, the last that can say so.
+                        out.bool(
+                            "baddata",
+                            (extract.broken_file || extract.needs_previous_volume)
+                                && !extract.missing_password
+                                && !extract.bad_password
+                                && !extract.missing_volume
+                                && !extract.dictionary_too_large
+                                && !extract.unknown_format,
+                        );
                         out.bool("nopassword", extract.missing_password);
                         out.bool("badpassword", extract.bad_password);
+                        out.bool("novolume", extract.missing_volume);
                         out.put("pos", arc.position());
                         out.bool("broken", arc.broken_header);
                         out.put("code", u64::from(arc.exit_code().number()));
                         if !go {
                             break arc.exit_code();
                         }
+                    }
+                    Err(Error::BadVolume { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::BadArchive.number()));
+                        break exit_code;
+                    }
+                    Err(Error::MissingPassword { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                        break exit_code;
                     }
                     Err(Error::NotYet(_)) => {
                         out.0 += " later";
@@ -413,6 +512,12 @@ fn answer(request: &str) -> String {
     if words[0] == "test" {
         let limit = words.get(2).map(|n| n.parse().expect("a limit"));
         return answer_test(&unhex(words.get(1).copied().unwrap_or("-")), limit, "");
+    }
+    if words[0] == "testvol" {
+        return answer_test_volumes(&words);
+    }
+    if words[0] == "comment" {
+        return answer_comment(&words);
     }
     if words[0] == "testpw" {
         let password = String::from_utf8(unhex(words[1])).expect("a password");
@@ -889,6 +994,175 @@ fn other_projects_archives_test_like_unrar() {
     );
 }
 
+/// The volumes each archive goes with: those of its folder with the same name
+/// up to the first dot, from it on, in the order UnRAR will ask for them.
+fn volume_sets() -> Vec<Vec<(String, Vec<u8>)>> {
+    let mut archives = support::other_projects_archives();
+    archives.extend(
+        libarchive_archives()
+            .into_iter()
+            .map(|(name, data)| (format!("libarchive/{name}"), data)),
+    );
+    let split = |name: &str| -> (String, String) {
+        let (folder, file) = name.rsplit_once('/').unwrap_or(("", name));
+        (folder.to_string(), file.to_string())
+    };
+    let mut sets = Vec::new();
+    for (name, data) in &archives {
+        if !matches!(Archive::open(data.as_slice(), true), Ok(arc) if arc.volume) {
+            continue;
+        }
+        let (folder, file) = split(name);
+        let stem = file.split('.').next().unwrap_or_default().to_string();
+        let mut set = vec![(file.clone(), data.clone())];
+        for (other, other_data) in &archives {
+            let (other_folder, other_file) = split(other);
+            if other_folder == folder
+                && other_file != file
+                && other_file.split('.').next() == Some(&stem)
+            {
+                set.push((other_file, other_data.clone()));
+            }
+        }
+        sets.push(set);
+    }
+    sets
+}
+
+fn volumes_request(password: Option<&str>, set: &[(String, Vec<u8>)]) -> String {
+    let mut request = format!(
+        "testvol {} 0",
+        password.map_or("-".to_string(), |p| hex(p.as_bytes()))
+    );
+    for (name, data) in set {
+        let _ = write!(request, " {name} {}", hex(data));
+    }
+    request
+}
+
+// Volumes whole, from any of them, with one missing, and with one damaged.
+#[cfg(target_os = "linux")]
+#[test]
+fn volumes_test_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_000a);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(2);
+    let sets = volume_sets();
+    let (mut compared, mut merged) = (0, 0);
+    for set in &sets {
+        for password in [None, Some("password"), Some("junrar")] {
+            let request = volumes_request(password, set);
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &set[0].0);
+            compared += 1;
+            if !want.contains("novolume=1") && !want.contains("code=6") {
+                merged += 1;
+            }
+            // The last volume of the set missing.
+            if set.len() > 1 {
+                let request = volumes_request(password, &set[..set.len() - 1]);
+                let want = oracle.ask(&request);
+                assert_same(&request, &want, &format!("{}, one missing", set[0].0));
+                compared += 1;
+            }
+            for i in 0..count {
+                let mut damaged = set.clone();
+                let which = rng.below(set.len() as u64) as usize;
+                let copy = damage(&mut rng, &damaged[which].1);
+                damaged[which].1 = copy;
+                if i % 2 == 1 {
+                    support::patch::fix_header_crcs(&mut damaged[which].1);
+                }
+                let request = volumes_request(password, &damaged);
+                let want = oracle.ask(&request);
+                assert_same(&request, &want, &format!("{}, damaged {i}", set[0].0));
+                compared += 1;
+            }
+        }
+    }
+    if let Some(folder) = std::env::var_os("HIVEPACK_RAR_VOLUMES_CORPUS") {
+        for entry in std::fs::read_dir(folder).expect("the folder") {
+            let input = std::fs::read(entry.expect("an entry").path()).expect("an input");
+            for request in volume_requests(&hex(&input)) {
+                let want = oracle.ask(&request);
+                assert_same(&request, &want, &format!("input {:.40}", hex(&input)));
+                compared += 1;
+            }
+        }
+    }
+    eprintln!("{} sets, {compared} compared, {merged} went on", sets.len());
+    assert!(
+        sets.is_empty() || merged > 10,
+        "only {merged} sets went through"
+    );
+}
+
+// Comments of every kind of archive, as they are and damaged.
+#[cfg(target_os = "linux")]
+#[test]
+fn comments_are_unrars() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_000b);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(5);
+    let mut archives = support::other_projects_archives();
+    archives.extend(libarchive_archives());
+    let (mut compared, mut comments) = (0, 0);
+    for (name, data) in &archives {
+        for password in ["-", "password", "junrar"] {
+            let pw = if password == "-" {
+                "-".to_string()
+            } else {
+                hex(password.as_bytes())
+            };
+            let request = format!("comment {pw} {}", hex(data));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, password {password}"));
+            compared += 1;
+            if want.contains(" comment=") {
+                comments += 1;
+            } else if data.len() > 64 << 10 || !want.contains(" none") {
+                continue;
+            }
+            if data.len() > 64 << 10 {
+                continue;
+            }
+            for i in 0..count {
+                let mut damaged = damage(&mut rng, data);
+                if i % 2 == 1 {
+                    support::patch::fix_header_crcs(&mut damaged);
+                }
+                let request = format!("comment {pw} {}", hex(&damaged));
+                let want = oracle.ask(&request);
+                assert_same(&request, &want, &format!("{name}, damaged {i}"));
+                compared += 1;
+            }
+        }
+    }
+    eprintln!("{compared} compared, {comments} comments read");
+    assert!(
+        archives.is_empty() || comments >= 15,
+        "only {comments} comments read"
+    );
+}
+
 // Encrypted archives damaged, with their password, and what the `rar_password`
 // target found. Each kind of encryption keeps its own password.
 #[cfg(target_os = "linux")]
@@ -924,6 +1198,12 @@ fn encrypted_archives_damaged_test_like_unrar() {
                 assert_same(&request, &want, &format!("{name}, damaged {i}"));
                 compared += 1;
             }
+        }
+    }
+    for (input, _) in recorded_volumes() {
+        for request in volume_requests(&input) {
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("recorded input {input:.40}"));
         }
     }
     for (input, _) in recorded_password() {
@@ -1156,6 +1436,42 @@ fn recorded_password() -> Vec<(String, String)> {
     recorded_inputs(&recorded_password_path())
 }
 
+fn recorded_volumes_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-volumes.txt")
+}
+
+/// The requests a `rar_volumes` input stands for: testing and its comment.
+fn volume_requests(input: &str) -> [String; 2] {
+    let input = unhex(input);
+    let (at, flags, rest) = match input.as_slice() {
+        [a, b, c, rest @ ..] => (usize::from(*a) | usize::from(*b) << 8, *c, rest),
+        _ => (0, 0, &[][..]),
+    };
+    let (first, second) = rest.split_at(at.min(rest.len()));
+    let (mut first, mut second) = (first.to_vec(), second.to_vec());
+    if flags & 1 != 0 {
+        support::patch::fix_header_crcs(&mut first);
+        support::patch::fix_header_crcs(&mut second);
+    }
+    let pw = hex(FUZZ_PASSWORD.as_bytes());
+    // Files of nothing are written all the same.
+    [
+        volumes_request(
+            Some(FUZZ_PASSWORD),
+            &[
+                ("a.part1.rar".to_string(), first.clone()),
+                ("a.part2.rar".to_string(), second),
+            ],
+        ),
+        format!("comment {pw} {}", hex(&first)),
+    ]
+}
+
+/// The same from the `rar_volumes` target.
+fn recorded_volumes() -> Vec<(String, String)> {
+    recorded_inputs(&recorded_volumes_path())
+}
+
 fn recorded_inputs(path: &std::path::Path) -> Vec<(String, String)> {
     let text = std::fs::read_to_string(path).expect("the recorded inputs");
     text.lines()
@@ -1219,6 +1535,45 @@ fn port_reads_encrypted_as_recorded() {
         }
         assert_eq!(support::recorded_form(&got), want, "{input:.300}");
     }
+}
+
+#[test]
+fn port_reads_volumes_as_recorded() {
+    let recorded = recorded_volumes();
+    assert!(recorded.len() > 50, "only {} inputs", recorded.len());
+    for (input, want) in recorded {
+        let [test, comment] = volume_requests(&input);
+        let got = format!(
+            "{} {}",
+            support::recorded_form(&answer(&test)),
+            support::recorded_form(&answer(&comment))
+        );
+        if usize::BITS == 32 && got.contains(" badalloc") {
+            continue;
+        }
+        assert_eq!(got, want, "{input:.300}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-volumes.txt from the oracle"]
+fn record_volumes_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle) for inputs the rar_volumes fuzz target found, replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_volumes_answers -- --ignored\n",
+    );
+    for (input, _) in recorded_volumes() {
+        let [test, comment] = volume_requests(&input);
+        let _ = writeln!(
+            text,
+            "{input}\t{} {}",
+            support::recorded_form(&oracle.ask(&test)),
+            support::recorded_form(&oracle.ask(&comment))
+        );
+    }
+    std::fs::write(recorded_volumes_path(), text).expect("written");
 }
 
 #[cfg(target_os = "linux")]

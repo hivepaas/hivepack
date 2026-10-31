@@ -19,6 +19,7 @@ use hivepack_crypto::Sha256;
 use crate::crypt::{KdfCache, Password, set_crypt_keys};
 use crate::error::{Error, ExitCode};
 use crate::headers::*;
+use crate::name::next_volume_name;
 use crate::name::{
     arc_char_to_wide, char_to_wide, convert_file_header, decode_encoded, utf_to_wide,
 };
@@ -35,6 +36,9 @@ fn safe_add(a: i64, b: i64, fallback: i64) -> i64 {
         fallback
     }
 }
+
+/// How a next volume is got, by its name.
+type OpenVolume<R> = Box<dyn FnMut(&str) -> Option<R>>;
 
 /// A RAR archive being read, header by header, as UnRAR's `Archive` reads
 /// it: [`open`](Archive::open) finds the signature and the main header,
@@ -81,6 +85,10 @@ pub struct Archive<R> {
     exit_code: ExitCode,
     /// `Cmd->Password`.
     pub(crate) password: Password,
+    /// `FileName`, and how to get what is called something else: without it,
+    /// no next volume can be found.
+    name: String,
+    open_volume: Option<OpenVolume<R>>,
     /// Where the derivations of keys are kept, for the headers and the data.
     pub(crate) kdf_cache: KdfCache,
 }
@@ -105,7 +113,36 @@ impl<R: ReadAt> Archive<R> {
         Archive::open_with(src, enable_broken, Some(password))
     }
 
+    /// [`Archive::open_with_password`] for a volume of many, called `name`. A
+    /// next volume's name comes from it as UnRAR makes it, the path included,
+    /// and `open` is asked for it: nothing, if there is none.
+    pub fn open_volumes(
+        src: R,
+        name: &str,
+        open: impl FnMut(&str) -> Option<R> + 'static,
+        enable_broken: bool,
+        password: &str,
+    ) -> Result<Archive<R>, Error> {
+        Archive::open_with_volumes(
+            src,
+            enable_broken,
+            Some(password),
+            name.to_string(),
+            Some(Box::new(open)),
+        )
+    }
+
     fn open_with(src: R, enable_broken: bool, password: Option<&str>) -> Result<Archive<R>, Error> {
+        Archive::open_with_volumes(src, enable_broken, password, String::new(), None)
+    }
+
+    fn open_with_volumes(
+        src: R,
+        enable_broken: bool,
+        password: Option<&str>,
+        name: String,
+        open_volume: Option<OpenVolume<R>>,
+    ) -> Result<Archive<R>, Error> {
         let mut archive = Archive {
             src,
             pos: 0,
@@ -140,6 +177,8 @@ impl<R: ReadAt> Archive<R> {
             silent_open: false,
             exit_code: ExitCode::Success,
             password: Password::new(password.unwrap_or_default()),
+            name,
+            open_volume,
             kdf_cache: KdfCache::default(),
         };
         if archive.is_archive(enable_broken)? {
@@ -392,6 +431,119 @@ impl<R: ReadAt> Archive<R> {
             self.cur_header_type = HEAD_UNKNOWN;
         }
         Ok(read_size)
+    }
+
+    /// `Archive::SearchBlock`.
+    fn search_block(&mut self, header_type: u32) -> Result<usize, Error> {
+        loop {
+            let size = self.read_header()?;
+            if size == 0 || (header_type != HEAD_ENDARC && self.cur_header_type == HEAD_ENDARC) {
+                return Ok(0);
+            }
+            if self.cur_header_type == header_type {
+                return Ok(size);
+            }
+            self.seek_to_next();
+        }
+    }
+
+    /// `Archive::SearchSubBlock`.
+    pub(crate) fn search_sub_block(&mut self, kind: &str) -> Result<usize, Error> {
+        loop {
+            let size = self.read_header()?;
+            if size == 0 || self.cur_header_type == HEAD_ENDARC {
+                return Ok(0);
+            }
+            if self.cur_header_type == HEAD_SERVICE && self.sub_head.is_named(kind) {
+                return Ok(size);
+            }
+            self.seek_to_next();
+        }
+    }
+
+    /// `Archive::GetStartPos`.
+    pub(crate) fn start_pos(&self) -> u64 {
+        let mut pos = self.sfx_size + u64::from(self.mark_head.head_size);
+        if self.format == Format::Rar15 {
+            pos += u64::from(self.main_head.base.head_size);
+        } else {
+            pos += u64::from(self.crypt_head.base.head_size)
+                + u64::from(self.full_header_size(self.main_head.base.head_size as usize));
+        }
+        pos
+    }
+
+    /// `File::Tell`, in the crate.
+    pub(crate) fn tell_pos(&self) -> u64 {
+        self.tell()
+    }
+
+    /// `File::GetByte`, in the crate.
+    pub(crate) fn next_byte(&mut self) -> io::Result<u8> {
+        self.get_byte()
+    }
+
+    /// `MergeArchive`: goes on to the next volume, nothing if there is none,
+    /// and otherwise where the data goes on: `DataIO->UnpVolume`, and
+    /// `SetPackedSizeToRead`. The hash of the packed data is left out, which
+    /// UnRAR only says something about.
+    pub(crate) fn merge_archive(&mut self) -> Result<Option<(bool, u64)>, Error> {
+        let header_type = self.cur_header_type;
+        let is_service = header_type == HEAD_SERVICE;
+        let is_part = header_type == HEAD_FILE || is_service;
+        let split_after = if is_service {
+            self.sub_head.split_after
+        } else {
+            self.file_head.split_after
+        };
+        let split_header = is_part && split_after;
+        let prev_vol_encrypted = self.encrypted;
+        let pos_before_close = self.tell();
+
+        let mut next_name = next_volume_name(&self.name, !self.new_numbering);
+        let mut opened = self.open_volume.as_mut().and_then(|open| open(&next_name));
+        if opened.is_none() {
+            // New style volumes renamed to the old style.
+            let alt_name = next_volume_name(&self.name, true);
+            opened = self.open_volume.as_mut().and_then(|open| open(&alt_name));
+            if opened.is_some() {
+                next_name = alt_name;
+            }
+        }
+        let Some(src) = opened else {
+            self.set_error_code(ExitCode::Open);
+            self.seek(pos_before_close);
+            return Ok(None);
+        };
+        self.src = src;
+        self.name = next_name;
+        self.seek(0);
+
+        // `CheckArc`, and `ErrHandler.Exit`, which sets the code first.
+        if !self.is_archive(true)? || self.encrypted != prev_vol_encrypted {
+            self.set_error_code(ExitCode::BadArchive);
+            return Err(Error::BadVolume {
+                exit_code: self.exit_code,
+            });
+        }
+
+        if split_header {
+            self.search_block(header_type)?;
+        } else {
+            self.read_header()?;
+        }
+        if self.cur_header_type == HEAD_FILE {
+            self.seek((self.next_block_pos - self.file_head.pack_size) as u64);
+        }
+        if header_type == HEAD_ENDARC {
+            return Ok(Some((false, 0)));
+        }
+        let hd = if is_service {
+            &self.sub_head
+        } else {
+            &self.file_head
+        };
+        Ok(Some((hd.split_after, hd.pack_size as u64)))
     }
 
     fn sanitize_header(&mut self) -> bool {

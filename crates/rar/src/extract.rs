@@ -36,34 +36,78 @@ const VER_UNPACK: u32 = 29;
 const VER_UNPACK7: u32 = 70;
 
 /// `ComprDataIO`, for an entry that is whole in this volume.
-struct DataIo<'a, 'o, R: ReadAt> {
-    arc: &'a mut Archive<R>,
-    packed_left: u64,
-    hash: &'a mut DataHash,
-    out: &'a mut Output<'o>,
-    skip_unp_crc: bool,
-    cur_unp_write: &'a mut u64,
-    decrypt: Option<CryptData>,
+pub(crate) struct DataIo<'a, 'o, R: ReadAt> {
+    pub(crate) arc: &'a mut Archive<R>,
+    /// `UnpPackedLeft`: below 0 only in the case `unp_read` tells of.
+    pub(crate) packed_left: i64,
+    pub(crate) hash: &'a mut DataHash,
+    pub(crate) out: &'a mut Output<'o>,
+    pub(crate) skip_unp_crc: bool,
+    pub(crate) cur_unp_write: &'a mut u64,
+    pub(crate) decrypt: Option<CryptData>,
+    /// `UnpVolume`: the data goes on in the next volume.
+    pub(crate) unp_volume: bool,
+    /// `NextVolumeMissing`.
+    pub(crate) next_volume_missing: bool,
 }
 
 impl<R: ReadAt> UnpIo for DataIo<'_, '_, R> {
-    fn unp_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    fn unp_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
+        let decrypting = self.decrypt.is_some();
         // Whole blocks: what reads here always asks for more than one.
-        let count = if self.decrypt.is_some() {
+        let mut count = if decrypting {
             buf.len() & !15
         } else {
             buf.len()
         };
-        let to_read = (count as u64).min(self.packed_left) as usize;
-        if to_read == 0 {
-            return Ok(0);
+        let (mut read, mut total) = (0, 0);
+        while count > 0 {
+            let mut to_read = (count as i64).min(self.packed_left).max(0) as usize;
+            if to_read > 0 {
+                if self.unp_volume && decrypting && count as i64 > self.packed_left {
+                    // Aligned blocks for decrypting: the next volume is only
+                    // asked for over the last few bytes, when what can be had
+                    // from this one has been had.
+                    let new_total = total + to_read;
+                    let new_to_read = to_read.wrapping_sub(new_total & 15);
+                    if new_to_read as i32 > 0 {
+                        to_read = new_to_read;
+                    }
+                }
+                read = self.arc.cursor().read(&mut buf[total..total + to_read])?;
+            }
+            // With nothing to read this is what was read the last time, as in
+            // UnRAR, when a next volume has no data after an unaligned read.
+            // UnRAR then goes on to read without end into its buffer, with the
+            // size below 0: `to_read` of nothing above, here.
+            total = (total + read).min(buf.len());
+            count = count.saturating_sub(read);
+            self.packed_left -= read as i64;
+
+            // Not asked for if this volume gave something, unless decrypting
+            // has an incomplete block.
+            if self.unp_volume
+                && self.packed_left == 0
+                && (read == 0 || decrypting && total & 15 != 0)
+            {
+                match self.arc.merge_archive()? {
+                    Some((unp_volume, packed_size)) => {
+                        self.unp_volume = unp_volume;
+                        self.packed_left = packed_size as i64;
+                    }
+                    None => {
+                        self.next_volume_missing = true;
+                        return Ok(None);
+                    }
+                }
+            } else {
+                break;
+            }
         }
-        let read = self.arc.cursor().read(&mut buf[..to_read])?;
-        self.packed_left -= read as u64;
         if let Some(decrypt) = &mut self.decrypt {
-            decrypt.decrypt_block(buf, read);
+            decrypt.decrypt_block(buf, total);
         }
-        Ok(read)
+        Ok(Some(total))
     }
 
     fn unp_write(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -101,10 +145,24 @@ pub struct Extract {
     /// Whether RAR 5's check says the password is not the last entry's: its
     /// data is not read, unless a solid stream needs it to go on.
     pub bad_password: bool,
+    /// Whether the last entry goes on from a volume before the first one seen:
+    /// `ERAR_BAD_DATA`, with the exit code [`ExitCode::Open`].
+    pub needs_previous_volume: bool,
+    /// Whether a next volume was wanted and is not there: `ERAR_EOPEN`, with
+    /// the exit code [`ExitCode::Open`].
+    pub missing_volume: bool,
+    /// Whether the last entry's dictionary is over `win_size_limit`.
+    pub dictionary_too_large: bool,
+    /// Whether the last entry is of a version or an encryption not known.
+    pub unknown_format: bool,
     /// `Unp`: made when first needed, and it lasts for a solid archive's sake.
     unp: Option<Box<Unpack>>,
     /// `FileCount`: the entries gone through that were to be read.
     file_count: u32,
+    /// `DataIO.UnpVolume`.
+    unp_volume: bool,
+    /// `FirstFile`: nothing was gone through yet.
+    gone_through: bool,
 }
 
 impl Default for Extract {
@@ -116,8 +174,14 @@ impl Default for Extract {
             broken_file: false,
             missing_password: false,
             bad_password: false,
+            needs_previous_volume: false,
+            missing_volume: false,
+            dictionary_too_large: false,
+            unknown_format: false,
             unp: None,
             file_count: 0,
+            unp_volume: false,
+            gone_through: false,
         }
     }
 }
@@ -154,37 +218,69 @@ impl Extract {
         self.broken_file = false;
         self.missing_password = false;
         self.bad_password = false;
+        self.needs_previous_volume = false;
+        self.missing_volume = false;
+        self.dictionary_too_large = false;
+        self.unknown_format = false;
         if header_size == 0 {
-            return Ok(false);
+            if !self.unp_volume {
+                return Ok(false);
+            }
+            // An old volume without an end of archive record, whose last file
+            // is not split.
+            match arc.merge_archive()? {
+                Some((unp_volume, _)) => self.unp_volume = unp_volume,
+                None => {
+                    self.missing_volume = true;
+                    arc.set_error_code(ExitCode::Warning);
+                    return Ok(false);
+                }
+            }
         }
         let header_type = arc.cur_header_type;
         if header_type != HEAD_FILE {
             if header_type == HEAD_ENDARC {
-                // MergeArchive cannot open a next volume, for now: volumes
-                // are step 3. It says so, and ExtractCurrentFile warns.
-                if arc.end_arc_head.next_volume {
-                    arc.set_error_code(ExitCode::Open);
-                    arc.set_error_code(ExitCode::Warning);
+                if !arc.end_arc_head.next_volume {
+                    return Ok(false);
                 }
-                return Ok(false);
+                match arc.merge_archive()? {
+                    Some((unp_volume, _)) => self.unp_volume = unp_volume,
+                    None => {
+                        self.missing_volume = true;
+                        arc.set_error_code(ExitCode::Warning);
+                        return Ok(false);
+                    }
+                }
+                arc.seek(arc.cur_block_pos as u64);
+                return Ok(true);
             }
             arc.seek_to_next();
             return Ok(true);
         }
 
         let head = &arc.file_head;
-        if head.split_before || head.split_after {
-            return Err(Error::NotYet("data split across volumes"));
-        }
-
         let named = !convert_path(&head.file_name).is_empty();
-        let (redir_type, dir) = (head.redir_type, head.dir);
+        let (redir_type, dir, split_before) = (head.redir_type, head.dir, head.split_before);
+        self.unp_volume = head.split_after;
 
         // `Arc.Seek(Arc.NextBlockPos-Arc.FileHead.PackSize,SEEK_SET)`: the end
         // of the header, as the next position is the header's end plus the
         // pack size, or reading the header would have failed. So this always
         // moves forward from the header's start.
         arc.seek((arc.next_block_pos - arc.file_head.pack_size) as u64);
+
+        // The first file going on from a volume that is not here.
+        let mut matched = true;
+        if !self.gone_through && split_before {
+            self.needs_previous_volume = true;
+            arc.set_error_code(ExitCode::Open);
+            matched = false;
+        }
+        self.gone_through = true;
+        if !matched && !arc.solid {
+            arc.seek_to_next();
+            return Ok(true);
+        }
 
         // `CheckUnpVer`: stored data does not care about the version. A kind
         // of encryption UnRAR does not know stops even a stored entry, whether
@@ -197,13 +293,14 @@ impl Extract {
                 !(13..=VER_UNPACK).contains(&unp_ver)
             };
         if wrong_ver || arc.file_head.crypt_method == CryptMethod::Unknown {
+            self.unknown_format = true;
             arc.set_error_code(ExitCode::Fatal);
             arc.seek_to_next();
             return Ok(!arc.solid);
         }
 
         // Also excludes names of nothing, like "/" or "../".
-        let mut extr_file = named;
+        let mut extr_file = matched && named && !split_before;
 
         let mut decrypt = None;
         let mut hash_key = None;
@@ -263,6 +360,7 @@ impl Extract {
 
         let mut hash = DataHash::new(arc.file_head.file_hash.kind);
         let mut show_checksum = true;
+        let mut next_volume_missing = false;
         if link_entry {
             // Nothing to read for any of them when testing. A kind nobody
             // knows has no checksum to speak of, and RAR 4's links keep
@@ -270,8 +368,10 @@ impl Extract {
             if redir_type == Redirection::Unknown || arc.format == Format::Rar15 {
                 show_checksum = false;
             }
+        } else if split_before {
+            // What this entry goes on from is not here: nothing to read.
         } else if arc.file_head.method == 0 {
-            let packed_left = arc.file_head.pack_size as u64;
+            let packed_left = arc.file_head.pack_size;
             let dest_left = arc.file_head.unp_size as u64;
             let mut io = DataIo {
                 arc: &mut *arc,
@@ -281,8 +381,12 @@ impl Extract {
                 skip_unp_crc: self.skip_solid,
                 cur_unp_write: &mut self.cur_unp_write,
                 decrypt,
+                unp_volume: self.unp_volume,
+                next_volume_missing: false,
             };
             unstore_file(&mut io, dest_left)?;
+            self.unp_volume = io.unp_volume;
+            next_volume_missing = io.next_volume_missing;
         } else {
             let unp = self.unp.get_or_insert_with(|| Box::new(Unpack::new()));
             unp.init(arc.file_head.win_size, arc.file_head.solid)?;
@@ -293,7 +397,7 @@ impl Extract {
             } else {
                 (arc.file_head.unp_ver, arc.file_head.solid)
             };
-            let packed_left = arc.file_head.pack_size as u64;
+            let packed_left = arc.file_head.pack_size;
             let mut io = DataIo {
                 arc: &mut *arc,
                 packed_left,
@@ -302,29 +406,37 @@ impl Extract {
                 skip_unp_crc: self.skip_solid,
                 cur_unp_write: &mut self.cur_unp_write,
                 decrypt,
+                unp_volume: self.unp_volume,
+                next_volume_missing: false,
             };
             unp.do_unpack(method, solid, &mut io)?;
+            self.unp_volume = io.unp_volume;
+            next_volume_missing = io.next_volume_missing;
         }
         arc.seek_to_next();
 
         let key = hash_key.filter(|_| arc.file_head.use_hash_key);
-        let valid = match &key {
-            Some(key) => hash.matches_keyed(&arc.file_head.file_hash, key),
-            None => hash.matches(&arc.file_head.file_hash),
-        };
+        // An entry still going on has a hash of its packed data, if any.
+        let valid = !arc.file_head.split_after
+            && match &key {
+                Some(key) => hash.matches_keyed(&arc.file_head.file_hash, key),
+                None => hash.matches(&arc.file_head.file_hash),
+            };
         if !self.skip_solid && show_checksum && !valid {
             self.broken_file = true;
             arc.set_error_code(ExitCode::Crc);
         }
-        Ok(true)
+        self.missing_volume = next_volume_missing;
+        Ok(!next_volume_missing)
     }
 
     /// `CmdExtract::CheckWinLimit`, where nobody allows more.
-    fn check_win_limit<R: ReadAt>(&self, arc: &mut Archive<R>) -> bool {
+    fn check_win_limit<R: ReadAt>(&mut self, arc: &mut Archive<R>) -> bool {
         // `Cmd->WinSize`, the default of the -md switch, is smaller.
         if arc.file_head.win_size <= self.win_size_limit {
             return true;
         }
+        self.dictionary_too_large = true;
         arc.set_error_code(ExitCode::Fatal);
         arc.seek_to_next();
         false
@@ -333,10 +445,13 @@ impl Extract {
 
 /// `CmdExtract::UnstoreFile`: up to the pack size is read, and up to the
 /// unpacked size written. Neither is negative: the header's reading sees to it.
-fn unstore_file<R: ReadAt>(io: &mut DataIo<'_, '_, R>, mut dest_left: u64) -> Result<(), Error> {
+pub(crate) fn unstore_file<R: ReadAt>(
+    io: &mut DataIo<'_, '_, R>,
+    mut dest_left: u64,
+) -> Result<(), Error> {
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
     loop {
-        let read = io.unp_read(&mut buffer)?;
+        let read = io.unp_read(&mut buffer)?.unwrap_or(0);
         if read == 0 {
             return Ok(());
         }

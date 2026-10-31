@@ -52,13 +52,15 @@
 //! ```
 //!
 //! [`extract_tar`] extracts tar archives with the same rules, reading them
-//! twice: once to check, once to write; [`extract_iso`] ISO 9660 images, the
-//! same way; [`extract_udf`] UDF volumes, walked and checked first, as ZIP
-//! archives are.
+//! twice: once to check, once to write; [`extract_cpio`] cpio archives
+//! (RPM packages' payloads among them) and [`extract_iso`] ISO 9660
+//! images, the same way; [`extract_udf`] UDF volumes, walked and checked
+//! first, as ZIP archives are.
 //!
 //! The design, and what comes next (RAR), are in the repository's
 //! `docs/extract.md`.
 
+mod cpio;
 mod destination;
 mod error;
 mod iso;
@@ -71,6 +73,7 @@ mod udf;
 mod unicode;
 mod zip;
 
+pub use cpio::extract_cpio;
 pub use error::{Error, ErrorKind};
 pub use iso::extract_iso;
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};

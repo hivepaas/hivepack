@@ -235,6 +235,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "extract_cpio"
+path = "fuzz_targets/extract_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rar_unpack"
 path = "fuzz_targets/rar_unpack.rs"
 test = false

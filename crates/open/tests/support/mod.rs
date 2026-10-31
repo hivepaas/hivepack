@@ -234,6 +234,39 @@ pub fn xz_preset(data: &[u8], preset: u32) -> Vec<u8> {
     lzma_stream(stream, data)
 }
 
+/// An xz stream without a check, as Apple's packages' pbzx chunks have.
+pub fn xz_no_check(data: &[u8]) -> Vec<u8> {
+    let stream =
+        liblzma::stream::Stream::new_easy_encoder(6, liblzma::stream::Check::None).expect("xz");
+    lzma_stream(stream, data)
+}
+
+/// A pbzx chunk: its size, the size of what stores it, and that.
+pub fn pbzx_chunk(size: u64, stored: &[u8]) -> Vec<u8> {
+    let mut chunk = size.to_be_bytes().to_vec();
+    chunk.extend((stored.len() as u64).to_be_bytes());
+    chunk.extend(stored);
+    chunk
+}
+
+/// pbzx with the block size `block`, and these chunks.
+pub fn pbzx_of(block: u64, chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut file = b"pbzx".to_vec();
+    file.extend(block.to_be_bytes());
+    file.extend(chunks.concat());
+    file
+}
+
+/// pbzx as Apple writes it: blocks of 16 MiB, each compressed with xz,
+/// here cut every `chunk` bytes.
+pub fn pbzx(data: &[u8], chunk: usize) -> Vec<u8> {
+    let chunks: Vec<_> = data
+        .chunks(chunk)
+        .map(|c| pbzx_chunk(c.len() as u64, &xz_no_check(c)))
+        .collect();
+    pbzx_of(1 << 24, &chunks)
+}
+
 /// .lzma, LZMA_Alone.
 pub fn lzma(data: &[u8]) -> Vec<u8> {
     let options = liblzma::stream::LzmaOptions::new_preset(6).expect("preset");
@@ -290,4 +323,90 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A newc cpio archive (SVR4, `070701`) of `entries`, files and, for names
+/// ending in `/`, directories, then `TRAILER!!!`, as GNU cpio writes one.
+pub fn newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut put = |name: &str, mode: u32, data: &[u8], ino: u32| {
+        let name = name.trim_end_matches('/');
+        let fields = [
+            ino,
+            mode,
+            1000,
+            1000,
+            1,
+            1_700_000_000,
+            data.len() as u32,
+            8,
+            1,
+            0,
+            0,
+            name.len() as u32 + 1,
+            0,
+        ];
+        out.extend(b"070701");
+        for field in fields {
+            out.extend(format!("{field:08x}").as_bytes());
+        }
+        out.extend(name.as_bytes());
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    };
+    for (i, &(name, data)) in entries.iter().enumerate() {
+        let mode = if name.ends_with('/') {
+            0o040755
+        } else {
+            0o100644
+        };
+        put(name, mode, data, i as u32 + 1);
+    }
+    put("TRAILER!!!", 0, b"", 0);
+    out
+}
+
+/// An RPM package around `payload`: a lead (version 3, a binary package),
+/// a signature header with one entry and its data, padded to 8 bytes, and
+/// a header with none, as rpm writes them.
+pub fn rpm(payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0xED, 0xAB, 0xEE, 0xDB, 3, 0, 0, 0, 0, 1];
+    let mut name = b"hello-1.0-1".to_vec();
+    name.resize(66, 0);
+    out.extend(name);
+    out.extend([0, 1, 0, 5]);
+    out.extend([0; 16]);
+    assert_eq!(out.len(), 96);
+    let header = |entries: &[[u8; 16]], data: &[u8]| {
+        let mut h = vec![0x8E, 0xAD, 0xE8, 0x01, 0, 0, 0, 0];
+        h.extend((entries.len() as u32).to_be_bytes());
+        h.extend((data.len() as u32).to_be_bytes());
+        for entry in entries {
+            h.extend(entry);
+        }
+        h.extend(data);
+        h
+    };
+    // RPMSIGTAG_SIZE, an INT32 at 0, of 1.
+    let size_tag = [0, 0, 0x03, 0xE8, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1];
+    out.extend(header(&[size_tag], &[0, 0, 0x30, 0x39, 1, 2, 3]));
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
+    out.extend(header(&[], &[]));
+    out.extend(payload);
+    out
+}
+
+/// Where `scripts/testdata.py` keeps the sets it fetches.
+pub fn testdata() -> PathBuf {
+    std::env::var_os("HIVEPACK_TESTDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository().join("target/testdata"))
 }

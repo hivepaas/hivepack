@@ -66,6 +66,7 @@ AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 
 
 What to read in it:
 
+- **Other machines:** the crate's README has Linux x86-64, Windows x86-64 and macOS arm64, from `.github/workflows/bench.yml`.
 - **Headers** are where a tar reader does its own work, and the port takes about half of Go's time. Neither was profiled, so why is not shown; Go's `Header` holds strings and maps, and Go has a garbage collector.
 - **Data** is mostly a copy, so it measures memory: from a file, the page cache. Compressors in front of tar will set the speed, not this.
 - **Seeking in a file** is what going through a large archive on disk needs: without it, as `Reader::new` does, all the data is read, at 32 GB/s here from the page cache and far less from a disk. From memory, the 134× is not the port's doing: its skip reads into a buffer nothing looks at, and about 14 µs for 64 MiB can only mean the compiler took the copy out, where Go's copy through a plain reader stays. A real source is a file or a decompressor, as in the rows beside it.

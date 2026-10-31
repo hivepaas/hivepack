@@ -23,16 +23,20 @@ How the port follows Go, and how it is checked, is in [docs/tar.md](../../docs/t
 
 Against Go 1.27.2's `archive/tar`, with `tools/tar-bench`. Above 1× the port is faster.
 
-| | hivepack-tar / Go |
-|---|---|
-| Going through entries, USTAR, PAX and sparse | 2.18–2.61× |
-| Going through entries, GNU long names | 1.48× |
-| Reading data, from memory | 1.20–2.00× |
-| Reading data, from a file | 1.02–1.05× |
-| Skipping data, through a buffer | 0.96× |
-| Skipping data, seeking in a file | 2.05–2.21× |
+| Port / Go | Linux x86-64 | Windows x86-64 | macOS arm64 |
+|---|---|---|---|
+| Going through entries, USTAR and PAX, from memory | 2.88–3.03× | 2.20–2.28× | 2.52× |
+| Going through entries, GNU long names, from memory | 1.81× | 1.43× | 1.75× |
+| Going through entries, from a file | 1.89–2.47× | 1.48–2.01× | 1.49–2.08× |
+| Going through sparse entries, from memory | 2.38–2.47× | no GNU tar | see below |
+| Reading data, from memory | 0.96–2.00× | 2.12–2.16× | 1.61–2.46× |
+| Reading data, from a file | 1.05–1.09× | 1.12–1.15× | 0.99–1.08× |
+| Skipping data, through a buffer | 1.04× | 0.96× | 1.26× |
+| Skipping data, seeking in a file | 1.78–1.92× | 1.41–1.49× | 1.51–1.53× |
 
-**Measured on:** AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, Go 1.27.2, in October 2026. The data is the Silesia corpus cut to 64 MiB, and archives of 200,000 entries, the best of five rounds taken in turn. Both found the same entries and read the same bytes. The whole table and the reasons are in [docs/tar.md](../../docs/tar.md#the-speed).
+**Measured on** GitHub's runners with `.github/workflows/bench.yml`, on October 31, 2026, the best of five rounds taken in turn: Linux on an AMD EPYC 9V45 (4 threads), Windows Server 2025 on an Intel processor (family 6, model 173) (4 threads), and macOS 26 on a virtual Apple M1 (3 threads). All with rustc 1.99.1 and Go 1.27.2. These are shared machines, so the ratios hold better than the speeds, and a runner's processor can differ from one run to the next.
+
+The archive's sparse rows are left out on macOS here: going through them gave 16–40×, which suggests that GNU tar found no holes there and wrote the data, whose skipping from memory the compiler takes out. On one machine with more detail, an AMD Ryzen 9 9950X, the whole table and the reasons are in [docs/tar.md](../../docs/tar.md#the-speed).
 
 ## License
 

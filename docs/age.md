@@ -71,12 +71,12 @@ AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 
 | Passphrase, scrypt at 2^18, age's default | 3.3 files/s | 3.2 files/s | 1.02× |
 | **Reading the payload** | | | |
 | Big file | 905 MB/s | 2,279 MB/s | 0.40× |
-| Big file, in ASCII armor | 132 MB/s | 493 MB/s | 0.27× |
+| Big file, in ASCII armor | 668 MB/s | 519 MB/s | 1.29× |
 | Files of 4 KiB | 12,362 files/s | 14,392 files/s | 0.86× |
 | **Parsing keys** | | | |
 | A file of 1,000 age keys | 14 k keys/s | 19 k keys/s | 0.72× |
 
-The big file's gap is ChaCha20-Poly1305, which Go runs in AVX2 assembly and the port in constant-time safe Rust ([crypto.md](crypto.md#speed)). In ASCII armor, 63% of the port's time is decoding base64 (`base64::decode_with`), a byte at a time, which is not looked into yet. Parsing keys is X25519, for each key's public half. Other work started on the machine towards the end of the run, though the best of the rounds should hide most of it.
+The big file's gap is ChaCha20-Poly1305, which Go runs in AVX2 assembly and the port in constant-time safe Rust ([crypto.md](crypto.md#speed)). ASCII armor went from 0.27× to 1.29×: a full line of 64 columns already in the reader's buffer is now decoded in place, with a table, where each line was two allocations and a `match` on each character. Anything else about a line goes the old way, with nothing consumed, so that errors stay as they were. The armor row was measured after that work, the others before it, which does not touch them. Parsing keys is X25519, for each key's public half. Other work started on the machine towards the end of the run, though the best of the rounds should hide most of it.
 
 ## How it is shown
 

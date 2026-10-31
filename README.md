@@ -42,7 +42,7 @@ Each port is timed against the library it comes from, on the same data, and ever
 | [`hivepack-zip`](crates/zip#speed) | libzip 1.12.1 | stored data 1.21–1.37×, compression 0.96–1.05×, finding entries 1.16–2.67×, editing many entries 1.46–1.99× | opening 200,000 entries 0.78×, WinZip AES 0.57–0.66× |
 | [`hivepack-7z`](crates/7z#speed) | LZMA SDK 26.05, 7-Zip | LZMA and LZMA2 1.10–1.24× against C, Deflate 1.39× | PPMd 0.88–0.92×, BZip2 0.62×, AES-256 with Copy 0.08× |
 | [`hivepack-tar`](crates/tar#speed) | Go 1.27.2's `archive/tar` | going through entries 1.48–2.61×, reading data 1.02–2.00×, seeking past data 2.05× | |
-| [`hivepack-age`](crates/age#speed) | age v1.3.2, in Go | scrypt 1.02–1.28× | X25519 0.77–0.92×, a big file's payload 0.40×, in armor 0.27× |
+| [`hivepack-age`](crates/age#speed) | age v1.3.2, in Go | scrypt 1.02–1.28×, a big file in ASCII armor 1.29× | X25519 0.77–0.92×, a big file's payload 0.40× |
 | [`hivepack-crypto`](crates/crypto#speed) | BearSSL 0.6 | 1.01–1.94× | Go's assembly, by up to 5.7×, on SHA-256 and ChaCha20-Poly1305 |
 
 **Measured on,** in October 2026, with safe code unless it says otherwise:

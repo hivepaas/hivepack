@@ -91,7 +91,10 @@ mod chacha20_ct;
 mod clear;
 mod ct;
 mod digest;
+#[cfg_attr(target_pointer_width = "64", allow(dead_code))]
 mod ec_c25519_m31;
+#[cfg(target_pointer_width = "64")]
+mod ec_c25519_m51;
 mod hkdf;
 mod hmac;
 mod md5;
@@ -108,7 +111,12 @@ pub use blake2sp::{BLAKE2SP_LENGTH, Blake2sp};
 pub use chacha20_ct::{CHACHA20_KEY_LENGTH, CHACHA20_NONCE_LENGTH, chacha20};
 pub use ct::equal;
 pub use digest::Digest;
-pub use ec_c25519_m31::{X25519_LENGTH, x25519, x25519_base};
+pub use ec_c25519_m31::X25519_LENGTH;
+#[cfg(not(target_pointer_width = "64"))]
+pub use ec_c25519_m31::x25519;
+pub use ec_c25519_m31::x25519_base;
+#[cfg(target_pointer_width = "64")]
+pub use ec_c25519_m51::x25519;
 pub use hkdf::{Hkdf, HkdfExpand};
 pub use hmac::{Hmac, HmacKey};
 pub use md5::{MD5_LENGTH, Md5};

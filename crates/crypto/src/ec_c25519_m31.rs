@@ -333,5 +333,5 @@ pub fn x25519(kb: &[u8; X25519_LENGTH], g: &[u8; X25519_LENGTH]) -> [u8; X25519_
 /// `api_mulgen`: X25519 of the scalar `x` and the base point: the public
 /// key of the private key `x`.
 pub fn x25519_base(x: &[u8; X25519_LENGTH]) -> [u8; X25519_LENGTH] {
-    x25519(x, &GEN)
+    crate::x25519(x, &GEN)
 }

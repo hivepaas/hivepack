@@ -9,16 +9,35 @@
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Each character's six bits; 0xFF for what is not in the alphabet.
+const VALUES: [u8; 256] = {
+    let mut values = [0xFF; 256];
+    let mut i = 0;
+    while i < 64 {
+        values[ALPHABET[i] as usize] = i as u8;
+        i += 1;
+    }
+    values
+};
+
 fn value(c: u8) -> Option<u32> {
-    let v = match c {
-        b'A'..=b'Z' => c - b'A',
-        b'a'..=b'z' => c - b'a' + 26,
-        b'0'..=b'9' => c - b'0' + 52,
-        b'+' => 62,
-        b'/' => 63,
-        _ => return None,
-    };
-    Some(u32::from(v))
+    let v = VALUES[c as usize];
+    if v == 0xFF { None } else { Some(u32::from(v)) }
+}
+
+/// Decodes whole groups of four characters, with no padding, into `out`: the
+/// armor's lines. `false` if a character is not in the alphabet, which the
+/// caller then finds out about the slow way, with `out` holding anything.
+pub(crate) fn decode_groups(input: &[u8; 64], out: &mut [u8; 48]) -> bool {
+    let mut seen = 0;
+    let (groups, _) = input.as_chunks::<4>();
+    let (outs, _) = out.as_chunks_mut::<3>();
+    for (&[a, b, c, d], out) in groups.iter().zip(outs) {
+        let [a, b, c, d] = [a, b, c, d].map(|c| VALUES[c as usize]);
+        seen |= a | b | c | d;
+        *out = [a << 2 | b >> 4, b << 4 | c >> 2, c << 6 | d];
+    }
+    seen & 0xC0 == 0
 }
 
 /// Decodes `input`, padded with `=` to a multiple of four characters if
@@ -137,6 +156,18 @@ mod tests {
             if padded != raw {
                 assert_eq!(decode(padded.as_bytes(), false), None, "{padded}");
                 assert_eq!(decode(raw.as_bytes(), true), None, "{raw}");
+            }
+        }
+        // The armor's lines, against the decoder they stand in for.
+        let line = *ALPHABET;
+        let mut out = [0; 48];
+        assert!(decode_groups(&line, &mut out));
+        assert_eq!(decode(&line, true).as_deref(), Some(&out[..]));
+        for at in 0..64 {
+            for bad in [b'=', b'\n', b'-', 0x80, 0xFF] {
+                let mut wrong = line;
+                wrong[at] = bad;
+                assert!(!decode_groups(&wrong, &mut out), "{at} {bad}");
             }
         }
         // Bits past the data, which Strict refuses, and Go's PEM does not.

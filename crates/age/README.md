@@ -48,8 +48,8 @@ Against age v1.3.2, the reference implementation in Go, with `tools/age-bench`. 
 | Passphrase, scrypt | 1.02–1.28× |
 | X25519 and ssh-ed25519 | 0.77–0.92× |
 | Files of 4 KiB | 0.86× |
+| A big file in ASCII armor | 1.29× |
 | A big file's payload | 0.40× |
-| A big file in ASCII armor | 0.27× |
 | Parsing age keys | 0.72× |
 
 **Measured on:** AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, Go 1.27.2 with age v1.3.2, in October 2026. The data is the Silesia corpus cut to 64 MiB, in memory, the best of five rounds taken in turn. Both read the same bytes. Go's ChaCha20-Poly1305 is AVX2 assembly, which is the big file's gap. More is in [docs/age.md](../../docs/age.md#the-speed).

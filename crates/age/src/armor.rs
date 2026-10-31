@@ -169,6 +169,30 @@ impl<R: BufRead> ArmoredReader<R> {
         error
     }
 
+    /// What most lines are, without a copy or an allocation: a full line of data,
+    /// already read, with its line end. Anything else, and anything wrong with
+    /// it, is left for the rest of `next_line`, with nothing consumed.
+    fn next_full_line(&mut self) -> bool {
+        let Ok(buf) = self.r.fill_buf() else {
+            return false;
+        };
+        let Some((line, rest)) = buf.split_first_chunk::<COLUMNS_PER_LINE>() else {
+            return false;
+        };
+        let end = match rest {
+            [b'\n', ..] => 1,
+            [b'\r', b'\n', ..] => 2,
+            _ => return false,
+        };
+        if !base64::decode_groups(line, &mut self.buf) {
+            return false;
+        }
+        self.r.consume(COLUMNS_PER_LINE + end);
+        self.start = 0;
+        self.end = BYTES_PER_LINE;
+        true
+    }
+
     /// The next line of data into `buf`, and the footer after a short one.
     fn next_line(&mut self) -> Result<(), Stop> {
         let mut removed_whitespace = 0;
@@ -188,6 +212,9 @@ impl<R: BufRead> ArmoredReader<R> {
                 )));
             }
             self.started = true;
+        }
+        if self.next_full_line() {
+            return Ok(());
         }
         let line = self.get_line()?;
         if line == FOOTER.as_bytes() {
@@ -249,5 +276,74 @@ impl<R: BufRead> Read for ArmoredReader<R> {
         p[..n].copy_from_slice(&self.buf[self.start..self.start + n]);
         self.start += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod full_line_tests {
+    use super::*;
+
+    /// All of what the reader gives, in pieces, and the error that ends it.
+    fn read_all(input: &[u8], capacity: usize) -> (Vec<u8>, Option<String>) {
+        let mut reader = ArmoredReader::new(io::BufReader::with_capacity(capacity, input));
+        let mut out = Vec::new();
+        let mut buf = [0; 100];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return (out, None),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => return (out, Some(e.to_string())),
+            }
+        }
+    }
+
+    /// A buffer of one byte never holds a full line, so that every line takes
+    /// the path that checks it: full lines change nothing else, on armor that is
+    /// right and armor that is not.
+    #[test]
+    fn full_lines_read_as_any_other() {
+        let mut state = 0x5eedu64;
+        let mut next = move |below: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize % below
+        };
+        let line = crate::base64::encode(&[0x5A; 48]);
+        let mut checked = 0;
+        for _ in 0..3000 {
+            let mut text = format!("{HEADER}\n").into_bytes();
+            for _ in 0..next(6) {
+                text.extend_from_slice(line.as_bytes());
+                text.extend_from_slice(if next(4) == 0 { b"\r\n" } else { b"\n" });
+            }
+            if next(2) == 0 {
+                text.extend_from_slice(b"Zm9v\n");
+            }
+            text.extend_from_slice(FOOTER.as_bytes());
+            text.push(b'\n');
+            for _ in 0..next(3) {
+                let at = next(text.len());
+                match next(4) {
+                    0 => text[at] = [b'=', b'\n', b'\r', b'-', 0xFF, b' '][next(6)],
+                    1 => text.truncate(at),
+                    2 => text.insert(at, b'A'),
+                    _ => {
+                        text.remove(at);
+                    }
+                }
+                if text.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                read_all(&text, 1 << 13),
+                read_all(&text, 1),
+                "{}",
+                String::from_utf8_lossy(&text)
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3000);
     }
 }

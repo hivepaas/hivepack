@@ -77,6 +77,27 @@ Against libzip 1.12.1, with `tools/zip-bench`. Above 1× the port is faster.
 
 LZMA and XZ read below liblzma because its x86-64 range decoder is inline assembly. AES here is against nettle's C: a libzip that uses the processor's AES instructions, as a usual build does, is further ahead. The whole table and the reasons are in [docs/zip.md](../../docs/zip.md#the-speed).
 
+### On GitHub's runners
+
+Against libzip 1.12.1, each row the mean and the range over its files or workloads.
+
+| Port / reference | Linux x86-64 | macOS arm64 |
+|---|---|---|
+| Opening many entries | 0.69× | 1.77× |
+| Opening with `ZIP_CHECKCONS` | 1.94× | 2.13× |
+| Finding entries by name | 0.93× | 0.96× |
+| Reading stored entries | 1.34× (1.30–1.38×) | 1.17× (0.53–1.80×) |
+| Reading Deflate and bzip2 | 0.98× (0.92–1.01×) | 0.90× (0.81–0.97×) |
+| Reading LZMA and XZ | 0.76× (0.74–0.77×) | 1.02× (1.01–1.04×) |
+| Writing stored entries | 1.29× (1.15–1.43×) | 1.42× (1.39–1.45×) |
+| Writing compressed, every method and level | 0.98× (0.94–1.01×) | 1.03× (0.92–1.07×) |
+| ZipCrypto, both ways | 1.08× (1.04–1.11×) | 0.90× (0.74–1.06×) |
+| WinZip AES, both ways | 0.71× (0.61–0.80×) | 0.55× (0.45–0.69×) |
+| Editing, the data copied | 1.77× (1.75–1.79×) | 1.81× (1.79–1.82×) |
+| Editing many entries | 2.87× (2.29–3.51×) | 1.78× (1.27–2.18×) |
+
+**Measured on** `.github/workflows/bench.yml`, on October 31, 2026, with rustc 1.99.1: Linux x86-64 on AMD EPYC 7763 64-Core Processor (4 threads); macOS arm64 on Apple M1 (Virtual) (3 threads). Each job gets what the runner has that day, so these are not the same processor from format to format, and they are shared machines: the ratios hold better than the speeds. Not on Windows yet, as the C side is built with POSIX tools.
+
 ## License
 
 BSD-3-Clause, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (C) 1999-2026 Dieter Baron and Thomas Klausner, and (c) 2026 HivePaaS.

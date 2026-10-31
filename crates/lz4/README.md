@@ -48,6 +48,19 @@ Against liblz4 1.10.0, with `tools/lz4-bench`, on the 12 Silesia files. Above 1�
 
 **Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of three or five rounds taken in turn. More, with lz4_flex beside it, is in [docs/lz4.md](../../docs/lz4.md#the-speed-target).
 
+### On GitHub's runners
+
+Against liblz4 1.10.0, without `unsafe-fast`, each row the mean and the range over its files or workloads.
+
+| Port / reference | Linux x86-64 | Windows x86-64 | macOS arm64 |
+|---|---|---|---|
+| Decoding blocks | 0.77× (0.72–0.84×) | 0.76× (0.68–0.83×) | 0.75× (0.65–0.83×) |
+| Reading frames | 0.77× (0.73–0.83×) | 0.77× (0.56–0.97×) | 0.99× (0.90–1.21×) |
+| Compressing blocks, level 1 | 0.93× (0.87–0.98×) | 1.03× (0.93–1.20×) | 0.98× (0.85–1.03×) |
+| Compressing blocks, level 9 | 0.90× (0.81–0.95×) | 0.89× (0.78–0.99×) | 0.86× (0.75–0.89×) |
+
+**Measured on** `.github/workflows/bench.yml`, on October 31, 2026, with rustc 1.99.1: Linux x86-64 on AMD EPYC 9V74 80-Core Processor (4 threads); Windows x86-64 on AMD64 Family 26 Model 2 Stepping 1 (4 threads); macOS arm64 on Apple M1 (Virtual) (3 threads). Each job gets what the runner has that day, so these are not the same processor from format to format, and they are shared machines: the ratios hold better than the speeds.
+
 ## License
 
 BSD-2-Clause, the license of the code it is ported from, liblz4's `lib/` (lz4's programs and tests are under the GPL, and are not ported). See [LICENSE](LICENSE). Copyright (c) 2011-2020 Yann Collet, and (c) 2026 HivePaaS.

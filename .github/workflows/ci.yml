@@ -358,6 +358,16 @@ jobs:
               pathlib.Path(f"fuzz/corpus/rar_test/r{i}").write_bytes(data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_test -- -max_total_time=45
+      - name: Seed the RAR unpacking corpus with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/rar_unpack
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-unpack.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/rar_unpack/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_unpack -- -max_total_time=45
       - name: Seed the bzip2 corpus
         run: |
           mkdir -p fuzz/corpus/bzip2

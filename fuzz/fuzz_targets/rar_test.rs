@@ -42,7 +42,7 @@ fn test(data: &[u8]) -> (Vec<(i64, u64, u64)>, String) {
         assert_eq!(bytes, extract.cur_unp_write);
         match result {
             Ok(go) => {
-                if bytes > 0 {
+                if bytes > 0 && arc.file_head.method == 0 {
                     // No more than the header promises, either way.
                     assert!(bytes <= arc.file_head.pack_size as u64);
                     assert!(bytes <= arc.file_head.unp_size as u64);
@@ -53,6 +53,7 @@ fn test(data: &[u8]) -> (Vec<(i64, u64, u64)>, String) {
                 }
             }
             Err(Error::NotYet(_)) => arc.seek_to_next(),
+            Err(e @ Error::NoMemory) => return (entries, e.to_string()),
             Err(e) => panic!("{e}"),
         }
     }

@@ -454,6 +454,39 @@ fn libarchive_s_cpio_archives_and_packages_open() {
     }
 }
 
+/// XAR archives, macOS's packages among them (`testdata/xar`), are told,
+/// under a layer too; a package's payload, under gzip, is cpio.
+#[test]
+fn xar_archives_and_package_payloads_open() {
+    for name in ["default.xar", "none-sha256.xar", "tiny.pkg", "product.pkg"] {
+        let file = std::fs::read(support::repository().join("testdata/xar").join(name)).unwrap();
+        assert_eq!(open(&file).unwrap().1, Container::Xar, "{name}");
+        let (layers, container, data) = open(&gzip(&file)).unwrap();
+        assert_eq!(
+            (layers, container),
+            (vec![Layer::Gzip], Container::Xar),
+            "{name}"
+        );
+        assert!(data == file, "{name}");
+    }
+    let file = std::fs::read(support::repository().join("testdata/xar/tiny.pkg")).unwrap();
+    let mut xar = hivepack_xar::Reader::new(&file[..]);
+    while let Some(h) = xar.next().unwrap() {
+        if h.path.as_deref() != Some(b"Payload") {
+            continue;
+        }
+        let mut once = Some(&mut xar);
+        let mut opener = Opener::new(move || Ok(once.take().unwrap()));
+        let opened = opener.open().unwrap();
+        assert_eq!(
+            (opened.layers(), opened.container()),
+            (&[Layer::Gzip][..], Container::Cpio)
+        );
+        return;
+    }
+    panic!("no Payload");
+}
+
 #[test]
 fn other_contents() {
     // One file, compressed.

@@ -215,13 +215,61 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
     }
 
     let first = open().map_err(|e| Error::global(ErrorKind::Io(e)))?;
+    let mut plan = plan(first, &run, options)?;
+    run.start(plan.entries_to_write(), plan.bytes_to_write(options));
+
+    let destination = Destination::open(destination, options.origin.as_ref())
+        .map_err(|e| Error::global(ErrorKind::Io(e)))?;
+    let mut summary = Summary {
+        skipped: std::mem::take(&mut plan.skipped),
+        ..Summary::default()
+    };
+    let second = open().map_err(|e| Error::global(ErrorKind::Io(e)))?;
+    write(second, &mut plan, &destination, &run, options, &mut summary)?;
+    Ok(summary)
+}
+
+/// A cpio archive read once and checked: what the second reading writes.
+pub(crate) struct Plan {
+    entries: Vec<Entry<Header>>,
+    items: Vec<Item>,
+    groups: HashMap<u64, Group>,
+    first_of: HashMap<u64, u64>,
+    plans: HashMap<u64, LinkPlan>,
+    /// The places of the entries to extract in `items`.
+    kept: Vec<usize>,
+    kept_indexes: HashSet<u64>,
+    /// The errors of the entries left out, with [`OnRefused::Skip`].
+    pub(crate) skipped: Vec<Error>,
+}
+
+impl Plan {
+    /// How many entries the second reading writes.
+    pub(crate) fn entries_to_write(&self) -> u64 {
+        self.kept_indexes.len() as u64
+    }
+
+    /// How many bytes it writes.
+    pub(crate) fn bytes_to_write(&self, options: &Options) -> u64 {
+        bytes_to_write(
+            &self.entries,
+            &self.items,
+            &self.kept_indexes,
+            &self.plans,
+            options,
+        )
+    }
+}
+
+/// The first reading of the archive `r`, and the checks on all of it.
+pub(crate) fn plan<R: Read>(r: R, run: &Run<'_>, options: &Options) -> Result<Plan, Error> {
     let FirstReading {
         entries,
         items,
         refused,
-        mut groups,
+        groups,
         first_of,
-    } = read_headers(first, &run, options)?;
+    } = read_headers(r, run, options)?;
     let (kept, mut skipped) = check(&items, options)?;
     skipped.splice(0..0, refused);
     skipped.sort_by_key(|e| e.index);
@@ -233,27 +281,60 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
         })
         .map(|item| item.index)
         .collect();
-    let created_later = |item: &Item| matches!(plans.get(&item.index), Some(LinkPlan::Symlink(..)));
-    run.start(
-        kept_indexes.len() as u64,
-        bytes_to_write(&entries, &items, &kept_indexes, &plans, options),
-    );
-
-    let destination = Destination::open(destination, options.origin.as_ref())
-        .map_err(|e| Error::global(ErrorKind::Io(e)))?;
-    let mut summary = Summary {
+    // An item's index is its entry's, and items come in their order.
+    let place: HashMap<u64, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| (item.index, at))
+        .collect();
+    let kept = kept
+        .iter()
+        .filter_map(|item| place.get(&item.index).copied())
+        .collect();
+    Ok(Plan {
+        entries,
+        items,
+        groups,
+        first_of,
+        plans,
+        kept,
+        kept_indexes,
         skipped,
-        ..Summary::default()
-    };
-    let writer = Writer {
-        destination: &destination,
-        plans: &plans,
-        run: &run,
-        options,
-    };
+    })
+}
 
+/// The second reading of the archive `r`, which must be the one `plan`
+/// read: its entries written into `destination`, then its symbolic links
+/// and its directories' times.
+pub(crate) fn write<R: Read>(
+    r: R,
+    plan: &mut Plan,
+    destination: &Destination<'_>,
+    run: &Run<'_>,
+    options: &Options,
+    summary: &mut Summary,
+) -> Result<(), Error> {
+    let Plan {
+        entries,
+        items,
+        groups,
+        first_of,
+        plans,
+        kept,
+        kept_indexes,
+        ..
+    } = plan;
+    let kept: Vec<&Item> = kept.iter().map(|&at| &items[at]).collect();
+    let created_later = |item: &Item| matches!(plans.get(&item.index), Some(LinkPlan::Symlink(..)));
+    let writer = Writer {
+        destination,
+        plans,
+        run,
+        options,
+        data_error: |e| ErrorKind::Cpio(hivepack_cpio::Error::from(e)),
+    };
+    let second = r;
     // The second reading.
-    let second = open().map_err(|e| Error::global(ErrorKind::Io(e)))?;
     let mut cpio = Reader::new(second);
     for (index, entry) in entries.iter().enumerate() {
         let index = index as u64;
@@ -277,9 +358,9 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
                 && items[at].kind == Kind::File
                 && kept_indexes.contains(&target)
             {
-                writer.file(&mut cpio, &items[at], h.size, &mut summary)?;
+                writer.file(&mut cpio, &items[at], h.size, summary)?;
                 for &waiting in &group.waiting {
-                    writer.hard_link(&items[waiting], &mut summary)?;
+                    writer.hard_link(&items[waiting], summary)?;
                 }
                 group.waiting.clear();
             }
@@ -309,7 +390,7 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
                     .and_then(|target| groups.get_mut(target))
                 {
                     Some(group) if !group.written => group.waiting.push(at),
-                    _ => writer.hard_link(item, &mut summary)?,
+                    _ => writer.hard_link(item, summary)?,
                 }
                 continue;
             }
@@ -318,7 +399,7 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
                     &mut &entry.target[..],
                     item,
                     entry.target.len() as u64,
-                    &mut summary,
+                    summary,
                 )?;
                 continue;
             }
@@ -329,12 +410,12 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
             Some(group) if group.data.is_some() => {}
             // A file with several names and no data at all.
             Some(_) => {
-                writer.file(&mut io::empty(), item, 0, &mut summary)?;
+                writer.file(&mut io::empty(), item, 0, summary)?;
                 if let Some(group) = groups.get_mut(&index) {
                     group.written = true;
                 }
             }
-            None => writer.file(&mut cpio, item, item.size, &mut summary)?,
+            None => writer.file(&mut cpio, item, item.size, summary)?,
         }
     }
     // The second reading must end where the first did.
@@ -345,7 +426,7 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
         }
         Err(e) => return Err(Error::global(ErrorKind::Cpio(e))),
     }
-    read_rest(cpio.into_inner(), &run, options)?;
+    read_rest(cpio.into_inner(), run, options)?;
 
     for &item in kept.iter().filter(|item| created_later(item)) {
         let error = |kind| item.error(kind);
@@ -365,21 +446,23 @@ pub fn extract_cpio<R: Read, F: FnMut() -> io::Result<R>>(
         run.entry_done();
     }
 
-    set_dir_times(&destination, &kept, &run)?;
-    Ok(summary)
+    set_dir_times(destination, &kept, run)?;
+    Ok(())
 }
 
-/// What the second reading writes with.
-struct Writer<'a> {
-    destination: &'a Destination<'a>,
-    plans: &'a HashMap<u64, LinkPlan>,
-    run: &'a Run<'a>,
-    options: &'a Options,
+/// What a second reading writes with.
+pub(crate) struct Writer<'a> {
+    pub(crate) destination: &'a Destination<'a>,
+    pub(crate) plans: &'a HashMap<u64, LinkPlan>,
+    pub(crate) run: &'a Run<'a>,
+    pub(crate) options: &'a Options,
+    /// The archive's error, from a read of an entry's data that failed.
+    pub(crate) data_error: fn(io::Error) -> ErrorKind,
 }
 
 impl Writer<'_> {
     /// Writes `item` as a file of the `size` bytes `r` gives.
-    fn file(
+    pub(crate) fn file(
         &self,
         r: &mut impl Read,
         item: &Item,
@@ -399,7 +482,16 @@ impl Writer<'_> {
             .limits
             .max_total_size
             .saturating_sub(summary.bytes);
-        match write_data(r, item, size, file, remaining, self.run, self.options) {
+        match write_data(
+            r,
+            item,
+            size,
+            file,
+            remaining,
+            self.run,
+            self.options,
+            self.data_error,
+        ) {
             Ok(written) => {
                 summary.files += 1;
                 summary.bytes += written;
@@ -416,7 +508,7 @@ impl Writer<'_> {
 
     /// Makes `item` a hard link to the file its plan names, which is
     /// written: a copy of it, with [`Links::AsFile`].
-    fn hard_link(&self, item: &Item, summary: &mut Summary) -> Result<(), Error> {
+    pub(crate) fn hard_link(&self, item: &Item, summary: &mut Summary) -> Result<(), Error> {
         let error = |kind| item.error(kind);
         let Some(LinkPlan::Hard(target)) = self.plans.get(&item.index) else {
             return Err(error(ErrorKind::HardLinkTarget));
@@ -468,6 +560,7 @@ impl Writer<'_> {
 
 /// Writes the `size` bytes of `r` into `file`, for `item`, at most
 /// `remaining` in all, then its time and permissions: the bytes written.
+#[allow(clippy::too_many_arguments)]
 fn write_data(
     r: &mut impl Read,
     item: &Item,
@@ -476,6 +569,7 @@ fn write_data(
     remaining: u64,
     run: &Run<'_>,
     options: &Options,
+    data_error: fn(io::Error) -> ErrorKind,
 ) -> Result<u64, ErrorKind> {
     let limits = &options.limits;
     if size > limits.max_entry_size {
@@ -494,7 +588,7 @@ fn write_data(
             Ok(0) => return Err(ErrorKind::SizeMismatch),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(ErrorKind::Cpio(hivepack_cpio::Error::from(e))),
+            Err(e) => return Err(data_error(e)),
         };
         written += n as u64;
         file.write_all(&buffer[..n]).map_err(ErrorKind::Io)?;

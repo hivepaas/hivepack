@@ -22,6 +22,9 @@ hivepack-zip.workspace = true
 hivepack-tar.workspace = true
 hivepack-iso.workspace = true
 hivepack-cpio.workspace = true
+hivepack-xar.workspace = true
+# The layers around a package's payloads (gzip, pbzx).
+hivepack-open.workspace = true
 hivepack-udf.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true

@@ -37,6 +37,16 @@ impl<'a> Destination<'a> {
         Ok(Destination { root, origin })
     }
 
+    /// The directory at `components`, as a destination of its own, opened
+    /// as [`Destination::directory`] opens it: a package's payload is
+    /// extracted into one.
+    pub(crate) fn within(&self, components: &[String]) -> Result<Destination<'a>, ErrorKind> {
+        Ok(Destination {
+            root: self.directory(components)?,
+            origin: self.origin,
+        })
+    }
+
     /// The directory at `components`, created where it is not there, each
     /// opened from the one before without following a link; those created
     /// get the mark of origin.

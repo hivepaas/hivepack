@@ -198,8 +198,10 @@ dependencies = [
  "cap-std",
  "hivepack-cpio",
  "hivepack-iso",
+ "hivepack-open",
  "hivepack-tar",
  "hivepack-udf",
+ "hivepack-xar",
  "hivepack-zip",
  "rustix",
 ]

@@ -2,8 +2,8 @@
 //! encryption, zstd, xz, lzip, .lzma, LZ4, gzip, bzip2 or pbzx
 //! compression, and RPM packages' lead and headers, found by their first
 //! bytes and taken off one after the other, as many as there are, until
-//! what is under them is a container (a tar, ZIP or cpio archive, an ISO
-//! 9660 image, a UDF volume), or plain data.
+//! what is under them is a container (a tar, ZIP, cpio or XAR archive, an
+//! ISO 9660 image, a UDF volume), or plain data.
 //!
 //! ```no_run
 //! use std::sync::Arc;

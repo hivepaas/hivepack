@@ -38,3 +38,5 @@ hivepack-extract.workspace = true
 hivepack-iso.workspace = true
 # For the UDF volumes it finds.
 hivepack-udf.workspace = true
+# For the payloads of the packages it finds.
+hivepack-xar.workspace = true

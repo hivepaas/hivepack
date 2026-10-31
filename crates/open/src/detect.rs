@@ -1,6 +1,6 @@
 //! What a stream is, from its first bytes: a layer to take off (age, a
 //! compressor, an RPM package's lead and headers), a container (tar, ZIP,
-//! cpio, an ISO 9660 image, a UDF volume), or plain data.
+//! cpio, XAR, an ISO 9660 image, a UDF volume), or plain data.
 
 /// A layer over the data: encryption or compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,6 +42,9 @@ pub enum Container {
     /// A cpio archive, which `hivepack-cpio` reads in order: Linux's
     /// initramfs, an RPM package's payload, a macOS package's.
     Cpio,
+    /// A XAR archive, which `hivepack-xar` reads in order: a macOS package
+    /// (`.pkg`), a `.xip` file.
+    Xar,
     /// An ISO 9660 image (`.iso`), which `hivepack-iso` reads in order, in
     /// a layer too (`.iso.xz`).
     Iso,
@@ -142,6 +145,16 @@ fn is_tar(head: &[u8]) -> bool {
     // A block of zeros sums to 256 with its checksum field as spaces;
     // a value written for it is still not a header.
     value != 0 && (value == unsigned || value == signed) && block[..100].iter().any(|&c| c != 0)
+}
+
+/// Whether `head` starts with a XAR header as libarchive's bid tells one:
+/// `xar!`, a header of 28 bytes, version 1, and a checksum it knows (none,
+/// SHA-1, MD5, SHA-256 or SHA-512).
+fn is_xar(head: &[u8]) -> bool {
+    let Some(h) = head.get(..28) else {
+        return false;
+    };
+    h.starts_with(b"xar!") && h[4..8] == [0, 28, 0, 1] && h[24..27] == [0, 0, 0] && h[27] <= 4
 }
 
 /// Whether `head` starts with a cpio header, as libarchive's bid tells
@@ -296,6 +309,9 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") || starts(b"PK\x07\x08") {
         return Detected::Container(Container::Zip);
     }
+    if is_xar(head) {
+        return Detected::Container(Container::Xar);
+    }
     if is_cpio(head) {
         return Detected::Container(Container::Cpio);
     }
@@ -388,6 +404,32 @@ mod tests {
                 Detected::Container(Container::Data),
                 "{head:?}"
             );
+        }
+    }
+
+    #[test]
+    fn xar_by_its_header() {
+        let header = |size: u16, version: u16, checksum: u32| {
+            let mut h = b"xar!".to_vec();
+            h.extend(size.to_be_bytes());
+            h.extend(version.to_be_bytes());
+            h.extend([0; 16]);
+            h.extend(checksum.to_be_bytes());
+            h
+        };
+        for checksum in 0..=4 {
+            assert_eq!(
+                layer(&header(28, 1, checksum)),
+                Detected::Container(Container::Xar)
+            );
+        }
+        for head in [
+            header(28, 1, 5),
+            header(64, 1, 1),
+            header(28, 2, 1),
+            header(28, 1, 1)[..27].to_vec(),
+        ] {
+            assert_eq!(layer(&head), Detected::Container(Container::Data));
         }
     }
 

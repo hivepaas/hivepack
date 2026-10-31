@@ -108,6 +108,21 @@ pub enum Permissions {
     Ignore,
 }
 
+/// What to do with the payloads of macOS packages, in a XAR archive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Packages {
+    /// Extract them, as `pkgutil --expand-full` does: an entry named
+    /// `Payload` or `Scripts` (a package's), or `Content` (a `.xip`
+    /// file's), whose data is a cpio archive under its layers (gzip,
+    /// pbzx), becomes a directory of that name, with the archive's files
+    /// (the default).
+    #[default]
+    Expand,
+    /// Write them as they are, as files.
+    AsFiles,
+}
+
 /// How to extract.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -138,6 +153,8 @@ pub struct Options {
     /// stops the extraction. None by default: the archive's path is the
     /// caller's.
     pub origin: Option<Origin>,
+    /// What to do with a macOS package's payloads ([`extract_xar`](crate::extract_xar)).
+    pub packages: Packages,
 }
 
 /// Shows the options, not the password or the progress function.

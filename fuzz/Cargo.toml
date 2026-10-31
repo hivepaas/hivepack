@@ -257,6 +257,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "extract_xar"
+path = "fuzz_targets/extract_xar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
 test = false

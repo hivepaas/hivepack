@@ -12,8 +12,6 @@
 //! and the reading and writing of `ComprDataIO` (rdwrfn.cpp), as they are
 //! when testing an archive: each entry's data is read, given to a callback
 //! and checked against its hash, and nothing is created.
-//!
-//! So far entries whole in this volume: anything else is [`Error::NotYet`].
 
 use std::io;
 
@@ -74,7 +72,7 @@ impl<R: ReadAt> UnpIo for DataIo<'_, '_, R> {
                         to_read = new_to_read;
                     }
                 }
-                read = self.arc.cursor().read(&mut buf[total..total + to_read])?;
+                read = self.arc.read(&mut buf[total..total + to_read])?;
             }
             // With nothing to read this is what was read the last time, as in
             // UnRAR, when a next volume has no data after an unaligned read.
@@ -202,8 +200,6 @@ impl Extract {
     ///
     /// # Errors
     ///
-    /// [`Error::NotYet`] for an entry that cannot be read yet, the position
-    /// left at its header's end: [`Archive::seek_to_next`] goes on past it.
     /// [`Error::NoMemory`] when a dictionary cannot be had: it stops
     /// everything, as `bad_alloc` does in UnRAR.
     /// [`Error::Io`] when the archive cannot be read or `out` fails.

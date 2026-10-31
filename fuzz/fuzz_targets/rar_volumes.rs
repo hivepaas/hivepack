@@ -51,7 +51,9 @@ fn test(first: &[u8], second: &[u8]) -> (Vec<(u64, u64)>, String) {
         let (mut bytes, mut sum) = (0u64, 0u64);
         let result = extract.current_file(&mut arc, size, &mut |piece| {
             bytes += piece.len() as u64;
-            sum = piece.iter().fold(sum, |s, &b| s.rotate_left(5) ^ u64::from(b));
+            sum = piece
+                .iter()
+                .fold(sum, |s, &b| s.rotate_left(5) ^ u64::from(b));
             Ok(())
         });
         assert_eq!(bytes, extract.cur_unp_write);
@@ -62,7 +64,12 @@ fn test(first: &[u8], second: &[u8]) -> (Vec<(u64, u64)>, String) {
                     return (entries, format!("end {:?}", arc.exit_code()));
                 }
             }
-            Err(e @ (Error::NoMemory | Error::BadVolume { .. } | Error::MissingPassword { .. })) => {
+            Err(
+                e @ (Error::NoMemory
+                | Error::BadVolume { .. }
+                | Error::BadSeek { .. }
+                | Error::MissingPassword { .. }),
+            ) => {
                 return (entries, e.to_string());
             }
             Err(e) => panic!("{e}"),

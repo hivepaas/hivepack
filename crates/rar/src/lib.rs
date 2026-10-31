@@ -62,9 +62,10 @@
 //! # }
 //! ```
 //!
-//! So far entries that are stored, not encrypted and whole in one volume are
-//! read; decompressing and decrypting come next. The plan is the repository's
-//! `docs/rar.md`.
+//! An archive that is encrypted is opened with
+//! [`Archive::open_with_password`], and one of many volumes with
+//! [`Archive::open_volumes`], which is told how to open the next. The plan is
+//! the repository's `docs/rar.md`.
 
 mod archive;
 mod comment;
@@ -74,6 +75,7 @@ mod extract;
 mod hash;
 mod headers;
 pub mod name;
+mod quick_open;
 mod raw;
 mod source;
 mod time;

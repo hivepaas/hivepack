@@ -352,6 +352,10 @@ fn answer_comment(words: &[&str]) -> String {
             out.put("thrown", u64::from(ExitCode::UserBreak.number()));
             exit_code
         }
+        Err(Error::BadSeek { exit_code }) => {
+            out.put("thrown", u64::from(ExitCode::Fatal.number()));
+            exit_code
+        }
         Err(e) => panic!("{e}"),
         Ok(mut arc) => {
             let mut code = None;
@@ -365,6 +369,10 @@ fn answer_comment(words: &[&str]) -> String {
                 Ok(None) => out.0 += " none",
                 Err(Error::MissingPassword { exit_code }) => {
                     out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                    code = Some(exit_code);
+                }
+                Err(Error::BadSeek { exit_code }) => {
+                    out.put("thrown", u64::from(ExitCode::Fatal.number()));
                     code = Some(exit_code);
                 }
                 Err(Error::NoMemory) => {
@@ -397,6 +405,10 @@ fn answer_test_on<R: hivepack_rar::ReadAt>(
             out.put("thrown", u64::from(ExitCode::UserBreak.number()));
             exit_code
         }
+        Err(Error::BadSeek { exit_code }) => {
+            out.put("thrown", u64::from(ExitCode::Fatal.number()));
+            exit_code
+        }
         Err(e) => panic!("{e}"),
         Ok(mut arc) => {
             out.0 += " archive";
@@ -409,6 +421,10 @@ fn answer_test_on<R: hivepack_rar::ReadAt>(
                     Ok(size) => size,
                     Err(Error::MissingPassword { exit_code }) => {
                         out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                        break exit_code;
+                    }
+                    Err(Error::BadSeek { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::Fatal.number()));
                         break exit_code;
                     }
                     Err(e) => panic!("{e}"),
@@ -466,9 +482,9 @@ fn answer_test_on<R: hivepack_rar::ReadAt>(
                         out.put("thrown", u64::from(ExitCode::UserBreak.number()));
                         break exit_code;
                     }
-                    Err(Error::NotYet(_)) => {
-                        out.0 += " later";
-                        arc.seek_to_next();
+                    Err(Error::BadSeek { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::Fatal.number()));
+                        break exit_code;
                     }
                     Err(Error::NoMemory) => {
                         out.0 += " badalloc";
@@ -549,6 +565,10 @@ fn answer(request: &str) -> String {
             out.put("thrown", u64::from(ExitCode::UserBreak.number()));
             exit_code
         }
+        Err(Error::BadSeek { exit_code }) => {
+            out.put("thrown", u64::from(ExitCode::Fatal.number()));
+            exit_code
+        }
         Err(e) => panic!("{e}"),
         Ok(mut archive) => {
             out.0 += " archive";
@@ -573,6 +593,10 @@ fn answer(request: &str) -> String {
                     }
                     Err(Error::MissingPassword { exit_code }) => {
                         out.put("thrown", u64::from(ExitCode::UserBreak.number()));
+                        break exit_code;
+                    }
+                    Err(Error::BadSeek { exit_code }) => {
+                        out.put("thrown", u64::from(ExitCode::Fatal.number()));
                         break exit_code;
                     }
                     Err(e) => panic!("{e}"),
@@ -1221,6 +1245,154 @@ fn encrypted_archives_damaged_test_like_unrar() {
         }
     }
     eprintln!("{compared} encrypted archives compared");
+}
+
+// QuickOpen records, whose copies of headers need not say what the headers say:
+// three ways of reading what the `rar_quick_open` target finds.
+fn quick_open_requests(input: &[u8]) -> [String; 4] {
+    let archive = hex(&support::patch::with_quick_open(input));
+    [
+        format!("list 1 {archive}"),
+        format!("test {archive}"),
+        format!("testpw {} {archive}", hex(FUZZ_PASSWORD.as_bytes())),
+        format!("comment - {archive}"),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn quick_open_records_read_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_000a);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(40);
+    let compare = |oracle: &mut Oracle, input: &[u8], context: &str| {
+        for request in quick_open_requests(input) {
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, context);
+        }
+    };
+    // What random bytes seldom come to: the file's header in another size, by
+    // way of a record that is not one, a second main header, a block of a size
+    // that does not end, and around the end of the record's buffer.
+    let other = [1 | 5 << 3, 42];
+    let mut cases: Vec<Vec<u8>> = vec![
+        [&[3][..], &other].concat(),
+        [&[4][..], &other].concat(),
+        [&[0, 5 | 1 << 3][..], &other].concat(),
+        [&[0, 5][..], &other].concat(),
+        vec![0, 3 | 1 << 3, 0xfe, 7],
+        vec![0, 3 | 1 << 3, 0xff, 7],
+        vec![0, 3, 0xfe, 7, 1 | 5 << 3, 42],
+        vec![0, 3, 0xff, 7, 1 | 5 << 3, 42],
+    ];
+    for (low, high) in [(0xfd, 0), (0xfe, 0), (0xff, 0), (0, 1)] {
+        for filler in 0..40 {
+            // Up to where the next block starts past the buffer's last 256
+            // bytes, or crosses its end, then the file's header in another size.
+            let mut input = vec![0, 3, low, high];
+            for _ in 0..filler {
+                input.extend_from_slice(&[3, 0, 0]);
+            }
+            input.extend_from_slice(&other);
+            cases.push(input);
+        }
+    }
+    for (i, input) in cases.iter().enumerate() {
+        compare(&mut oracle, input, &format!("case {i}"));
+    }
+    for i in 0..count {
+        let mut input = vec![0; rng.below(256) as usize];
+        for byte in &mut input {
+            *byte = rng.next() as u8;
+        }
+        compare(&mut oracle, &input, &format!("random input {i}"));
+    }
+    for (input, _) in recorded_quick_open() {
+        compare(
+            &mut oracle,
+            &unhex(&input),
+            &format!("recorded input {input:.40}"),
+        );
+    }
+    let Some(folder) = std::env::var_os("HIVEPACK_RAR_QUICK_OPEN_CORPUS") else {
+        return;
+    };
+    let mut compared = 0;
+    for entry in std::fs::read_dir(folder).expect("the folder") {
+        let path = entry.expect("an entry").path();
+        let input = std::fs::read(&path).expect("an input");
+        compare(&mut oracle, &input, &path.display().to_string());
+        compared += 1;
+    }
+    eprintln!("{compared} inputs compared");
+}
+
+fn recorded_quick_open_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-quick-open.txt")
+}
+
+/// The same from the `rar_quick_open` target.
+fn recorded_quick_open() -> Vec<(String, String)> {
+    let path = recorded_quick_open_path();
+    if path.exists() {
+        recorded_inputs(&path)
+    } else {
+        Vec::new()
+    }
+}
+
+// The copies are what is read: a copy of the file's header with another size
+// and name stands for it, in UnRAR and here. If this fails the inputs above say
+// nothing of QuickOpen, as records that are not found compare the same.
+#[test]
+fn quick_open_copies_stand_for_headers() {
+    // Block 1: the file's header, its name cut to 5 bytes and its size 42.
+    let input = [0, 1 | 5 << 3, 42];
+    let got = answer(&format!(
+        "list 1 {}",
+        hex(&support::patch::with_quick_open(&input))
+    ));
+    assert!(got.contains(" name=68.65.6c.6c.6f "), "{got:.2000}");
+    assert!(got.contains(" unpsize=2a "), "{got:.2000}");
+}
+
+#[test]
+fn port_reads_quick_open_as_recorded() {
+    for (input, want) in recorded_quick_open() {
+        let got: Vec<String> = quick_open_requests(&unhex(&input))
+            .iter()
+            .map(|request| support::recorded_form(&answer(request)))
+            .collect();
+        assert_eq!(got.join(" # "), want, "{input:.300}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-quick-open.txt from the oracle"]
+fn record_quick_open_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle) for inputs the rar_quick_open fuzz target found, as support::patch::with_quick_open makes archives of them, replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_quick_open_answers -- --ignored\n",
+    );
+    for (input, _) in recorded_quick_open() {
+        let replies: Vec<String> = quick_open_requests(&unhex(&input))
+            .iter()
+            .map(|request| support::recorded_form(&oracle.ask(request)))
+            .collect();
+        let _ = writeln!(text, "{input}\t{}", replies.join(" # "));
+    }
+    std::fs::write(recorded_quick_open_path(), text).expect("written");
 }
 
 // A dictionary too large for the limit, on archives that hold what they say:

@@ -7,8 +7,7 @@
 //
 //   list <enable_broken> <hex>
 //
-// opens the archive (its bytes in hex), with QuickOpen off, as IsArchive
-// opens it, then reads every header as Archive::ReadHeader reads them,
+// opens the archive (its bytes in hex), as IsArchive opens it, then reads every header as Archive::ReadHeader reads them,
 // printing what UnRAR keeps of each: the header's fields, the archive's
 // state, and the exit code at the end.
 //
@@ -357,7 +356,6 @@ static void do_list(int enable_broken, const char *hex) {
   out = "list";
   ErrHandler.Clean();
   CommandData Cmd;
-  Cmd.QOpenMode = QOPEN_NONE;
   set_password(Cmd);
   try {
     Archive Arc(&Cmd);
@@ -466,12 +464,11 @@ static void do_test(const char *hex, unsigned long long limit) {
 
   out = "test";
   ErrHandler.Clean();
-  // What RAROpenArchiveEx and ProcessFile set for testing, with QuickOpen off.
+  // What RAROpenArchiveEx and ProcessFile set for testing, QuickOpen on, as there.
   // Recursing is the one difference: with "*" as the only mask and no recursing,
   // UnRAR stops after a first file whose name is that very "*", taking it for
   // all that was asked for, which says nothing of reading the archive.
   CommandData Cmd;
-  Cmd.QOpenMode = QOPEN_NONE;
   Cmd.FileArgs.AddString(L"*");
   Cmd.Overwrite = OVERWRITE_ALL;
   Cmd.VersionControl = 1;
@@ -557,7 +554,6 @@ static void do_comment(const char *hex) {
   out = "comment";
   ErrHandler.Clean();
   CommandData Cmd;
-  Cmd.QOpenMode = QOPEN_NONE;
   set_password(Cmd);
   try {
     Archive Arc(&Cmd);

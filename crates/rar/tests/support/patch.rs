@@ -217,6 +217,226 @@ pub fn with_old_packed_data(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `MAIN` with its locator saying the QuickOpen record is at `offset` from the
+/// main header, in the three bytes RAR leaves for that or in all ten.
+fn main_with_locator(offset: u64, long: bool) -> Vec<u8> {
+    let mut extra = vec![1, 1];
+    if long {
+        let mut value = offset;
+        for _ in 0..9 {
+            extra.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        extra.push(value as u8 & 1);
+    } else {
+        extra.push(offset as u8 | 0x80);
+        extra.push((offset >> 7) as u8 | 0x80);
+        extra.push((offset >> 14) as u8 & 0x7f);
+    }
+    let mut body = vec![1, 5];
+    put_vint(&mut body, extra.len() as u64 + 1);
+    body.push(0);
+    put_vint(&mut body, extra.len() as u64);
+    body.extend_from_slice(&extra);
+    let mut header = Vec::new();
+    put_vint(&mut header, body.len() as u64);
+    header.extend_from_slice(&body);
+    let mut out = MAIN[..8].to_vec();
+    out.extend_from_slice(&crc32(&header).to_le_bytes());
+    out.extend_from_slice(&header);
+    out
+}
+
+/// A service header called `name`, encrypted with these rounds if any: a
+/// record with no salt or start worth anything, as nothing here encrypts.
+fn put_service(out: &mut Vec<u8>, name: &[u8], unp_size: u64, data: &[u8], rounds: Option<u8>) {
+    let mut extra = Vec::new();
+    if let Some(rounds) = rounds {
+        extra.extend_from_slice(&[35, 1, 0, 0, rounds]);
+        extra.extend((0..32).map(|i| i * 7 + rounds));
+    }
+    let mut body = vec![3, if extra.is_empty() { 2 } else { 3 }];
+    if !extra.is_empty() {
+        put_vint(&mut body, extra.len() as u64);
+    }
+    put_vint(&mut body, data.len() as u64);
+    body.push(0);
+    put_vint(&mut body, unp_size);
+    body.extend_from_slice(&[0, 0, 1]);
+    put_vint(&mut body, name.len() as u64);
+    body.extend_from_slice(name);
+    body.extend_from_slice(&extra);
+    let mut header = Vec::new();
+    put_vint(&mut header, body.len() as u64);
+    header.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&header).to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(data);
+}
+
+/// A block of a QuickOpen record: a copy of `header` that belongs `offset`
+/// before the record's header.
+fn put_quick_open_item(out: &mut Vec<u8>, offset: u64, header: &[u8], good_crc: bool) {
+    let mut body = Vec::new();
+    body.push(0);
+    put_vint(&mut body, offset);
+    put_vint(&mut body, header.len() as u64);
+    body.extend_from_slice(header);
+    let mut block = Vec::new();
+    put_vint(&mut block, body.len() as u64);
+    block.extend_from_slice(&body);
+    let crc = crc32(&block);
+    out.extend_from_slice(&(if good_crc { crc } else { !crc }).to_le_bytes());
+    out.extend_from_slice(&block);
+}
+
+/// A copy of `rar5_stored.rar` with a QuickOpen record, whose copies of headers
+/// `input` says, so that they get past the record's CRCs and need not say what
+/// the headers they stand for say.
+///
+/// The first byte says where the locator points (bits 0 to 2: 0 to 2 the record,
+/// 3 the record called something else, 4 a second main header that points to the
+/// record, 5 the file's header, 6 past the end and 7 further than a file can
+/// be), whether the record's header says it is encrypted (bit 3),
+/// whether its size says less or more than there is (bits 4 and 5) and how many
+/// rounds its keys take (bits 6 and 7). Then each block has a byte saying what
+/// it is, in its low 3 bits, with what follows:
+///
+/// - 0: a true copy of the main header (higher bits 0), the file's or the end's
+/// - 1: the file's header with another size, and a name of the higher bits' length
+/// - 2: an offset of 2 bytes, a size of 1 and that many bytes
+/// - 3: a size in units of 256, of 11 bits, of zeros that end where the archive
+///   starts, so that they are read past, or over the file's header if the higher
+///   bits are odd. The last two sizes are too large for a block's size to say
+/// - 4: a true copy of the file's header with a wrong CRC
+/// - 5: a block of no size, or if the higher bits are not 0 one whose size does
+///   not end, either of which ends it all
+/// - 6: a service header standing for the file's, encrypted if the higher bits are
+/// - 7: a byte's worth of what follows, as it is
+pub fn with_quick_open(input: &[u8]) -> Vec<u8> {
+    let options = input.first().copied().unwrap_or(0);
+    let rounds = [1, 2, 3, 25][usize::from(options >> 6)];
+    let long = options & 7 == 7;
+
+    let mut file = Vec::new();
+    put_file(&mut file, 0, 11, b"hello world");
+    let main_len = main_with_locator(0, long).len() - 8;
+    let file_pos = 8 + main_len;
+    let mut qo_pos = file_pos + file.len();
+    let second_main = options & 7 == 4;
+    if second_main {
+        qo_pos += main_len;
+    }
+    let main = main_with_locator(0, long);
+    let file_header_len = file.len() - 11;
+
+    let mut record = Vec::new();
+    let mut at = 1;
+    let next = |at: &mut usize| {
+        let byte = input.get(*at).copied().unwrap_or(0);
+        *at += 1;
+        byte
+    };
+    while at < input.len() {
+        let op = next(&mut at);
+        let high = op >> 3;
+        let to_file = (qo_pos - file_pos) as u64;
+        match op & 7 {
+            0 => match high {
+                0 => put_quick_open_item(&mut record, qo_pos as u64 - 8, &main[8..], true),
+                1 => {
+                    put_quick_open_item(&mut record, to_file, &file[..file_header_len], true);
+                }
+                _ => put_quick_open_item(&mut record, 0, END, true),
+            },
+            1 => {
+                let size = u64::from(next(&mut at));
+                let name = &NAME[..usize::from(high).min(NAME.len())];
+                let mut body = vec![2, 3];
+                put_vint(&mut body, FILE_EXTRA.len() as u64);
+                put_vint(&mut body, 11);
+                body.push(0);
+                put_vint(&mut body, size);
+                body.extend_from_slice(ATTRIBUTES);
+                body.extend_from_slice(&[0, 1]);
+                put_vint(&mut body, name.len() as u64);
+                body.extend_from_slice(name);
+                body.extend_from_slice(FILE_EXTRA);
+                let mut header = Vec::new();
+                put_vint(&mut header, body.len() as u64);
+                header.extend_from_slice(&body);
+                let mut copy = crc32(&header).to_le_bytes().to_vec();
+                copy.extend_from_slice(&header);
+                put_quick_open_item(&mut record, to_file, &copy, true);
+            }
+            2 => {
+                let offset = u64::from(next(&mut at)) | u64::from(next(&mut at)) << 8;
+                let size = usize::from(next(&mut at));
+                let end = (at + size).min(input.len());
+                put_quick_open_item(&mut record, offset, &input[at.min(end)..end], true);
+                at = end;
+            }
+            3 => {
+                let size = usize::from(next(&mut at)) | usize::from(next(&mut at) & 7) << 8;
+                let size = match size {
+                    0x7fe => 0x20_0000,
+                    0x7ff => 0x20_0001,
+                    _ => size * 256,
+                };
+                let zeros = vec![0; size];
+                let offset = if high & 1 != 0 {
+                    to_file
+                } else {
+                    qo_pos as u64 + size as u64
+                };
+                put_quick_open_item(&mut record, offset, &zeros, true);
+            }
+            4 => {
+                put_quick_open_item(&mut record, to_file, &file[..file_header_len], false);
+            }
+            5 if high == 0 => record.extend_from_slice(&[0; 7]),
+            5 => record.extend_from_slice(&[0, 0, 0, 0, 0x80, 0x80, 0x80]),
+            6 => {
+                let mut copy = Vec::new();
+                let chosen = (high != 0).then_some(rounds);
+                put_service(&mut copy, b"CMT", 0, &[], chosen);
+                put_quick_open_item(&mut record, to_file, &copy, true);
+            }
+            _ => {
+                let end = (at + usize::from(high)).min(input.len());
+                record.extend_from_slice(&input[at.min(end)..end]);
+                at = end;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let offset = match options & 7 {
+        4 => (file_pos + file.len()) as u64 - 8,
+        5 => file_pos as u64 - 8,
+        6 => 1 << 20,
+        7 => 1 << 63,
+        _ => qo_pos as u64 - 8,
+    };
+    out.extend_from_slice(&main_with_locator(offset, long));
+    out.extend_from_slice(&file);
+    if second_main {
+        let main_pos = file_pos + file.len();
+        out.extend_from_slice(&main_with_locator((qo_pos - main_pos) as u64, false)[8..]);
+    }
+    let size = record.len() as u64;
+    let unp_size = match options >> 4 & 3 {
+        0 | 3 => size,
+        1 => size / 2,
+        _ => size * 2,
+    };
+    let chosen = (options & 8 != 0).then_some(rounds);
+    let name: &[u8] = if options & 7 == 3 { b"CMT" } else { b"QO" };
+    put_service(&mut out, name, unp_size, &record, chosen);
+    out.extend_from_slice(END);
+    out
+}
+
 fn get_vint(data: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in 0..10 {

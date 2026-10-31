@@ -143,7 +143,7 @@ impl<R: ReadAt> Archive<R> {
                 return Ok(None);
             }
             let mut cmt_raw = vec![0; cmt_length as usize];
-            let read = self.cursor().read(&mut cmt_raw)?;
+            let read = self.read(&mut cmt_raw)?;
             cmt_raw.truncate(read);
             if self.format != Format::Rar14 {
                 let mut hash = DataHash::new(HashType::Crc32);

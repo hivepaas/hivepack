@@ -17,8 +17,9 @@ use std::io;
 
 use hivepack_deflate::crc32;
 
+use crate::archive::Archive;
 use crate::crypt::CryptData;
-use crate::source::Cursor;
+use crate::source::ReadAt;
 
 /// The bytes of one header, and how far they are taken apart.
 #[derive(Debug, Default)]
@@ -44,7 +45,11 @@ impl RawRead {
     /// Reads `size` more bytes from `src`: the number read, fewer at the
     /// end of the archive. Encrypted, whole blocks are read, and what they
     /// hold past `size` is there for the next read.
-    pub(crate) fn read(&mut self, src: &mut Cursor<'_>, size: usize) -> io::Result<usize> {
+    pub(crate) fn read<R: ReadAt>(
+        &mut self,
+        src: &mut Archive<R>,
+        size: usize,
+    ) -> io::Result<usize> {
         if let Some(crypt) = &mut self.crypt {
             let full_size = self.data.len();
             let data_left = full_size - self.data_size;

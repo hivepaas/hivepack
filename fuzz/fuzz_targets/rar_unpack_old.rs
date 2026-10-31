@@ -14,7 +14,6 @@
 //! included in license, or in documentation if license is not available, and
 //! in source code comments of resulting package.
 
-
 #![no_main]
 
 use hivepack_rar::{Archive, Error, Extract};
@@ -39,7 +38,9 @@ fn test(data: &[u8]) -> (Vec<(u64, u64)>, String) {
         let (mut bytes, mut sum) = (0u64, 0u64);
         let result = extract.current_file(&mut arc, size, &mut |piece| {
             bytes += piece.len() as u64;
-            sum = piece.iter().fold(sum, |s, &b| s.rotate_left(5) ^ u64::from(b));
+            sum = piece
+                .iter()
+                .fold(sum, |s, &b| s.rotate_left(5) ^ u64::from(b));
             Ok(())
         });
         assert_eq!(bytes, extract.cur_unp_write);
@@ -50,7 +51,7 @@ fn test(data: &[u8]) -> (Vec<(u64, u64)>, String) {
                     return (entries, format!("end {:?}", arc.exit_code()));
                 }
             }
-            Err(e @ Error::NoMemory) => return (entries, e.to_string()),
+            Err(e @ (Error::NoMemory | Error::BadSeek { .. })) => return (entries, e.to_string()),
             Err(e) => panic!("{e}"),
         }
     }

@@ -104,8 +104,9 @@ pub enum Error {
     /// A next volume is not an archive, or says otherwise about encrypting
     /// its headers: UnRAR stops all reading there, with this exit code.
     BadVolume { exit_code: ExitCode },
-    /// What hivepack-rar cannot read yet, which UnRAR can.
-    NotYet(&'static str),
+    /// A QuickOpen record is said to be further than a file can be: UnRAR
+    /// stops all reading there, with this exit code.
+    BadSeek { exit_code: ExitCode },
     /// There is no memory for a dictionary, or UnRAR refuses it for one: too
     /// large, or larger than the one of the solid stream it goes on.
     NoMemory,
@@ -127,7 +128,7 @@ impl fmt::Display for Error {
                 f.write_str("the headers are encrypted, and no password was given")
             }
             Error::BadVolume { .. } => f.write_str("a next volume is not of this archive"),
-            Error::NotYet(what) => write!(f, "{what}: not read yet"),
+            Error::BadSeek { .. } => f.write_str("a QuickOpen record is past where a file can be"),
             Error::NoMemory => f.write_str("no memory for this dictionary"),
             Error::Io(e) => write!(f, "{e}"),
         }

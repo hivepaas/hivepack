@@ -23,6 +23,7 @@ use crate::name::next_volume_name;
 use crate::name::{
     arc_char_to_wide, char_to_wide, convert_file_header, decode_encoded, utf_to_wide,
 };
+use crate::quick_open::QuickOpen;
 use crate::raw::RawRead;
 use crate::source::{Cursor, ReadAt};
 use crate::time::RarTime;
@@ -45,8 +46,10 @@ type OpenVolume<R> = Box<dyn FnMut(&str) -> Option<R>>;
 /// then [`read_header`](Archive::read_header) reads the next header and
 /// [`seek_to_next`](Archive::seek_to_next) moves past its data.
 pub struct Archive<R> {
-    src: R,
-    pos: u64,
+    pub(crate) src: R,
+    /// Where the file is: `File::Tell`, which `tell` is unless a QuickOpen
+    /// record is loaded.
+    pub(crate) pos: u64,
 
     pub format: Format,
     pub solid: bool,
@@ -91,6 +94,8 @@ pub struct Archive<R> {
     open_volume: Option<OpenVolume<R>>,
     /// Where the derivations of keys are kept, for the headers and the data.
     pub(crate) kdf_cache: KdfCache,
+    pub(crate) qopen: QuickOpen,
+    pub(crate) prohibit_qopen: bool,
 }
 
 impl<R: ReadAt> Archive<R> {
@@ -180,6 +185,8 @@ impl<R: ReadAt> Archive<R> {
             name,
             open_volume,
             kdf_cache: KdfCache::default(),
+            qopen: QuickOpen::default(),
+            prohibit_qopen: false,
         };
         if archive.is_archive(enable_broken)? {
             Ok(archive)
@@ -197,30 +204,51 @@ impl<R: ReadAt> Archive<R> {
 
     /// Where the next read starts: `Tell`.
     pub fn position(&self) -> u64 {
-        self.pos
+        self.tell()
     }
 
-    pub(crate) fn cursor(&mut self) -> Cursor<'_> {
+    /// `Archive::Read`.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(read) = self.qopen_read(buf)? {
+            return Ok(read);
+        }
         Cursor {
             src: &self.src,
             pos: &mut self.pos,
         }
+        .read(buf)
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.cursor().read(buf)
-    }
-
+    /// `Archive::Seek`.
     pub(crate) fn seek(&mut self, pos: u64) {
-        self.pos = pos;
+        if self.qopen.loaded {
+            self.qopen_seek(pos);
+        } else {
+            self.pos = pos;
+        }
     }
 
-    fn tell(&self) -> u64 {
-        self.pos
+    /// `Archive::Tell`.
+    pub(crate) fn tell(&self) -> u64 {
+        if self.qopen.loaded {
+            self.qopen.seek_pos
+        } else {
+            self.pos
+        }
     }
 
-    fn file_length(&self) -> io::Result<u64> {
-        self.src.size()
+    /// `File::FileLength`, by way of `Seek` and `Tell`: with a QuickOpen
+    /// record loaded, going back can read it again from its start.
+    fn file_length(&mut self) -> io::Result<u64> {
+        let save_pos = self.tell();
+        let length = self.src.size()?;
+        if self.qopen.loaded {
+            self.qopen_seek_end(length);
+        } else {
+            self.pos = length;
+        }
+        self.seek(save_pos);
+        Ok(length)
     }
 
     /// `IsSignature`: which format the bytes start with.
@@ -499,6 +527,8 @@ impl<R: ReadAt> Archive<R> {
         let split_header = is_part && split_after;
         let prev_vol_encrypted = self.encrypted;
         let pos_before_close = self.tell();
+        // `Archive::Open`, whether or not there is anything to open.
+        self.qopen.loaded = false;
 
         let mut next_name = next_volume_name(&self.name, !self.new_numbering);
         let mut opened = self.open_volume.as_mut().and_then(|open| open(&next_name));
@@ -601,7 +631,7 @@ impl<R: ReadAt> Archive<R> {
             }
         }
 
-        raw.read(&mut self.cursor(), SIZEOF_SHORTBLOCKHEAD)?;
+        raw.read(self, SIZEOF_SHORTBLOCKHEAD)?;
         if raw.size() == 0 {
             self.unexp_end_arc_msg()?;
             return Ok(0);
@@ -635,14 +665,11 @@ impl<R: ReadAt> Archive<R> {
         if short.header_type == HEAD3_CMT {
             // An old comment header inside a main or file header: only its
             // fixed part.
-            raw.read(&mut self.cursor(), SIZEOF_COMMHEAD - SIZEOF_SHORTBLOCKHEAD)?;
+            raw.read(self, SIZEOF_COMMHEAD - SIZEOF_SHORTBLOCKHEAD)?;
         } else if short.header_type == HEAD_MAIN && short.flags & MHD_COMMENT != 0 {
-            raw.read(&mut self.cursor(), SIZEOF_MAINHEAD3 - SIZEOF_SHORTBLOCKHEAD)?;
+            raw.read(self, SIZEOF_MAINHEAD3 - SIZEOF_SHORTBLOCKHEAD)?;
         } else {
-            raw.read(
-                &mut self.cursor(),
-                short.head_size as usize - SIZEOF_SHORTBLOCKHEAD,
-            )?;
+            raw.read(self, short.head_size as usize - SIZEOF_SHORTBLOCKHEAD)?;
         }
 
         self.next_block_pos =
@@ -998,7 +1025,7 @@ impl<R: ReadAt> Archive<R> {
 
         // The CRC, then up to 3 bytes of size: a header is 2 MB at most.
         const FIRST_READ_SIZE: usize = 7;
-        if raw.read(&mut self.cursor(), FIRST_READ_SIZE)? < FIRST_READ_SIZE {
+        if raw.read(self, FIRST_READ_SIZE)? < FIRST_READ_SIZE {
             self.unexp_end_arc_msg()?;
             return Ok(0);
         }
@@ -1023,7 +1050,7 @@ impl<R: ReadAt> Archive<R> {
             return Ok(0);
         }
 
-        raw.read(&mut self.cursor(), size_to_read as usize)?;
+        raw.read(self, size_to_read as usize)?;
         if raw.size() < header_size as usize {
             self.unexp_end_arc_msg()?;
             return Ok(0);
@@ -1120,7 +1147,19 @@ impl<R: ReadAt> Archive<R> {
                 if extra_size != 0 {
                     self.process_extra50(&mut raw, extra_size as usize, short.header_type);
                 }
-                // QuickOpen records are not read yet.
+                if !self.prohibit_qopen && self.main_head.locator && self.main_head.qopen_offset > 0
+                {
+                    // Reading the record moves through the archive: what
+                    // called this goes on from the same blocks.
+                    let save_cur = self.cur_block_pos;
+                    let save_next = self.next_block_pos;
+                    let save_type = self.cur_header_type;
+                    self.qopen.loaded = false;
+                    self.qopen_load(self.main_head.qopen_offset)?;
+                    self.cur_block_pos = save_cur;
+                    self.next_block_pos = save_next;
+                    self.cur_header_type = save_type;
+                }
             }
             HEAD_FILE | HEAD_SERVICE => {
                 let file_block = short.header_type == HEAD_FILE;
@@ -1491,7 +1530,7 @@ impl<R: ReadAt> Archive<R> {
     fn read_header14(&mut self) -> Result<usize, Error> {
         let mut raw = RawRead::new();
         if self.cur_block_pos <= self.sfx_size as i64 {
-            raw.read(&mut self.cursor(), SIZEOF_MAINHEAD14)?;
+            raw.read(self, SIZEOF_MAINHEAD14)?;
             self.main_head = MainHeader::default();
             let mut mark = [0u8; 4];
             raw.get_b(&mut mark);
@@ -1508,7 +1547,7 @@ impl<R: ReadAt> Archive<R> {
             self.main_head.comment_in_header = flags & MHD_COMMENT != 0;
             self.main_head.pack_comment = flags & MHD_PACK_COMMENT != 0;
         } else {
-            raw.read(&mut self.cursor(), SIZEOF_FILEHEAD14)?;
+            raw.read(self, SIZEOF_FILEHEAD14)?;
             let hd = &mut self.file_head;
             hd.reset();
             hd.base.header_type = HEAD_FILE;
@@ -1543,7 +1582,7 @@ impl<R: ReadAt> Archive<R> {
             hd.hs_type = HostSystem::Windows;
             hd.mtime.set_dos(file_time);
 
-            raw.read(&mut self.cursor(), name_size)?;
+            raw.read(self, name_size)?;
             let hd = &mut self.file_head;
             let mut file_name = vec![0u8; name_size];
             raw.get_b(&mut file_name);

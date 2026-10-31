@@ -872,6 +872,24 @@ fn a_name_that_decodes_to_nothing_is_no_path() {
     }
 }
 
+/// An entry's data read only as far as its size, not to its end, is
+/// skipped from there: the next entry follows, from a stream too, where
+/// libarchive counts the last block twice and goes back for it
+/// (`docs/xar.md`).
+#[test]
+fn data_read_in_part_is_skipped_where_it_ends() {
+    let path = repository().join("testdata/xar/tiny.pkg");
+    let archive = std::fs::read(path).unwrap();
+    let mut xar = Reader::new(&archive[..]);
+    let mut names = Vec::new();
+    while let Some(h) = xar.next().unwrap() {
+        let mut data = vec![0; h.size as usize];
+        xar.read_exact(&mut data).unwrap();
+        names.push(h.path.unwrap());
+    }
+    assert_eq!(names, [&b"Bom"[..], b"Payload", b"PackageInfo"]);
+}
+
 /// The archives macOS's `xar`, `pkgbuild` and `productbuild` made, in
 /// `testdata/xar`.
 fn macos_archives() -> Vec<(String, Vec<u8>)> {

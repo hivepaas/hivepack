@@ -72,6 +72,7 @@ jobs:
       - run: cargo check -p hivepack-open --lib --locked
       - run: cargo check -p hivepack-tar --lib --locked
       - run: cargo check -p hivepack-udf --lib --locked
+      - run: cargo check -p hivepack-xar --lib --locked
       - run: cargo check -p hivepack-zip --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked
       - run: cargo check -p hivepack-zstd --lib --locked --features unsafe-fast
@@ -460,6 +461,11 @@ jobs:
               pathlib.Path(f"fuzz/corpus/extract_iso/{path.name}").write_bytes(bytes([i % 256]) + path.read_bytes())
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_iso -- -max_total_time=60 -rss_limit_mb=4096
+      - name: Seed the XAR corpus with the archives of macOS's xar and pkgbuild
+        run: |
+          mkdir -p fuzz/corpus/xar
+          cp testdata/xar/*.xar testdata/xar/*.pkg fuzz/corpus/xar/
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu xar -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the cpio corpus with the recorded archives
         run: |
           mkdir -p fuzz/corpus/cpio

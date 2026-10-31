@@ -1,6 +1,7 @@
 //! The published test vectors: AES from FIPS-197 (appendix C) and NIST SP
-//! 800-38A (F.1, ECB); SHA-1, SHA-256 and SHA-512 from FIPS 180; HMAC-SHA1
-//! from RFC 2202, HMAC-SHA256 and HMAC-SHA512 from RFC 4231;
+//! 800-38A (F.1, ECB); SHA-1, SHA-256 and SHA-512 from FIPS 180; MD5 from
+//! RFC 1321; HMAC-SHA1 and HMAC-MD5 from RFC 2202, HMAC-SHA256 and
+//! HMAC-SHA512 from RFC 4231;
 //! PBKDF2-HMAC-SHA1 from RFC 6070 and PBKDF2-HMAC-SHA256 from RFC 7914;
 //! HKDF from RFC 5869; ChaCha20 and ChaCha20-Poly1305 from RFC 8439;
 //! X25519 from RFC 7748; scrypt from RFC 7914. `tests/oracle.rs` compares
@@ -11,7 +12,7 @@
 mod support;
 
 use hivepack_crypto::{
-    Aes, Digest, Hkdf, Hmac, HmacKey, ScryptError, Sha1, Sha256, Sha512, chacha20,
+    Aes, Digest, Hkdf, Hmac, HmacKey, Md5, ScryptError, Sha1, Sha256, Sha512, chacha20,
     chacha20_poly1305, equal, pbkdf2, scrypt, x25519, x25519_base,
 };
 use support::{hex, unhex};
@@ -256,6 +257,87 @@ fn hmac_sha1_rfc_2202() {
             b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data"
         ),
         "e8e99d0f45237d786d6bbaa7965c7808bbff1a91"
+    );
+}
+
+fn md5(data: &[u8]) -> String {
+    let mut md5 = Md5::new();
+    md5.update(data);
+    hex(&md5.out())
+}
+
+/// RFC 1321, appendix A.5, and a million times "a".
+#[test]
+fn md5_rfc_1321() {
+    assert_eq!(md5(b""), "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(md5(b"a"), "0cc175b9c0f1b6a831c399e269772661");
+    assert_eq!(md5(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(md5(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+    assert_eq!(
+        md5(b"abcdefghijklmnopqrstuvwxyz"),
+        "c3fcd3d76192e4007dfb496cca67e13b"
+    );
+    assert_eq!(
+        md5(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+        "d174ab98d277d9f5a5611c2c9f419d9f"
+    );
+    assert_eq!(
+        md5(b"1234567890123456789012345678901234567890\
+              1234567890123456789012345678901234567890"),
+        "57edf4a22be3c955ac49da2e2107b67a"
+    );
+    let mut md5 = Md5::new();
+    for _ in 0..1000 {
+        md5.update(&[b'a'; 1000]);
+    }
+    assert_eq!(hex(&md5.out()), "7707d6ae4e027c70eea2a935c2296f21");
+}
+
+#[test]
+fn md5_goes_on_after_out() {
+    let mut md5 = Md5::new();
+    md5.update(b"ab");
+    assert_eq!(hex(&md5.out()), self::md5(b"ab"));
+    md5.update(b"c");
+    assert_eq!(hex(&md5.out()), "900150983cd24fb0d6963f7d28e17f72");
+}
+
+#[test]
+fn hmac_md5_rfc_2202() {
+    assert_eq!(
+        hmac_with::<Md5>(&[0x0b; 16], b"Hi There"),
+        "9294727a3638bb1c13f48ef8158bfc9d"
+    );
+    assert_eq!(
+        hmac_with::<Md5>(b"Jefe", b"what do ya want for nothing?"),
+        "750c783e6ab0b503eaa86e310a5db738"
+    );
+    assert_eq!(
+        hmac_with::<Md5>(&[0xaa; 16], &[0xdd; 50]),
+        "56be34521d144c88dbb8c733f0e8b3f6"
+    );
+    let key: Vec<u8> = (1..=25).collect();
+    assert_eq!(
+        hmac_with::<Md5>(&key, &[0xcd; 50]),
+        "697eaf0aca3a3aea3a75164746ffaa79"
+    );
+    assert_eq!(
+        hmac_with::<Md5>(&[0x0c; 16], b"Test With Truncation"),
+        "56461ef2342edc00f9bab995690efd4c"
+    );
+    assert_eq!(
+        hmac_with::<Md5>(
+            &[0xaa; 80],
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        ),
+        "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd"
+    );
+    assert_eq!(
+        hmac_with::<Md5>(
+            &[0xaa; 80],
+            b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data"
+        ),
+        "6f630fad67cda0ee1fb1f562db3aa53e"
     );
 }
 

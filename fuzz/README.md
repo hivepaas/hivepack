@@ -89,10 +89,14 @@ inputs of its compression requests, behind the modes that compress them:
 cargo fuzz run lz4 -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
-CI seeds `sevenz` with the archives of `testdata/oracle/7z.txt`:
+CI seeds `sevenz` with the archives of `testdata/oracle/7z.txt`, and
+`extract_7z` with those of `testdata/7z` behind a byte of options:
 
 ```sh
+mkdir -p fuzz/corpus/extract_7z
+for f in testdata/7z/*.7z; do { printf '\x12'; cat "$f"; } > "fuzz/corpus/extract_7z/$(basename "$f")"; done
 cargo fuzz run sevenz -- -max_total_time=3600 -rss_limit_mb=4096
+cargo fuzz run extract_7z -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and

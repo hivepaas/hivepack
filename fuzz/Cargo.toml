@@ -294,3 +294,10 @@ path = "fuzz_targets/sevenz.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "extract_7z"
+path = "fuzz_targets/extract_7z.rs"
+test = false
+doc = false
+bench = false

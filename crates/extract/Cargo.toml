@@ -34,5 +34,7 @@ hivepack-deflate.workspace = true
 # answers give.
 hivepack-crypto.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# File times past 2038 where time_t has 32 bits, and on macOS the
+# quarantine's extended attribute.
+[target.'cfg(unix)'.dependencies]
 rustix.workspace = true

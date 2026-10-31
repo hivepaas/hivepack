@@ -422,12 +422,54 @@ fn write_file<R: ReadAt>(
     }
 
     if let Some(mtime) = item.mtime {
-        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
-            .map_err(ErrorKind::Io)?;
+        set_file_time(&file, mtime)?;
     }
     set_permissions(&file, item.mode, options.permissions)?;
     file.flush().map_err(ErrorKind::Io)?;
     Ok(written)
+}
+
+/// Sets the time `file` was last changed to `mtime`, on Unix through
+/// `futimens`: the standard library's `File::set_times` refuses a time past
+/// January 2038 where `time_t` has 32 bits (i686 Linux), though the system
+/// takes it (`utimensat_time64`).
+#[cfg(unix)]
+pub(crate) fn set_file_time(
+    file: &std::fs::File,
+    mtime: std::time::SystemTime,
+) -> Result<(), ErrorKind> {
+    use rustix::fs::{Timespec, Timestamps, UTIME_OMIT};
+    let (tv_sec, tv_nsec) = match mtime.duration_since(UNIX_EPOCH) {
+        Ok(after) => (after.as_secs() as i64, i64::from(after.subsec_nanos())),
+        Err(before) => {
+            let before = before.duration();
+            match before.subsec_nanos() {
+                0 => (-(before.as_secs() as i64), 0),
+                n => (-(before.as_secs() as i64) - 1, 1_000_000_000 - i64::from(n)),
+            }
+        }
+    };
+    let times = Timestamps {
+        last_access: Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        last_modification: Timespec {
+            tv_sec,
+            tv_nsec: tv_nsec as _,
+        },
+    };
+    rustix::fs::futimens(file, &times).map_err(|e| ErrorKind::Io(e.into()))
+}
+
+/// Sets the time `file` was last changed to `mtime`.
+#[cfg(not(unix))]
+pub(crate) fn set_file_time(
+    file: &std::fs::File,
+    mtime: std::time::SystemTime,
+) -> Result<(), ErrorKind> {
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .map_err(ErrorKind::Io)
 }
 
 /// The permission bits of `mode`, as `permissions` says, on Unix.

@@ -844,6 +844,34 @@ fn original_twice_is_refused() {
     }
 }
 
+/// A name in base64 that decodes to nothing leaves libarchive's string
+/// without a buffer, and the entry without a path; under it, a file's path
+/// is its parent's, empty, then `/` and its name (directories with a mode,
+/// as libarchive leaves out those with nothing but a name and a type).
+/// Damaged copies of the
+/// written archives found it, when the damage fell in such a name.
+#[test]
+fn a_name_that_decodes_to_nothing_is_no_path() {
+    let toc = b"<?xml version=\"1.0\"?><xar><toc>\
+        <file id=\"1\"><name enctype=\"base64\">&gt;w7H=</name><type>directory</type><mode>0755</mode>\
+        <file id=\"2\"><name>b</name><type>directory</type><mode>0755</mode></file></file>\
+        <file id=\"3\"><name enctype=\"base64\">YQ==</name><type>directory</type><mode>0755</mode></file>\
+        </toc></xar>";
+    let archive = archive::assemble(toc, 6, archive::NONE, b"");
+    let mut xar = Reader::new(&archive[..]);
+    let mut paths = Vec::new();
+    while let Some(h) = xar.next().unwrap() {
+        paths.push(h.path);
+    }
+    assert_eq!(paths, [None, Some(b"/b".to_vec()), Some(b"a".to_vec())]);
+    if let Some(mut oracle) = Oracle::spawn("xar-oracle") {
+        let sizes = sizes(&mut oracle);
+        for mode in ["m", "s"] {
+            compare(&mut oracle, sizes, "no path", &archive, mode, &mut Rng(3));
+        }
+    }
+}
+
 /// The archives macOS's `xar`, `pkgbuild` and `productbuild` made, in
 /// `testdata/xar`.
 fn macos_archives() -> Vec<(String, Vec<u8>)> {

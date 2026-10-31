@@ -572,8 +572,10 @@ fn base64(c: u8) -> Option<u32> {
 /// `strappend_base64`: the bytes of `s`, decoded, appended to `as`
 /// through a 256-byte buffer, each of whose fills stops at a NUL as
 /// `archive_strncat` does; decoding stops at the first byte that is not
-/// base64.
-pub(crate) fn strappend_base64(out: &mut Vec<u8>, s: &[u8]) {
+/// base64. Whether anything was appended: libarchive's string has a
+/// buffer, and the entry a path, only if it was.
+pub(crate) fn strappend_base64(out: &mut Vec<u8>, s: &[u8]) -> bool {
+    let mut appended = false;
     let mut buff = [0u8; 256];
     let mut len = 0;
     let mut b = 0;
@@ -609,12 +611,15 @@ pub(crate) fn strappend_base64(out: &mut Vec<u8>, s: &[u8]) {
         }
         if len + 3 >= buff.len() {
             strncat(out, &buff[..len]);
+            appended = true;
             len = 0;
         }
     }
     if len > 0 {
         strncat(out, &buff[..len]);
+        appended = true;
     }
+    appended
 }
 
 /// `is_string`: whether `data` is `known`.
@@ -1784,18 +1789,24 @@ impl Xar {
                 if self.files[f].has & HAS_PATHNAME != 0 {
                     return Ok(());
                 }
+                // The buffer libarchive's string is given only by what is
+                // appended to it: a name in base64 that decodes to nothing,
+                // with no parent before it, leaves the path unset.
+                let mut allocated = self.files[f].pathname.s.is_some();
                 let mut path = self.files[f].pathname.s.take().unwrap_or_default();
                 if let Some(p) = self.files[f].parent {
                     path.extend_from_slice(self.files[p].pathname.bytes());
                     path.push(b'/');
+                    allocated = true;
                 }
                 self.files[f].has |= HAS_PATHNAME;
                 if self.base64text {
-                    strappend_base64(&mut path, s);
+                    allocated |= strappend_base64(&mut path, s);
                 } else {
                     strncat(&mut path, s);
+                    allocated = true;
                 }
-                self.files[f].pathname.s = Some(path);
+                self.files[f].pathname.s = allocated.then_some(path);
             }
             S::FileLink => {
                 let file = &mut self.files[f];

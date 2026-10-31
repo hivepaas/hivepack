@@ -38,7 +38,7 @@ In safe Rust, against BearSSL 0.6, built with `gcc -O2`, and Go 1.27.2's `golang
 | SHA-512 | 788 MB/s | 752 MB/s | 1,359 MB/s |
 | ChaCha20 | 1,340 MB/s | 1,300 MB/s | 1,265 MB/s |
 | ChaCha20-Poly1305 | 998 MB/s | 964 MB/s | 3,663 MB/s |
-| X25519 | 66 µs | 79 µs | 47 µs |
+| X25519 | 22 µs | 79 µs | 47 µs |
 
 **Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, 64 MiB at a time. More is in [docs/crypto.md](../../docs/crypto.md#speed).
 

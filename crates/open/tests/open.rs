@@ -575,6 +575,32 @@ fn udf_volumes_under_layers_open() {
     }
 }
 
+/// 7z archives of `testdata/7z`, made by 7-Zip: found by their signature,
+/// alone and under layers, and opened by hivepack-7z from what comes out.
+#[test]
+fn seven_zip_archives_under_layers_open() {
+    for name in ["plain.7z", "encrypted.7z"] {
+        let path = support::repository().join("testdata/7z").join(name);
+        let archive = std::fs::read(path).unwrap();
+        assert_eq!(
+            open(&archive).unwrap(),
+            (vec![], Container::SevenZip, archive.clone()),
+            "{name}"
+        );
+        for (layer, compress) in [(Layer::Zstd, zstd as Compress), (Layer::Xz, xz)] {
+            let (layers, container, data) = open(&compress(&archive)).unwrap();
+            assert_eq!(
+                (layers, container),
+                (vec![layer], Container::SevenZip),
+                "{name}"
+            );
+            assert!(data == archive, "{name}");
+            let opened = hivepack_7z::Archive::open(Cursor::new(data)).unwrap();
+            assert_eq!(opened.len(), 9, "{name}");
+        }
+    }
+}
+
 /// Data looked into for an ISO 9660 image, cut short in what is looked
 /// at: it opens, and the error comes after the data before it, as without
 /// the look.

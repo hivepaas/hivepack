@@ -12,7 +12,8 @@
 //! `--limit-mb` in all. "Big" archives hold them as they are, "small" ones `--small`
 //! pieces of 4 KiB from them, and "many" ones `--many` entries of 16 bytes, where
 //! what counts is the headers. Go's `tar.Writer` makes the archives, and GNU tar,
-//! which must be installed, the sparse ones, which `tar.Writer` does not write.
+//! as `gtar` or `tar`, the sparse ones, which `tar.Writer` does not write; without
+//! it, or if it finds no holes in the files, those rows are left out.
 //!
 //! Go runs in a program of its own, `tools/tar-bench/go`. Most rows read from
 //! memory, so that only the reader is timed, through a plain reader on both sides.
@@ -436,8 +437,19 @@ fn make_lists(
     Ok((big, pieces, total))
 }
 
+/// GNU tar's name here, if it is installed.
+fn gnu_tar() -> Option<&'static str> {
+    ["gtar", "tar"].into_iter().find(|tar| {
+        Command::new(tar)
+            .arg("--version")
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("GNU tar"))
+    })
+}
+
 /// Sparse archives, by GNU tar: files with 4 KiB of data every 64 KiB.
-fn make_sparse(dir: &Path, out: &Path, options: &[&str]) -> Result<()> {
+fn make_sparse(tar: &str, dir: &Path, out: &Path, options: &[&str]) -> Result<()> {
     let folder = dir.join("sparse");
     if !folder.exists() {
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -456,7 +468,7 @@ fn make_sparse(dir: &Path, out: &Path, options: &[&str]) -> Result<()> {
             file.flush().map_err(|e| e.to_string())?;
         }
     }
-    let status = Command::new("tar")
+    let status = Command::new(tar)
         .current_dir(dir)
         .args(["--sparse", "-cf"])
         .arg(out)
@@ -467,6 +479,10 @@ fn make_sparse(dir: &Path, out: &Path, options: &[&str]) -> Result<()> {
         .map_err(|e| format!("GNU tar: {e}"))?;
     if !status.success() {
         return Err(format!("tar {options:?}: {status}"));
+    }
+    let len = std::fs::metadata(out).map_err(|e| e.to_string())?.len();
+    if len > SPARSE_FILES as u64 * SPARSE_SIZE / 2 {
+        return Err(format!("tar {options:?} found no holes: {len} bytes"));
     }
     Ok(())
 }
@@ -501,6 +517,15 @@ fn real_main() -> Result<()> {
         make_lists(&options.data, &dir, options.limit_mb << 20, options.small)?;
 
     println!("| Workload | hivepack-tar | Go | Port / Go |\n|---|---|---|---|");
+    // On macOS, GNU tar writes these files whole, whose rows would then time something else.
+    let tar = gnu_tar().filter(|tar| {
+        make_sparse(tar, &dir, &dir.join("probe.tar"), &["--format=gnu"])
+            .inspect_err(|e| eprintln!("the sparse rows are left out: {e}"))
+            .is_ok()
+    });
+    if gnu_tar().is_none() {
+        eprintln!("no GNU tar here: the sparse rows are left out");
+    }
     let mut category = "";
     let mut made: Vec<(Archive, PathBuf, Vec<u8>, u64)> = Vec::new();
     for w in WORKLOADS {
@@ -508,6 +533,10 @@ fn real_main() -> Result<()> {
             && !w.category.contains(only.as_str())
             && !w.name.contains(only.as_str())
         {
+            continue;
+        }
+        let sparse = matches!(w.archive, Archive::SparseGnu | Archive::SparsePax);
+        if sparse && tar.is_none() {
             continue;
         }
         if w.category != category {
@@ -528,9 +557,16 @@ fn real_main() -> Result<()> {
                 Archive::Small => go
                     .ask(&format!("pack {out} {}", text(&small_list)?))
                     .map(|_| ())?,
-                Archive::SparseGnu => make_sparse(&dir, &path, &["--format=gnu"])?,
+                Archive::SparseGnu => {
+                    make_sparse(tar.unwrap_or("tar"), &dir, &path, &["--format=gnu"])?
+                }
                 Archive::SparsePax => {
-                    make_sparse(&dir, &path, &["--format=pax", "--sparse-version=1.0"])?;
+                    make_sparse(
+                        tar.unwrap_or("tar"),
+                        &dir,
+                        &path,
+                        &["--format=pax", "--sparse-version=1.0"],
+                    )?;
                 }
             }
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;

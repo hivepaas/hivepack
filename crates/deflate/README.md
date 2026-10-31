@@ -40,6 +40,18 @@ Against zlib 1.3.2, with `tools/deflate-bench`, on the Silesia corpus at levels 
 
 **Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of three rounds taken in turn. More is in [docs/deflate.md](../../docs/deflate.md#the-speed-target).
 
+### On GitHub's runners
+
+Against zlib 1.3.2, each row the mean and the range over its files or workloads.
+
+| Port / reference | Linux x86-64 | Windows x86-64 | macOS arm64 |
+|---|---|---|---|
+| Decompression, in one call | 0.89× (0.80–0.97×) | 0.91× (0.82–1.00×) | 0.94× (0.80–1.08×) |
+| Decompression, streaming | 0.96× (0.85–1.06×) | 0.95× (0.83–1.10×) | 0.94× (0.74–1.10×) |
+| Compression, levels 1, 6 and 9 | 0.97× (0.92–1.01×) | 1.12× (0.99–1.31×) | 0.98× (0.84–1.12×) |
+
+**Measured on** `.github/workflows/bench.yml`, on October 31, 2026, with rustc 1.99.1: Linux x86-64 on AMD EPYC 7763 64-Core Processor (4 threads); Windows x86-64 on AMD64 Family 25 Model 1 Stepping 1 (4 threads); macOS arm64 on Apple M1 (Virtual) (3 threads). Each job gets what the runner has that day, so these are not the same processor from format to format, and they are shared machines: the ratios hold better than the speeds.
+
 ## License
 
 The zlib license, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler, and (c) 2026 HivePaaS.

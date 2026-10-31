@@ -45,14 +45,14 @@ Against age v1.3.2, the reference implementation in Go, with `tools/age-bench`. 
 
 | Port / age | Linux x86-64 | Windows x86-64 | macOS arm64 |
 |---|---|---|---|
-| Passphrase, scrypt | 0.95–1.22× | 1.10–1.15× | 1.00–1.08× |
-| A big file in ASCII armor | 1.25× | 1.29× | 1.20× |
-| X25519 and ssh-ed25519, an empty file | 0.70–0.77× | 0.79–0.95× | 0.73–0.78× |
-| Files of 4 KiB | 0.74× | 0.85× | 0.74× |
-| Parsing age keys | 0.72× | 0.77× | 0.77× |
-| A big file's payload | 0.34× | 0.22× | 0.53× |
+| X25519 and ssh-ed25519, an empty file | 2.20–2.24× | 2.08–2.22× | 2.12–2.36× |
+| Parsing age keys | 2.27× | 2.13× | 2.38× |
+| Files of 4 KiB | 1.94× | 1.95× | 1.96× |
+| A big file in ASCII armor | 1.23× | 1.19× | 1.29× |
+| Passphrase, scrypt | 0.99–1.25× | 1.10–1.15× | 0.99–1.23× |
+| A big file's payload | 0.22× | 0.33× | 0.52× |
 
-**Measured on** GitHub's runners with `.github/workflows/bench.yml`, on October 31, 2026, the best of five rounds taken in turn: Linux on an AMD EPYC 9V45 (4 threads), Windows Server 2025 on an AMD processor (family 25, model 1) (4 threads), and macOS 26 on a virtual Apple M1 (3 threads). All with rustc 1.99.1 and Go 1.27.2. These are shared machines, so the ratios hold better than the speeds, and a runner's processor can differ from one run to the next.
+**Measured on** GitHub's runners with `.github/workflows/bench.yml`, on October 31, 2026, the best of five rounds taken in turn: Linux on an AMD EPYC 7763 (4 threads), Windows Server 2025 on an AMD processor (family 26, model 2, 4 threads), and macOS 26 on a virtual Apple M1 (3 threads). All with rustc 1.99.1 and Go 1.27.2. These are shared machines, so the ratios hold better than the speeds, and a runner's processor can differ from one run to the next.
 
 Go's ChaCha20-Poly1305 is assembly, which is the big file's gap. On one machine with more detail, an AMD Ryzen 9 9950X, the whole table is in [docs/age.md](../../docs/age.md#the-speed).
 

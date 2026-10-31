@@ -38,6 +38,17 @@ Against liblzma 5.8.4, with `tools/xz-bench`, on the 12 Silesia files with CRC64
 
 **Measured on:** AMD Ryzen 9 9950X (x86-64, Linux), in October 2026, the best of two or three rounds taken in turn. Threads and more are in [docs/xz.md](../../docs/xz.md#the-speed-target).
 
+### On GitHub's runners
+
+Against liblzma 5.8.4, each row the mean and the range over its files or workloads.
+
+| Port / reference | Linux x86-64 | Windows x86-64 | macOS arm64 |
+|---|---|---|---|
+| Decompression | 0.79× (0.71–0.87×) | 1.04× (0.96–1.13×) | 1.01× (0.89–1.18×) |
+| Compression, presets 0 and 6 | 1.00× (0.89–1.06×) | 1.01× (0.91–1.08×) | 1.04× (0.91–1.16×) |
+
+**Measured on** `.github/workflows/bench.yml`, on October 31, 2026, with rustc 1.99.1: Linux x86-64 on AMD EPYC 7763 64-Core Processor (4 threads); Windows x86-64 on AMD64 Family 25 Model 1 Stepping 1 (4 threads); macOS arm64 on Apple M1 (Virtual) (3 threads). Each job gets what the runner has that day, so these are not the same processor from format to format, and they are shared machines: the ratios hold better than the speeds. Linux's decompression is below 1× as liblzma has x86-64 assembly for it there; why Windows, with x86-64 too, is near 1× has not been looked into.
+
 ## License
 
 The BSD Zero Clause License (`0BSD`), liblzma's license. See [LICENSE](LICENSE). Copyright (C) The XZ Utils authors and contributors, and (c) 2026 HivePaaS.

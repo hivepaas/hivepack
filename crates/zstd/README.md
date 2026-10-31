@@ -38,6 +38,20 @@ Against libzstd 1.5.7, with `tools/zstd-bench`, on the 12 Silesia files, in one 
 
 **Measured on:** an Apple M1 Pro, and GitHub's hosted runners, shared machines with 4 threads (`ubuntu-latest` and `ubuntu-24.04-arm`, with `.github/workflows/bench.yml`), in October 2026, the best of three rounds taken in turn. On x86-64, libzstd decodes Huffman with its assembly loop. These are means; the ranges and every level are in [docs/porting.md](../../docs/porting.md#the-speed-target).
 
+### On GitHub's runners
+
+Against libzstd 1.5.7, without `unsafe-fast`, each row the mean and the range over its files or workloads.
+
+| Port / reference | Linux x86-64 | Windows x86-64 | macOS arm64 |
+|---|---|---|---|
+| Decompression | 0.73× (0.70–0.81×) | 0.90× (0.86–0.96×) | 0.91× (0.67–1.24×) |
+| Compression, level 1 | 0.84× (0.77–0.89×) | 0.90× (0.86–0.95×) | 0.88× (0.72–1.00×) |
+| Compression, level 3 | 0.88× (0.83–0.92×) | 0.85× (0.80–0.89×) | 0.90× (0.79–1.02×) |
+| Compression, level 9 | 0.55× (0.46–0.69×) | 0.58× (0.46–0.69×) | 0.60× (0.48–0.72×) |
+| Compression, level 19 | 0.85× (0.77–0.90×) | 0.92× (0.85–1.05×) | 0.92× (0.69–1.17×) |
+
+**Measured on** `.github/workflows/bench.yml`, on October 31, 2026, with rustc 1.99.1: Linux x86-64 on AMD EPYC 7763 64-Core Processor (4 threads); Windows x86-64 on AMD64 Family 25 Model 17 Stepping 1 (4 threads); macOS arm64 on Apple M1 (Virtual) (3 threads). Each job gets what the runner has that day, so these are not the same processor from format to format, and they are shared machines: the ratios hold better than the speeds.
+
 ## License
 
 BSD-3-Clause, the license of the code it is ported from. See [LICENSE](LICENSE). Copyright (c) Meta Platforms, Inc. and affiliates, and (c) 2026 HivePaaS. The suffix sort of the dictionary builder, `src/dict_builder/divsufsort.rs`, is ported from libdivsufsort-lite, which libzstd ships, and is under the MIT license, with its notice there and in [LICENSE](LICENSE): Copyright (c) 2003-2008 Yuta Mori.

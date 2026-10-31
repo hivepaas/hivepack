@@ -19,6 +19,9 @@
  *   sha1 <data>
  *       Answered "ok <digest>".
  *
+ *   md5 <data>
+ *       Answered "ok <digest>".
+ *
  *   hmac <key> <data>
  *       HMAC-SHA1. Answered "ok <mac>".
  *
@@ -33,6 +36,7 @@
 
 #include <nettle/aes.h>
 #include <nettle/hmac.h>
+#include <nettle/md5.h>
 #include <nettle/pbkdf2.h>
 #include <nettle/sha1.h>
 
@@ -115,6 +119,18 @@ static void do_sha1(const char *data_hex) {
     free(data);
 }
 
+static void do_md5(const char *data_hex) {
+    size_t len;
+    unsigned char *data = unhex(data_hex, &len);
+    unsigned char digest[MD5_DIGEST_SIZE];
+    struct md5_ctx ctx;
+    md5_init(&ctx);
+    md5_update(&ctx, len, data);
+    md5_digest(&ctx, MD5_DIGEST_SIZE, digest);
+    answer(digest, MD5_DIGEST_SIZE);
+    free(data);
+}
+
 static void do_hmac(const char *key_hex, const char *data_hex) {
     size_t key_len, len;
     unsigned char *key = unhex(key_hex, &key_len);
@@ -169,6 +185,8 @@ int main(void) {
             do_aes(words[1], words[2]);
         else if (count == 2 && strcmp(words[0], "sha1") == 0)
             do_sha1(words[1]);
+        else if (count == 2 && strcmp(words[0], "md5") == 0)
+            do_md5(words[1]);
         else if (count == 3 && strcmp(words[0], "hmac") == 0)
             do_hmac(words[1], words[2]);
         else if (count == 5 && strcmp(words[0], "pbkdf2") == 0)

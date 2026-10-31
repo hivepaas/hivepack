@@ -27,6 +27,11 @@
 //! - [`Blake2sp`] and [`Blake2s`] are the BLAKE2 reference implementation's
 //!   `blake2sp-ref.c` and `blake2s-ref.c`, as BearSSL has no BLAKE2.
 //!
+//! What XAR checks its table of contents and files with, in hivepack-xar,
+//! besides SHA-1, SHA-256 and SHA-512:
+//!
+//! - [`Md5`] is BearSSL's `md5.c`.
+//!
 //! Secrets are overwritten when the values that hold them are dropped, as
 //! libzip clears them with `_zip_crypto_clear`. That is best effort: safe
 //! Rust has no volatile write, and the compiler could leave out the
@@ -36,7 +41,7 @@
 //! Go, are in the repository: `docs/crypto.md` and `docs/safety.md`.
 //!
 //! ```
-//! use hivepack_crypto::{Aes, Hkdf, Hmac, HmacKey, Sha1, Sha256, pbkdf2, x25519, x25519_base};
+//! use hivepack_crypto::{Aes, Hkdf, Hmac, HmacKey, Md5, Sha1, Sha256, pbkdf2, x25519, x25519_base};
 //!
 //! // FIPS-197, appendix C.1.
 //! let key: Vec<u8> = (0..16).collect();
@@ -48,6 +53,11 @@
 //! let mut sha1 = Sha1::new();
 //! sha1.update(b"abc");
 //! assert_eq!(sha1.out()[..4], [0xa9, 0x99, 0x3e, 0x36]);
+//!
+//! // RFC 1321, appendix A.5.
+//! let mut md5 = Md5::new();
+//! md5.update(b"abc");
+//! assert_eq!(md5.out()[..4], [0x90, 0x01, 0x50, 0x98]);
 //!
 //! // RFC 2202, test case 2.
 //! let mut hmac = Hmac::new(&HmacKey::<Sha1>::new(b"Jefe"));
@@ -84,6 +94,7 @@ mod digest;
 mod ec_c25519_m31;
 mod hkdf;
 mod hmac;
+mod md5;
 mod pbkdf2;
 mod poly1305_ctmul;
 mod scrypt;
@@ -100,6 +111,7 @@ pub use digest::Digest;
 pub use ec_c25519_m31::{X25519_LENGTH, x25519, x25519_base};
 pub use hkdf::{Hkdf, HkdfExpand};
 pub use hmac::{Hmac, HmacKey};
+pub use md5::{MD5_LENGTH, Md5};
 pub use pbkdf2::pbkdf2;
 pub use poly1305_ctmul::{POLY1305_TAG_LENGTH, chacha20_poly1305};
 pub use scrypt::{ScryptError, scrypt};

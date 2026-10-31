@@ -17,6 +17,8 @@
 // Test helpers: a broken oracle should stop the test.
 #![allow(dead_code, clippy::expect_used, clippy::panic)]
 
+pub mod patch;
+
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;

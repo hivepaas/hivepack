@@ -103,6 +103,9 @@ pub enum Error {
     MissingPassword { exit_code: ExitCode },
     /// What hivepack-rar cannot read yet, which UnRAR can.
     NotYet(&'static str),
+    /// There is no memory for a dictionary, or UnRAR refuses it for one: too
+    /// large, or larger than the one of the solid stream it goes on.
+    NoMemory,
     /// The archive could not be read.
     Io(io::Error),
 }
@@ -121,6 +124,7 @@ impl fmt::Display for Error {
                 f.write_str("the headers are encrypted, and no password was given")
             }
             Error::NotYet(what) => write!(f, "{what}: not read yet"),
+            Error::NoMemory => f.write_str("no memory for this dictionary"),
             Error::Io(e) => write!(f, "{e}"),
         }
     }

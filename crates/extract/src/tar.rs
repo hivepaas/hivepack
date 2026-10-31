@@ -24,7 +24,7 @@ use crate::error::{Error, ErrorKind};
 use crate::name::{Name, NameError, check_name, link_target, prepare};
 use crate::plan::{Item, Kind, Links, Names, OnRefused, Options, check, fold};
 use crate::progress::Run;
-use crate::zip::{Summary, set_dir_times, set_file_time, set_permissions};
+use crate::zip::{Summary, set_dir_times, set_modified, set_permissions};
 
 /// GNU's volume label, which names the archive, not a file.
 const TYPE_GNU_VOLUME: u8 = b'V';
@@ -595,7 +595,7 @@ pub(crate) fn finish_file(
         origin.write_file(file).map_err(ErrorKind::Origin)?;
     }
     if let Some(mtime) = item.mtime {
-        set_file_time(file, mtime)?;
+        set_modified(file, mtime)?;
     }
     set_permissions(file, item.mode, options.permissions)?;
     let mut file = file;

@@ -13,8 +13,8 @@
 //! when testing an archive: each entry's data is read, given to a callback
 //! and checked against its hash, and nothing is created.
 //!
-//! So far entries that are stored, not encrypted and whole in this volume:
-//! anything else is [`Error::NotYet`].
+//! So far stored entries and the compression of RAR 2.9 and later, not
+//! encrypted and whole in this volume: anything else is [`Error::NotYet`].
 
 use std::io;
 
@@ -24,17 +24,54 @@ use crate::hash::DataHash;
 use crate::headers::{CryptMethod, Format, HEAD_ENDARC, HEAD_FILE, Redirection};
 use crate::name::convert_path;
 use crate::source::ReadAt;
+use crate::unpack::{UnpIo, Unpack};
 
 /// A size at a time. `File::CopyBufferSize`'s is larger, which makes no
 /// difference to what comes out.
 const COPY_BUFFER_SIZE: usize = 64 << 10;
+
+/// `VER_UNPACK`.
+const VER_UNPACK: u32 = 29;
+/// `VER_UNPACK7`.
+const VER_UNPACK7: u32 = 70;
+
+/// `ComprDataIO`, for an entry that is not encrypted and whole in this volume.
+struct DataIo<'a, 'o, R: ReadAt> {
+    arc: &'a mut Archive<R>,
+    packed_left: u64,
+    hash: &'a mut DataHash,
+    out: &'a mut Output<'o>,
+    skip_unp_crc: bool,
+    cur_unp_write: &'a mut u64,
+}
+
+impl<R: ReadAt> UnpIo for DataIo<'_, '_, R> {
+    fn unp_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let to_read = (buf.len() as u64).min(self.packed_left) as usize;
+        if to_read == 0 {
+            return Ok(0);
+        }
+        let read = self.arc.cursor().read(&mut buf[..to_read])?;
+        self.packed_left -= read as u64;
+        Ok(read)
+    }
+
+    fn unp_write(&mut self, data: &[u8]) -> Result<(), Error> {
+        (self.out)(data)?;
+        *self.cur_unp_write += data.len() as u64;
+        if !self.skip_unp_crc {
+            self.hash.update(data);
+        }
+        Ok(())
+    }
+}
 
 /// Where an entry's data goes.
 pub type Output<'a> = dyn FnMut(&[u8]) -> io::Result<()> + 'a;
 
 /// `CmdExtract`: what lasts from one entry to the next, and what became of
 /// the last entry.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Extract {
     /// The largest dictionary an entry may ask for, stored or not: over it
     /// the extraction stops, as `CheckWinLimit` stops it when nobody allows
@@ -48,6 +85,8 @@ pub struct Extract {
     pub skip_solid: bool,
     /// Whether the last entry's hash was checked and failed.
     pub broken_file: bool,
+    /// `Unp`: made when first needed, and it lasts for a solid archive's sake.
+    unp: Option<Box<Unpack>>,
 }
 
 impl Default for Extract {
@@ -57,6 +96,7 @@ impl Default for Extract {
             cur_unp_write: 0,
             skip_solid: false,
             broken_file: false,
+            unp: None,
         }
     }
 }
@@ -79,6 +119,8 @@ impl Extract {
     ///
     /// [`Error::NotYet`] for an entry that cannot be read yet, the position
     /// left at its header's end: [`Archive::seek_to_next`] goes on past it.
+    /// [`Error::NoMemory`] when a dictionary cannot be had: it stops
+    /// everything, as `bad_alloc` does in UnRAR.
     /// [`Error::Io`] when the archive cannot be read or `out` fails.
     pub fn current_file<R: ReadAt>(
         &mut self,
@@ -108,8 +150,11 @@ impl Extract {
         }
 
         let head = &arc.file_head;
-        if head.method != 0 {
-            return Err(Error::NotYet("compressed data"));
+        if head.method != 0
+            && arc.format != Format::Rar50
+            && matches!(head.unp_ver, 13..=15 | 20 | 26)
+        {
+            return Err(Error::NotYet("compression of RAR 1.5 and 2.x"));
         }
         if head.encrypted {
             return Err(Error::NotYet("encrypted data"));
@@ -127,9 +172,17 @@ impl Extract {
         // moves forward from the header's start.
         arc.seek((arc.next_block_pos - arc.file_head.pack_size) as u64);
 
-        // `CheckUnpVer`: a kind of encryption UnRAR does not know stops even a
-        // stored entry, whether or not the entry says it is encrypted.
-        if arc.file_head.crypt_method == CryptMethod::Unknown {
+        // `CheckUnpVer`: stored data does not care about the version. A kind
+        // of encryption UnRAR does not know stops even a stored entry, whether
+        // or not the entry says it is encrypted.
+        let unp_ver = arc.file_head.unp_ver;
+        let wrong_ver = arc.file_head.method != 0
+            && if arc.format == Format::Rar50 {
+                unp_ver > VER_UNPACK7
+            } else {
+                !(13..=VER_UNPACK).contains(&unp_ver)
+            };
+        if wrong_ver || arc.file_head.crypt_method == CryptMethod::Unknown {
             arc.set_error_code(ExitCode::Fatal);
             arc.seek_to_next();
             return Ok(!arc.solid);
@@ -170,8 +223,23 @@ impl Extract {
             if redir_type == Redirection::Unknown || arc.format == Format::Rar15 {
                 show_checksum = false;
             }
-        } else {
+        } else if arc.file_head.method == 0 {
             self.unstore_file(arc, &mut hash, out)?;
+        } else {
+            let unp = self.unp.get_or_insert_with(|| Box::new(Unpack::new()));
+            unp.init(arc.file_head.win_size, arc.file_head.solid)?;
+            unp.set_dest_size(arc.file_head.unp_size);
+            let (method, solid) = (arc.file_head.unp_ver, arc.file_head.solid);
+            let packed_left = arc.file_head.pack_size as u64;
+            let mut io = DataIo {
+                arc: &mut *arc,
+                packed_left,
+                hash: &mut hash,
+                out,
+                skip_unp_crc: self.skip_solid,
+                cur_unp_write: &mut self.cur_unp_write,
+            };
+            unp.do_unpack(method, solid, &mut io)?;
         }
         arc.seek_to_next();
 

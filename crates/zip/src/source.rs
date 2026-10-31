@@ -30,6 +30,15 @@ pub trait ReadAt {
     fn accept_empty(&self) -> bool {
         false
     }
+
+    /// Not in libzip: where each volume starts, for a source that joins
+    /// the volumes of a split archive ([`Volumes`](crate::Volumes)), whose
+    /// disk numbers are then read as those volumes. `None` for a source in
+    /// one piece, where an archive of several disks is refused with
+    /// `ZIP_ER_MULTIDISK`, as libzip refuses it.
+    fn volume_starts(&self) -> Option<&[u64]> {
+        None
+    }
 }
 
 impl ReadAt for [u8] {
@@ -76,6 +85,10 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
 
     fn accept_empty(&self) -> bool {
         (**self).accept_empty()
+    }
+
+    fn volume_starts(&self) -> Option<&[u64]> {
+        (**self).volume_starts()
     }
 }
 
@@ -273,6 +286,12 @@ impl<R: ReadAt + ?Sized> Source<R> {
     /// `zip_source_accept_empty`.
     pub(crate) fn accept_empty(&self) -> bool {
         self.inner.accept_empty()
+    }
+
+    /// Not in libzip: where each volume of a split archive starts, if the
+    /// source joins them.
+    pub(crate) fn volume_starts(&self) -> Option<Vec<u64>> {
+        self.inner.volume_starts().map(<[u64]>::to_vec)
     }
 
     /// Moves the position: port of `zip_source_seek`, with

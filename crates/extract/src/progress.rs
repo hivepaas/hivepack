@@ -98,6 +98,13 @@ impl Run<'_> {
         });
     }
 
+    /// `bytes` more than was said at the start are to be written: an entry
+    /// whose size is not known.
+    #[cfg(feature = "rar")]
+    pub(crate) fn more_to_write(&self, bytes: u64) {
+        self.update(|progress| progress.total_bytes += bytes);
+    }
+
     /// `bytes` more are written.
     pub(crate) fn wrote(&self, bytes: u64) {
         self.update(|progress| progress.bytes += bytes);

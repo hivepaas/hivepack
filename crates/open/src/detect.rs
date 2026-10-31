@@ -43,6 +43,9 @@ pub enum Container {
     /// headers from its end: in a layer, it must be taken out to a file
     /// first.
     SevenZip,
+    /// A RAR archive, which `hivepack-rar` reads, under UnRAR's license, and
+    /// so is not a dependency here: only told, by its signature.
+    Rar,
     /// A cpio archive, which `hivepack-cpio` reads in order: Linux's
     /// initramfs, an RPM package's payload, a macOS package's.
     Cpio,
@@ -95,6 +98,11 @@ const AGE_ARMOR: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
 const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
 const LZ4_MAGIC: &[u8] = &[0x04, 0x22, 0x4D, 0x18];
 const LZ4_LEGACY_MAGIC: &[u8] = &[0x02, 0x21, 0x4C, 0x18];
+/// The signatures of RAR 1.5 to 7 (`Rar!\x1a\x07`, then 0 or 1 for the format,
+/// as `Archive::IsSignature` tells them) and RAR 1.4 (`RE~^`).
+const RAR_MAGIC: &[u8] = b"Rar!\x1a\x07";
+const RAR14_MAGIC: &[u8] = b"RE~^";
+
 /// A 7z archive's signature (`hivepack_7z::SIGNATURE`, kept here so that
 /// telling one does not take the decoder).
 const SEVEN_ZIP_MAGIC: &[u8] = &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
@@ -318,6 +326,9 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     }
     if starts(SEVEN_ZIP_MAGIC) {
         return Detected::Container(Container::SevenZip);
+    }
+    if starts(RAR14_MAGIC) || starts(RAR_MAGIC) && matches!(head.get(6), Some(0 | 1)) {
+        return Detected::Container(Container::Rar);
     }
     if is_xar(head) {
         return Detected::Container(Container::Xar);
@@ -675,6 +686,27 @@ mod tests {
             layer(&far[..UDF_HEAD_LEN]),
             Detected::Container(Container::Data)
         );
+    }
+
+    #[test]
+    fn rar_by_its_signature() {
+        let rar = Detected::Container(Container::Rar);
+        assert_eq!(layer(b"Rar!\x1a\x07\x00\xcf\x90"), rar);
+        assert_eq!(layer(b"Rar!\x1a\x07\x01\x00"), rar);
+        assert_eq!(layer(b"RE~^\x00\x00"), rar);
+        // Cut short, a format to come, or a byte off: data.
+        for head in [
+            &b"Rar!\x1a\x07"[..],
+            b"Rar!\x1a\x07\x05",
+            b"Rar!\x1a\x08\x00",
+            b"RE~",
+        ] {
+            assert_eq!(
+                layer(head),
+                Detected::Container(Container::Data),
+                "{head:?}"
+            );
+        }
     }
 
     #[test]

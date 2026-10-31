@@ -232,6 +232,7 @@ dependencies = [
  "hivepack-deflate",
  "hivepack-iso",
  "hivepack-open",
+ "hivepack-rar",
  "hivepack-tar",
  "hivepack-udf",
  "hivepack-xar",

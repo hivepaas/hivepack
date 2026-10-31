@@ -324,6 +324,15 @@ pub fn convert_path(s: &[u32]) -> &[u32] {
     &s[dest.min(s.len())..]
 }
 
+/// A name as text: nothing if any of it is not a character.
+pub fn to_string(name: &[u32]) -> Option<String> {
+    // U+FFFE marks what could not be decoded: U+E080 to U+E0FF after it.
+    name.iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| char::from_u32(c).filter(|&c| c != '\u{fffe}'))
+        .collect()
+}
+
 /// A name as text: its characters, U+FFFD for what is not one.
 pub fn to_string_lossy(name: &[u32]) -> String {
     name.iter()

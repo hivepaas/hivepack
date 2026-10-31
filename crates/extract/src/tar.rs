@@ -516,7 +516,7 @@ pub(crate) fn bytes_to_write<S>(
 
 /// Writes `size` bytes of `r` into `file`, for `item`, at most `remaining`
 /// in all, then its time and permissions: the bytes written.
-fn write_from(
+pub(crate) fn write_from(
     r: &mut impl Read,
     item: &Item,
     size: u64,

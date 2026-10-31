@@ -34,11 +34,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo clippy --workspace --all-targets --locked --features hivepack-zstd/unsafe-fast,hivepack-lz4/unsafe-fast -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features hivepack-zstd/unsafe-fast,hivepack-lz4/unsafe-fast,hivepack-extract/rar -- -D warnings
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo doc --workspace --no-deps --locked --features hivepack-zstd/unsafe-fast,hivepack-lz4/unsafe-fast
+      - run: cargo doc --workspace --no-deps --locked --features hivepack-zstd/unsafe-fast,hivepack-lz4/unsafe-fast,hivepack-extract/rar
         env:
           RUSTDOCFLAGS: -D warnings
       - run: python3 -m py_compile scripts/testdata.py
@@ -143,6 +143,7 @@ jobs:
           for group in ${HIVEPACK_TESTDATA_REQUIRED//,/ }; do args+=(--group "$group"); done
           python scripts/testdata.py fetch "${args[@]}"
       - run: cargo test --workspace --locked
+      - run: cargo test -p hivepack-extract --locked --features rar --test rar
       - if: matrix.unsafe-fast
         run: cargo test -p hivepack-zstd --locked --features unsafe-fast
       - if: matrix.unsafe-fast
@@ -502,6 +503,16 @@ jobs:
           mkdir -p fuzz/corpus/extract_7z
           for f in testdata/7z/*.7z; do { printf '\x12'; cat "$f"; } > "fuzz/corpus/extract_7z/$(basename "$f")"; done
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_7z -- -max_total_time=60 -rss_limit_mb=4096
+      - name: Seed the corpus of RAR extraction with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/extract_rar
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-password.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/extract_rar/r{i}").write_bytes(bytes([i % 256]) + bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_rar -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the tar corpus with Go's test archives
         run: |
           mkdir -p fuzz/corpus/tar

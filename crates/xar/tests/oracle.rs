@@ -1017,7 +1017,11 @@ fn port_matches_recorded_answers() {
     }
     // Without libarchive's archives (the `core` group, which the emulated
     // jobs leave out), only the crafted ones and macOS's are read.
-    let floor = if libarchive_archives().is_empty() { 200 } else { 300 };
+    let floor = if libarchive_archives().is_empty() {
+        200
+    } else {
+        300
+    };
     assert!(checked >= floor, "only {checked} recorded answers");
 }
 

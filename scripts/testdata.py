@@ -12,7 +12,7 @@ testdata/manifest.json lists every set:
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
 
-    python3 scripts/testdata.py fetch [--group core|generated|fuzz|bench|all ...]
+    python3 scripts/testdata.py fetch [--group core|generated|fuzz|bench|all ...] [--set NAME ...]
     python3 scripts/testdata.py list
 
 Only the standard library is used, so any Python 3.9 or newer runs it.
@@ -620,7 +620,9 @@ def build_go(sources: list, folder: Path) -> None:
     if go is None:
         sys.exit("building the Go oracles needs Go: https://go.dev/dl/")
     module = ROOT / Path(sources[0]).parent
-    subprocess.run([go, "build", "-trimpath", "-mod=readonly", "-o", str(folder / "oracle"), "."],
+    # Windows runs a program by its .exe, which a program's path may leave out.
+    name = "oracle.exe" if sys.platform == "win32" else "oracle"
+    subprocess.run([go, "build", "-trimpath", "-mod=readonly", "-o", str(folder / name), "."],
                    cwd=module, check=True, env={**os.environ, "CGO_ENABLED": "0"})
 
 
@@ -687,6 +689,9 @@ def main() -> None:
     fetch = sub.add_parser("fetch", help="download and generate sets")
     fetch.add_argument("--group", action="append", choices=GROUPS + ["all"],
                        help="sets to get (default: core); repeat for several")
+    fetch.add_argument("--set", action="append", default=[], metavar="NAME",
+                       help="a set by its name, as `list` shows them, in place of the groups; "
+                            "repeat for several")
     sub.add_parser("list", help="show every set and where it lives")
     args = parser.parse_args()
 
@@ -699,12 +704,15 @@ def main() -> None:
             print(f"{entry['name']:36} {entry['kind']:12} {where}")
         return
 
-    groups = set(args.group or ["core"])
+    unknown = [name for name in args.set if name not in sets]
+    if unknown:
+        sys.exit(f"no such set: {', '.join(unknown)}")
+    groups = set(args.group or ([] if args.set else ["core"]))
     if "all" in groups:
         groups = set(GROUPS)
     for entry in sets.values():
         group = group_of(entry)
-        if group not in groups:
+        if group not in groups and entry["name"] not in args.set:
             continue
         if "fetch" in entry:
             fetch_set(entry, cache)

@@ -1,6 +1,8 @@
-//! The decompressors as `io::Read`: zstd, xz (and lzip and .lzma), gzip and
-//! bzip2, each over hivepack's port of its library, through one adapter;
-//! and LZ4, whose port has its own reader of `.lz4` files.
+//! The decompressors as `io::Read`: zstd, xz (and lzip and .lzma), gzip,
+//! bzip2 and pbzx (xz streams, a block at a time), each over hivepack's
+//! port of its library, through one adapter; LZ4, whose port has its own
+//! reader of `.lz4` files; and RPM packages, whose lead and headers
+//! hivepack-cpio's port of libarchive's filter takes off.
 //!
 //! A file can hold several streams one after the other, as their tools
 //! make and read them: zstd frames (skippable ones too), gzip members,
@@ -365,6 +367,200 @@ impl Codec for XzCodec {
     }
 }
 
+/// pbzx's header: `pbzx` and the block size, a 64-bit big-endian number.
+const PBZX_HEADER: usize = 12;
+/// A chunk's header: its size, then the size of what stores it.
+const PBZX_CHUNK_HEADER: usize = 16;
+
+/// A 64-bit big-endian number, pbzx's.
+fn be64(b: &[u8]) -> u64 {
+    b.iter().take(8).fold(0, |n, &c| n << 8 | u64::from(c))
+}
+
+/// Where pbzx's reader is.
+enum PbzxState {
+    /// In a header, the file's or a chunk's: the bytes of it so far.
+    Header,
+    /// In a stored chunk: the bytes left to copy.
+    Stored(u64),
+    /// In a chunk compressed with xz: one stream, of `left_in` more bytes,
+    /// that decompresses to `left_out` more.
+    Xz {
+        s: hivepack_xz::Stream,
+        left_in: u64,
+        left_out: u64,
+    },
+}
+
+/// pbzx, as Apple's tools read it (`pkgutil --expand-full`): after the
+/// header, chunks one after the other to the end of the stream, each of
+/// at most the block size, decompressed and stored. A chunk whose stored
+/// size is its size is stored as it is, whatever its first bytes, and any
+/// other is one xz stream that decompresses to exactly its size. A chunk
+/// of nothing is allowed; a header cut short, or anything after the last
+/// chunk, is not.
+struct PbzxCodec {
+    xz_memlimit: u64,
+    header: [u8; PBZX_CHUNK_HEADER],
+    have: usize,
+    /// The block size, once the file's header is read.
+    block: Option<u64>,
+    state: PbzxState,
+}
+
+impl PbzxCodec {
+    fn new(xz_memlimit: u64) -> PbzxCodec {
+        PbzxCodec {
+            xz_memlimit,
+            header: [0; PBZX_CHUNK_HEADER],
+            have: 0,
+            block: None,
+            state: PbzxState::Header,
+        }
+    }
+
+    /// The next chunk, from its header: an error's message if it cannot be.
+    fn begin_chunk(&mut self, block: u64) -> Result<(), String> {
+        let size = be64(&self.header[..8]);
+        let stored = be64(&self.header[8..16]);
+        if size > block || stored > block {
+            return Err("a chunk is larger than the block size".into());
+        }
+        self.state = if stored == size {
+            PbzxState::Stored(size)
+        } else {
+            PbzxState::Xz {
+                s: hivepack_xz::Stream::stream_decoder(self.xz_memlimit, 0)
+                    .map_err(|e| e.to_string())?,
+                left_in: stored,
+                left_out: size,
+            }
+        };
+        Ok(())
+    }
+}
+
+impl Codec for PbzxCodec {
+    fn step(&mut self, mut input: &[u8], output: &mut [u8], finish: bool) -> Step {
+        let mut step = Step::default();
+        loop {
+            match &mut self.state {
+                PbzxState::Header => {
+                    // At the end, between chunks, the stream ends.
+                    if self.have == 0 && input.is_empty() {
+                        step.ended = finish && self.block.is_some();
+                        return step;
+                    }
+                    let want = match self.block {
+                        None => PBZX_HEADER,
+                        Some(_) => PBZX_CHUNK_HEADER,
+                    };
+                    let n = (want - self.have).min(input.len());
+                    self.header[self.have..self.have + n].copy_from_slice(&input[..n]);
+                    self.have += n;
+                    input = &input[n..];
+                    step.consumed += n;
+                    if self.have < want {
+                        return step;
+                    }
+                    self.have = 0;
+                    let Some(block) = self.block else {
+                        if !self.header.starts_with(b"pbzx") {
+                            step.error = Some("not a pbzx stream".into());
+                            return step;
+                        }
+                        self.block = Some(be64(&self.header[4..12]));
+                        continue;
+                    };
+                    if let Err(e) = self.begin_chunk(block) {
+                        step.error = Some(e);
+                        return step;
+                    }
+                }
+                PbzxState::Stored(left) => {
+                    if *left == 0 {
+                        self.state = PbzxState::Header;
+                        continue;
+                    }
+                    let room = output.len() - step.produced;
+                    let n = (*left).min(room as u64).min(input.len() as u64) as usize;
+                    if n == 0 {
+                        return step;
+                    }
+                    output[step.produced..step.produced + n].copy_from_slice(&input[..n]);
+                    input = &input[n..];
+                    *left -= n as u64;
+                    step.consumed += n;
+                    step.produced += n;
+                }
+                PbzxState::Xz {
+                    s,
+                    left_in,
+                    left_out,
+                } => {
+                    let take = (*left_in).min(input.len() as u64) as usize;
+                    let room = (output.len() - step.produced) as u64;
+                    // Past its size, a byte more would be too many.
+                    let mut past = [0u8; 1];
+                    let out: &mut [u8] = if *left_out == 0 {
+                        &mut past
+                    } else {
+                        let n = room.min(*left_out) as usize;
+                        &mut output[step.produced..step.produced + n]
+                    };
+                    if out.is_empty() {
+                        return step;
+                    }
+                    // The chunk ends where its stored size says.
+                    let action = if take as u64 == *left_in {
+                        hivepack_xz::Action::Finish
+                    } else {
+                        hivepack_xz::Action::Run
+                    };
+                    let mut i = hivepack_xz::InBuffer::new(&input[..take]);
+                    let mut o = hivepack_xz::OutBuffer::new(out);
+                    let result = s.code(&mut o, &mut i, action);
+                    let (consumed, produced) = (i.pos, o.pos);
+                    input = &input[consumed..];
+                    *left_in -= consumed as u64;
+                    step.consumed += consumed;
+                    if *left_out == 0 && produced > 0 {
+                        step.error = Some("a chunk decompresses to more than its size".into());
+                        return step;
+                    }
+                    *left_out -= produced as u64;
+                    step.produced += produced;
+                    match result {
+                        Ok(hivepack_xz::Status::StreamEnd) => {
+                            if *left_in > 0 {
+                                step.error = Some("data after a chunk's xz stream".into());
+                                return step;
+                            }
+                            if *left_out > 0 {
+                                step.error =
+                                    Some("a chunk decompresses to less than its size".into());
+                                return step;
+                            }
+                            self.state = PbzxState::Header;
+                        }
+                        Ok(_) if consumed == 0 && produced == 0 => return step,
+                        Ok(_) => {}
+                        Err(hivepack_xz::Error::Buf) if *left_in == 0 => {
+                            step.error = Some("a chunk's xz stream is cut short".into());
+                            return step;
+                        }
+                        Err(hivepack_xz::Error::Buf) => return step,
+                        Err(e) => {
+                            step.error = Some(e.to_string());
+                            return step;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// An error of the reader under LZ4's, told apart from LZ4's own on its
 /// way through LZ4's reader, which passes it on as it is.
 #[derive(Debug)]
@@ -418,6 +614,33 @@ impl<R: Read> Read for Lz4Layer<R> {
     }
 }
 
+/// An RPM package's payload: hivepack-cpio's port of libarchive's RPM
+/// filter, its errors given as the other layers' are, and the errors of
+/// the reader under it as they are.
+struct RpmLayer<R> {
+    reader: hivepack_cpio::rpm::Reader<R>,
+}
+
+impl<R: Read> Read for RpmLayer<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf).map_err(|e| {
+            let Some(error) = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<hivepack_cpio::Error>())
+            else {
+                return e;
+            };
+            // libarchive says nothing of a package that ends before its
+            // payload.
+            let message = match error.message() {
+                Some(text) => String::from_utf8_lossy(&text).into_owned(),
+                None => "the stream is cut short".into(),
+            };
+            decode_error(Layer::Rpm, message)
+        })
+    }
+}
+
 /// The limits of the decoders.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodeLimits {
@@ -468,6 +691,14 @@ pub(crate) fn decoder<'a, R: Read + Send + 'a>(
             };
             Box::new(Decoder::new(inner, XzCodec { s, after }, layer))
         }
+        Layer::Pbzx => Box::new(Decoder::new(
+            inner,
+            PbzxCodec::new(limits.xz_memlimit),
+            layer,
+        )),
+        Layer::Rpm => Box::new(RpmLayer {
+            reader: hivepack_cpio::rpm::Reader::new(inner),
+        }),
         Layer::Lz4 => Box::new(Lz4Layer {
             decoder: hivepack_lz4::Decoder::new(Tagged(inner)),
             failed: None,

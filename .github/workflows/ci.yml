@@ -309,6 +309,20 @@ jobs:
                   pathlib.Path(f"fuzz/corpus/zip_ppmd/s{i}").write_bytes(params.to_bytes(2, "little") + stream)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_ppmd -- -max_total_time=60
+      - name: Seed the split corpus with Info-ZIP's split archives
+        run: |
+          mkdir -p fuzz/corpus/zip_split
+          python3 - <<'PY'
+          import pathlib, struct
+          folder = pathlib.Path("testdata/zip-split")
+          for last in sorted(folder.glob("*.zip")):
+              # The number of volumes less one, where each but the last ends, then the volumes.
+              parts = sorted(folder.glob(f"{last.stem}.z[0-9][0-9]")) + [last]
+              data = [p.read_bytes() for p in parts]
+              head = bytes([len(data) - 1]) + b"".join(struct.pack("<I", len(d)) for d in data[:-1])
+              pathlib.Path(f"fuzz/corpus/zip_split/{last.stem}").write_bytes(head + b"".join(data))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu zip_split -- -max_total_time=60
       - name: Seed the editing corpus with the same archives, behind a few edits
         run: |
           mkdir -p fuzz/corpus/zip_edit
@@ -359,6 +373,16 @@ jobs:
               pathlib.Path(f"fuzz/corpus/rar_test/r{i}").write_bytes(data)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_test -- -max_total_time=45
+      - name: Seed the RAR unpacking corpus with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/rar_unpack
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-unpack.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/rar_unpack/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_unpack -- -max_total_time=45
       - name: Seed the bzip2 corpus
         run: |
           mkdir -p fuzz/corpus/bzip2
@@ -480,6 +504,11 @@ jobs:
               pathlib.Path(f"fuzz/corpus/cpio/r{i}").write_bytes(b"" if data == "-" else bytes.fromhex(data))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu cpio -- -max_total_time=60
+      - name: Seed the cpio extraction corpus with the same archives behind a byte of options
+        run: |
+          mkdir -p fuzz/corpus/extract_cpio
+          for f in fuzz/corpus/cpio/r*; do { printf '\x22'; cat "$f"; } > "fuzz/corpus/extract_cpio/$(basename "$f")"; done
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_cpio -- -max_total_time=60
       - name: Seed the layers corpus with the recorded age files and what they hold
         run: |
           mkdir -p fuzz/corpus/open
@@ -493,6 +522,15 @@ jobs:
               request, answer = line.split("\t")
               pathlib.Path(f"fuzz/corpus/open/p{i}").write_bytes(b"\0" + bytes.fromhex(request.split(" ")[3]))
               pathlib.Path(f"fuzz/corpus/open/a{i}").write_bytes(b"\0" + bytes.fromhex(answer.split(" ")[1]))
+          # pbzx, as Apple writes it: xz chunks without a check, one stored.
+          import lzma, struct
+          data = pathlib.Path("README.md").read_bytes()[:20000]
+          chunks = [data[i:i + 8192] for i in range(0, len(data), 8192)]
+          pbzx = b"pbzx" + struct.pack(">Q", 1 << 24)
+          for i, c in enumerate(chunks):
+              stored = c if i == 1 else lzma.compress(c, format=lzma.FORMAT_XZ, check=lzma.CHECK_NONE)
+              pbzx += struct.pack(">QQ", len(c), len(stored)) + stored
+          pathlib.Path("fuzz/corpus/open/pbzx").write_bytes(b"\0" + pbzx)
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu open -- -max_total_time=30
       - name: Seed the UDF corpus with the descriptors of the test images

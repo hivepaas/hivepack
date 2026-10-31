@@ -369,6 +369,10 @@ fn answer_test(archive: &[u8], limit: Option<u64>) -> String {
                         out.0 += " later";
                         arc.seek_to_next();
                     }
+                    Err(Error::NoMemory) => {
+                        out.0 += " badalloc";
+                        break arc.exit_code();
+                    }
                     Err(e) => panic!("{e}"),
                 }
             }
@@ -622,6 +626,117 @@ fn damaged_archives_test_like_unrar() {
     eprintln!("{compared} damaged archives tested, {failed_hash} with a bad hash or header");
 }
 
+// Damage with the headers' CRCs made right again: what random damage to a header
+// would not get past. So solid flags, dictionaries, algorithms and sizes vary.
+#[cfg(target_os = "linux")]
+#[test]
+fn damaged_headers_test_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0004);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    let mut compared = 0;
+    for (name, data) in &libarchive_archives() {
+        if data.len() > 64 << 10 {
+            continue;
+        }
+        for i in 0..count {
+            let head = data.len().min(512);
+            let mut damaged = damage(&mut rng, &data[..head]);
+            damaged.extend_from_slice(&data[head..]);
+            support::patch::fix_header_crcs(&mut damaged);
+            let request = format!("test {}", hex(&damaged));
+            let want = oracle.ask(&request);
+            assert_same(&request, &want, &format!("{name}, damaged {i}"));
+            compared += 1;
+        }
+    }
+    eprintln!("{compared} archives with damaged headers tested");
+}
+
+// Bytes as compressed data, and what the `rar_unpack` target found.
+#[cfg(target_os = "linux")]
+#[test]
+fn packed_data_unpacks_like_unrar() {
+    let Some(mut oracle) = Oracle::spawn() else {
+        return;
+    };
+    let seed = std::env::var("HIVEPACK_RAR_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x4152_0005);
+    let mut rng = Rng(seed);
+    let count: usize = std::env::var("HIVEPACK_RAR_DAMAGED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    for i in 0..count * 10 {
+        let size = rng.below(4096) as usize;
+        let mut input = vec![0; size];
+        for byte in &mut input {
+            *byte = rng.next() as u8;
+        }
+        let request = format!("test {}", hex(&support::patch::with_packed_data(&input)));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("random input {i}"));
+    }
+    for (input, _) in recorded_unpack() {
+        let request = unpack_request(&input);
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("recorded input {input:.40}"));
+    }
+    // PPMd over random bytes goes on for as long as there are bytes, and over
+    // zeros it takes what it finds most likely, which makes long contexts. So
+    // the model fills its memory and starts again, which is why the first
+    // streams are long.
+    let streams = (count / 4).max(3);
+    for i in 0..streams {
+        let size = if i < 2 {
+            1 << 20
+        } else {
+            1 << (14 + rng.below(3))
+        };
+        let order = rng.below(32) as u8;
+        // A PPMd block that resets, with the smallest memory: the byte says
+        // so with its high bits, and the rest of its bits are the order.
+        let mut input = vec![16, 0, 0, 0x80 | 0x20 | order, rng.below(2) as u8];
+        while input.len() < size {
+            let run = 256 + rng.below(4096) as usize;
+            if rng.below(2) == 0 {
+                input.resize(input.len() + run, 0);
+            } else {
+                for _ in 0..run {
+                    input.push(rng.next() as u8);
+                }
+            }
+        }
+        let request = format!("test {}", hex(&support::patch::with_packed_data(&input)));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &format!("PPMd stream {i}"));
+    }
+    let Some(folder) = std::env::var_os("HIVEPACK_RAR_UNPACK_CORPUS") else {
+        return;
+    };
+    let mut compared = 0;
+    for entry in std::fs::read_dir(folder).expect("the folder") {
+        let path = entry.expect("an entry").path();
+        let input = std::fs::read(&path).expect("an input");
+        let request = format!("test {}", hex(&support::patch::with_packed_data(&input)));
+        let want = oracle.ask(&request);
+        assert_same(&request, &want, &path.display().to_string());
+        compared += 1;
+    }
+    eprintln!("{compared} inputs compared");
+}
+
 // A dictionary too large for the limit, on archives that hold what they say:
 // random damage rarely gets to a size past the default 4 GiB.
 #[cfg(target_os = "linux")]
@@ -774,14 +889,72 @@ fn port_tests_as_recorded() {
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
         let (request, want) = line.split_once('\t').expect("request, tab, answer");
-        assert_eq!(
-            support::recorded_form(&answer(request)),
-            want,
-            "{request:.300}"
-        );
+        let got = answer(request);
+        // UnRAR's 32-bit builds refuse a dictionary over 2 GiB, which the
+        // answers were not recorded on.
+        if usize::BITS == 32 && got.contains(" badalloc") {
+            continue;
+        }
+        assert_eq!(support::recorded_form(&got), want, "{request:.300}");
         checked += 1;
     }
     assert!(checked > 200, "only {checked} recorded answers");
+}
+
+fn recorded_unpack_path() -> std::path::PathBuf {
+    support::repository().join("testdata/oracle/rar-unpack.txt")
+}
+
+fn unpack_request(input: &str) -> String {
+    format!(
+        "test {}",
+        hex(&support::patch::with_packed_data(&unhex(input)))
+    )
+}
+
+/// What the `rar_unpack` target found, which damage does not get to: the
+/// inputs, and UnRAR's answers for where the oracle is not.
+fn recorded_unpack() -> Vec<(String, String)> {
+    let text =
+        std::fs::read_to_string(recorded_unpack_path()).expect("testdata/oracle/rar-unpack.txt");
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|line| {
+            let (input, want) = line.split_once('\t').expect("input, tab, answer");
+            (input.to_string(), want.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn port_unpacks_as_recorded() {
+    let recorded = recorded_unpack();
+    assert!(recorded.len() > 50, "only {} inputs", recorded.len());
+    for (input, want) in recorded {
+        let request = unpack_request(&input);
+        let got = answer(&request);
+        // As in `port_tests_as_recorded`.
+        if usize::BITS == 32 && got.contains(" badalloc") {
+            continue;
+        }
+        assert_eq!(support::recorded_form(&got), want, "{input:.300}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "rewrites testdata/oracle/rar-unpack.txt from the oracle"]
+fn record_unpack_answers() {
+    let mut oracle = Oracle::spawn().expect("the oracle is built");
+    let mut text = String::from(
+        "# Answers from UnRAR 7.3.2 (tools/rar-oracle) for inputs the rar_unpack fuzz target found, replayed by crates/rar/tests/oracle.rs.\n\
+         # Regenerate with: cargo test -p hivepack-rar --test oracle record_unpack_answers -- --ignored\n",
+    );
+    for (input, _) in recorded_unpack() {
+        let reply = oracle.ask(&unpack_request(&input));
+        let _ = writeln!(text, "{input}\t{}", support::recorded_form(&reply));
+    }
+    std::fs::write(recorded_unpack_path(), text).expect("written");
 }
 
 #[cfg(target_os = "linux")]

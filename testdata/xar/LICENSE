@@ -1,0 +1,38 @@
+The archives in this folder were made on macOS 27.0.1 with its /usr/bin/xar
+(xar 1.8dev), pkgbuild and productbuild, from small files written for the
+tests (text, a few kilobytes of patterned bytes, an empty file, a symbolic
+link, a hard link, extended attributes, a name with "é & <>"):
+
+  default.xar        xar -c (gzip, SHA-1)
+  none-sha256.xar    xar -c --compression=none --toc-cksum=sha256 --file-cksum=sha512
+  bzip2-sha512.xar   xar -c -j --toc-cksum=sha512
+  coalesce.xar       xar -c --coalesce-heap --link-same (data shared by files)
+  subdoc.xar         xar -c -n info -s subdoc.xml (a subdocument in the TOC)
+  tiny.pkg           pkgbuild --ownership recommended, of one file
+  product.pkg        productbuild --package tiny.pkg
+
+Then the owner's user name was replaced by "nobody" in each table of
+contents, which was compressed again with zlib, and its checksum written
+again. Nothing else was changed. They are under the repository's license:
+
+MIT License
+
+Copyright (c) 2026 HivePaaS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

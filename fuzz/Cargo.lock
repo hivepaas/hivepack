@@ -216,6 +216,7 @@ dependencies = [
  "hivepack-rar",
  "hivepack-tar",
  "hivepack-udf",
+ "hivepack-xar",
  "hivepack-xz",
  "hivepack-zip",
  "hivepack-zstd",
@@ -266,6 +267,16 @@ version = "0.0.0"
 [[package]]
 name = "hivepack-udf"
 version = "0.0.0"
+
+[[package]]
+name = "hivepack-xar"
+version = "0.0.0"
+dependencies = [
+ "hivepack-bzip2",
+ "hivepack-crypto",
+ "hivepack-deflate",
+ "hivepack-xz",
+]
 
 [[package]]
 name = "hivepack-xz"

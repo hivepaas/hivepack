@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-fuzz"
 version = "0.0.0"
-description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open, hivepack-7z and hivepack-udf any input"
+description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open, hivepack-7z, hivepack-udf and hivepack-xar any input"
 publish = false
 license = "MIT"
 edition = "2024"
@@ -34,6 +34,7 @@ hivepack-iso = { path = "../crates/iso" }
 hivepack-rar = { path = "../crates/rar" }
 hivepack-open = { path = "../crates/open" }
 hivepack-udf = { path = "../crates/udf" }
+hivepack-xar = { path = "../crates/xar" }
 # libbzip2 1.0.8, built from bzip2-sys's bundled sources, as the tests build
 # it.
 bzip2 = { version = "0.6.1", default-features = false, features = ["bzip2-sys", "static"] }
@@ -204,6 +205,13 @@ name = "rar_test"
 path = "fuzz_targets/rar_test.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "xar"
+path = "fuzz_targets/xar.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "extract_iso"

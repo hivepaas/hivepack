@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-fuzz"
 version = "0.0.0"
-description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-open, hivepack-7z and hivepack-udf any input"
+description = "Fuzzers that compare hivepack-zstd with libzstd, hivepack-deflate with zlib, hivepack-bzip2 with libbzip2, hivepack-lz4 with liblz4, and hivepack-xz with liblzma, and that feed hivepack-zip, hivepack-extract, hivepack-age, hivepack-tar, hivepack-iso, hivepack-cpio, hivepack-open, hivepack-7z and hivepack-udf any input"
 publish = false
 license = "MIT"
 edition = "2024"
@@ -31,6 +31,7 @@ hivepack-bzip2 = { path = "../crates/bzip2" }
 hivepack-age = { path = "../crates/age" }
 hivepack-tar = { path = "../crates/tar" }
 hivepack-iso = { path = "../crates/iso" }
+hivepack-cpio = { path = "../crates/cpio" }
 hivepack-rar = { path = "../crates/rar" }
 hivepack-open = { path = "../crates/open" }
 hivepack-udf = { path = "../crates/udf" }
@@ -196,6 +197,13 @@ doc = false
 [[bin]]
 name = "iso"
 path = "fuzz_targets/iso.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cpio"
+path = "fuzz_targets/cpio.rs"
 test = false
 doc = false
 bench = false

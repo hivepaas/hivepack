@@ -27,7 +27,7 @@ The port follows [BearSSL](https://bearssl.org) **0.6** (August 2018, the latest
 | `src/kdf/hkdf.c` | `hkdf.rs` (`Hkdf`, `HkdfExpand`) | HKDF (RFC 5869) |
 | `src/symcipher/chacha20_ct.c` | `chacha20_ct.rs` (`chacha20`) | ChaCha20 (RFC 8439) |
 | `src/symcipher/poly1305_ctmul.c` | `poly1305_ctmul.rs` (`chacha20_poly1305`) | ChaCha20-Poly1305 (RFC 8439, section 2.8) |
-| `src/ec/ec_c25519_m31.c` | `ec_c25519_m31.rs` (`x25519`, `x25519_base`) | X25519 (RFC 7748) |
+| `src/ec/ec_c25519_m31.c` | `ec_c25519_m31.rs` (`x25519`, `x25519_base`) | X25519 (RFC 7748), on 32-bit machines |
 | `NOT`, `MUX`, `EQ`, `GT` (`src/inner.h`), `src/codec/ccopy.c` | `ct.rs` (`equal`) | constant-time selection and comparison |
 | (none) | `pbkdf2.rs` (`pbkdf2`) | PBKDF2, from RFC 8018, section 5.2 |
 | (none) | `scrypt.rs` (`scrypt`) | scrypt, from RFC 7914 |
@@ -40,6 +40,7 @@ The rules are those of [porting.md](porting.md): a module for each C file, the C
 - **HMAC's whole output**; libzip cuts HMAC-SHA1 to 10 bytes itself. BearSSL's hashes are a vtable (`br_hash_class`) that HMAC takes at run time; here they are a trait, `Digest`, that HMAC, HKDF and PBKDF2 are generic over. SHA-1, SHA-256, SHA-512 and MD5, not SHA-224 or SHA-384, which nothing here uses.
 - **HKDF's two steps are two types**: `Hkdf` takes the input key material, and `flip` turns it into `HkdfExpand`, which produces the output; BearSSL keeps a union of the two. Once 255 blocks are produced, later calls produce nothing, where BearSSL's counter would go on and start the block numbers again.
 - **ChaCha20-Poly1305 with one ChaCha20**: BearSSL's `br_poly1305_ctmul_run` takes its ChaCha20 as a function pointer; `chacha20_poly1305` always uses `chacha20`. Whole 64-byte blocks of ChaCha20 are XORed with the key stream a word at a time, and Poly1305 reads whole 16-byte blocks where they are, without copying them first; the results are the same and it is faster (see Speed). After decrypting, BearSSL leaves it to the caller to compare the tags; `equal` does that in constant time.
+- **X25519 on 64-bit machines** is not BearSSL's: `ec_c25519_m51.rs` has the usual field of five 51-bit words with 128-bit products, and the same ladder in constant time. It is more than twice as fast as 30-bit words here. A unit test compares it with the port of `m31`, on random input and at the edges, and the 32-bit build keeps `m31`, where 128-bit products would be calls into the compiler's runtime.
 - **X25519 alone**: BearSSL's `br_ec_c25519_m31` is a `br_ec_impl`, with the curve's generator and order and a `muladd` that Curve25519 does not implement. The port has `mul` and `mulgen`, as `x25519` and `x25519_base`, on 32-byte arrays. Like BearSSL, it returns the all-zero result of a point of small order; age refuses it.
 - **A key of the wrong length** is `None`, where BearSSL's key schedule returns 0 rounds.
 
@@ -84,7 +85,7 @@ The same machine, October 2026, for what age needs. Go is Go 1.27.2 with `golang
 | SHA-512 | 788 MB/s | 752 MB/s | 1,359 MB/s |
 | ChaCha20 | 1,340 MB/s | 1,300 MB/s (`chacha20_ct`) | 1,265 MB/s |
 | ChaCha20-Poly1305 | 998 MB/s | 964 MB/s (`poly1305_ctmul`) | 3,663 MB/s (AVX2 assembly) |
-| X25519 | 66 µs | 79 µs (`m31`) | 47 µs |
+| X25519 | 22 µs | 79 µs (`m31`) | 47 µs |
 | scrypt, N = 2^18, r = 8, p = 1 (age's default work factor, 256 MiB) | 0.30 s | | 0.33 s |
 | scrypt, N = 2^20 (1 GiB) | 1.20 s | | 1.37 s |
 

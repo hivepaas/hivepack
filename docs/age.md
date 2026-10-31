@@ -64,19 +64,19 @@ AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 
 | Workload | The port | age | Port / age |
 |---|---|---|---|
 | **Finding the file key, in an empty file** | | | |
-| X25519 | 13,161 files/s | 14,258 files/s | 0.92× |
-| X25519, the last of ten recipients | 1,377 files/s | 1,792 files/s | 0.77× |
-| ssh-ed25519 | 6,800 files/s | 7,647 files/s | 0.89× |
+| X25519 | 35,903 files/s | 15,877 files/s | 2.26× |
+| X25519, the last of ten recipients | 4,069 files/s | 1,827 files/s | 2.23× |
+| ssh-ed25519 | 19,494 files/s | 8,306 files/s | 2.35× |
 | Passphrase, scrypt at 2^14 | 71.2 files/s | 55.7 files/s | 1.28× |
 | Passphrase, scrypt at 2^18, age's default | 3.3 files/s | 3.2 files/s | 1.02× |
 | **Reading the payload** | | | |
 | Big file | 905 MB/s | 2,279 MB/s | 0.40× |
 | Big file, in ASCII armor | 668 MB/s | 519 MB/s | 1.29× |
-| Files of 4 KiB | 12,362 files/s | 14,392 files/s | 0.86× |
+| Files of 4 KiB | 30,981 files/s | 15,345 files/s | 2.02× |
 | **Parsing keys** | | | |
-| A file of 1,000 age keys | 14 k keys/s | 19 k keys/s | 0.72× |
+| A file of 1,000 age keys | 43 k keys/s | 20 k keys/s | 2.19× |
 
-The big file's gap is ChaCha20-Poly1305, which Go runs in AVX2 assembly and the port in constant-time safe Rust ([crypto.md](crypto.md#speed)). ASCII armor went from 0.27× to 1.29×: a full line of 64 columns already in the reader's buffer is now decoded in place, with a table, where each line was two allocations and a `match` on each character. Anything else about a line goes the old way, with nothing consumed, so that errors stay as they were. The armor row was measured after that work, the others before it, which does not touch them. Parsing keys is X25519, for each key's public half. Other work started on the machine towards the end of the run, though the best of the rounds should hide most of it.
+The big file's gap is ChaCha20-Poly1305, which Go runs in AVX2 assembly and the port in constant-time safe Rust ([crypto.md](crypto.md#speed)). ASCII armor went from 0.27× to 1.29×: a full line of 64 columns already in the reader's buffer is now decoded in place, with a table, where each line was two allocations and a `match` on each character. Anything else about a line goes the old way, with nothing consumed, so that errors stay as they were. The armor row was measured after that work, the others before it, which does not touch them. Parsing keys is X25519, for each key's public half. The rows with X25519 went from 0.72–0.92× to 2.02–2.35× with 51-bit words on 64-bit machines, measured after that work. Other work started on the machine towards the end of the run, though the best of the rounds should hide most of it.
 
 ## How it is shown
 

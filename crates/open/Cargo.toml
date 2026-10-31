@@ -1,7 +1,7 @@
 [package]
 name = "hivepack-open"
 version = "0.0.0"
-description = "Opening what hivepack reads: age, zstd, xz, lz4, gzip and bzip2 layers found and stacked, then the container told"
+description = "Opening what hivepack reads: age, zstd, xz, lz4, gzip, bzip2, pbzx and RPM layers found and stacked, then the container told"
 license = "MIT"
 readme = "README.md"
 keywords = ["archive", "decompression", "age", "tar", "zstd"]
@@ -20,6 +20,7 @@ workspace = true
 [dependencies]
 hivepack-age.workspace = true
 hivepack-bzip2.workspace = true
+hivepack-cpio.workspace = true
 hivepack-deflate.workspace = true
 hivepack-lz4.workspace = true
 hivepack-xz.workspace = true

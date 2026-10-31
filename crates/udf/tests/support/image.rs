@@ -365,7 +365,7 @@ impl Writer {
     /// apart, on partition `part`: (length, block) of each.
     fn data_extents(&mut self, part: u16, data: &[u8], per: usize, gap: usize) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
-        for chunk in data.chunks(per * self.bs) {
+        for chunk in data.chunks(per.saturating_mul(self.bs)) {
             let first = if part == self.nref && self.nref != self.dref {
                 // On the node partition: one block at a time, in order.
                 let first = self.node_block();

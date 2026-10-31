@@ -1,0 +1,6 @@
+# The files the archives here were made of: name, size, CRC-32.
+f/mixed.bin	36000	e928c8c2
+f/noise.bin	90000	7a1216b5
+f/text.txt	150000	5224b679
+f/sub/empty	0	00000000
+f/sub/small.txt	6	b61c02a7

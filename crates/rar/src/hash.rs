@@ -11,6 +11,7 @@
 //! The hash of a file's data: UnRAR's `DataHash` (hash.cpp), and RAR 1.4's
 //! checksum (`Checksum14`, crc.cpp).
 
+use crate::crypt::{crc32_to_mac, digest_to_mac};
 use hivepack_crypto::Blake2sp;
 use hivepack_deflate::crc32;
 
@@ -72,6 +73,18 @@ impl DataHash {
     /// `DataHash::Cmp`, without a key: whether the hash so far is `value`.
     pub fn matches(&self, value: &HashValue) -> bool {
         same(&self.result(), value)
+    }
+
+    /// `DataHash::Cmp` with a key: RAR 5 keeps a keyed hash of an encrypted
+    /// entry, so that the header does not say what the data's hash is.
+    pub(crate) fn matches_keyed(&self, value: &HashValue, key: &[u8; 32]) -> bool {
+        let mut result = self.result();
+        match result.kind {
+            HashType::Crc32 => result.crc32 = crc32_to_mac(result.crc32, key),
+            HashType::Blake2 => result.digest = digest_to_mac(&result.digest, key),
+            HashType::None | HashType::Rar14 => {}
+        }
+        same(&result, value)
     }
 }
 

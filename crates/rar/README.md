@@ -2,7 +2,7 @@
 
 Reading RAR archives in safe Rust: a port of [UnRAR](https://www.rarlab.com/rar_add.htm) 7.3.2, RARLAB's source, under UnRAR's license. It reads RAR and never writes it.
 
-> **Status:** reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, broken ones included, compared with UnRAR on libarchive's RAR archives and a quarter of a million damaged copies, and tests entries as UnRAR does: stored, or compressed by RAR 2.9 to 7 (LZ, PPMd, filters, solid), checked against CRC-32, BLAKE2sp or RAR 1.4's checksum. Decryption, volumes and the algorithms of RAR 1.5 and 2.x come next. This crate is not on crates.io.
+> **Status:** reads what UnRAR reads, as UnRAR does, broken archives included: the headers of RAR 1.4 to 7, entries stored or compressed by any RAR, encrypted with a password, split across volumes, comments and QuickOpen records, checked against CRC-32, BLAKE2sp or RAR 1.4's checksum. Compared with UnRAR on the archives of four other projects and damaged copies of them. Extracting to disk comes next, in `hivepack-extract`. This crate is not on crates.io.
 
 ```rust
 use hivepack_rar::{Archive, HEAD_FILE, name};

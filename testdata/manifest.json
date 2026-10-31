@@ -417,6 +417,27 @@
       "kind": "archives"
     },
     {
+      "name": "rarfile-tests",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/markokr/rarfile/archive/d2f7df6fc843dae356fd6b0a85971dc36fd6e757.tar.gz", "sha256": "2c6d581a7e2d36e14e8310667297f215c96b244dbb467e4de15d08da5bc2c133", "unpack": "tar.gz" }] },
+      "source": "https://github.com/markokr/rarfile at commit d2f7df6fc843dae356fd6b0a85971dc36fd6e757: the RAR archives of rarfiles tests (test/files)",
+      "license": "ISC",
+      "kind": "archives"
+    },
+    {
+      "name": "junrar-tests",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/junrar/junrar/archive/c831d1ed9eccf63083f2d4304149019d43f48c06.tar.gz", "sha256": "ebe141658fdef940adfc9616a8bdadcbd4c370f6427529acfc9a22e89db3ebea", "unpack": "tar.gz" }] },
+      "source": "https://github.com/junrar/junrar at commit c831d1ed9eccf63083f2d4304149019d43f48c06: the RAR archives of junrar's tests (src/test/resources)",
+      "license": "UnRAR",
+      "kind": "archives"
+    },
+    {
+      "name": "unrar-rs-tests",
+      "fetch": { "group": "generated", "files": [{ "url": "https://github.com/muja/unrar.rs/archive/0628d12b4f2f79d80e6c6c0707ce611e8952b052.tar.gz", "sha256": "a3fedebd8b1e92d96b4de05560ab931dd2dc2f14853f970d71f30ca9972eeee5", "unpack": "tar.gz" }] },
+      "source": "https://github.com/muja/unrar.rs at commit 0628d12b4f2f79d80e6c6c0707ce611e8952b052: the RAR archives of unrar.rs's tests (data)",
+      "license": "MIT or Apache-2.0",
+      "kind": "archives"
+    },
+    {
       "name": "libarchive-zip-ppmd",
       "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/test_read_format_zip*ppmd*.uu" },
       "source": "libarchive 3.8.10's ZIP test archives with PPMd entries (libarchive/test/test_read_format_zip*ppmd*.uu), decoded",

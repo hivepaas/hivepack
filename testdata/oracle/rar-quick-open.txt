@@ -1,0 +1,302 @@
+# Answers from UnRAR 7.3.2 (tools/rar-oracle) for inputs the rar_quick_open fuzz target found, as support::patch::with_quick_open makes archives of them, replayed by crates/rar/tests/oracle.rs.
+# Regenerate with: cargo test -p hivepack-rar --test oracle record_quick_open_answers -- --ignored
+4e	fnv64:d5a2fabd3c507095 # fnv64:e4baa7acb2a58717 # fnv64:e4baa7acb2a58717 # comment none pos=17 exit=1
+97	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+1d	fnv64:51d2b49394c76cfd # fnv64:0ff4a4ee9a276913 # fnv64:0ff4a4ee9a276913 # comment none pos=17 exit=0
+32	fnv64:935913f35e1bb1c6 # fnv64:58b36a4a680bcfff # fnv64:58b36a4a680bcfff # comment none pos=17 exit=0
+68	fnv64:d5a2f9bd3c506ee2 # fnv64:0ff4a4ee9a276913 # fnv64:0ff4a4ee9a276913 # comment none pos=17 exit=0
+25	fnv64:935913f35e1bb1c6 # fnv64:58b36a4a680bcfff # fnv64:58b36a4a680bcfff # comment none pos=17 exit=0
+fe	fnv64:b9b76eef85d79ccf # fnv64:eebb5d24435bed06 # fnv64:eebb5d24435bed06 # comment none pos=17 exit=1
+e0fe	fnv64:382db1b8a6679728 # fnv64:5cba9dd806873716 # fnv64:5cba9dd806873716 # comment none pos=17 exit=3
+b64e	fnv64:3c55db421beb9190 # fnv64:562522c8b3ea7792 # fnv64:562522c8b3ea7792 # comment none pos=17 exit=1
+0301	fnv64:b83f32653a0bd96a # fnv64:adeeaff935f9a30f # fnv64:adeeaff935f9a30f # comment none pos=17 exit=0
+e9fe	fnv64:d741d149b64b58e3 # fnv64:a57b787e1b753ea6 # fnv64:a57b787e1b753ea6 # comment none pos=17 exit=3
+d28a	fnv64:c018aa43351cb3c7 # fnv64:a179ea3c8902dd4f # fnv64:a179ea3c8902dd4f # comment none pos=17 exit=0
+2a0a	fnv64:2ef38f7084cce409 # fnv64:276b1497ed0c1a2c # fnv64:276b1497ed0c1a2c # comment none pos=17 exit=0
+69fe	fnv64:4ccc3f0b86ee4b62 # fnv64:9d50dad1a780e77f # fnv64:9d50dad1a780e77f # comment none pos=17 exit=0
+0006	fnv64:9b23a5968a398e7d # fnv64:90241809bf8d8975 # fnv64:90241809bf8d8975 # comment comment= pos=17 exit=1
+5b5b	fnv64:d5bed210819deba3 # fnv64:ac9b874c0134caa6 # fnv64:ac9b874c0134caa6 # comment none pos=17 exit=0
+a303	fnv64:7c8506edc393f250 # fnv64:54984180daf35a5f # fnv64:54984180daf35a5f # comment none pos=17 exit=0
+8821	fnv64:bbb5a0753b61668a # fnv64:9f1616c72529bee1 # fnv64:9f1616c72529bee1 # comment none pos=17 exit=0
+ff25	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+0221	fnv64:80f37b85d3179932 # fnv64:f21a9708ad638142 # fnv64:f21a9708ad638142 # comment none pos=17 exit=0
+ff06	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+b8fe	fnv64:056cce953a354751 # fnv64:9d50dad1a780e77f # fnv64:9d50dad1a780e77f # comment none pos=17 exit=0
+0300	fnv64:27239426791a6139 # fnv64:d23b76cfdcd0f105 # fnv64:d23b76cfdcd0f105 # comment none pos=17 exit=0
+5629	fnv64:b29453719c7e16bb # fnv64:1af13929b4374b82 # fnv64:1af13929b4374b82 # comment none pos=17 exit=1
+0331	fnv64:6a05671df96a13ee # fnv64:f8526ef4a6f84c03 # fnv64:f8526ef4a6f84c03 # comment none pos=17 exit=0
+3214	fnv64:677b63e0cc85f888 # fnv64:a19040a04014cfe8 # fnv64:a19040a04014cfe8 # comment none pos=17 exit=0
+0d08	fnv64:7e896231648fcab8 # fnv64:e73c824b28ec9543 # fnv64:e73c824b28ec9543 # comment none pos=17 exit=0
+ff5e	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+2306	fnv64:d5e0d74e7ab9ae61 # fnv64:33c1ce17b6cdd29b # fnv64:33c1ce17b6cdd29b # comment none pos=17 exit=0
+c2f5	fnv64:abb3984ebcfcbd01 # fnv64:f58a92d517c411ee # fnv64:f58a92d517c411ee # comment none pos=17 exit=0
+4141	fnv64:8e035c7a89ebab1c # fnv64:a79c7488af60824f # fnv64:a79c7488af60824f # comment none pos=17 exit=0
+69b9	fnv64:9694ae9062871b6a # fnv64:e73c824b28ec9543 # fnv64:e73c824b28ec9543 # comment none pos=17 exit=0
+b211	fnv64:d2c12ebde45fc049 # fnv64:14402f78bd0ec871 # fnv64:14402f78bd0ec871 # comment none pos=17 exit=0
+ffff	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+230a	fnv64:7c8506edc393f250 # fnv64:54984180daf35a5f # fnv64:54984180daf35a5f # comment none pos=17 exit=0
+4ccd	fnv64:bfdfcd54fe8e67d2 # fnv64:017d1f5a99f36cbf # fnv64:017d1f5a99f36cbf # comment none pos=17 exit=0
+320328	fnv64:fdb906b2037f1212 # fnv64:e473afab95acd244 # fnv64:e473afab95acd244 # comment none pos=17 exit=0
+295b5b	fnv64:e4f56931a12dbfc8 # fnv64:f984cec90b1fd564 # fnv64:f984cec90b1fd564 # comment none pos=17 exit=0
+070707	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+ffa9ff	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+5b5b04	fnv64:a1aeede7073382ee # fnv64:c8e7ebc427f97950 # fnv64:c8e7ebc427f97950 # comment none pos=17 exit=0
+565b29	fnv64:b9ec6f3f4fa6fea4 # fnv64:67c74333960a3990 # fnv64:67c74333960a3990 # comment none pos=17 exit=1
+30fefe	fnv64:0a77322612a725b3 # fnv64:e8df46b4eeada4b4 # fnv64:e8df46b4eeada4b4 # comment none pos=17 exit=3
+ff2b07	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+b8bb3c	fnv64:89d9f319e63b60be # fnv64:24297a87683938bc # fnv64:24297a87683938bc # comment none pos=17 exit=0
+d503ff	fnv64:9feafb71062e631b # fnv64:b9dbf70750bb45de # fnv64:b9dbf70750bb45de # comment none pos=17 exit=0
+009104	fnv64:407d094e9050bde2 # fnv64:89cca62aa759b6b3 # fnv64:89cca62aa759b6b3 # comment none pos=17 exit=0
+4e3a4e	fnv64:b2fb60974836fa02 # fnv64:1331ae107c4277f8 # fnv64:1331ae107c4277f8 # comment none pos=17 exit=1
+034ccd	fnv64:25445bb27483d351 # fnv64:715c0a97590c98e5 # fnv64:715c0a97590c98e5 # comment none pos=17 exit=0
+4ccdcd	fnv64:dbd6451dda015f6e # fnv64:5adca3081f57d8bf # fnv64:5adca3081f57d8bf # comment none pos=17 exit=0
+2300fe	fnv64:22dd9bb2c3e61683 # fnv64:68939407070105d1 # fnv64:68939407070105d1 # comment none pos=17 exit=0
+e0fee9	fnv64:ebe26ca59484ddd9 # fnv64:b6c3df23940bf2a1 # fnv64:b6c3df23940bf2a1 # comment none pos=17 exit=3
+c201f5	fnv64:cfee8547a83718f1 # fnv64:60bdf3be5354ed4a # fnv64:60bdf3be5354ed4a # comment none pos=17 exit=0
+6d6dfe	fnv64:fa2e0e26cb0fa1c7 # fnv64:b0b9ea9074bbbe92 # fnv64:b0b9ea9074bbbe92 # comment none pos=17 exit=0
+040606	fnv64:bde7f3d0705ffbc2 # fnv64:c8079868f31148dd # fnv64:c8079868f31148dd # comment none pos=17 exit=0
+4b4b4b	fnv64:8fd7d315fddca457 # fnv64:7bcf73e0f309aed3 # fnv64:7bcf73e0f309aed3 # comment none pos=17 exit=0
+c36d04	fnv64:25445bb27483d351 # fnv64:715c0a97590c98e5 # fnv64:715c0a97590c98e5 # comment none pos=17 exit=0
+000404	fnv64:114e6836205ab69a # fnv64:c79765c817ea82b0 # fnv64:c79765c817ea82b0 # comment none pos=17 exit=0
+5b5b37	fnv64:5cfba9c915bd4720 # fnv64:6468c361752136f6 # fnv64:6468c361752136f6 # comment none pos=17 exit=0
+88ee32	fnv64:a9f1980ff9f020b9 # fnv64:8535bc7abbdc0441 # fnv64:8535bc7abbdc0441 # comment none pos=17 exit=0
+b82b29	fnv64:1beac726f8d6764f # fnv64:b710b84d9b346bd3 # fnv64:b710b84d9b346bd3 # comment none pos=17 exit=0
+2c2b7a	fnv64:81559b0e2cbe469a # fnv64:5fd8247c421b7191 # fnv64:5fd8247c421b7191 # comment none pos=17 exit=0
+e9fee0	fnv64:385dfa4c916fd703 # fnv64:1d0b530744b3d3a0 # fnv64:1d0b530744b3d3a0 # comment none pos=17 exit=3
+e0fe2a	fnv64:a67f462c7a684e60 # fnv64:9abc323814e46884 # fnv64:9abc323814e46884 # comment none pos=17 exit=3
+040000	fnv64:e9d87e929cd750ee # fnv64:7f70ba018a2c97d4 # fnv64:7f70ba018a2c97d4 # comment none pos=17 exit=0
+002441	fnv64:c77623a8aa8106e9 # fnv64:e3da49c4c82f8de5 # fnv64:e3da49c4c82f8de5 # comment none pos=17 exit=0
+af4604	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+03ec09	fnv64:bfab3dd88db1946f # fnv64:b22df9bbacfe4058 # fnv64:b22df9bbacfe4058 # comment none pos=17 exit=0
+32b6c5	fnv64:3db7316bf0b1ff4a # fnv64:839fcef64d201733 # fnv64:839fcef64d201733 # comment none pos=17 exit=3
+b8bb43	fnv64:373c3c4e02ae2815 # fnv64:c9c7d1bbb904f87a # fnv64:c9c7d1bbb904f87a # comment none pos=17 exit=0
+ff053b	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+4b4bb8	fnv64:e1c547f6d04b64ac # fnv64:c2937cff13374783 # fnv64:c2937cff13374783 # comment none pos=17 exit=0
+32b6b8c5	fnv64:072ead97110c258d # fnv64:80e0139a9a98b6fc # fnv64:80e0139a9a98b6fc # comment none pos=17 exit=3
+32b6b829	fnv64:faaaa2be9841e43b # fnv64:9c9df1316d83587f # fnv64:9c9df1316d83587f # comment none pos=17 exit=3
+32fe035e	fnv64:014d7ce0e6f14835 # test archive | read=0 headertype=ff cur=5c next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=83 broken=1 code=3 exit=3 # fnv64:131fa3afde17676d # comment none pos=5c exit=3
+32230a27	fnv64:27c60638f2b0a4fd # fnv64:49cd2347842ce03e # fnv64:49cd2347842ce03e # comment none pos=17 exit=0
+03b6c54e	fnv64:52c82aae33c610c9 # fnv64:121a97ce056bfcd9 # fnv64:121a97ce056bfcd9 # comment none pos=17 exit=0
+108bffff	fnv64:571a009b86671b27 # fnv64:154b079b792dc599 # fnv64:154b079b792dc599 # comment none pos=17 exit=0
+1dc6fec6	fnv64:4148bd0a73dee522 # fnv64:1c0aedd38d5156f3 # fnv64:1c0aedd38d5156f3 # comment none pos=17 exit=0
+d5034bb8	fnv64:99dd12f5360b1e9b # fnv64:fa0191ee6eeb4e52 # fnv64:fa0191ee6eeb4e52 # comment none pos=17 exit=0
+0303b6fe	fnv64:0811aac067a2d149 # fnv64:c2ef718741dd3cae # fnv64:c2ef718741dd3cae # comment none pos=17 exit=0
+4b6dfffe	fnv64:572fa71eb9094a15 # fnv64:ac9b874c0134caa6 # fnv64:ac9b874c0134caa6 # comment none pos=17 exit=0
+e8414141	fnv64:e08fc7bb7d782ceb # fnv64:d9b5aaf4cf79a44f # fnv64:d9b5aaf4cf79a44f # comment none pos=17 exit=2
+e8410300	fnv64:051bf53f1e3e5af0 # fnv64:510e50a7066243bc # fnv64:510e50a7066243bc # comment none pos=17 exit=2
+b2fe2ad8	fnv64:6101f09c83a3b0e9 # test archive | read=0 headertype=ff cur=ac next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=ac broken=1 code=3 exit=3 # fnv64:46725ce4b46095cd # comment none pos=ac exit=3
+5b2003b6	fnv64:2e904518f8fae4bc # fnv64:87e2fb1fc05b1c9f # fnv64:87e2fb1fc05b1c9f # comment none pos=17 exit=0
+5b5bc201	fnv64:27624c526ba033ee # fnv64:3464fd1e7c49e61f # fnv64:3464fd1e7c49e61f # comment none pos=17 exit=0
+5b5b3f04	fnv64:300a2639e56a52c0 # fnv64:6cc0977cdf516d08 # fnv64:6cc0977cdf516d08 # comment none pos=17 exit=0
+b8bb3cfe	fnv64:178ea7658b491c40 # fnv64:0e453085e814f4f5 # fnv64:0e453085e814f4f5 # comment none pos=17 exit=0
+32000404	fnv64:92b3705f94b799ed # fnv64:c5d5f0a35e1d6074 # fnv64:c5d5f0a35e1d6074 # comment none pos=17 exit=0
+3dcdcdcd	fnv64:20d1b037d621ae5c # fnv64:757f83a0fa5a9bf5 # fnv64:757f83a0fa5a9bf5 # comment none pos=17 exit=0
+32230a32	fnv64:7b85a3939e4cd048 # fnv64:1fa7b546e9854fd5 # fnv64:1fa7b546e9854fd5 # comment none pos=17 exit=0
+32b6212a	fnv64:e4faac27803558b1 # fnv64:faa5f19e0fe45f91 # fnv64:faa5f19e0fe45f91 # comment none pos=17 exit=3
+03000903	fnv64:ff2d318658a5640b # fnv64:51e0e6dca6e2e302 # fnv64:51e0e6dca6e2e302 # comment none pos=17 exit=0
+e0fe2a8a	fnv64:dc4b23c52d65e946 # fnv64:e8e436e141b52241 # fnv64:e8e436e141b52241 # comment none pos=17 exit=3
+32b1b8c5	fnv64:22d33796a46d563c # fnv64:dcf85e1073b7e73b # fnv64:dcf85e1073b7e73b # comment none pos=17 exit=0
+008bffff	fnv64:9d31015c4aecb5ae # fnv64:d976044a1536abb7 # fnv64:d976044a1536abb7 # comment none pos=17 exit=0
+030004c6	fnv64:6973cc449ff1d40f # fnv64:f038a1093c2f1320 # fnv64:f038a1093c2f1320 # comment none pos=17 exit=0
+32fe200a	fnv64:417d16f90c5a9c25 # test archive | read=0 headertype=ff cur=bb next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=bb broken=1 code=3 exit=3 # fnv64:1a4076e2d6c1eeff # comment none pos=bb exit=3
+6903b5b5	fnv64:9255f1640fc42321 # fnv64:1225da946c6c677d # fnv64:1225da946c6c677d # comment none pos=17 exit=0
+03b6b8fe	fnv64:b0d36db9c196b6e3 # fnv64:d974084d9dbc2197 # fnv64:d974084d9dbc2197 # comment none pos=17 exit=0
+13b6b8fe	fnv64:4694d89ec2684beb # fnv64:77a950b9c18915dd # fnv64:77a950b9c18915dd # comment none pos=17 exit=0
+32b6033a	fnv64:cee8865c4a36fcbf # fnv64:1d12e55e9e0142d8 # fnv64:47679dea6dddcdcf # comment none pos=5c exit=3
+2eb62eb6	fnv64:840d4e16e4219505 # fnv64:083abbdf42e2f693 # fnv64:083abbdf42e2f693 # comment none pos=17 exit=1
+d203008a	fnv64:4513b6c9babfbc31 # fnv64:a04cb2dcf21f77b2 # fnv64:a04cb2dcf21f77b2 # comment none pos=17 exit=0
+00040404	fnv64:161a5071430dd20a # fnv64:beb6f431ae905085 # fnv64:beb6f431ae905085 # comment none pos=17 exit=0
+04000000	fnv64:711d136bad478f9c # fnv64:242cdc8fafd045bc # fnv64:242cdc8fafd045bc # comment none pos=17 exit=0
+2300ffff	fnv64:6727dbd45f4bd62b # fnv64:6f053a0e5ba540de # fnv64:6f053a0e5ba540de # comment none pos=17 exit=0
+21e9a7e0	fnv64:f0562a97c36874fc # fnv64:6e8e7653a4aca374 # fnv64:6a72442b3aca4945 # comment none pos=17 exit=0
+03f603f6	fnv64:597c8d48548b8a1f # fnv64:81af97f1fc6802da # fnv64:81af97f1fc6802da # comment none pos=17 exit=0
+4bfe2b07	fnv64:f85835c416d5ef9a # fnv64:a5cc28d2308b36f7 # fnv64:a5cc28d2308b36f7 # comment none pos=17 exit=0
+4b686868	fnv64:765fdc0a1242da37 # fnv64:4da346237ef69979 # fnv64:4da346237ef69979 # comment none pos=17 exit=0
+4bfe6868	fnv64:fa766876d7f5673b # fnv64:176fee6331bf12bd # fnv64:176fee6331bf12bd # comment none pos=17 exit=0
+4bfe2b4b	fnv64:b97b8f510bff13e8 # fnv64:0c5bc7b75034e5d1 # fnv64:0c5bc7b75034e5d1 # comment none pos=17 exit=0
+e0fee0fe	fnv64:9c36dc7f89538efc # fnv64:c9308c93a65db222 # fnv64:c9308c93a65db222 # comment none pos=17 exit=3
+e9fec000	fnv64:aea4a08a80d5eefb # fnv64:1d0b530744b3d3a0 # fnv64:1d0b530744b3d3a0 # comment none pos=17 exit=3
+32b6c1c5	fnv64:1361965052e2ae16 # fnv64:3fdbc8187d921a56 # fnv64:3fdbc8187d921a56 # comment none pos=17 exit=3
+3c080800	fnv64:59167b9616d72c45 # fnv64:2feb42d2fe9746c4 # fnv64:2feb42d2fe9746c4 # comment none pos=17 exit=0
+0349284e	fnv64:699622813a442be4 # fnv64:f09ad0e998036b2a # fnv64:f09ad0e998036b2a # comment none pos=17 exit=0
+32feffff	fnv64:d68f098ee85a8684 # fnv64:7c7b515a5ae5da7a # fnv64:7c7b515a5ae5da7a # comment none pos=17 exit=3
+32fe4e0a	fnv64:cee8865c4a36fcbf # fnv64:8ecb64c3c52c5d6a # fnv64:918c19c96d561fef # comment none pos=5c exit=3
+682bb8fa	fnv64:0631bdbfd9d44901 # fnv64:d79948a9a2abe251 # fnv64:d79948a9a2abe251 # comment none pos=17 exit=0
+6200ee3f	fnv64:b458ba5a82490eaf # fnv64:4cac41918db9caab # fnv64:78686df9180ea338 # comment none pos=5c exit=3
+32003e04	fnv64:66bcd024092f33b7 # fnv64:ecedfe22e00cdf85 # fnv64:ecedfe22e00cdf85 # comment none pos=17 exit=3
+02010201	fnv64:42da06022246e540 # fnv64:6d92f9b719542662 # fnv64:6d92f9b719542662 # comment none pos=17 exit=0
+0349c54e	fnv64:131ea3486d265d7b # fnv64:a17d3df2282389d8 # fnv64:a17d3df2282389d8 # comment none pos=17 exit=0
+21e9fee0	fnv64:48a5963642824094 # fnv64:6e8e7653a4aca374 # fnv64:6a72442b3aca4945 # comment none pos=17 exit=0
+30eefefe	fnv64:4803673df56647c3 # fnv64:0b9360bdb0e051df # fnv64:0b9360bdb0e051df # comment none pos=17 exit=3
+e8410041	fnv64:2c438c59384a87ae # fnv64:1438db8f6d7541e5 # fnv64:1438db8f6d7541e5 # comment none pos=17 exit=2
+30323032	fnv64:9bd26841cfeb40e0 # fnv64:de07dd414f873f70 # fnv64:de07dd414f873f70 # comment none pos=17 exit=0
+b2fe2a3d	fnv64:738be9e047f4b858 # fnv64:8a5e52f11008d50c # fnv64:8a5e52f11008d50c # comment none pos=17 exit=3
+ff2bffcf	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+03310331	fnv64:90d56a271e3c3b68 # fnv64:cd8fa75215dfc6cd # fnv64:cd8fa75215dfc6cd # comment none pos=17 exit=0
+5423fffff3	fnv64:0fbefc28a0cc5fc1 # fnv64:c04d12982d5946c8 # fnv64:c04d12982d5946c8 # comment none pos=17 exit=0
+382c2b0a3f	fnv64:674a34e60e024aaa # fnv64:294b1a75880615eb # fnv64:294b1a75880615eb # comment none pos=17 exit=0
+032dbdbdbd	fnv64:6cc593bd3cc62377 # fnv64:7e21d5842cd4ad9e # fnv64:7e21d5842cd4ad9e # comment none pos=17 exit=0
+e9fee00f7f	fnv64:cc925dd59fa2bead # fnv64:1d0b530744b3d3a0 # fnv64:1d0b530744b3d3a0 # comment none pos=17 exit=3
+32b132b1c5	fnv64:7bd6a7312d8894ec # fnv64:80c606a3c108a867 # fnv64:80c606a3c108a867 # comment none pos=17 exit=0
+3391a9200a	fnv64:0d2d03f2fe0569b0 # fnv64:084d7824d6e98caf # fnv64:084d7824d6e98caf # comment none pos=17 exit=0
+13b629b8fe	fnv64:6f67dad422de646c # fnv64:95074fc752b9e782 # fnv64:95074fc752b9e782 # comment none pos=17 exit=0
+e841085141	fnv64:9150843790f9b6e9 # fnv64:5d91956b4e9add24 # fnv64:5d91956b4e9add24 # comment none pos=17 exit=2
+32b6c1bcc5	fnv64:e557fdf4a9cbf1e9 # fnv64:81d62362640b4533 # fnv64:81d62362640b4533 # comment none pos=17 exit=3
+e841264141	fnv64:e36160bb05c398c3 # fnv64:8b4edbd8260eed91 # fnv64:8b4edbd8260eed91 # comment none pos=17 exit=2
+230000fe00	fnv64:f2f5d3822158ed9d # fnv64:5a6a3907918d9b6c # fnv64:5a6a3907918d9b6c # comment none pos=17 exit=0
+3d00000000	fnv64:f67c4a954a600e6f # fnv64:7941db0221aadf9c # fnv64:7941db0221aadf9c # comment none pos=17 exit=0
+e00300e003	fnv64:c4e87a5b18e56871 # fnv64:1fbda43fc041a828 # fnv64:1fbda43fc041a828 # comment none pos=17 exit=0
+a040a0a0a0	fnv64:91f0d074b2537f29 # fnv64:cb3cdb5253382f14 # fnv64:cb3cdb5253382f14 # comment none pos=17 exit=0
+4b844bffff	fnv64:821d194f560248dd # fnv64:9d322c9c949633bb # fnv64:9d322c9c949633bb # comment none pos=17 exit=0
+a0fe03002c	fnv64:ad7ce1abbab00d19 # fnv64:3654b95dee090e2f # fnv64:3654b95dee090e2f # comment none pos=17 exit=3
+4b00686868	fnv64:f465d9f461a7562d # fnv64:339d0467e31b2cb0 # fnv64:339d0467e31b2cb0 # comment none pos=17 exit=0
+0900f9ff51	fnv64:7b412582dadca249 # fnv64:f777a56b144a04ae # fnv64:f777a56b144a04ae # comment none pos=17 exit=0
+03f603f6f6	fnv64:9d787b35c789d06f # fnv64:0e7dff7451016460 # fnv64:0e7dff7451016460 # comment none pos=17 exit=0
+32b623c545	fnv64:5667f3e5b53f5ee1 # fnv64:976d781ce0a38505 # fnv64:976d781ce0a38505 # comment none pos=17 exit=3
+00f6f3fef3	fnv64:0ee57abc56b9ca4c # fnv64:83476fdf81f149f5 # fnv64:83476fdf81f149f5 # comment none pos=17 exit=3
+03003cfe24	fnv64:f796633662f991bf # fnv64:4b7129a1899c44df # fnv64:4b7129a1899c44df # comment none pos=17 exit=0
+32fe0300ff	fnv64:2a8b096a4200d64d # fnv64:418c94dbb212e828 # fnv64:418c94dbb212e828 # comment none pos=17 exit=3
+4b3a4bffff	fnv64:7c676ec7a45d7a96 # fnv64:a81b4a61f5864f44 # fnv64:a81b4a61f5864f44 # comment none pos=17 exit=0
+3221d501ff	fnv64:121ed600263a4321 # fnv64:bd5602db213025a6 # fnv64:bd5602db213025a6 # comment none pos=17 exit=0
+30eefe4949	fnv64:e2e130d70a15de59 # fnv64:cd73e191f5d01f42 # fnv64:cd73e191f5d01f42 # comment none pos=17 exit=3
+000200300002	fnv64:9955d666a98df68b # fnv64:248022376980569d # fnv64:248022376980569d # comment none pos=17 exit=0
+000024414141	fnv64:e5a1b3c3285a1d0e # fnv64:c21aae095a7b3d34 # fnv64:c21aae095a7b3d34 # comment none pos=17 exit=0
+d109d109d131	fnv64:191896bf3fcaf24d # fnv64:211af49b959b7e28 # fnv64:211af49b959b7e28 # comment none pos=17 exit=0
+01fe096dfe23	fnv64:7f02d3167f90194c # fnv64:d2e57c04c98a038e # fnv64:d2e57c04c98a038e # comment none pos=17 exit=3
+ff32ff003b3b	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+a0fe03a2992a	fnv64:096c2818af108834 # fnv64:4b36c34768a670f3 # fnv64:4b36c34768a670f3 # comment none pos=17 exit=3
+06bb32b6033a	fnv64:5246beaf05aa65c4 # fnv64:939691b4ec6f51d2 # fnv64:939691b4ec6f51d2 # comment none pos=17 exit=1
+a0fe03002ea2	fnv64:bbfd34a04b9261a0 # test archive | read=0 headertype=ff cur=102 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=109 broken=1 code=3 exit=3 # fnv64:ca32c0b890409427 # comment none pos=102 exit=3
+2b0000000000	fnv64:8df0df0aba92fb36 # fnv64:380e23b5232b1728 # fnv64:380e23b5232b1728 # comment none pos=17 exit=0
+e000de0bca09	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+b8bb0aff0aff	fnv64:0df80a8b70cb748b # fnv64:4e0fd2d086f23a8f # fnv64:4e0fd2d086f23a8f # comment none pos=17 exit=0
+2b29230e0e0e	fnv64:26b59ae37621b0ae # fnv64:24b6a6e070d52df5 # fnv64:24b6a6e070d52df5 # comment none pos=17 exit=0
+110020000000	fnv64:91f0d074b2537f29 # fnv64:cb3cdb5253382f14 # fnv64:cb3cdb5253382f14 # comment none pos=17 exit=0
+4b0400003aff	fnv64:ed6cbf6a7eae530d # fnv64:7f5fcf3a437b6124 # fnv64:7f5fcf3a437b6124 # comment none pos=17 exit=0
+03f603f6f603	fnv64:6831883cf5e1a313 # fnv64:04a2167a7aa86146 # fnv64:04a2167a7aa86146 # comment none pos=17 exit=0
+0400c54e0000	fnv64:59f3420f6d548cfb # fnv64:36de5dfc585b4a00 # fnv64:36de5dfc585b4a00 # comment none pos=17 exit=0
+32212125853d	fnv64:003d36668f6f3815 # fnv64:da83af64e9b99a29 # fnv64:da83af64e9b99a29 # comment none pos=17 exit=0
+022102210201	fnv64:b9276f32e39be07e # fnv64:34749a6bc205998e # fnv64:34749a6bc205998e # comment none pos=17 exit=0
+1dd1d1d1d131	fnv64:17c7ed77c35afe39 # fnv64:82eef42ff7bebcfb # fnv64:82eef42ff7bebcfb # comment none pos=17 exit=0
+32b603c20100	fnv64:c3e8977e79158516 # fnv64:c0983cf7c8f3de03 # fnv64:d1b9fd33178131fd # comment none pos=68 exit=3
+72c1c160c165	fnv64:aeb8f38981239c4a # fnv64:409242664382da9b # fnv64:bf7a8c308259d5fe # comment none pos=17 exit=0
+c6fe1dc6fec6	fnv64:73ffd10b4ba99a06 # fnv64:9139faf3d53759b9 # fnv64:9139faf3d53759b9 # comment none pos=17 exit=1
+fff3f7fff3f7	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+0201c5011201	fnv64:ec5036c68e8c2ff8 # fnv64:b8da6056d4ab72b3 # fnv64:b8da6056d4ab72b3 # comment none pos=17 exit=0
+00000000b211	fnv64:9d2a0aba5abf68cd # fnv64:4b1c7835063967d3 # fnv64:4b1c7835063967d3 # comment none pos=17 exit=0
+200a310a31b6	fnv64:1c160f313701bf71 # fnv64:b66ebf31f8bf4b19 # fnv64:b66ebf31f8bf4b19 # comment none pos=17 exit=0
+32fe0300ffd5	fnv64:7a1ca84ab00a18a3 # fnv64:b242a91581be9ca7 # fnv64:879b9b33de02af4b # comment none pos=a5 exit=3
+a0fe0300a2992a	fnv64:93e225d50ef24bba # fnv64:71b1c4669a699fc8 # fnv64:23a0c32017a04ff4 # comment none pos=7a exit=3
+e0be040bca2909	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+a30340a3031300	fnv64:cc717bf457438988 # fnv64:ba453c648ceedbd1 # fnv64:ba453c648ceedbd1 # comment none pos=17 exit=0
+32fe01040bca09	fnv64:fb380e101d9bc302 # fnv64:81bceb33b61d1575 # fnv64:81bceb33b61d1575 # comment none pos=17 exit=3
+e0fe999999992a	fnv64:ea769eb870bb3836 # fnv64:b8965a2ef2b755a4 # fnv64:b8965a2ef2b755a4 # comment none pos=17 exit=3
+402b0a2c2bffff	fnv64:ef19e7bc9ee8f20d # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+01000000000003	fnv64:92b3705f94b799ed # fnv64:c5d5f0a35e1d6074 # fnv64:c5d5f0a35e1d6074 # comment none pos=17 exit=0
+3f29b1b1b1b1b1	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+a9030032fe23cd	fnv64:365fef3505c813ca # fnv64:3b2ad175ce2e761d # fnv64:3b2ad175ce2e761d # comment none pos=17 exit=0
+e9fee00f7fffff	fnv64:cc9ed4c1313410e1 # fnv64:1d0b530744b3d3a0 # fnv64:1d0b530744b3d3a0 # comment none pos=17 exit=3
+da91da91038303	fnv64:24c555280e93fec4 # fnv64:9890aa8882c17f50 # fnv64:9890aa8882c17f50 # comment none pos=17 exit=2
+30494949494949	fnv64:d0b5b068ee1732de # fnv64:5788004b227d9729 # fnv64:5788004b227d9729 # comment none pos=17 exit=0
+d0a60b03022109	fnv64:f6062aa4d39a64fc # fnv64:5098e9bdd73fc9e6 # fnv64:5098e9bdd73fc9e6 # comment none pos=17 exit=3
+3c080008080041	fnv64:38abc73233630d12 # fnv64:39dbd06f3cf118a6 # fnv64:39dbd06f3cf118a6 # comment none pos=17 exit=0
+13b63dcdcdcdff	fnv64:428184ecf84c8bcb # fnv64:9efe42365bd28888 # fnv64:9efe42365bd28888 # comment none pos=17 exit=0
+60fee0fefee001	fnv64:3ffd028de7451526 # fnv64:5f8420ddf4157b30 # fnv64:c2e18865d5305f16 # comment none pos=5c exit=3
+1dd109d1d1c131	fnv64:6a46865746e57b13 # fnv64:26b9fd41efe4a64d # fnv64:26b9fd41efe4a64d # comment none pos=17 exit=0
+32fe038303000004	fnv64:0cbff2e63391752b # fnv64:9e7e2c1069885509 # fnv64:9e7e2c1069885509 # comment none pos=17 exit=3
+0002007000020070	fnv64:0d48dcfac789f7db # fnv64:c27ff2e28d0bfe4c # fnv64:c27ff2e28d0bfe4c # comment none pos=17 exit=0
+10863ba1868be8ff	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+2300000000000006	fnv64:aeeca3e94959e961 # fnv64:f6479c63ad9c7887 # fnv64:f6479c63ad9c7887 # comment none pos=17 exit=0
+2036320aff21ff31	fnv64:d2464cbe84943eae # fnv64:661c3966ed082e3b # fnv64:2d20089480b54c86 # comment none pos=5c exit=3
+0221020102210221	fnv64:b9276f32e39be07e # fnv64:34749a6bc205998e # fnv64:34749a6bc205998e # comment none pos=17 exit=0
+1354000000b6b69d	fnv64:4eccb489cc376c37 # fnv64:f314441716296e2e # fnv64:f314441716296e2e # comment none pos=17 exit=0
+1c07072b1c2b0707	fnv64:199a029a242db2b7 # fnv64:6feca3112e72af8a # fnv64:6feca3112e72af8a # comment none pos=17 exit=0
+72c1c1c1fe20300a	fnv64:d98f21b6903131b1 # fnv64:e67de5e379a63a61 # fnv64:e67de5e379a63a61 # comment none pos=17 exit=0
+0041414100414141	fnv64:ffb6f0766e94d3d5 # fnv64:0d60d1ab532f63bb # fnv64:0d60d1ab532f63bb # comment none pos=17 exit=0
+20363262ff21582b	fnv64:5d425d5b2cc2fe80 # fnv64:661c3966ed082e3b # fnv64:2d20089480b54c86 # comment none pos=5c exit=3
+200a310a310300b6	fnv64:09a60f2150b21987 # fnv64:f74b3d6fcf6eae13 # fnv64:f74b3d6fcf6eae13 # comment none pos=17 exit=0
+b21f1fcb2c002fd8	fnv64:386d85fc7221fb96 # fnv64:032c65fe64c3a85f # fnv64:032c65fe64c3a85f # comment none pos=17 exit=0
+2036320aff217231	fnv64:1102dd4644f5803e # fnv64:312ef7015b5c5ac5 # fnv64:2d20089480b54c86 # comment none pos=5c exit=3
+108686a1868b29ff	fnv64:2aac3e39da4fba47 # fnv64:15e3564b006fe31d # fnv64:15e3564b006fe31d # comment none pos=17 exit=3
+03b6303dcdcdc5ff	fnv64:feb6b974c1c99cf9 # fnv64:e5c047cabad53869 # fnv64:e5c047cabad53869 # comment none pos=17 exit=0
+4bfe2b0770030107	fnv64:ef13664bb3f2ef8d # fnv64:65092d054b0535ab # fnv64:65092d054b0535ab # comment none pos=17 exit=0
+ececececec01008a	fnv64:8e23222aac49dcaa # fnv64:b67a4a13954ea75a # fnv64:b67a4a13954ea75a # comment none pos=17 exit=0
+0431033031000000	fnv64:e159dc73790f2782 # fnv64:89467f81e235b2e3 # fnv64:89467f81e235b2e3 # comment none pos=17 exit=0
+10868686868b29ff	fnv64:141bb515d1a46990 # fnv64:84f94a9375db0f08 # fnv64:84f94a9375db0f08 # comment none pos=17 exit=3
+fff3f7fff3f7fff3	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+0000260403030303	fnv64:14ffd0057c3baff4 # fnv64:5ee04a458b96ca97 # fnv64:5ee04a458b96ca97 # comment none pos=17 exit=3
+0201ff0112011201	fnv64:a7e64a83c6d80e42 # fnv64:b8da6056d4ab72b3 # fnv64:b8da6056d4ab72b3 # comment none pos=17 exit=0
+3c08000834080008	fnv64:cb3a3c3928a66bef # fnv64:99eafcc46cac71a3 # fnv64:99eafcc46cac71a3 # comment none pos=17 exit=0
+ff2bffff2bffcfcf	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+1dd109d1d1c1ff31	fnv64:bc2f68dc1a18b781 # fnv64:4b74915261ba7324 # fnv64:4b74915261ba7324 # comment none pos=17 exit=0
+10868686a1868be8ff	fnv64:d31ddf32cfaa570d # fnv64:c6a40950c3a22c69 # fnv64:c6a40950c3a22c69 # comment none pos=17 exit=3
+2036324aff2d210101	fnv64:8b7236f2aa541b5c # fnv64:a458f23042569bf9 # fnv64:1dbd078977807a29 # comment none pos=5c exit=3
+30ee01494949494949	fnv64:536da572946dfd9f # fnv64:a22b773ca9cab290 # fnv64:a22b773ca9cab290 # comment none pos=17 exit=3
+0004045c5c5c5c5c5c	fnv64:0b320ed20044570e # fnv64:b23dbd01fa70687a # fnv64:b23dbd01fa70687a # comment none pos=17 exit=0
+2036320affffffff31	fnv64:358811087f09e58b # fnv64:a458f23042569bf9 # fnv64:1dbd078977807a29 # comment none pos=5c exit=3
+030000000000000000	fnv64:0ea0f9708635b8e3 # fnv64:bcfd58c3b39c61b1 # fnv64:bcfd58c3b39c61b1 # comment none pos=17 exit=0
+0100060006040bca09	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+000024000000000000	fnv64:8015f73984c25d5c # fnv64:a2b6e238efd531fc # fnv64:a2b6e238efd531fc # comment none pos=17 exit=0
+13b629b819000000fe	fnv64:a4c0fd3a904107cb # fnv64:3193c9298463de5f # fnv64:3193c9298463de5f # comment none pos=17 exit=0
+000600060074414141	fnv64:00f684d64591633a # fnv64:15304580be28f908 # fnv64:15304580be28f908 # comment none pos=17 exit=3
+cecececececececece	fnv64:52fde115fca4fdd6 # fnv64:27bbefdab72782c8 # fnv64:27bbefdab72782c8 # comment none pos=17 exit=1
+e84100e007413ae9e0	fnv64:831232e0e269adf6 # fnv64:c8bcf7b03f695406 # fnv64:c8bcf7b03f695406 # comment none pos=17 exit=2
+0100060006040fca09	fnv64:1f2fdb3812b1af29 # fnv64:db575bc4268837c1 # fnv64:db575bc4268837c1 # comment none pos=17 exit=3
+1c1c3807072b072b07	fnv64:0f4bb5ee0e73c56c # fnv64:75fd9b92043658bd # fnv64:75fd9b92043658bd # comment none pos=17 exit=0
+004b2a034b03010303	fnv64:ef19e7bc9ee8f20d # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+a0a040a0a040a0a0a0	fnv64:91f0d074b2537f29 # fnv64:cb3cdb5253382f14 # fnv64:cb3cdb5253382f14 # comment none pos=17 exit=0
+32fe0383030034343434	fnv64:a096cc6f687116b7 # fnv64:43f1db378182969c # fnv64:43f1db378182969c # comment none pos=17 exit=3
+0b0000fbb20000000011	fnv64:87dce616c77e843a # fnv64:78cc1d67b5d24817 # fnv64:78cc1d67b5d24817 # comment none pos=17 exit=0
+214c0000000000003339	fnv64:4e565629174503f7 # fnv64:f9a72a232c3dfa38 # fnv64:f9a72a232c3dfa38 # comment none pos=17 exit=0
+3a231100000000000000	fnv64:d035132c68f4a887 # fnv64:e37468c46fb2412e # fnv64:e37468c46fb2412e # comment none pos=17 exit=0
+0909090909090948cd09	fnv64:cdaa84db28e7df22 # fnv64:02b38170777b64d4 # fnv64:02b38170777b64d4 # comment none pos=17 exit=0
+000000000f0f0f0f0f0f	fnv64:878296a3f770e6b6 # fnv64:2531d2131c506300 # fnv64:2531d2131c506300 # comment none pos=17 exit=0
+3d8585858585854d4d85	fnv64:d6e1de6b27a04a11 # fnv64:9d50dad1a780e77f # fnv64:9d50dad1a780e77f # comment none pos=17 exit=0
+0000000000000000b211	fnv64:aa5cf27b9fa8e9b8 # fnv64:580f2600edc7028d # fnv64:580f2600edc7028d # comment none pos=17 exit=0
+e054d9f7a506440bca09	fnv64:62c004518a85a5ba # fnv64:b9cf3a6cbd63a45d # fnv64:b9cf3a6cbd63a45d # comment none pos=17 exit=3
+cda99191919191919191	fnv64:4a52714b2f7f83e5 # fnv64:506d96b2747f7ff0 # fnv64:506d96b2747f7ff0 # comment none pos=17 exit=0
+2036320affffff2cff31	fnv64:bb9b8aa3d85d6f39 # fnv64:c2f17f8828b9ab97 # fnv64:8da49cde48aaaf3f # comment none pos=5c exit=3
+30ee01494930ee014949	fnv64:2d091bc6c5454d6c # fnv64:9706b8e0825f5f04 # fnv64:9706b8e0825f5f04 # comment none pos=17 exit=3
+322d060000000006fe06	fnv64:2a97a54677e1d5dd # fnv64:d599eed4cc934e16 # fnv64:d599eed4cc934e16 # comment none pos=17 exit=0
+0f0f0f0f281d0f0f0f0f	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+2323000000f30000fef3	fnv64:206ae9eb34e28977 # fnv64:a3f563df4f498b4f # fnv64:a3f563df4f498b4f # comment none pos=17 exit=0
+4b000000006000686868	fnv64:5fe58e42389d2e96 # fnv64:bc2527bfaa60f0ca # fnv64:bc2527bfaa60f0ca # comment none pos=17 exit=0
+2036320affff0c21ff31	fnv64:cc93cb12e8679105 # fnv64:c07db9846eadbc2a # fnv64:8da49cde48aaaf3f # comment none pos=5c exit=3
+d0a6f019000004d8d7de	fnv64:3460302de320c4b1 # fnv64:e1e63fc183a97739 # fnv64:e1e63fc183a97739 # comment none pos=17 exit=3
+328e8e8e8e8e24210006	fnv64:50f962309f85674b # fnv64:75672d2a5b877c0b # fnv64:75672d2a5b877c0b # comment none pos=17 exit=3
+1dc6fe0707070707070707	fnv64:de3d38b64625208a # fnv64:0945c1d26046e47a # fnv64:0945c1d26046e47a # comment none pos=17 exit=0
+10868686868b29abababff	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+0400040000000400000028	fnv64:5425d1a8ed2d731a # fnv64:877eed6ce0f545f1 # fnv64:877eed6ce0f545f1 # comment none pos=17 exit=0
+2036320affff0c21a9ff31	fnv64:a67eac59cb4ea710 # fnv64:4103fdd4fb380dec # fnv64:de5fcabde210aaa6 # comment none pos=5c exit=3
+e0fe0baaa5aaaa00007425	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+e84100e00710413ae923e0	fnv64:8ed709bfb425b417 # fnv64:854deec3a61a5cfa # fnv64:854deec3a61a5cfa # comment none pos=17 exit=2
+2036320affe3ffff2cff31	fnv64:c54bf71ccc3a813b # fnv64:699fe5e3c0eb8609 # fnv64:de5fcabde210aaa6 # comment none pos=5c exit=3
+097a000001007a00004141	fnv64:1ee0ae62f5d5eb5f # fnv64:00806a0ab8611af0 # fnv64:00806a0ab8611af0 # comment none pos=17 exit=0
+2b2b004000000000040000	fnv64:f6a27d19fcef8af8 # fnv64:edd0482e56bf4c02 # fnv64:edd0482e56bf4c02 # comment none pos=17 exit=0
+0606060606060606065b2e	fnv64:da3b25554c3e2ed0 # fnv64:7d511c66baace44a # fnv64:7d511c66baace44a # comment none pos=17 exit=1
+d801003000000036d0a603	fnv64:600fb13c4a7e4f0d # fnv64:e839d0ae22c35bbd # fnv64:e839d0ae22c35bbd # comment none pos=17 exit=2
+32b6212a4b4b4bb8b24b4b	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+0000c60000040bca0930302e	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+32000000000000fe0300ffd5	fnv64:1eb657ff3e55339a # fnv64:42a86a0eb0aa4cbb # fnv64:42a86a0eb0aa4cbb # comment none pos=17 exit=3
+0f0f281d0fbb0d0f0f09d1d1	list thrown=2 exit=2 # test thrown=2 exit=2 # test thrown=2 exit=2 # comment thrown=2 exit=2
+d0a60b032330b1b80700fede	fnv64:4ed715a7dd13a3bc # fnv64:8e82743a8a0a4f2a # fnv64:8e82743a8a0a4f2a # comment none pos=17 exit=3
+32fe01a8a8a8a80bca09fe00	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+d0a60b032331b1b8000000ea	fnv64:80f0b2fd7604d6b2 # fnv64:f6f6eae8780c2cdf # fnv64:f6f6eae8780c2cdf # comment none pos=17 exit=3
+d0a60b032331b1b80700fede	fnv64:119a6e05f62afc7c # fnv64:02b8387883709d0b # fnv64:02b8387883709d0b # comment none pos=17 exit=3
+10868686868b29ab5cffff00	fnv64:bc7d4159ba49edbe # fnv64:8edeb665758adfe0 # fnv64:8edeb665758adfe0 # comment none pos=17 exit=3
+d0a60b032331b1c20700fede	fnv64:c7ef2eb6c40a373b # fnv64:87e1d6aeb33eb58c # fnv64:87e1d6aeb33eb58c # comment none pos=17 exit=3
+03b67afffffffffffffffffe	fnv64:8164a71ea6b5795f # fnv64:ceffb10b7305dd48 # fnv64:ceffb10b7305dd48 # comment none pos=17 exit=0
+e9fe01000000000000510000	fnv64:34bee0e65207000f # fnv64:1d0b530744b3d3a0 # fnv64:1d0b530744b3d3a0 # comment none pos=17 exit=3
+a0fefe02030000a2020300a2	fnv64:014d7ce0e6f14835 # test archive | read=0 headertype=ff cur=5c next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=63 broken=1 code=3 exit=3 # fnv64:76b6641c3507a7df # comment none pos=5c exit=3
+d403ec070300b2fe03feec03fc	fnv64:6cebda548b89a938 # fnv64:2f27ae77dd6c5768 # fnv64:2f27ae77dd6c5768 # comment none pos=17 exit=0
+3d040bca090000320000000a33	fnv64:fdc154cd492abdaa # fnv64:f9596eb998d05982 # fnv64:f9596eb998d05982 # comment none pos=17 exit=0
+000600060100060006040bca09	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+10868686868b29abab00000000	fnv64:103820353dd26ea4 # fnv64:69a9f07cff0be725 # fnv64:69a9f07cff0be725 # comment none pos=17 exit=3
+2036320a36320affffffffff31	fnv64:861d0a0aafed1f58 # fnv64:95224f577b6f9892 # fnv64:27947dc1dbbfef09 # comment none pos=5c exit=3
+32000000000000000000000032	fnv64:819411a6523b4b82 # fnv64:b2845573db89a2f7 # fnv64:b2845573db89a2f7 # comment none pos=17 exit=0
+d0a60b032331b1c20700fed2de	fnv64:22cd5d3afccc79d3 # fnv64:a6b67301b5518aa3 # fnv64:a6b67301b5518aa3 # comment none pos=17 exit=3
+0000000000000000000000595b	fnv64:cf723e03a4b87526 # fnv64:487b4b47617062ef # fnv64:487b4b47617062ef # comment none pos=17 exit=0
+0000000086868b2129abababff	fnv64:0a000519aa7a1935 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # test archive | read=0 headertype=ff cur=17 next=17 data=0 fnv=cbf29ce484222325 baddata=0 nopassword=0 badpassword=0 novolume=0 pos=1e broken=1 code=3 exit=3 # comment none pos=17 exit=3
+000a000026000080eeee0000005b	fnv64:fe9636c7ab7d30eb # fnv64:b934d63a5227dbea # fnv64:b934d63a5227dbea # comment none pos=17 exit=0
+3941ffe80541bdbdbdbdbdbdbdbd	fnv64:b9001968a94a2339 # fnv64:23f1a9be25262f90 # fnv64:23f1a9be25262f90 # comment none pos=17 exit=0
+d8013a00000000010000d0a60b03	fnv64:dfdbb52d7d623043 # fnv64:e0aa2117190cdb1c # fnv64:e0aa2117190cdb1c # comment none pos=17 exit=2

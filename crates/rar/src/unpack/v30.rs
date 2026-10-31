@@ -127,10 +127,10 @@ impl Unpack {
 
         loop {
             self.unp_ptr &= self.max_win_mask();
-            self.reserve_window()?;
 
             self.first_win_done |= self.prev_ptr > self.unp_ptr;
             self.prev_ptr = self.unp_ptr;
+            self.reserve_window()?;
 
             if self.inp.in_addr > self.read_border && !self.unp_read_buf30(io)? {
                 break;
@@ -550,11 +550,10 @@ impl Unpack {
             data_size = self.read_top;
         }
         let (from, to) = (data_size as usize, BitInput::MAX_SIZE as usize);
-        let read_code = io.unp_read(&mut self.inp.in_buf[from..to])? as i32;
-        self.read_top += read_code;
+        let read_code = io.unp_read(&mut self.inp.in_buf[from..to])?;
+        self.read_top += read_code.unwrap_or(0) as i32;
         self.read_border = self.read_top - 30;
-        // `UnpRead` returns -1 only for a missing volume or a closed file.
-        Ok(true)
+        Ok(read_code.is_some())
     }
 
     /// `Unpack::UnpWriteBuf30`.

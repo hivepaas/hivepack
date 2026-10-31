@@ -427,8 +427,15 @@ static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
 static std::vector<std::pair<std::string, std::string>> request_volumes;
 
 static std::string write_volumes() {
-  char dir[] = "/tmp/rar-oracle-XXXXXX";
-  if (!mkdtemp(dir))
+  // In memory where there is any, as for the memfd of a lone archive: ext4
+  // refuses a seek past 16 TiB, which a damaged size asks for, and UnRAR takes
+  // that for a fatal error, which says something of the file system only.
+  char shared[] = "/dev/shm/rar-oracle-XXXXXX";
+  char temporary[] = "/tmp/rar-oracle-XXXXXX";
+  char *dir = mkdtemp(shared);
+  if (!dir)
+    dir = mkdtemp(temporary);
+  if (!dir)
     return "";
   for (auto &volume : request_volumes) {
     std::vector<byte> data = unhex(volume.second.c_str());

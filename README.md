@@ -41,15 +41,16 @@ Each port is timed against the library it comes from, on the same data, and ever
 | [`hivepack-zip`](crates/zip#speed) | libzip 1.12.1 | stored data 1.21–1.37×, compression 0.96–1.05×, finding entries 1.16–2.67×, editing many entries 1.46–1.99× | opening 200,000 entries 0.78×, WinZip AES 0.57–0.66× |
 | [`hivepack-7z`](crates/7z#speed) | LZMA SDK 26.05, 7-Zip | LZMA and LZMA2 1.10–1.24× against C, Deflate 1.39× | PPMd 0.88–0.92×, BZip2 0.62×, AES-256 with Copy 0.08× |
 | [`hivepack-tar`](crates/tar#speed) | Go 1.27.2's `archive/tar` | going through entries 1.48–2.61×, reading data 1.02–2.00×, seeking past data 2.05× | |
+| [`hivepack-age`](crates/age#speed) | age v1.3.2, in Go | scrypt 1.02–1.28× | X25519 0.77–0.92×, a big file's payload 0.40×, in armor 0.27× |
 | [`hivepack-crypto`](crates/crypto#speed) | BearSSL 0.6 | 1.01–1.94× | Go's assembly, by up to 5.7×, on SHA-256 and ChaCha20-Poly1305 |
 
 **Measured on,** in October 2026, with safe code unless it says otherwise:
 
-- `hivepack-zip`, `hivepack-7z` and `hivepack-tar`: AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile; the libraries built with GCC 15.2.
+- `hivepack-zip`, `hivepack-7z`, `hivepack-tar` and `hivepack-age`: AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile; the libraries built with GCC 15.2.
 - `hivepack-bzip2`, `hivepack-deflate`, `hivepack-lz4`, `hivepack-xz` and `hivepack-crypto`: an AMD Ryzen 9 9950X (x86-64, Linux).
 - `hivepack-zstd`: an Apple M1 Pro, and GitHub's runners, an AMD EPYC 7763 and a Neoverse-N2.
 
-These are snapshots of one machine or two, on the Silesia corpus: run the tools to see your own. How a reference is built matters: liblzma and libzstd have x86-64 assembly, and the usual builds of 7-Zip and of libzip's crypto libraries go further than the ones timed here, as each README says. `hivepack-age`, `hivepack-iso`, `hivepack-udf`, `hivepack-rar`, `hivepack-open` and `hivepack-extract` have no such comparison yet.
+These are snapshots of one machine or two, on the Silesia corpus: run the tools to see your own. How a reference is built matters: liblzma and libzstd have x86-64 assembly, and the usual builds of 7-Zip and of libzip's crypto libraries go further than the ones timed here, as each README says. `hivepack-iso`, `hivepack-udf`, `hivepack-rar`, `hivepack-open` and `hivepack-extract` have no such comparison yet.
 
 ## 🧪 Tests
 

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "age-bench"
+version = "0.0.0"
+dependencies = [
+ "hivepack-age",
+]
+
+[[package]]
 name = "ambient-authority"
 version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -219,11 +226,15 @@ version = "0.0.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "hivepack-7z",
+ "hivepack-cpio",
  "hivepack-crypto",
  "hivepack-deflate",
  "hivepack-iso",
+ "hivepack-open",
  "hivepack-tar",
  "hivepack-udf",
+ "hivepack-xar",
  "hivepack-xz",
  "hivepack-zip",
  "rustix",
@@ -251,14 +262,17 @@ version = "0.0.0"
 dependencies = [
  "bzip2",
  "flate2",
+ "hivepack-7z",
  "hivepack-age",
  "hivepack-bzip2",
+ "hivepack-cpio",
  "hivepack-deflate",
  "hivepack-extract",
  "hivepack-iso",
  "hivepack-lz4",
  "hivepack-tar",
  "hivepack-udf",
+ "hivepack-xar",
  "hivepack-xz",
  "hivepack-zstd",
  "liblzma",
@@ -287,6 +301,16 @@ name = "hivepack-udf"
 version = "0.0.0"
 dependencies = [
  "hivepack-crypto",
+ "hivepack-xz",
+]
+
+[[package]]
+name = "hivepack-xar"
+version = "0.0.0"
+dependencies = [
+ "hivepack-bzip2",
+ "hivepack-crypto",
+ "hivepack-deflate",
  "hivepack-xz",
 ]
 

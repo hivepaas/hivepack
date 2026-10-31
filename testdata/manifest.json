@@ -242,6 +242,13 @@
       "kind": "tool"
     },
     {
+      "name": "age-bench-go",
+      "generate": { "group": "bench", "tool": "go", "sources": ["tools/age-bench/go/main.go", "tools/age-bench/go/go.mod", "tools/age-bench/go/go.sum"] },
+      "source": "tools/age-bench/go/main.go, built with Go and the modules its go.sum pins: age v1.3.2 (filippo.io/age) and golang.org/x/crypto v0.55.0",
+      "license": "MIT (the program) and BSD-3-Clause (age, golang.org/x/crypto)",
+      "kind": "tool"
+    },
+    {
       "name": "libzip-1.12.1-source",
       "fetch": { "group": "generated", "files": [{ "url": "https://github.com/nih-at/libzip/releases/download/v1.12.1/libzip-1.12.1.tar.gz", "sha256": "3b66fe92cbc768d8d4d16e1427bfb7399e15d9c2795c2fc482e7b30a6332a422", "unpack": "tar.gz" }] },
       "source": "https://github.com/nih-at/libzip/releases/tag/v1.12.1 (commit 8e037534ccd62f444abbe4ce265443ee74bbfeb3)",
@@ -361,6 +368,13 @@
       "kind": "vectors"
     },
     {
+      "name": "xar",
+      "path": "xar",
+      "source": "seven small XAR archives made on macOS 27.0.1 with /usr/bin/xar, pkgbuild and productbuild from files written for the tests, the owner's name replaced by nobody (see xar/LICENSE)",
+      "license": "MIT",
+      "kind": "vectors"
+    },
+    {
       "name": "cctv-age",
       "fetch": { "group": "core", "files": [{ "url": "https://proxy.golang.org/c2sp.org/%21c%21c%21t%21v/age/@v/v0.0.0-20260829155415-4448f2097b2d.zip", "sha256": "6720e26a39fdea14c0f94fe1aa4d1a112b19d284996cdd0a419bd71ca7895fb1", "unpack": "zip" }] },
       "source": "https://github.com/C2SP/CCTV/tree/4448f2097b2d/age (the Go module c2sp.org/CCTV/age, which age v1.3.2 tests with), from Go's module proxy",
@@ -436,6 +450,34 @@
       "source": "tools/iso-oracle/oracle.c, built with the libarchive 3.8.10 and zlib 1.3.2 sources",
       "license": "MIT (the program), BSD-2-Clause (libarchive) and Zlib (zlib)",
       "kind": "tool"
+    },
+    {
+      "name": "libarchive-xar",
+      "generate": { "group": "core", "from": "libarchive-3.8.10-source", "tool": "uudecode", "glob": "libarchive-3.8.10/libarchive/test/test_read_format_xar*.uu" },
+      "source": "libarchive 3.8.10's XAR test archives (libarchive/test/test_read_format_xar*.uu), decoded",
+      "license": "BSD-2-Clause",
+      "kind": "archives"
+    },
+    {
+      "name": "libxml2-2.15.4-source",
+      "fetch": { "group": "generated", "files": [{ "url": "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz", "sha256": "98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821", "unpack": "tar.xz" }] },
+      "source": "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz, the libxml2 2.15.4 release; its SHA-256 is the one the release gives beside it (libxml2-2.15.4.sha256sum)",
+      "license": "MIT",
+      "kind": "source"
+    },
+    {
+      "name": "xar-oracle",
+      "generate": { "group": "generated", "from": "libarchive-3.8.10-source", "with": ["zlib-1.3.2-source", "bzip2-1.0.8-source", "xz-5.8.4-source", "nettle-3.10.2-source", "libxml2-2.15.4-source"], "tool": "oracle", "sources": ["tools/xar-oracle/oracle.c", "tools/xar-oracle/config.h", "tools/xar-oracle/libxml2/config.h", "tools/xar-oracle/libxml2/libxml/xmlversion.h"] },
+      "source": "tools/xar-oracle/oracle.c, built with the libarchive 3.8.10, libxml2 2.15.4, zlib 1.3.2, bzip2 1.0.8, XZ Utils 5.8.4 and nettle 3.10.2 sources",
+      "license": "MIT (the program and libxml2), BSD-2-Clause (libarchive), Zlib (zlib), bzip2-1.0.6 (libbzip2), 0BSD (liblzma) and nettle's",
+      "kind": "tool"
+    },
+    {
+      "name": "zip-split",
+      "path": "zip-split",
+      "source": "Made for hivepack with Info-ZIP's zip 3.0 (macOS's): zip -s 64k -r, plain, with -fz (Zip64) and with -P secret (ZipCrypto), of the generated files contents.txt lists",
+      "license": "MIT",
+      "kind": "archives"
     },
     {
       "name": "libarchive-iso",

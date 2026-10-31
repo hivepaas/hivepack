@@ -75,14 +75,34 @@ pub enum ErrorKind {
     /// directory, a name not in UTF-16, a part of a file's data out of
     /// place.
     IsoEntry(hivepack_iso::Warning),
+    /// The cpio archive could not be read: cut short, without
+    /// `TRAILER!!!`, or with a header that cannot be.
+    Cpio(hivepack_cpio::Error),
+    /// An entry of the cpio archive found after bytes that are not a
+    /// header were passed over ([`hivepack_cpio::Warning`]): what they
+    /// held is lost.
+    CpioEntry(hivepack_cpio::Warning),
+    /// The XAR archive could not be read: its table of contents, or an
+    /// entry's data (a checksum that does not match, data that does not
+    /// decompress), or an entry whose data is before the place read to.
+    Xar(hivepack_xar::Error),
+    /// An entry of the XAR archive that libarchive gives with something
+    /// missing ([`hivepack_xar::Warning`]): a name that is not UTF-8.
+    XarEntry(hivepack_xar::Warning),
+    /// A package's payload could not be opened through its layers.
+    Payload(std::io::Error),
     /// The UDF volume could not be read: an entry's node, data or link
     /// target, or a directory with a broken entry.
     Udf(hivepack_udf::Error),
+    /// The 7z archive's data could not be read: damaged, a CRC that does
+    /// not match, a method `hivepack-7z` does not decode, or a password
+    /// missing or wrong.
+    SevenZip(hivepack_7z::Error),
     /// A directory of the UDF volume met again: under two names, or its
     /// own ancestor, which UDF does not allow.
     DirectoryAgain,
-    /// The tar archive or ISO 9660 image read again, to write it, is not
-    /// the one checked.
+    /// The tar or cpio archive or ISO 9660 image read again, to write it,
+    /// is not the one checked.
     Changed,
     /// The destination could not be written.
     Io(std::io::Error),
@@ -131,7 +151,13 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Tar(e) => write!(f, "archive: {e}"),
             ErrorKind::Iso(e) => write!(f, "image: {e}"),
             ErrorKind::IsoEntry(w) => write!(f, "entry with something missing: {w}"),
+            ErrorKind::Cpio(e) => write!(f, "archive: {e}"),
+            ErrorKind::CpioEntry(w) => write!(f, "entry after a damaged part: {w}"),
+            ErrorKind::Xar(e) => write!(f, "archive: {e}"),
+            ErrorKind::XarEntry(w) => write!(f, "entry with something missing: {w}"),
+            ErrorKind::Payload(e) => write!(f, "payload: {e}"),
             ErrorKind::Udf(e) => write!(f, "volume: {e}"),
+            ErrorKind::SevenZip(e) => write!(f, "archive: {e}"),
             ErrorKind::DirectoryAgain => f.write_str("a directory met again"),
             ErrorKind::Changed => f.write_str("the archive changed between its two readings"),
             ErrorKind::Io(e) => write!(f, "{e}"),
@@ -159,7 +185,11 @@ impl std::error::Error for Error {
             ErrorKind::Archive(e) => Some(e),
             ErrorKind::Tar(e) => Some(e),
             ErrorKind::Iso(e) => Some(e),
+            ErrorKind::Cpio(e) => Some(e),
+            ErrorKind::Xar(e) => Some(e),
+            ErrorKind::Payload(e) => Some(e),
             ErrorKind::Udf(e) => Some(e),
+            ErrorKind::SevenZip(e) => Some(e),
             ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }

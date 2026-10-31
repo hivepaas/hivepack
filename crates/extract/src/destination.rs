@@ -37,6 +37,16 @@ impl<'a> Destination<'a> {
         Ok(Destination { root, origin })
     }
 
+    /// The directory at `components`, as a destination of its own, opened
+    /// as [`Destination::directory`] opens it: a package's payload is
+    /// extracted into one.
+    pub(crate) fn within(&self, components: &[String]) -> Result<Destination<'a>, ErrorKind> {
+        Ok(Destination {
+            root: self.directory(components)?,
+            origin: self.origin,
+        })
+    }
+
     /// The directory at `components`, created where it is not there, each
     /// opened from the one before without following a link; those created
     /// get the mark of origin.
@@ -145,7 +155,11 @@ impl<'a> Destination<'a> {
     /// Sets the time of `name` in `dir`, without following a link.
     pub(crate) fn set_time(dir: &Dir, name: &str, mtime: SystemTime) -> Result<(), ErrorKind> {
         let mtime = SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(mtime));
-        dir.set_symlink_times(name, None, Some(mtime))
-            .map_err(ErrorKind::Io)
+        // A time the system cannot hold is left, as for files
+        // (`zip::set_modified`).
+        match dir.set_symlink_times(name, None, Some(mtime)) {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            result => result.map_err(ErrorKind::Io),
+        }
     }
 }

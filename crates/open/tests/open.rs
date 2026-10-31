@@ -11,7 +11,10 @@ mod support;
 use std::io::{self, Cursor, Read};
 
 use hivepack_open::{Container, DecodeError, Error, Layer, Limits, Opener};
-use support::{Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, sample_tar, xz, xz_preset, zstd};
+use support::{
+    Scratch, bzip2, gzip, lz4, lz4_legacy, lzip, lzma, newc, pbzx, pbzx_chunk, pbzx_of, rpm,
+    sample_tar, xz, xz_no_check, xz_preset, zstd,
+};
 
 /// A reference library's compressor.
 type Compress = fn(&[u8]) -> Vec<u8>;
@@ -32,6 +35,11 @@ fn open(file: &[u8]) -> Result<(Vec<Layer>, Container, Vec<u8>), Error> {
     open_named(file, None)
 }
 
+/// pbzx in chunks of 64 KiB.
+fn pbzx_64k(data: &[u8]) -> Vec<u8> {
+    pbzx(data, 1 << 16)
+}
+
 /// The layer a read failed in.
 fn failed_layer(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> Layer {
     match result {
@@ -49,7 +57,7 @@ fn failed_layer(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> Laye
 #[test]
 fn each_layer_comes_off() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 7] = [
+    let cases: [(Layer, Compress); 8] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
@@ -57,6 +65,7 @@ fn each_layer_comes_off() {
         (Layer::Lz4, lz4_legacy),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let (layers, container, data) = open(&compress(&tar)).unwrap();
@@ -97,6 +106,385 @@ fn layers_stack() {
     let (layers, _, data) = open(&lz4(&gzip(&lz4_legacy(&tar)))).unwrap();
     assert_eq!(layers, [Layer::Lz4, Layer::Gzip, Layer::Lz4]);
     assert!(data == tar);
+}
+
+/// The message of the layer `result` failed in.
+fn failure(result: Result<(Vec<Layer>, Container, Vec<u8>), Error>) -> (Layer, String) {
+    match result {
+        Err(Error::Io(e)) => {
+            let inner = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<DecodeError>())
+                .unwrap_or_else(|| panic!("not a DecodeError: {e}"));
+            (inner.layer, inner.message.clone())
+        }
+        other => panic!("not a decoding error: {other:?}"),
+    }
+}
+
+/// pbzx, as macOS packages' payloads have it, read as Apple's tools read
+/// it (`pkgutil --expand-full`, on files like these: see docs/open.md):
+/// chunks to the end of the stream, short ones among them; stored chunks,
+/// whatever their first bytes; chunks of nothing.
+#[test]
+fn pbzx_chunks_come_off() {
+    let tar = sample_tar();
+    let (layers, container, data) = open(&pbzx(&tar, 1 << 16)).unwrap();
+    assert_eq!((layers, container), (vec![Layer::Pbzx], Container::Tar));
+    assert!(data == tar);
+    let xz_chunk = |c: &[u8]| pbzx_chunk(c.len() as u64, &xz_no_check(c));
+    let stored = |c: &[u8]| pbzx_chunk(c.len() as u64, c);
+    let (a, b) = tar.split_at(1000);
+    let files = [
+        // One chunk.
+        pbzx(&tar, tar.len()),
+        // Chunks of the block's size.
+        pbzx_of(4096, &tar.chunks(4096).map(xz_chunk).collect::<Vec<_>>()),
+        // A short chunk, then more.
+        pbzx_of(1 << 24, &[xz_chunk(a), xz_chunk(b)]),
+        // Stored chunks, and chunks of nothing, before and after.
+        pbzx_of(
+            1 << 16,
+            &[
+                stored(&[]),
+                xz_chunk(&tar[..30_000]),
+                stored(&tar[30_000..60_000]),
+                stored(&[]),
+                xz_chunk(&tar[60_000..]),
+                stored(&[]),
+            ],
+        ),
+        // A check in each stream.
+        pbzx_of(
+            1 << 24,
+            &tar.chunks(50_000)
+                .map(|c| pbzx_chunk(c.len() as u64, &xz(c)))
+                .collect::<Vec<_>>(),
+        ),
+    ];
+    for (i, file) in files.iter().enumerate() {
+        assert_eq!(
+            open(file).unwrap(),
+            (vec![Layer::Pbzx], Container::Tar, tar.clone()),
+            "file {i}"
+        );
+    }
+    // A stored chunk that starts with xz's magic is stored.
+    let mut text = b"some notes ".repeat(100);
+    let at = text.len();
+    text.extend(b"\xFD7zXZ\0 and then more notes");
+    let file = pbzx_of(1 << 24, &[xz_chunk(&text[..at]), stored(&text[at..])]);
+    assert_eq!(
+        open(&file).unwrap(),
+        (vec![Layer::Pbzx], Container::Data, text)
+    );
+    // Nothing but the header: nothing.
+    assert_eq!(
+        open(&pbzx_of(1 << 24, &[])).unwrap(),
+        (vec![Layer::Pbzx], Container::Data, vec![])
+    );
+}
+
+/// What Apple's tools refuse in pbzx (see docs/open.md) is refused.
+#[test]
+fn pbzx_refuses_what_apple_s_tools_refuse() {
+    let text = b"Notes, in chunks.\n".repeat(2000);
+    let chunks: Vec<_> = text
+        .chunks(8192)
+        .map(|c| pbzx_chunk(c.len() as u64, &xz_no_check(c)))
+        .collect();
+    let good = pbzx_of(1 << 24, &chunks);
+    assert_eq!(open(&good).unwrap().2, text);
+    let (part, more) = text.split_at(200);
+    let cut_after = |n: usize| {
+        let mut file = good.clone();
+        file.truncate(file.len() - n);
+        file
+    };
+    let then = |extra: &[u8]| {
+        let mut file = good.clone();
+        file.extend(extra);
+        file
+    };
+    let two_streams = [xz_no_check(part), xz_no_check(&more[..100])].concat();
+    let short_stream = {
+        let stream = xz_no_check(part);
+        stream[..stream.len() - 10].to_vec()
+    };
+    let cases: [(&str, Vec<u8>, &str); 12] = [
+        (
+            "chunks larger than the block",
+            pbzx_of(4096, &chunks),
+            "a chunk is larger than the block size",
+        ),
+        (
+            "a stored chunk larger than the block",
+            pbzx_of(100, &[pbzx_chunk(200, part)]),
+            "a chunk is larger than the block size",
+        ),
+        (
+            "a chunk that decompresses to more",
+            pbzx_of(1 << 24, &[pbzx_chunk(199, &xz_no_check(part))]),
+            "a chunk decompresses to more than its size",
+        ),
+        (
+            "a chunk that decompresses to less",
+            pbzx_of(1 << 24, &[pbzx_chunk(201, &xz_no_check(part))]),
+            "a chunk decompresses to less than its size",
+        ),
+        (
+            "two xz streams in a chunk",
+            pbzx_of(1 << 24, &[pbzx_chunk(300, &two_streams)]),
+            "data after a chunk's xz stream",
+        ),
+        (
+            "a chunk neither stored nor xz",
+            pbzx_of(1 << 24, &[pbzx_chunk(201, part)]),
+            "file format not recognized",
+        ),
+        (
+            "a chunk's header cut short",
+            then(&[0; 8]),
+            "the stream is cut short",
+        ),
+        (
+            "a chunk cut short",
+            cut_after(10),
+            "the stream is cut short",
+        ),
+        (
+            "an xz stream longer than its chunk",
+            pbzx_of(1 << 24, &[pbzx_chunk(200, &short_stream)]),
+            "a chunk's xz stream is cut short",
+        ),
+        (
+            "a chunk's stored size past the end",
+            cut_after(0)
+                .into_iter()
+                .chain(pbzx_chunk(100, &[1; 100]).into_iter().take(16 + 5))
+                .collect(),
+            "the stream is cut short",
+        ),
+        (
+            "anything after the last chunk",
+            then(b"and something after it"),
+            "a chunk is larger than the block size",
+        ),
+        (
+            "the header cut short",
+            good[..8].to_vec(),
+            "the stream is cut short",
+        ),
+    ];
+    for (what, file, message) in cases {
+        assert_eq!(
+            failure(open(&file)),
+            (Layer::Pbzx, message.to_string()),
+            "{what}"
+        );
+    }
+    // Zeros after the last chunk are chunks of nothing.
+    assert_eq!(open(&then(&[0; 32])).unwrap().2, text);
+}
+
+/// A cpio archive under each layer, and an RPM package's payload under
+/// each compressor rpm uses, LZMA's without magic among them: told as
+/// libarchive tells them, then read by hivepack-cpio.
+#[test]
+fn cpio_archives_and_rpm_packages_open() {
+    let tar = sample_tar();
+    let cpio = newc(&[
+        ("usr/", b""),
+        ("usr/share/doc/README", b"Read me.\n"),
+        ("usr/lib/big.bin", &tar),
+    ]);
+    assert_eq!(
+        open(&cpio).unwrap(),
+        (vec![], Container::Cpio, cpio.clone())
+    );
+    let cases: [(Layer, Compress); 5] = [
+        (Layer::Gzip, gzip),
+        (Layer::Bzip2, bzip2),
+        (Layer::Xz, xz),
+        (Layer::Zstd, zstd),
+        (Layer::Pbzx, pbzx_64k),
+    ];
+    for (layer, compress) in cases {
+        let (layers, container, data) = open(&compress(&cpio)).unwrap();
+        assert_eq!((layers, container), (vec![layer], Container::Cpio));
+        assert!(data == cpio, "{layer:?}");
+        // rpm's payload compressors, but pbzx.
+        if layer == Layer::Pbzx {
+            continue;
+        }
+        let (layers, container, data) = open(&rpm(&compress(&cpio))).unwrap();
+        assert_eq!(
+            (layers, container),
+            (vec![Layer::Rpm, layer], Container::Cpio)
+        );
+        assert!(data == cpio, "{layer:?}");
+    }
+    // LZMA, which RPM packages had before xz, has no magic, and the
+    // payload no name: its header tells it, as libarchive tells it.
+    let (layers, container, data) = open(&rpm(&lzma(&cpio))).unwrap();
+    assert_eq!(
+        (layers, container),
+        (vec![Layer::Rpm, Layer::Lzma], Container::Cpio)
+    );
+    assert!(data == cpio);
+    assert_eq!(open(&lzma(&cpio)).unwrap().1, Container::Data);
+    // A payload left uncompressed.
+    assert_eq!(
+        open(&rpm(&cpio)).unwrap(),
+        (vec![Layer::Rpm], Container::Cpio, cpio.clone())
+    );
+    // What hivepack-cpio reads through the layers.
+    let mut opener = Opener::new(|| Ok(Cursor::new(rpm(&xz(&cpio)))));
+    let mut reader = hivepack_cpio::Reader::new(opener.open().unwrap());
+    let mut entries = Vec::new();
+    while let Some(h) = reader.next().unwrap() {
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).unwrap();
+        entries.push((h.path, data.len()));
+    }
+    assert_eq!(
+        entries,
+        [
+            (b"usr".to_vec(), 0),
+            (b"usr/share/doc/README".to_vec(), 9),
+            (b"usr/lib/big.bin".to_vec(), tar.len()),
+        ]
+    );
+}
+
+/// An RPM package extracts through the opener: its payload's files, the
+/// package's lead, headers and compression taken off.
+#[test]
+fn an_rpm_package_extracts_through_the_opener() {
+    let cpio = newc(&[
+        ("usr/", b""),
+        ("usr/bin/", b""),
+        ("usr/bin/hello", b"#!/bin/sh\necho hello\n"),
+    ]);
+    let package = rpm(&xz(&cpio));
+    let scratch = Scratch::new();
+    let out = scratch.path().join("out");
+    let mut opener = Opener::new(|| Ok(Cursor::new(&package[..])));
+    let summary = hivepack_extract::extract_cpio(
+        || Ok(opener.open()?),
+        &out,
+        &hivepack_extract::Options::default(),
+    )
+    .unwrap();
+    assert_eq!((summary.files, summary.directories), (1, 2));
+    assert_eq!(
+        std::fs::read(out.join("usr/bin/hello")).unwrap(),
+        b"#!/bin/sh\necho hello\n"
+    );
+}
+
+/// RPM packages that end before their payload, or have no header, fail
+/// with libarchive's messages.
+#[test]
+fn rpm_packages_without_a_payload_fail() {
+    let package = rpm(&gzip(&newc(&[("a", b"a")])));
+    let header_end = 96 + 16 + 16 + 7 + 1 + 16;
+    for (file, message) in [
+        (
+            package[..50].to_vec(),
+            "Truncated input file (needed 96 bytes, only 50 available)",
+        ),
+        (package[..96].to_vec(), "the stream is cut short"),
+        (
+            package[..header_end - 4].to_vec(),
+            "the stream is cut short",
+        ),
+        (
+            [&package[..96], &gzip(b"no headers")[..]].concat(),
+            "Unrecognized rpm header",
+        ),
+    ] {
+        assert_eq!(failure(open(&file)), (Layer::Rpm, message.to_string()));
+    }
+    // An outer layer's error comes through the package as it is.
+    let mut outer = gzip(&package);
+    outer.truncate(outer.len() - 4);
+    assert_eq!(failed_layer(open(&outer)), Layer::Gzip);
+}
+
+/// libarchive's own cpio archives and RPM packages, when the core sets are
+/// there (`scripts/testdata.py fetch`): every format of cpio, and packages
+/// with gzip and bzip2 payloads, told and their first entry read.
+#[test]
+fn libarchive_s_cpio_archives_and_packages_open() {
+    let folder = support::testdata().join("libarchive-cpio");
+    if !folder.join(".complete").exists() {
+        eprintln!("skipping: the libarchive-cpio set is not fetched");
+        return;
+    }
+    let cases: [(&str, &[Layer]); 8] = [
+        ("cpio_bin_be.cpio", &[]),
+        ("cpio_bin_le.cpio", &[]),
+        // Its test's two parts make one archive.
+        ("cpio_afio_header.part*.cpio", &[]),
+        ("cpio_filename_utf8_jp.cpio", &[]),
+        ("test_compat_cpio_1.cpio", &[]),
+        ("test_write_disk_appledouble.cpio.gz", &[Layer::Gzip]),
+        ("cpio_svr4_gzip_rpm.rpm", &[Layer::Rpm, Layer::Gzip]),
+        ("cpio_svr4_bzip2_rpm.rpm", &[Layer::Rpm, Layer::Bzip2]),
+    ];
+    for (name, layers) in cases {
+        let file = match name.split_once('*') {
+            Some((stem, end)) => ["1", "2"]
+                .iter()
+                .flat_map(|part| std::fs::read(folder.join(format!("{stem}{part}{end}"))).unwrap())
+                .collect(),
+            None => std::fs::read(folder.join(name)).unwrap(),
+        };
+        let mut opener = Opener::new(|| Ok(Cursor::new(file.clone())));
+        let opened = opener.open().unwrap();
+        assert_eq!(
+            (opened.layers(), opened.container()),
+            (layers, Container::Cpio),
+            "{name}"
+        );
+        // The first entry: afio's test is that header alone.
+        let mut reader = hivepack_cpio::Reader::new(opened);
+        assert!(reader.next().unwrap().is_some(), "{name}");
+    }
+}
+
+/// XAR archives, macOS's packages among them (`testdata/xar`), are told,
+/// under a layer too; a package's payload, under gzip, is cpio.
+#[test]
+fn xar_archives_and_package_payloads_open() {
+    for name in ["default.xar", "none-sha256.xar", "tiny.pkg", "product.pkg"] {
+        let file = std::fs::read(support::repository().join("testdata/xar").join(name)).unwrap();
+        assert_eq!(open(&file).unwrap().1, Container::Xar, "{name}");
+        let (layers, container, data) = open(&gzip(&file)).unwrap();
+        assert_eq!(
+            (layers, container),
+            (vec![Layer::Gzip], Container::Xar),
+            "{name}"
+        );
+        assert!(data == file, "{name}");
+    }
+    let file = std::fs::read(support::repository().join("testdata/xar/tiny.pkg")).unwrap();
+    let mut xar = hivepack_xar::Reader::new(&file[..]);
+    while let Some(h) = xar.next().unwrap() {
+        if h.path.as_deref() != Some(b"Payload") {
+            continue;
+        }
+        let mut once = Some(&mut xar);
+        let mut opener = Opener::new(move || Ok(once.take().unwrap()));
+        let opened = opener.open().unwrap();
+        assert_eq!(
+            (opened.layers(), opened.container()),
+            (&[Layer::Gzip][..], Container::Cpio)
+        );
+        return;
+    }
+    panic!("no Payload");
 }
 
 #[test]
@@ -184,6 +572,32 @@ fn udf_volumes_under_layers_open() {
         assert_eq!(open(&image).unwrap().1, Container::Udf, "{name}");
         let udf = hivepack_udf::Udf::open(Cursor::new(image)).unwrap();
         assert!(!udf.volume().name.is_empty(), "{name}");
+    }
+}
+
+/// 7z archives of `testdata/7z`, made by 7-Zip: found by their signature,
+/// alone and under layers, and opened by hivepack-7z from what comes out.
+#[test]
+fn seven_zip_archives_under_layers_open() {
+    for name in ["plain.7z", "encrypted.7z"] {
+        let path = support::repository().join("testdata/7z").join(name);
+        let archive = std::fs::read(path).unwrap();
+        assert_eq!(
+            open(&archive).unwrap(),
+            (vec![], Container::SevenZip, archive.clone()),
+            "{name}"
+        );
+        for (layer, compress) in [(Layer::Zstd, zstd as Compress), (Layer::Xz, xz)] {
+            let (layers, container, data) = open(&compress(&archive)).unwrap();
+            assert_eq!(
+                (layers, container),
+                (vec![layer], Container::SevenZip),
+                "{name}"
+            );
+            assert!(data == archive, "{name}");
+            let opened = hivepack_7z::Archive::open(Cursor::new(data)).unwrap();
+            assert_eq!(opened.len(), 9, "{name}");
+        }
     }
 }
 
@@ -286,12 +700,13 @@ fn streams_one_after_another() {
 #[test]
 fn other_data_after_the_streams_fails() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 5] = [
+    let cases: [(Layer, Compress); 6] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lz4, lz4),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let mut file = compress(&tar);
@@ -303,7 +718,7 @@ fn other_data_after_the_streams_fails() {
 #[test]
 fn a_stream_cut_short_fails() {
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 8] = [
+    let cases: [(Layer, Compress); 9] = [
         (Layer::Zstd, zstd),
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
@@ -312,6 +727,7 @@ fn a_stream_cut_short_fails() {
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
         (Layer::Lzma, lzma),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let file = compress(&tar);
@@ -368,13 +784,14 @@ fn what_comes_before_an_error_is_given_out() {
     // its error, so that what is read does not depend on the size of the
     // reads (the fuzz target found it with a .lzma file).
     let tar = sample_tar();
-    let cases: [(Layer, Compress); 6] = [
+    let cases: [(Layer, Compress); 7] = [
         (Layer::Xz, xz),
         (Layer::Lzip, lzip),
         (Layer::Lzma, lzma),
         (Layer::Lz4, lz4),
         (Layer::Gzip, gzip),
         (Layer::Bzip2, bzip2),
+        (Layer::Pbzx, pbzx_64k),
     ];
     for (layer, compress) in cases {
         let mut file = compress(&tar);
@@ -435,6 +852,7 @@ fn input_a_byte_at_a_time() {
         lzip(&tar),
         lz4(&tar),
         lz4_legacy(&tar),
+        pbzx_64k(&tar),
     ] {
         let mut opener = Opener::new(|| Ok(Trickle(&file, false)));
         let mut opened = opener.open().unwrap();

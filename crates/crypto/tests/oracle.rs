@@ -1,13 +1,13 @@
 //! Comparison with nettle 3.10.2 through `tools/nettle-oracle`: AES with
-//! every key length, SHA-1 and HMAC-SHA1 on lengths around SHA-1's blocks,
-//! and PBKDF2-HMAC-SHA1 with the lengths WinZip AES derives.
+//! every key length, SHA-1, MD5 and HMAC-SHA1 on lengths around their
+//! blocks, and PBKDF2-HMAC-SHA1 with the lengths WinZip AES derives.
 //!
 //! The oracle is a small C program built with nettle's sources by
 //! `scripts/testdata.py`. It answers requests such as `sha1 616263` by
 //! calling nettle, one line per request. [`answer`] answers the same
 //! requests with the port, in the same format, so the two can be compared
 //! as text. The port feeds SHA-1 and HMAC their data in pieces of random
-//! sizes, which nettle gets whole.
+//! sizes, which nettle gets whole; MD5 too.
 //!
 //! - With the oracle built, generated requests are compared with nettle
 //!   directly.
@@ -26,7 +26,7 @@ mod support;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use hivepack_crypto::{Aes, Hmac, HmacKey, Sha1, pbkdf2};
+use hivepack_crypto::{Aes, Hmac, HmacKey, Md5, Sha1, pbkdf2};
 use support::{Oracle, Rng, hex, repository, unhex};
 
 fn recorded_path() -> PathBuf {
@@ -72,6 +72,14 @@ fn answer(request: &str, rng: &mut Rng) -> String {
                 sha1.update(piece);
             }
             format!("ok {}", hex(&sha1.out()))
+        }
+        ["md5", data] => {
+            let data = unhex(data);
+            let mut md5 = Md5::new();
+            for piece in pieces(rng, &data) {
+                md5.update(piece);
+            }
+            format!("ok {}", hex(&md5.out()))
         }
         ["hmac", key, data] => {
             let data = unhex(data);
@@ -179,6 +187,17 @@ fn requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
     requests
 }
 
+/// `count` MD5 requests, with data up to `max` bytes: apart from
+/// [`requests`], whose recorded answers came first.
+fn md5_requests(rng: &mut Rng, count: usize, max: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            let len = length(rng, max);
+            format!("md5 {}", hex(&bytes(rng, len)))
+        })
+        .collect()
+}
+
 #[test]
 fn port_matches_nettle() {
     let Some(mut oracle) = Oracle::spawn("nettle-oracle") else {
@@ -187,6 +206,11 @@ fn port_matches_nettle() {
     let mut rng = Rng(0x5eed_c001);
     let requests = requests(&mut rng, 1500, 3000);
     for request in &requests {
+        let want = oracle.ask(request);
+        assert_eq!(answer(request, &mut rng), want, "{request:.300}");
+    }
+    let mut rng = Rng(0x5eed_c0d5);
+    for request in &md5_requests(&mut rng, 1500, 3000) {
         let want = oracle.ask(request);
         assert_eq!(answer(request, &mut rng), want, "{request:.300}");
     }
@@ -205,7 +229,7 @@ fn port_matches_recorded_answers() {
         assert_eq!(answer(request, &mut rng), want, "{request:.300}");
         checked += 1;
     }
-    assert!(checked >= 800, "only {checked} recorded answers");
+    assert!(checked >= 1000, "only {checked} recorded answers");
 }
 
 #[test]
@@ -219,6 +243,11 @@ fn record_oracle_answers() {
     );
     // Short data keeps the file small: the long is for the live comparison.
     for request in requests(&mut rng, 200, 200) {
+        let reply = oracle.ask(&request);
+        let _ = writeln!(text, "{request}\t{reply}");
+    }
+    let mut rng = Rng(0x5eed_c0d6);
+    for request in md5_requests(&mut rng, 200, 200) {
         let reply = oracle.ask(&request);
         let _ = writeln!(text, "{request}\t{reply}");
     }

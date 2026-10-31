@@ -1,6 +1,6 @@
-//! What a stream is, from its first bytes: a layer to take off (age, or a
-//! compressor), a container (tar, ZIP, an ISO 9660 image, a UDF volume),
-//! or plain data.
+//! What a stream is, from its first bytes: a layer to take off (age, a
+//! compressor, an RPM package's lead and headers), a container (tar, ZIP,
+//! 7z, cpio, XAR, an ISO 9660 image, a UDF volume), or plain data.
 
 /// A layer over the data: encryption or compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,6 +22,12 @@ pub enum Layer {
     Gzip,
     /// bzip2.
     Bzip2,
+    /// pbzx, the layer of macOS packages' payloads and of `.xip` files'
+    /// content: xz streams, a block at a time.
+    Pbzx,
+    /// An RPM package: its lead and headers, around its payload, a cpio
+    /// archive, compressed.
+    Rpm,
 }
 
 /// What is under the layers.
@@ -33,6 +39,16 @@ pub enum Container {
     /// A ZIP archive, which is read by random access: in a layer, it must
     /// be taken out to a file first.
     Zip,
+    /// A 7z archive, which `hivepack-7z` reads by random access, its
+    /// headers from its end: in a layer, it must be taken out to a file
+    /// first.
+    SevenZip,
+    /// A cpio archive, which `hivepack-cpio` reads in order: Linux's
+    /// initramfs, an RPM package's payload, a macOS package's.
+    Cpio,
+    /// A XAR archive, which `hivepack-xar` reads in order: a macOS package
+    /// (`.pkg`), a `.xip` file.
+    Xar,
     /// An ISO 9660 image (`.iso`), which `hivepack-iso` reads in order, in
     /// a layer too (`.iso.xz`).
     Iso,
@@ -79,6 +95,9 @@ const AGE_ARMOR: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
 const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
 const LZ4_MAGIC: &[u8] = &[0x04, 0x22, 0x4D, 0x18];
 const LZ4_LEGACY_MAGIC: &[u8] = &[0x02, 0x21, 0x4C, 0x18];
+/// A 7z archive's signature (`hivepack_7z::SIGNATURE`, kept here so that
+/// telling one does not take the decoder).
+const SEVEN_ZIP_MAGIC: &[u8] = &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 
 /// Whether `head` starts with a skippable frame's magic, 0x184D2A50 to
 /// 0x184D2A5F, little-endian: zstd's and LZ4's, which share them.
@@ -133,6 +152,80 @@ fn is_tar(head: &[u8]) -> bool {
     // A block of zeros sums to 256 with its checksum field as spaces;
     // a value written for it is still not a header.
     value != 0 && (value == unsigned || value == signed) && block[..100].iter().any(|&c| c != 0)
+}
+
+/// Whether `head` starts with a XAR header as libarchive's bid tells one:
+/// `xar!`, a header of 28 bytes, version 1, and a checksum it knows (none,
+/// SHA-1, MD5, SHA-256 or SHA-512).
+fn is_xar(head: &[u8]) -> bool {
+    let Some(h) = head.get(..28) else {
+        return false;
+    };
+    h.starts_with(b"xar!") && h[4..8] == [0, 28, 0, 1] && h[24..27] == [0, 0, 0] && h[27] <= 4
+}
+
+/// Whether `head` starts with a cpio header, as libarchive's bid tells
+/// one, and whole: an ASCII header's digits all digits of its format, and
+/// the binary format's two bytes of magic, which data can start with,
+/// followed by a name of 1 to 1,024 bytes that ends where its length says.
+fn is_cpio(head: &[u8]) -> bool {
+    let digits = |len: usize, digit: fn(&u8) -> bool| {
+        head.get(6..len)
+            .is_some_and(|field| field.iter().all(digit))
+    };
+    let octal = |c: &u8| (b'0'..=b'7').contains(c);
+    if head.starts_with(b"070707") {
+        return digits(76, octal);
+    }
+    if head.starts_with(b"070701") || head.starts_with(b"070702") {
+        return digits(110, u8::is_ascii_hexdigit);
+    }
+    if head.starts_with(b"070727") {
+        // afio's large ASCII header: hexadecimal, but for the mode, with a
+        // letter after some fields.
+        return head.len() >= 116
+            && [(30, b'm'), (85, b'n'), (98, b's'), (115, b':')]
+                .iter()
+                .all(|&(at, c)| head[at] == c)
+            && [6..30, 31..85, 86..98, 99..115]
+                .into_iter()
+                .all(|field| head[field].iter().all(u8::is_ascii_hexdigit));
+    }
+    let Some(magic) = head.get(..2) else {
+        return false;
+    };
+    let number: fn([u8; 2]) -> u16 = if magic == [0xC7, 0x71] {
+        u16::from_le_bytes
+    } else if magic == [0x71, 0xC7] {
+        u16::from_be_bytes
+    } else {
+        return false;
+    };
+    let Some(size) = head.get(20..22) else {
+        return false;
+    };
+    let size = usize::from(number([size[0], size[1]]));
+    (1..=1024).contains(&size) && head.get(26 + size - 1).is_none_or(|&c| c == 0)
+}
+
+/// Whether `head` starts as an LZMA_Alone stream (`.lzma`), which has no
+/// magic, does, as libarchive's bidder tells one: a properties byte LZMA
+/// can have, and a dictionary size that the LZMA SDK's `lzma` or XZ Utils'
+/// writes, or, with the usual properties and the size left unknown, one
+/// that XZ Utils lowered in steps of 1 MiB for want of memory. Only an RPM
+/// package's payload is told so, as it has no name: elsewhere `.lzma` is
+/// told by its name.
+pub(crate) fn is_lzma_alone(head: &[u8]) -> bool {
+    let Some(h) = head.get(..14) else {
+        return false;
+    };
+    if h[0] > (4 * 5 + 4) * 9 + 8 {
+        return false;
+    }
+    let usual = (h[0] == 0x5D || h[0] == 0x5E) && h[5..13] == [0xFF; 8];
+    let dictionary = u32::from_le_bytes([h[1], h[2], h[3], h[4]]);
+    (dictionary.is_power_of_two() && (1 << 12..=1 << 27).contains(&dictionary))
+        || (usual && (0x30_0000..=0x3F0_0000).contains(&dictionary) && dictionary % (1 << 20) == 0)
 }
 
 /// Whether `head` has an ISO 9660 volume descriptor where the first one
@@ -208,6 +301,12 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     if starts(b"LZIP") {
         return Detected::Layer(Layer::Lzip);
     }
+    if starts(b"pbzx") {
+        return Detected::Layer(Layer::Pbzx);
+    }
+    if hivepack_cpio::rpm::bid(head) > 0 {
+        return Detected::Layer(Layer::Rpm);
+    }
     if starts(&[0x1F, 0x8B]) {
         return Detected::Layer(Layer::Gzip);
     }
@@ -216,6 +315,15 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     }
     if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") || starts(b"PK\x07\x08") {
         return Detected::Container(Container::Zip);
+    }
+    if starts(SEVEN_ZIP_MAGIC) {
+        return Detected::Container(Container::SevenZip);
+    }
+    if is_xar(head) {
+        return Detected::Container(Container::Xar);
+    }
+    if is_cpio(head) {
+        return Detected::Container(Container::Cpio);
     }
     if is_tar(head) {
         return Detected::Container(Container::Tar);
@@ -257,6 +365,119 @@ mod tests {
     }
 
     #[test]
+    fn cpio_by_its_headers() {
+        let cpio = Detected::Container(Container::Cpio);
+        let ascii = |magic: &[u8], len: usize, digit: u8| {
+            let mut h = magic.to_vec();
+            h.resize(len, digit);
+            h
+        };
+        let mut afio = ascii(b"070727", 116, b'a');
+        for (at, c) in [(30, b'm'), (85, b'n'), (98, b's'), (115, b':')] {
+            afio[at] = c;
+        }
+        let binary = |magic: [u8; 2], size: [u8; 2], name: &[u8]| {
+            let mut h = vec![0; 26];
+            h[..2].copy_from_slice(&magic);
+            h[20..22].copy_from_slice(&size);
+            h.extend(name);
+            h
+        };
+        for head in [
+            ascii(b"070707", 76, b'7'),
+            ascii(b"070701", 110, b'f'),
+            ascii(b"070702", 110, b'A'),
+            afio.clone(),
+            binary([0xC7, 0x71], [2, 0], b"a\0"),
+            binary([0x71, 0xC7], [0, 2], b"a\0"),
+            // A name past what is looked at.
+            binary([0xC7, 0x71], [0, 4], b""),
+        ] {
+            assert_eq!(layer(&head), cpio, "{head:?}");
+        }
+        // Near misses are data.
+        let mut afio_off = afio;
+        afio_off[30] = b'0';
+        for head in [
+            ascii(b"070707", 76, b'8'),
+            ascii(b"070707", 75, b'0'),
+            ascii(b"070701", 110, b'g'),
+            ascii(b"070703", 110, b'0'),
+            afio_off,
+            binary([0xC7, 0x71], [0, 0], b""),
+            binary([0xC7, 0x71], [2, 0], b"ab"),
+            binary([0xC7, 0x71], [1, 4], b""),
+            vec![0xC7, 0x71, 0],
+        ] {
+            assert_eq!(
+                layer(&head),
+                Detected::Container(Container::Data),
+                "{head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xar_by_its_header() {
+        let header = |size: u16, version: u16, checksum: u32| {
+            let mut h = b"xar!".to_vec();
+            h.extend(size.to_be_bytes());
+            h.extend(version.to_be_bytes());
+            h.extend([0; 16]);
+            h.extend(checksum.to_be_bytes());
+            h
+        };
+        for checksum in 0..=4 {
+            assert_eq!(
+                layer(&header(28, 1, checksum)),
+                Detected::Container(Container::Xar)
+            );
+        }
+        for head in [
+            header(28, 1, 5),
+            header(64, 1, 1),
+            header(28, 2, 1),
+            header(28, 1, 1)[..27].to_vec(),
+        ] {
+            assert_eq!(layer(&head), Detected::Container(Container::Data));
+        }
+    }
+
+    #[test]
+    fn rpm_by_its_lead() {
+        let lead = |version: u8, kind: u8| [0xED, 0xAB, 0xEE, 0xDB, version, 0, 0, kind, 0, 1];
+        assert_eq!(layer(&lead(3, 0)), Detected::Layer(Layer::Rpm));
+        assert_eq!(layer(&lead(4, 1)), Detected::Layer(Layer::Rpm));
+        for head in [&lead(5, 0)[..], &lead(3, 2)[..], &lead(3, 0)[..7]] {
+            assert_eq!(layer(head), Detected::Container(Container::Data));
+        }
+    }
+
+    #[test]
+    fn lzma_alone_by_its_header() {
+        let header = |props: u8, dictionary: u32, size: u64| {
+            let mut h = vec![props];
+            h.extend(dictionary.to_le_bytes());
+            h.extend(size.to_le_bytes());
+            h.push(0);
+            h
+        };
+        let unknown = u64::MAX;
+        // xz -6's, and the LZMA SDK's at its smallest and largest.
+        assert!(is_lzma_alone(&header(0x5D, 8 << 20, unknown)));
+        assert!(is_lzma_alone(&header(0, 1 << 12, 1000)));
+        assert!(is_lzma_alone(&header(224, 1 << 27, 1000)));
+        // xz lowered to 3 MiB, which only the usual header allows.
+        assert!(is_lzma_alone(&header(0x5E, 3 << 20, unknown)));
+        assert!(!is_lzma_alone(&header(0x5D, 3 << 20, 1000)));
+        assert!(!is_lzma_alone(&header(0x40, 3 << 20, unknown)));
+        assert!(!is_lzma_alone(&header(225, 8 << 20, unknown)));
+        assert!(!is_lzma_alone(&header(0x5D, 1 << 28, unknown)));
+        assert!(!is_lzma_alone(&header(0x5D, (8 << 20) + 1, unknown)));
+        assert!(!is_lzma_alone(&header(0x5D, 8 << 20, unknown)[..13]));
+    }
+
+    #[test]
     fn layers_by_their_magic() {
         let cases: &[(&[u8], Layer)] = &[
             (b"age-encryption.org/v1\n-> X25519", Layer::Age),
@@ -269,6 +490,7 @@ mod tests {
             (b"LZIP\x01\x14", Layer::Lzip),
             (&[0x1F, 0x8B, 0x08], Layer::Gzip),
             (b"BZh91AY&SY", Layer::Bzip2),
+            (b"pbzx\0\0\0\0\x01\0\0\0", Layer::Pbzx),
         ];
         for &(head, want) in cases {
             assert_eq!(layer(head), Detected::Layer(want), "{head:?}");
@@ -279,6 +501,8 @@ mod tests {
             b"BZh",
             b"\xFD7zXZ",
             b"LZI",
+            b"pbz",
+            b"PBZX",
             b"\x1F",
             b"\x60\x2A\x4D\x18",
         ] {
@@ -451,6 +675,28 @@ mod tests {
             layer(&far[..UDF_HEAD_LEN]),
             Detected::Container(Container::Data)
         );
+    }
+
+    #[test]
+    fn seven_zip_by_its_signature() {
+        let seven = Detected::Container(Container::SevenZip);
+        // The signature, its version (0.4) and its start header's CRC.
+        assert_eq!(layer(b"7z\xBC\xAF\x27\x1C\x00\x04\x8d\x9b\xd5\x0f"), seven);
+        assert_eq!(layer(b"7z\xBC\xAF\x27\x1C"), seven);
+        // Cut short, or a byte off: data.
+        for head in [
+            &b"7z\xBC\xAF\x27"[..],
+            b"7z\xBC\xAF\x27\x1D",
+            b"7Z\xBC\xAF\x27\x1C",
+        ] {
+            assert_eq!(
+                layer(head),
+                Detected::Container(Container::Data),
+                "{head:?}"
+            );
+        }
+        // Not under a name: the signature tells.
+        assert_eq!(detect(b"7z\xBC\xAF\x27\x1C", Some("x.lzma")), seven);
     }
 
     #[test]

@@ -7,7 +7,7 @@ testdata/manifest.json lists every set:
   into <cache>/<name>.
 - Sets with "generate" are made in <cache>/<name> by zstd's own tools, or
   by the oracles in tools/, built from the pinned zstd, zlib, bzip2, lz4,
-  XZ Utils, libzip, nettle and libarchive releases, or with Go from the
+  XZ Utils, libzip, nettle, libarchive and libxml2 releases, or with Go from the
   modules their go.sum pins.
 
 The cache is target/testdata, or $HIVEPACK_TESTDATA when set.
@@ -235,15 +235,15 @@ LIBLZMA_LEFT_OUT = ["hardware_",
                     "crc32_small", "crc64_small", "tablegen", "crc_clmul_consts_gen"]
 
 
-# nettle's AES (encryption only), SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, in
-# C: what the oracles call, without the assembly versions or the fat
+# nettle's AES (encryption only), SHA-1, MD5, HMAC-SHA1 and PBKDF2-HMAC-SHA1,
+# in C: what the oracles call, without the assembly versions or the fat
 # builds that choose between them.
 NETTLE_SOURCES = [
     "aes-set-encrypt-key.c", "aes128-set-encrypt-key.c", "aes192-set-encrypt-key.c",
     "aes256-set-encrypt-key.c", "aes-set-key-internal.c", "aes-encrypt-internal.c",
     "aes-encrypt-table.c", "aes128-encrypt.c", "aes192-encrypt.c", "aes256-encrypt.c",
-    "sha1.c", "sha1-compress.c", "sha1-meta.c", "hmac.c", "hmac-sha1.c", "pbkdf2.c",
-    "pbkdf2-hmac-sha1.c", "memxor.c", "write-be32.c",
+    "sha1.c", "sha1-compress.c", "sha1-meta.c", "md5.c", "hmac.c", "hmac-sha1.c", "pbkdf2.c",
+    "pbkdf2-hmac-sha1.c", "memxor.c", "write-be32.c", "write-le32.c",
 ]
 
 
@@ -303,6 +303,85 @@ LIBARCHIVE_CPIO_SOURCES = [
     "archive_write_set_format_cpio_binary.c", "archive_write_set_format_cpio_newc.c",
     "archive_write_set_format_cpio_odc.c",
 ]
+
+
+# libarchive: the reader and writer of XAR archives, what they call (the
+# checksums of archive_digest.c among them), and the memory and callback
+# inputs and outputs the oracle uses.
+XAR_LIBARCHIVE_SOURCES = [
+    "archive_acl.c", "archive_check_magic.c", "archive_digest.c", "archive_entry.c",
+    "archive_entry_sparse.c", "archive_entry_xattr.c", "archive_options.c", "archive_random.c",
+    "archive_rb.c", "archive_read.c", "archive_read_open_memory.c", "archive_read_set_options.c",
+    "archive_read_support_format_xar.c", "archive_string_sprintf.c", "archive_util.c",
+    "archive_virtual.c", "archive_write.c", "archive_write_add_filter_none.c",
+    "archive_write_set_format_xar.c", "archive_write_set_options.c",
+]
+
+
+# nettle's MD5, SHA-1, SHA-256 and SHA-512, in C, without the assembly
+# versions: the checksums libarchive's archive_digest.c takes from nettle.
+XAR_NETTLE_SOURCES = [
+    "md5.c", "sha1.c", "sha1-compress.c", "sha256.c", "sha256-compress-n.c", "sha512.c",
+    "sha512-compress.c", "write-be32.c", "write-le32.c",
+]
+
+
+# libxml2: its core, as CMakeLists.txt lists it in LIBXML2_SRCS, and the
+# modules the XAR reader and writer use: the reader (xmlreader.c), the
+# writer (xmlwriter.c) and the serialization it needs (xmlsave.c), and
+# regular expressions (xmlregexp.c), which validation takes. The others
+# are left out, as tools/xar-oracle/libxml2/libxml/xmlversion.h says.
+LIBXML2_SOURCES = [
+    "buf.c", "chvalid.c", "dict.c", "encoding.c", "entities.c", "error.c", "globals.c", "hash.c",
+    "list.c", "parser.c", "parserInternals.c", "SAX2.c", "threads.c", "tree.c", "uri.c", "valid.c",
+    "xmlIO.c", "xmlmemory.c", "xmlstring.c", "xmlsave.c", "xmlreader.c", "xmlregexp.c",
+    "xmlwriter.c",
+]
+
+
+def liblzma_objects(xz: Path, folder: Path, compiler: str) -> list:
+    """liblzma's C files compiled apart, with tools/xz-oracle/config.h, as it
+    has a config.h of its own: the objects."""
+    objects = folder / "liblzma"
+    objects.mkdir()
+    dirs = [xz / d for d in LIBLZMA_DIRS]
+    xz_files = sorted(str(f) for d in dirs for f in d.glob("*.c")
+                      if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
+    xz_includes = [f"-I{d}" for d in [ROOT / "tools/xz-oracle", xz / "api", *dirs, xz.parent / "common"]]
+    subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *xz_includes, "-c", *xz_files],
+                   check=True, cwd=objects)
+    return sorted(str(f) for f in objects.glob("*.o"))
+
+
+def build_xar_oracle(libarchive: Path, sources: list, folder: Path, extra: list, compiler: str) -> None:
+    """tools/xar-oracle: libarchive's XAR reader and writer with libxml2,
+    zlib, libbzip2, liblzma and nettle. libxml2 has a config.h of its own
+    (tools/xar-oracle/libxml2/config.h, with the xmlversion.h its build
+    writes beside it) and liblzma too, so both are compiled apart."""
+    zlib = next(extra[0].glob("zlib-*"))
+    bzip2 = next(extra[1].glob("bzip2-*"))
+    xz = next(extra[2].glob("xz-*/src/liblzma"))
+    nettle = next(extra[3].glob("nettle-*"))
+    libxml2 = next(extra[4].glob("libxml2-*"))
+    config = ROOT / Path(sources[0]).parent
+    xml_config = config / "libxml2"
+    objects = folder / "libxml2"
+    objects.mkdir()
+    subprocess.run([compiler, "-O2", "-w", "-pthread", f"-I{xml_config}", f"-I{libxml2 / 'include'}", "-c",
+                    *[str(libxml2 / name) for name in LIBXML2_SOURCES]], check=True, cwd=objects)
+    files = [str(ROOT / s) for s in sources if s.endswith(".c")]
+    files += [str(libarchive / name) for name in XAR_LIBARCHIVE_SOURCES]
+    files += [str(libarchive_string(libarchive, folder))]
+    files += sorted(str(f) for f in zlib.glob("*.c") if not f.name.startswith("gz"))
+    files += [str(bzip2 / name) for name in BZIP2_SOURCES]
+    files += [str(nettle / name) for name in XAR_NETTLE_SOURCES]
+    files += liblzma_objects(xz, folder, compiler)
+    files += sorted(str(f) for f in objects.glob("*.o"))
+    include = nettle_headers(nettle, folder)
+    subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", f"-I{config}", f"-I{libarchive}",
+                    f"-I{zlib}", f"-I{bzip2}", f"-I{xz / 'api'}", f"-I{include}", f"-I{nettle}",
+                    f"-I{xml_config}", f"-I{libxml2 / 'include'}", *files, "-o", str(folder / "oracle")],
+                   check=True)
 
 
 # archive_string.c without the Unicode normalization of names converted from
@@ -406,7 +485,10 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
     tools/iso-oracle is built with libarchive's LIBARCHIVE_SOURCES, its
     archive_string.c without the Unicode normalization (libarchive_string),
     its own config.h, and zlib's (the `extra` set); tools/cpio-oracle, told
-    by its folder, with LIBARCHIVE_CPIO_SOURCES and its own config.h.
+    by its folder, with LIBARCHIVE_CPIO_SOURCES and its own config.h;
+    tools/xar-oracle, told by its folder too, with XAR_LIBARCHIVE_SOURCES,
+    the same archive_string.c, and libxml2's, zlib's, libbzip2's,
+    liblzma's and nettle's (build_xar_oracle).
     tools/zip-oracle is built with libzip's, its crypto backend for
     GnuTLS and its bzip2 algorithm among them, its own config.h and
     zipconf.h in place of those libzip's CMake build writes, the part of
@@ -448,15 +530,7 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
         include = nettle_headers(nettle, folder)
         config = ROOT / Path(sources[0]).parent
         # liblzma has a config.h of its own, so it is compiled apart.
-        objects = folder / "liblzma"
-        objects.mkdir()
-        dirs = [xz / d for d in LIBLZMA_DIRS]
-        xz_files = sorted(str(f) for d in dirs for f in d.glob("*.c")
-                          if not any(part in f.name for part in LIBLZMA_LEFT_OUT))
-        xz_includes = [f"-I{d}" for d in [ROOT / "tools/xz-oracle", xz / "api", *dirs, xz.parent / "common"]]
-        subprocess.run([compiler, "-O2", "-w", "-pthread", "-DHAVE_CONFIG_H", *xz_includes, "-c", *xz_files],
-                       check=True, cwd=objects)
-        files += sorted(str(f) for f in objects.glob("*.o"))
+        files += liblzma_objects(xz, folder, compiler)
         # So is libzstd, whose headers have common names.
         objects = folder / "libzstd"
         objects.mkdir()
@@ -471,6 +545,9 @@ def build_oracle(source: Path, sources: list, included: list, folder: Path, extr
                        check=True)
         return
     libarchive = next(source.glob("libarchive-*/libarchive"), None)
+    if libarchive is not None and Path(sources[0]).parent.name == "xar-oracle":
+        build_xar_oracle(libarchive, sources, folder, extra, compiler)
+        return
     if libarchive is not None and folder.name == "cpio-oracle":
         files += [str(libarchive / name) for name in LIBARCHIVE_CPIO_SOURCES]
         config = ROOT / Path(sources[0]).parent

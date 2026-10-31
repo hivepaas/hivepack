@@ -3,12 +3,13 @@
 
 use std::fmt::Debug;
 
-/// A hash function with Merkle–Damgård padding: [`Sha1`](crate::Sha1),
-/// [`Sha256`](crate::Sha256) or [`Sha512`](crate::Sha512). BearSSL's
+/// A hash function with Merkle–Damgård padding: [`Md5`](crate::Md5),
+/// [`Sha1`](crate::Sha1), [`Sha256`](crate::Sha256) or
+/// [`Sha512`](crate::Sha512). BearSSL's
 /// `br_hash_class`, whose `init`, `update`, `out`, `state` and `set_state`
 /// are the methods here.
 ///
-/// For these three the state after whole blocks is as long as the digest,
+/// For these four the state after whole blocks is as long as the digest,
 /// so both are [`Digest::Output`].
 pub trait Digest: Clone + Debug {
     /// The digest, `[u8; OUTPUT_LENGTH]`.

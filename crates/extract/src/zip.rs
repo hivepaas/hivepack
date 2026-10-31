@@ -422,12 +422,24 @@ fn write_file<R: ReadAt>(
     }
 
     if let Some(mtime) = item.mtime {
-        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
-            .map_err(ErrorKind::Io)?;
+        set_modified(&file, mtime)?;
     }
     set_permissions(&file, item.mode, options.permissions)?;
     file.flush().map_err(ErrorKind::Io)?;
     Ok(written)
+}
+
+/// Sets `file`'s modification time, unless the system cannot hold it: a
+/// 32-bit system's `time_t` ends in January 2038, and a file dated after
+/// keeps the time it is written at, rather than stop the extraction.
+pub(crate) fn set_modified(
+    file: &std::fs::File,
+    mtime: std::time::SystemTime,
+) -> Result<(), ErrorKind> {
+    match file.set_times(std::fs::FileTimes::new().set_modified(mtime)) {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        result => result.map_err(ErrorKind::Io),
+    }
 }
 
 /// The permission bits of `mode`, as `permissions` says, on Unix.

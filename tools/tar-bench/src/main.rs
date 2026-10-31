@@ -13,7 +13,7 @@
 //! pieces of 4 KiB from them, and "many" ones `--many` entries of 16 bytes, where
 //! what counts is the headers. Go's `tar.Writer` makes the archives, and GNU tar,
 //! as `gtar` or `tar`, the sparse ones, which `tar.Writer` does not write; without
-//! it, those rows are left out.
+//! it, or if it finds no holes in the files, those rows are left out.
 //!
 //! Go runs in a program of its own, `tools/tar-bench/go`. Most rows read from
 //! memory, so that only the reader is timed, through a plain reader on both sides.
@@ -470,8 +470,7 @@ fn make_sparse(tar: &str, dir: &Path, out: &Path, options: &[&str]) -> Result<()
     }
     let status = Command::new(tar)
         .current_dir(dir)
-        // Looking for zeros, as file systems differ in what they report as holes.
-        .args(["--sparse", "--hole-detection=raw", "-cf"])
+        .args(["--sparse", "-cf"])
         .arg(out)
         .args(options)
         .arg("sparse")
@@ -518,8 +517,13 @@ fn real_main() -> Result<()> {
         make_lists(&options.data, &dir, options.limit_mb << 20, options.small)?;
 
     println!("| Workload | hivepack-tar | Go | Port / Go |\n|---|---|---|---|");
-    let tar = gnu_tar();
-    if tar.is_none() {
+    // On macOS, GNU tar writes these files whole, whose rows would then time something else.
+    let tar = gnu_tar().filter(|tar| {
+        make_sparse(tar, &dir, &dir.join("probe.tar"), &["--format=gnu"])
+            .inspect_err(|e| eprintln!("the sparse rows are left out: {e}"))
+            .is_ok()
+    });
+    if gnu_tar().is_none() {
         eprintln!("no GNU tar here: the sparse rows are left out");
     }
     let mut category = "";

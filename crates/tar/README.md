@@ -28,7 +28,7 @@ Against Go 1.27.2's `archive/tar`, with `tools/tar-bench`. Above 1× the port is
 | Going through entries, USTAR and PAX, from memory | 2.88–3.03× | 2.20–2.28× | 2.52× |
 | Going through entries, GNU long names, from memory | 1.81× | 1.43× | 1.75× |
 | Going through entries, from a file | 1.89–2.47× | 1.48–2.01× | 1.49–2.08× |
-| Going through sparse entries, from memory | 2.38–2.47× | no GNU tar | see below |
+| Going through sparse entries, from memory | 2.38–2.47× | no GNU tar | no holes |
 | Reading data, from memory | 0.96–2.00× | 2.12–2.16× | 1.61–2.46× |
 | Reading data, from a file | 1.05–1.09× | 1.12–1.15× | 0.99–1.08× |
 | Skipping data, through a buffer | 1.04× | 0.96× | 1.26× |
@@ -36,7 +36,7 @@ Against Go 1.27.2's `archive/tar`, with `tools/tar-bench`. Above 1× the port is
 
 **Measured on** GitHub's runners with `.github/workflows/bench.yml`, on October 31, 2026, the best of five rounds taken in turn: Linux on an AMD EPYC 9V45 (4 threads), Windows Server 2025 on an Intel processor (family 6, model 173) (4 threads), and macOS 26 on a virtual Apple M1 (3 threads). All with rustc 1.99.1 and Go 1.27.2. These are shared machines, so the ratios hold better than the speeds, and a runner's processor can differ from one run to the next.
 
-The archive's sparse rows are left out on macOS here: going through them gave 16–40×, which suggests that GNU tar found no holes there and wrote the data, whose skipping from memory the compiler takes out. On one machine with more detail, an AMD Ryzen 9 9950X, the whole table and the reasons are in [docs/tar.md](../../docs/tar.md#the-speed).
+The sparse rows are missing on macOS because GNU tar writes those files whole there, so the archives have no holes to read, and on Windows because the runners have no GNU tar. On one machine with more detail, an AMD Ryzen 9 9950X, the whole table and the reasons are in [docs/tar.md](../../docs/tar.md#the-speed).
 
 ## License
 

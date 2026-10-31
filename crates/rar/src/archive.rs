@@ -16,11 +16,14 @@ use std::io;
 
 use hivepack_crypto::Sha256;
 
+use crate::crypt::{KdfCache, Password, set_crypt_keys};
 use crate::error::{Error, ExitCode};
 use crate::headers::*;
+use crate::name::next_volume_name;
 use crate::name::{
     arc_char_to_wide, char_to_wide, convert_file_header, decode_encoded, utf_to_wide,
 };
+use crate::quick_open::QuickOpen;
 use crate::raw::RawRead;
 use crate::source::{Cursor, ReadAt};
 use crate::time::RarTime;
@@ -35,13 +38,18 @@ fn safe_add(a: i64, b: i64, fallback: i64) -> i64 {
     }
 }
 
+/// How a next volume is got, by its name.
+type OpenVolume<R> = Box<dyn FnMut(&str) -> Option<R>>;
+
 /// A RAR archive being read, header by header, as UnRAR's `Archive` reads
 /// it: [`open`](Archive::open) finds the signature and the main header,
 /// then [`read_header`](Archive::read_header) reads the next header and
 /// [`seek_to_next`](Archive::seek_to_next) moves past its data.
 pub struct Archive<R> {
-    src: R,
-    pos: u64,
+    pub(crate) src: R,
+    /// Where the file is: `File::Tell`, which `tell` is unless a QuickOpen
+    /// record is loaded.
+    pub(crate) pos: u64,
 
     pub format: Format,
     pub solid: bool,
@@ -78,6 +86,16 @@ pub struct Archive<R> {
     /// password, as UnRAR's library opens them without a callback.
     silent_open: bool,
     exit_code: ExitCode,
+    /// `Cmd->Password`.
+    pub(crate) password: Password,
+    /// `FileName`, and how to get what is called something else: without it,
+    /// no next volume can be found.
+    name: String,
+    open_volume: Option<OpenVolume<R>>,
+    /// Where the derivations of keys are kept, for the headers and the data.
+    pub(crate) kdf_cache: KdfCache,
+    pub(crate) qopen: QuickOpen,
+    pub(crate) prohibit_qopen: bool,
 }
 
 impl<R: ReadAt> Archive<R> {
@@ -86,6 +104,50 @@ impl<R: ReadAt> Archive<R> {
     /// then `IsArchive`). `enable_broken` reads on past a broken main
     /// header, as UnRAR's `IsArchive(true)` does.
     pub fn open(src: R, enable_broken: bool) -> Result<Archive<R>, Error> {
+        Archive::open_with(src, enable_broken, None)
+    }
+
+    /// [`Archive::open`] for an archive that may be encrypted. A password of
+    /// nothing is no password, as for UnRAR. Only the first 127 characters
+    /// count, as RAR itself takes no more.
+    pub fn open_with_password(
+        src: R,
+        enable_broken: bool,
+        password: &str,
+    ) -> Result<Archive<R>, Error> {
+        Archive::open_with(src, enable_broken, Some(password))
+    }
+
+    /// [`Archive::open_with_password`] for a volume of many, called `name`. A
+    /// next volume's name comes from it as UnRAR makes it, the path included,
+    /// and `open` is asked for it: nothing, if there is none.
+    pub fn open_volumes(
+        src: R,
+        name: &str,
+        open: impl FnMut(&str) -> Option<R> + 'static,
+        enable_broken: bool,
+        password: &str,
+    ) -> Result<Archive<R>, Error> {
+        Archive::open_with_volumes(
+            src,
+            enable_broken,
+            Some(password),
+            name.to_string(),
+            Some(Box::new(open)),
+        )
+    }
+
+    fn open_with(src: R, enable_broken: bool, password: Option<&str>) -> Result<Archive<R>, Error> {
+        Archive::open_with_volumes(src, enable_broken, password, String::new(), None)
+    }
+
+    fn open_with_volumes(
+        src: R,
+        enable_broken: bool,
+        password: Option<&str>,
+        name: String,
+        open_volume: Option<OpenVolume<R>>,
+    ) -> Result<Archive<R>, Error> {
         let mut archive = Archive {
             src,
             pos: 0,
@@ -119,6 +181,12 @@ impl<R: ReadAt> Archive<R> {
             sub_block_head: SubBlockHeader::default(),
             silent_open: false,
             exit_code: ExitCode::Success,
+            password: Password::new(password.unwrap_or_default()),
+            name,
+            open_volume,
+            kdf_cache: KdfCache::default(),
+            qopen: QuickOpen::default(),
+            prohibit_qopen: false,
         };
         if archive.is_archive(enable_broken)? {
             Ok(archive)
@@ -136,30 +204,51 @@ impl<R: ReadAt> Archive<R> {
 
     /// Where the next read starts: `Tell`.
     pub fn position(&self) -> u64 {
-        self.pos
+        self.tell()
     }
 
-    pub(crate) fn cursor(&mut self) -> Cursor<'_> {
+    /// `Archive::Read`.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(read) = self.qopen_read(buf)? {
+            return Ok(read);
+        }
         Cursor {
             src: &self.src,
             pos: &mut self.pos,
         }
+        .read(buf)
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.cursor().read(buf)
-    }
-
+    /// `Archive::Seek`.
     pub(crate) fn seek(&mut self, pos: u64) {
-        self.pos = pos;
+        if self.qopen.loaded {
+            self.qopen_seek(pos);
+        } else {
+            self.pos = pos;
+        }
     }
 
-    fn tell(&self) -> u64 {
-        self.pos
+    /// `Archive::Tell`.
+    pub(crate) fn tell(&self) -> u64 {
+        if self.qopen.loaded {
+            self.qopen.seek_pos
+        } else {
+            self.pos
+        }
     }
 
-    fn file_length(&self) -> io::Result<u64> {
-        self.src.size()
+    /// `File::FileLength`, by way of `Seek` and `Tell`: with a QuickOpen
+    /// record loaded, going back can read it again from its start.
+    fn file_length(&mut self) -> io::Result<u64> {
+        let save_pos = self.tell();
+        let length = self.src.size()?;
+        if self.qopen.loaded {
+            self.qopen_seek_end(length);
+        } else {
+            self.pos = length;
+        }
+        self.seek(save_pos);
+        Ok(length)
     }
 
     /// `IsSignature`: which format the bytes start with.
@@ -372,6 +461,121 @@ impl<R: ReadAt> Archive<R> {
         Ok(read_size)
     }
 
+    /// `Archive::SearchBlock`.
+    fn search_block(&mut self, header_type: u32) -> Result<usize, Error> {
+        loop {
+            let size = self.read_header()?;
+            if size == 0 || (header_type != HEAD_ENDARC && self.cur_header_type == HEAD_ENDARC) {
+                return Ok(0);
+            }
+            if self.cur_header_type == header_type {
+                return Ok(size);
+            }
+            self.seek_to_next();
+        }
+    }
+
+    /// `Archive::SearchSubBlock`.
+    pub(crate) fn search_sub_block(&mut self, kind: &str) -> Result<usize, Error> {
+        loop {
+            let size = self.read_header()?;
+            if size == 0 || self.cur_header_type == HEAD_ENDARC {
+                return Ok(0);
+            }
+            if self.cur_header_type == HEAD_SERVICE && self.sub_head.is_named(kind) {
+                return Ok(size);
+            }
+            self.seek_to_next();
+        }
+    }
+
+    /// `Archive::GetStartPos`.
+    pub(crate) fn start_pos(&self) -> u64 {
+        let mut pos = self.sfx_size + u64::from(self.mark_head.head_size);
+        if self.format == Format::Rar15 {
+            pos += u64::from(self.main_head.base.head_size);
+        } else {
+            pos += u64::from(self.crypt_head.base.head_size)
+                + u64::from(self.full_header_size(self.main_head.base.head_size as usize));
+        }
+        pos
+    }
+
+    /// `File::Tell`, in the crate.
+    pub(crate) fn tell_pos(&self) -> u64 {
+        self.tell()
+    }
+
+    /// `File::GetByte`, in the crate.
+    pub(crate) fn next_byte(&mut self) -> io::Result<u8> {
+        self.get_byte()
+    }
+
+    /// `MergeArchive`: goes on to the next volume, nothing if there is none,
+    /// and otherwise where the data goes on: `DataIO->UnpVolume`, and
+    /// `SetPackedSizeToRead`. The hash of the packed data is left out, which
+    /// UnRAR only says something about.
+    pub(crate) fn merge_archive(&mut self) -> Result<Option<(bool, u64)>, Error> {
+        let header_type = self.cur_header_type;
+        let is_service = header_type == HEAD_SERVICE;
+        let is_part = header_type == HEAD_FILE || is_service;
+        let split_after = if is_service {
+            self.sub_head.split_after
+        } else {
+            self.file_head.split_after
+        };
+        let split_header = is_part && split_after;
+        let prev_vol_encrypted = self.encrypted;
+        let pos_before_close = self.tell();
+        // `Archive::Open`, whether or not there is anything to open.
+        self.qopen.loaded = false;
+
+        let mut next_name = next_volume_name(&self.name, !self.new_numbering);
+        let mut opened = self.open_volume.as_mut().and_then(|open| open(&next_name));
+        if opened.is_none() {
+            // New style volumes renamed to the old style.
+            let alt_name = next_volume_name(&self.name, true);
+            opened = self.open_volume.as_mut().and_then(|open| open(&alt_name));
+            if opened.is_some() {
+                next_name = alt_name;
+            }
+        }
+        let Some(src) = opened else {
+            self.set_error_code(ExitCode::Open);
+            self.seek(pos_before_close);
+            return Ok(None);
+        };
+        self.src = src;
+        self.name = next_name;
+        self.seek(0);
+
+        // `CheckArc`, and `ErrHandler.Exit`, which sets the code first.
+        if !self.is_archive(true)? || self.encrypted != prev_vol_encrypted {
+            self.set_error_code(ExitCode::BadArchive);
+            return Err(Error::BadVolume {
+                exit_code: self.exit_code,
+            });
+        }
+
+        if split_header {
+            self.search_block(header_type)?;
+        } else {
+            self.read_header()?;
+        }
+        if self.cur_header_type == HEAD_FILE {
+            self.seek((self.next_block_pos - self.file_head.pack_size) as u64);
+        }
+        if header_type == HEAD_ENDARC {
+            return Ok(Some((false, 0)));
+        }
+        let hd = if is_service {
+            &self.sub_head
+        } else {
+            &self.file_head
+        };
+        Ok(Some((hd.split_after, hd.pack_size as u64)))
+    }
+
     fn sanitize_header(&mut self) -> bool {
         if self.cur_header_type == HEAD_FILE || self.cur_header_type == HEAD_SERVICE {
             let file_block = self.cur_header_type == HEAD_FILE;
@@ -390,9 +594,12 @@ impl<R: ReadAt> Archive<R> {
         true
     }
 
-    /// The password the headers need: there is none yet, so the reading
-    /// stops as UnRAR's library stops without one.
+    /// The password the headers need: without one the reading stops, as
+    /// UnRAR's library stops without a callback that gives one.
     fn request_arc_password(&mut self) -> Result<(), Error> {
+        if self.password.is_set() {
+            return Ok(());
+        }
         // `ErrHandler.Exit(RARX_USERBREAK)`, which sets the code first.
         self.set_error_code(ExitCode::UserBreak);
         Err(Error::MissingPassword {
@@ -406,9 +613,25 @@ impl<R: ReadAt> Archive<R> {
             self.encrypted && self.cur_block_pos > (self.sfx_size + SIZEOF_MARKHEAD3 as u64) as i64;
         if decrypt {
             self.request_arc_password()?;
+            let mut salt = [0u8; SIZE_SALT30];
+            if self.read(&mut salt)? != SIZE_SALT30 {
+                self.unexp_end_arc_msg()?;
+                return Ok(0);
+            }
+            let keys = set_crypt_keys(
+                CryptMethod::Rar30,
+                &self.password,
+                &mut self.kdf_cache,
+                Some(&salt),
+                &[0; SIZE_INITV],
+                0,
+            );
+            if let Some((crypt, _)) = keys {
+                raw.set_crypt(crypt);
+            }
         }
 
-        raw.read(&mut self.cursor(), SIZEOF_SHORTBLOCKHEAD)?;
+        raw.read(self, SIZEOF_SHORTBLOCKHEAD)?;
         if raw.size() == 0 {
             self.unexp_end_arc_msg()?;
             return Ok(0);
@@ -442,14 +665,11 @@ impl<R: ReadAt> Archive<R> {
         if short.header_type == HEAD3_CMT {
             // An old comment header inside a main or file header: only its
             // fixed part.
-            raw.read(&mut self.cursor(), SIZEOF_COMMHEAD - SIZEOF_SHORTBLOCKHEAD)?;
+            raw.read(self, SIZEOF_COMMHEAD - SIZEOF_SHORTBLOCKHEAD)?;
         } else if short.header_type == HEAD_MAIN && short.flags & MHD_COMMENT != 0 {
-            raw.read(&mut self.cursor(), SIZEOF_MAINHEAD3 - SIZEOF_SHORTBLOCKHEAD)?;
+            raw.read(self, SIZEOF_MAINHEAD3 - SIZEOF_SHORTBLOCKHEAD)?;
         } else {
-            raw.read(
-                &mut self.cursor(),
-                short.head_size as usize - SIZEOF_SHORTBLOCKHEAD,
-            )?;
+            raw.read(self, short.head_size as usize - SIZEOF_SHORTBLOCKHEAD)?;
         }
 
         self.next_block_pos =
@@ -781,11 +1001,31 @@ impl<R: ReadAt> Archive<R> {
                 return Ok(0);
             }
             self.request_arc_password()?;
+            let keys = set_crypt_keys(
+                CryptMethod::Rar50,
+                &self.password,
+                &mut self.kdf_cache,
+                Some(&self.crypt_head.salt),
+                &init_v,
+                self.crypt_head.lg2_count,
+            );
+            if let Some((crypt, checks)) = keys {
+                // A damaged header cannot be relied on for the check value.
+                if self.crypt_head.use_psw_check
+                    && !self.broken_header
+                    && checks.psw_check != self.crypt_head.psw_check
+                {
+                    self.failed_header_decryption = true;
+                    self.set_error_code(ExitCode::BadPassword);
+                    return Ok(0);
+                }
+                raw.set_crypt(crypt);
+            }
         }
 
         // The CRC, then up to 3 bytes of size: a header is 2 MB at most.
         const FIRST_READ_SIZE: usize = 7;
-        if raw.read(&mut self.cursor(), FIRST_READ_SIZE)? < FIRST_READ_SIZE {
+        if raw.read(self, FIRST_READ_SIZE)? < FIRST_READ_SIZE {
             self.unexp_end_arc_msg()?;
             return Ok(0);
         }
@@ -810,7 +1050,7 @@ impl<R: ReadAt> Archive<R> {
             return Ok(0);
         }
 
-        raw.read(&mut self.cursor(), size_to_read as usize)?;
+        raw.read(self, size_to_read as usize)?;
         if raw.size() < header_size as usize {
             self.unexp_end_arc_msg()?;
             return Ok(0);
@@ -907,7 +1147,19 @@ impl<R: ReadAt> Archive<R> {
                 if extra_size != 0 {
                     self.process_extra50(&mut raw, extra_size as usize, short.header_type);
                 }
-                // QuickOpen records are not read yet.
+                if !self.prohibit_qopen && self.main_head.locator && self.main_head.qopen_offset > 0
+                {
+                    // Reading the record moves through the archive: what
+                    // called this goes on from the same blocks.
+                    let save_cur = self.cur_block_pos;
+                    let save_next = self.next_block_pos;
+                    let save_type = self.cur_header_type;
+                    self.qopen.loaded = false;
+                    self.qopen_load(self.main_head.qopen_offset)?;
+                    self.cur_block_pos = save_cur;
+                    self.next_block_pos = save_next;
+                    self.cur_header_type = save_type;
+                }
             }
             HEAD_FILE | HEAD_SERVICE => {
                 let file_block = short.header_type == HEAD_FILE;
@@ -1278,7 +1530,7 @@ impl<R: ReadAt> Archive<R> {
     fn read_header14(&mut self) -> Result<usize, Error> {
         let mut raw = RawRead::new();
         if self.cur_block_pos <= self.sfx_size as i64 {
-            raw.read(&mut self.cursor(), SIZEOF_MAINHEAD14)?;
+            raw.read(self, SIZEOF_MAINHEAD14)?;
             self.main_head = MainHeader::default();
             let mut mark = [0u8; 4];
             raw.get_b(&mut mark);
@@ -1295,7 +1547,7 @@ impl<R: ReadAt> Archive<R> {
             self.main_head.comment_in_header = flags & MHD_COMMENT != 0;
             self.main_head.pack_comment = flags & MHD_PACK_COMMENT != 0;
         } else {
-            raw.read(&mut self.cursor(), SIZEOF_FILEHEAD14)?;
+            raw.read(self, SIZEOF_FILEHEAD14)?;
             let hd = &mut self.file_head;
             hd.reset();
             hd.base.header_type = HEAD_FILE;
@@ -1330,7 +1582,7 @@ impl<R: ReadAt> Archive<R> {
             hd.hs_type = HostSystem::Windows;
             hd.mtime.set_dos(file_time);
 
-            raw.read(&mut self.cursor(), name_size)?;
+            raw.read(self, name_size)?;
             let hd = &mut self.file_head;
             let mut file_name = vec![0u8; name_size];
             raw.get_b(&mut file_name);

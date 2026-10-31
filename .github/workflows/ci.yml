@@ -90,7 +90,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # ubuntu-latest, which builds every oracle and compares with zstd's
+    # corpora, took 53 minutes before XAR extraction's tests were added.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -383,6 +385,46 @@ jobs:
               pathlib.Path(f"fuzz/corpus/rar_unpack/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_unpack -- -max_total_time=45
+      - name: Seed the corpus of RAR's older algorithms with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/rar_unpack_old
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-unpack-old.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/rar_unpack_old/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_unpack_old -- -max_total_time=45
+      - name: Seed the corpus of encrypted RAR archives with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/rar_password
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-password.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/rar_password/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_password -- -max_total_time=45
+      - name: Seed the corpus of RAR QuickOpen records with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/rar_quick_open
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-quick-open.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/rar_quick_open/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_quick_open -- -max_total_time=45
+      - name: Seed the corpus of RAR volumes with the recorded inputs
+        run: |
+          mkdir -p fuzz/corpus/rar_volumes
+          python3 - <<'PY'
+          import pathlib
+          lines = pathlib.Path("testdata/oracle/rar-volumes.txt").read_text().splitlines()
+          for i, line in enumerate(l for l in lines if l and not l.startswith("#")):
+              pathlib.Path(f"fuzz/corpus/rar_volumes/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
+          PY
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu rar_volumes -- -max_total_time=45
       - name: Seed the bzip2 corpus
         run: |
           mkdir -p fuzz/corpus/bzip2
@@ -457,6 +499,11 @@ jobs:
               pathlib.Path(f"fuzz/corpus/sevenz/r{i}").write_bytes(bytes.fromhex(line.split("\t")[0]))
           PY
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu sevenz -- -max_total_time=60 -rss_limit_mb=4096
+      - name: Seed the 7z extraction corpus with testdata/7z, behind a byte of options
+        run: |
+          mkdir -p fuzz/corpus/extract_7z
+          for f in testdata/7z/*.7z; do { printf '\x12'; cat "$f"; } > "fuzz/corpus/extract_7z/$(basename "$f")"; done
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract_7z -- -max_total_time=60 -rss_limit_mb=4096
       - name: Seed the tar corpus with Go's test archives
         run: |
           mkdir -p fuzz/corpus/tar

@@ -94,6 +94,10 @@ pub enum ErrorKind {
     /// The UDF volume could not be read: an entry's node, data or link
     /// target, or a directory with a broken entry.
     Udf(hivepack_udf::Error),
+    /// The 7z archive's data could not be read: damaged, a CRC that does
+    /// not match, a method `hivepack-7z` does not decode, or a password
+    /// missing or wrong.
+    SevenZip(hivepack_7z::Error),
     /// A directory of the UDF volume met again: under two names, or its
     /// own ancestor, which UDF does not allow.
     DirectoryAgain,
@@ -153,6 +157,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::XarEntry(w) => write!(f, "entry with something missing: {w}"),
             ErrorKind::Payload(e) => write!(f, "payload: {e}"),
             ErrorKind::Udf(e) => write!(f, "volume: {e}"),
+            ErrorKind::SevenZip(e) => write!(f, "archive: {e}"),
             ErrorKind::DirectoryAgain => f.write_str("a directory met again"),
             ErrorKind::Changed => f.write_str("the archive changed between its two readings"),
             ErrorKind::Io(e) => write!(f, "{e}"),
@@ -184,6 +189,7 @@ impl std::error::Error for Error {
             ErrorKind::Xar(e) => Some(e),
             ErrorKind::Payload(e) => Some(e),
             ErrorKind::Udf(e) => Some(e),
+            ErrorKind::SevenZip(e) => Some(e),
             ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }

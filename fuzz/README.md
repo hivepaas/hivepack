@@ -36,6 +36,10 @@ nightly, where `rust-toolchain.toml` pins a stable: the nightly CI uses
 | `rar_headers` | Opening the input as a RAR archive, its first byte choosing whether a broken main header is read past, and reading every header, twice: the same headers both times, each past the one before |
 | `rar_test` | Going through the input as UnRAR tests an archive, twice: the same data both times, no more of a stored entry than its header's pack and unpacked sizes |
 | `rar_unpack` | The input as the packed data of a copy of an existing RAR 5 or RAR 4 archive, one or two entries, decompressed twice: the same data both times. What it finds is compared with UnRAR by `HIVEPACK_RAR_UNPACK_CORPUS` |
+| `rar_unpack_old` | The same with RAR 1.5 and 2.x, whose entries can go on from each other and from RAR 3's |
+| `rar_password` | The input as an archive read with a password, as `rar_test` does, so that it gets to what is encrypted. Key derivation is cut short in fuzzing builds. What it finds is compared with UnRAR by hand, without that |
+| `rar_quick_open` | The input as `support::patch::with_quick_open` makes a QuickOpen record of it, read with no password and with one, so that it gets past the record's CRCs. What it finds is compared with UnRAR by hand |
+| `rar_volumes` | The input as two volumes of an archive with a password, its comment first, as `rar_test` does. What it finds is compared with UnRAR |
 | `extract_tar` | Extracting the input as a tar archive with hivepack-extract, as `extract` does a ZIP archive: options from its first byte, cancelled after some progress if it says so; nothing written beside the destination, every link created staying inside it, the summary counting what is there (a hard link's file once), and no file left cut off |
 | `iso` | Reading the input as an ISO 9660 image, as an input that cannot seek and as one that can, every entry and up to 4 MiB of each one's data, twice each, in pieces of different sizes its first eight bytes pick: the same headers, data, warnings and end both times, and no panic (`crates/iso/tests/oracle.rs` compares the answers with libarchive) |
 | `cpio` | Reading the input as a cpio archive, with the `pwb` option or without as its first eight bytes pick, every entry and all of its data, twice, from pieces of the input and in pieces of different sizes they pick: the same headers, data and end both times; with some entries' data left for `next` to skip, the same headers; and when the RPM filter's bid takes the input for a package, its payload twice the same, read as a cpio archive too; no panic (`crates/cpio/tests/oracle.rs` compares the answers with libarchive) |
@@ -89,10 +93,14 @@ inputs of its compression requests, behind the modes that compress them:
 cargo fuzz run lz4 -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
-CI seeds `sevenz` with the archives of `testdata/oracle/7z.txt`:
+CI seeds `sevenz` with the archives of `testdata/oracle/7z.txt`, and
+`extract_7z` with those of `testdata/7z` behind a byte of options:
 
 ```sh
+mkdir -p fuzz/corpus/extract_7z
+for f in testdata/7z/*.7z; do { printf '\x12'; cat "$f"; } > "fuzz/corpus/extract_7z/$(basename "$f")"; done
 cargo fuzz run sevenz -- -max_total_time=3600 -rss_limit_mb=4096
+cargo fuzz run extract_7z -- -max_total_time=3600 -rss_limit_mb=4096
 ```
 
 CI seeds `zip_open` with the archives of `testdata/oracle/zip-open.txt` and

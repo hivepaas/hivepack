@@ -1,8 +1,8 @@
 # Porting UnRAR
 
-`hivepack-rar` will read RAR archives: list them, check them and give their entries' data, from RAR 1.4 to RAR 7. It is a port of UnRAR, RARLAB's own source, to safe Rust, under UnRAR's license, and it is checked against a program built from the same source. It does not write RAR, and never will: UnRAR's license forbids it, and so does this plan.
+`hivepack-rar` reads RAR archives: it lists them, checks them and gives their entries' data, from RAR 1.4 to RAR 7. It is a port of UnRAR, RARLAB's own source, to safe Rust, under UnRAR's license, and it is checked against a program built from the same source. It does not write RAR, and never will: UnRAR's license forbids it, and so does this plan.
 
-> **Status:** step 1 half done: `hivepack-rar` reads the headers of RAR 1.4, 1.5 to 4.x and 5.0 as UnRAR does, compared with UnRAR on libarchive's 131 RAR archives and 250,000 damaged copies of them (see [Progress](#progress)). The data of stored entries and their hashes come next.
+> **Status:** steps 1 to 3 are done: `hivepack-rar` reads what UnRAR reads, every algorithm, every cipher, volumes, comments and QuickOpen records, compared with UnRAR on the archives of libarchive, rarfile, junrar and unrar.rs and on damaged copies of them (see [Progress](#progress)). Extracting to disk, step 4, comes next.
 
 ## Why UnRAR
 
@@ -72,7 +72,7 @@ The cryptography stays in `hivepack-crypto`, under its own license, where it is 
 
 ## Progress
 
-**Step 1, the headers.** `Archive::open` finds the signature, at the start or after a self-extracting module in the first 4 MB, and reads up to the main header as `IsArchive` does; `read_header` reads each header as `ReadHeader` does, RAR 1.4's, RAR 1.5 to 4.x's and RAR 5's with their extra records, and `seek_to_next` moves past its data. What UnRAR keeps of each header is kept the same, its fields left as they were where UnRAR leaves them (`FileHeader::Reset` clears some fields only), and so are the archive's state, the positions, the broken header flag and the exit code UnRAR's `ErrHandler` would give. Headers that need a password stop the reading, as UnRAR's library stops without a callback; decryption is step 3. QuickOpen records, whose copies of the headers UnRAR reads in place of the headers when an archive has one, are read in step 3; the oracle runs with them off.
+**Step 1, the headers.** `Archive::open` finds the signature, at the start or after a self-extracting module in the first 4 MB, and reads up to the main header as `IsArchive` does; `read_header` reads each header as `ReadHeader` does, RAR 1.4's, RAR 1.5 to 4.x's and RAR 5's with their extra records, and `seek_to_next` moves past its data. What UnRAR keeps of each header is kept the same, its fields left as they were where UnRAR leaves them (`FileHeader::Reset` clears some fields only), and so are the archive's state, the positions, the broken header flag and the exit code UnRAR's `ErrHandler` would give. Headers that need a password stop the reading, as UnRAR's library stops without a callback; decryption is step 3. QuickOpen records, whose copies of the headers UnRAR reads in place of the headers when an archive has one, came in step 3.
 
 The oracle prints all of that, field by field, after every header, and `crates/rar/tests/oracle.rs` prints the same from the port. They agree on libarchive's 131 RAR archives, both with and without reading past a broken main header, on 2,500 damaged copies of the 125 under 64 KB in every run (`HIVEPACK_RAR_DAMAGED` and `HIVEPACK_RAR_SEED` make more: 250,000 agreed in a run by hand), and on the 2,000 inputs four minutes of fuzzing collected (`HIVEPACK_RAR_CORPUS`). Where UnRAR leaves a field unset, so that it holds what an earlier header or the heap left, neither side prints it. What the comparison found:
 
@@ -83,7 +83,7 @@ The oracle prints all of that, field by field, after every header, and `crates/r
 
 The comparison runs on Linux: UnRAR's macOS build decodes names with `UtfToWide`, where Linux's uses `mbsrtowcs`, and the port reads them as Linux's does. `testdata/oracle/rar-list.txt` holds the oracle's answers for libarchive's archives of 2 KB or less and damaged copies, 576 of them, replayed everywhere. The `rar_headers` fuzz target reads every header of its input twice: 7.4 million inputs over four minutes found nothing before the first commit.
 
-**Step 1, stored data.** `Extract::current_file` is `CmdExtract::ExtractCurrentFile` as UnRAR tests an archive: it takes the header `read_header` read, reads a stored entry's data as `UnstoreFile`, `UnpRead` and `UnpWrite` do, gives it to a callback, and checks it against CRC-32, BLAKE2sp or RAR 1.4's checksum. An entry that is compressed, encrypted or split across volumes is `Error::NotYet` for now, and the oracle passes over the same entries.
+**Step 1, stored data.** `Extract::current_file` is `CmdExtract::ExtractCurrentFile` as UnRAR tests an archive: it takes the header `read_header` read, reads a stored entry's data as `UnstoreFile`, `UnpRead` and `UnpWrite` do, gives it to a callback, and checks it against CRC-32, BLAKE2sp or RAR 1.4's checksum. Compressed, encrypted and split entries came in steps 2 and 3.
 
 The oracle's `test` request drives UnRAR's own `CmdExtract` the same way, with the options UnRAR's library sets, and prints after each header how much data came out, its FNV-1a hash, whether its hash failed, the position and the exit code. They agree on libarchive's 131 archives, with and without a smaller dictionary limit, and on 625,000 damaged copies by hand and 2,500 in each run. What they had to agree on, which is not in the format's description:
 
@@ -99,7 +99,7 @@ No archive at hand stores data under BLAKE2sp or RAR 1.4's checksum, and hivepac
 
 `testdata/oracle/rar-test.txt` holds the oracle's answers for libarchive's stored archives and those of 2 KB or less with damaged copies, and for hashes, replayed everywhere. The `rar_test` fuzz target goes through its input twice: 7.1 million inputs over four minutes found nothing before the first commit.
 
-**Step 2, decompression.** `Unpack` is UnRAR's `Unpack`: `v50` the algorithm of RAR 5.0 and 7.0 (unpack50.cpp), `v30` that of RAR 2.9 to 4 (unpack30.cpp), `ppm` its PPMd variant H (model.cpp, suballoc.cpp, coder.cpp) and `filters` its standard filters (rarvm.cpp). Solid entries go on from each other as they do in UnRAR. An entry compressed by RAR 1.5 or 2.x is still `Error::NotYet`, as is one that is encrypted or split across volumes. Three things differ from UnRAR, none in what comes out:
+**Step 2, decompression.** `Unpack` is UnRAR's `Unpack`: `v50` the algorithm of RAR 5.0 and 7.0 (unpack50.cpp), `v30` that of RAR 2.9 to 4 (unpack30.cpp), `ppm` its PPMd variant H (model.cpp, suballoc.cpp, coder.cpp) and `filters` its standard filters (rarvm.cpp). Solid entries go on from each other as they do in UnRAR. Three things differ from UnRAR, none in what comes out:
 
 - **The window grows as data reaches it.** UnRAR allocates the whole dictionary an entry asks for. It only reads the window where it has been written, so a few damaged bytes asking for 4 GiB cost nothing here. The one exception is a RAR 3 filter of no length, which reads to the end of the dictionary: what is not there yet is zeros.
 - **PPMd's heap is a byte array with 32-bit offsets**, in the layout of 6-byte states and 12-byte units that the algorithm was made for. UnRAR's larger structures are its adjustment to 64-bit pointers, which keeps to these sizes for every decision.
@@ -124,11 +124,36 @@ They agree on libarchive's 131 archives, and in runs by hand on the last code: 2
 
 `testdata/oracle/rar-unpack.txt` holds 790 of what the fuzzer found with UnRAR's answers, chosen so that they catch what the rest does not, and `rar-filters.txt` the answers for the filters, both replayed everywhere. A stream of 241 MB out of 176 KB takes about 1.6 times UnRAR's time, and a smaller one of binary data about 1.3 times. There is no large archive at hand to say more.
 
+**Step 3, the rest of reading.** `v15` and `v20` are `Unpack15` and `Unpack20`, with RAR 2's audio blocks. `crypt` is `CryptData`: the ciphers of RAR 1.3, 1.5 and 2.0, RAR 3's AES with its own SHA-1 variant, RAR 5's AES with PBKDF2, the password check and the keyed hashes, with encrypted headers too. `Archive::open_with_password` takes the password, and nothing else asks for one: an entry without one stops the reading and says so, and one RAR 5's check refuses says that, both as UnRAR's library does. `Archive::open_volumes` takes a volume's name and how to open others by theirs; `merge_archive` is `MergeArchive`, and an entry's data goes on across volumes, encrypted too. `Archive::get_comment` is `GetComment` and `ReadSubData`. `quick_open` is `QuickOpen`.
+
+What they had to agree on, which is not written anywhere:
+
+- A stream of RAR 1.5 or 2.x goes on into RAR 3's and back. A window can be made again under a solid stream, and reads as zeros; a distance of 0 is copied onto itself; and a table of RAR 3 can decode past what RAR 2's static tables have, which is out of bounds in UnRAR and zero here.
+- Entries of RAR 1.3 to 1.5 go by the archive's solid flag and how many entries came before, as they have none of their own.
+- RAR 3's SHA-1 goes its own way only on long passwords, so the `crypt` request compares passwords of every length and alphabet.
+
+**A QuickOpen record changes what an archive says.** RAR 5 puts copies of headers near an archive's end, each with where it belongs, and a main header's locator says where they are. UnRAR's library has them on, so while a record is loaded every read at such a place gets the copy and not what is there, for data as for headers. A copy passes the same CRC as a header, and nothing compares it with the header it stands for, so one archive can show one list of files to UnRAR and another to a reader that does not take QuickOpen into account, which is why the port follows it and the oracle runs with it on. The rest of what it comes to:
+
+- The `Read`, `Seek` and `Tell` of `Archive` go by the record's position, and the file's own position goes its own way. When a record fails, reading goes on from wherever the file is, if a read was the last thing to touch it.
+- `FileLength` goes by way of `Seek` and `Tell`, and going back before the copy at hand reads the record again from its start, so asking how long a file is can change the reading.
+- `SubHead` is read when it is needed and not when the record is loaded: another service header on the way changes whether the record is taken as encrypted, and with what keys. Reading the record also leaves its own header in `SubHead`, and the check value of its keys.
+- A record with no password for it is dropped without a word, with the file wherever it was.
+- A locator further than `lseek` can go is a fatal error, `Error::BadSeek`, and a record of some other name is passed over.
+- A copy of 2 MiB is out of reach. A block's size has three bytes, and a block saying more than those can is taken as invalid, which ends the record, before the check on a copy's size in `ReadNext` can say anything.
+
+No archive at hand gives a record any trouble, so `tests/support/patch.rs` makes one from a fuzzer's bytes, `with_quick_open`, with its CRCs right: copies true or false, of other sizes, around the end of the record's 64 KiB buffer. `quick_open_copies_stand_for_headers` checks that the copies are what is read, because these inputs compare the same when no record is found: a mistake in the patch did that at first, and only mutants showed it.
+
+Of 45 mutants of `quick_open` and what calls it, what CI runs catches 30. Of the 15 left, 7 change nothing: the locator's flag, which an offset cannot be set without, a position set again before it is read, the threshold for moving the buffer, which a block crossing its end does not depend on, the two checks of a block's size, either of which is enough as a size that does not end reads as 0, and the two limits on a copy's size. 5 next to nothing: what `FileLength` leaves when reading is over, `SubHead`'s check value, which nothing reads afterwards, and how many bytes of a last incomplete encrypted block are decrypted. The other 3 are not reached: a volume without a record after one with, a file's header at the locator with a record's service header before it, and a read of the file, then of a copy, then of the file.
+
+They agree in a run by hand on this code, with `HIVEPACK_RAR_DAMAGED=300`: 37,500 damaged copies listed, 37,500 tested and 37,500 with damaged headers, 14,400 encrypted, 247,566 for comments and 74,277 of 82 sets of volumes, whole, from any volume, one missing and damaged, all with QuickOpen on. For the record itself, 5,000 inputs at random and the 636 the fuzzer found in six minutes, each read four ways: listed, tested without and with a password, and for its comment.
+
+`testdata/oracle/rar-unpack-old.txt`, `rar-password.txt`, `rar-volumes.txt` and `rar-quick-open.txt` hold what the `rar_unpack_old`, `rar_password`, `rar_volumes` and `rar_quick_open` fuzz targets found, with UnRAR's answers, replayed everywhere.
+
 ## The order of work
 
-1. **Headers and stored data.** The signature, after a self-extracting module or not; the headers of RAR 1.4, 1.5 to 4.x and 5.0, their CRCs and RAR 5's extra records; listing; the data of stored entries, checked against CRC-32 or BLAKE2sp. `hivepack-crypto` gets BLAKE2s and BLAKE2sp.
-2. **Decompression**: RAR 2.9/3.x (its LZ, PPMd and standard filters), and RAR 5.0 and 7.0, solid archives included. RAR 7's algorithm is only reached by the copies above, as no archive at hand uses it.
-3. **The rest of reading**: encryption (RAR 1.3, 1.5, 2.0, 3.x and 5.0, headers too; `hivepack-crypto` gets AES decryption, HMAC-SHA256 and PBKDF2-HMAC-SHA256), volumes, comments, RAR 1.5 and 2.x compression.
+1. **Headers and stored data**, done. The signature, after a self-extracting module or not; the headers of RAR 1.4, 1.5 to 4.x and 5.0, their CRCs and RAR 5's extra records; listing; the data of stored entries, checked against CRC-32 or BLAKE2sp. `hivepack-crypto` gets BLAKE2s and BLAKE2sp.
+2. **Decompression**, done: RAR 2.9/3.x (its LZ, PPMd and standard filters), and RAR 5.0 and 7.0, solid archives included. RAR 7's algorithm is only reached by the copies above, as no archive at hand uses it.
+3. **The rest of reading**, done: QuickOpen records, encryption (RAR 1.3, 1.5, 2.0, 3.x and 5.0, headers too; `hivepack-crypto` gets AES decryption, HMAC-SHA256 and PBKDF2-HMAC-SHA256), volumes, comments, RAR 1.5 and 2.x compression.
 4. **Extracting**: `extract_rar` in `hivepack-extract`, through its rules, with RAR's links and times, and the archives behind RAR's CVEs (WinRAR's CVE-2025-8088 and CVE-2025-6218, 7-Zip's CVE-2026-58052).
 
 Each step is a pull request or a few, with its tests against the oracle.

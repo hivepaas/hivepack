@@ -30,12 +30,19 @@ fn read(data: &[u8], enable_broken: bool) -> (Vec<(u32, i64, i64, usize)>, Strin
         match archive.read_header() {
             Ok(0) => return (headers, format!("end {:?}", archive.exit_code())),
             Ok(size) => {
-                headers.push((archive.cur_header_type, archive.cur_block_pos, archive.next_block_pos, size));
+                headers.push((
+                    archive.cur_header_type,
+                    archive.cur_block_pos,
+                    archive.next_block_pos,
+                    size,
+                ));
                 // Each header is past the one before: reading ends.
                 assert!(archive.next_block_pos > archive.cur_block_pos);
                 archive.seek_to_next();
             }
-            Err(e @ Error::MissingPassword { .. }) => return (headers, e.to_string()),
+            Err(e @ (Error::MissingPassword { .. } | Error::BadSeek { .. })) => {
+                return (headers, e.to_string());
+            }
             Err(e) => panic!("{e}"),
         }
     }

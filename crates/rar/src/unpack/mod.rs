@@ -10,9 +10,9 @@
 // in source code comments of resulting package.
 
 //! Decompressing: UnRAR's `Unpack` (unpack.cpp, unpackinline.cpp) and its
-//! `BitInput` (getbits.cpp), what all its algorithms share. `v30` is the
-//! algorithm of RAR 2.9 to 4, with `ppm` and `filters`, and `v50` that of
-//! RAR 5.0 and 7.0.
+//! `BitInput` (getbits.cpp), what all its algorithms share. `v15` is the
+//! algorithm of RAR 1.3 to 1.5, `v20` that of RAR 2.x, `v30` that of RAR 2.9
+//! to 4, with `ppm` and `filters`, and `v50` that of RAR 5.0 and 7.0.
 //!
 //! One difference from UnRAR, which makes none to what comes out: UnRAR
 //! allocates the whole dictionary an entry asks for, and the window here grows
@@ -22,8 +22,10 @@
 
 mod filters;
 #[cfg(test)]
-mod oracle_tests;
+pub(crate) mod oracle_tests;
 mod ppm;
+mod v15;
+mod v20;
 mod v30;
 mod v50;
 
@@ -33,6 +35,8 @@ use crate::error::Error;
 
 use filters::{RarVm, StandardFilter};
 use ppm::ModelPpm;
+use v15::State15;
+use v20::State20;
 use v30::{BlockType, Filter30, HUFF_TABLE_SIZE30};
 
 /// `MAX_QUICK_DECODE_BITS`.
@@ -74,8 +78,9 @@ const NC30: usize = 299;
 
 /// What decompression reads from and writes to: `ComprDataIO`.
 pub(crate) trait UnpIo {
-    /// `UnpRead`: packed data, how many bytes, 0 when none is left.
-    fn unp_read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
+    /// `UnpRead`: packed data, how many bytes, 0 when none is left, and
+    /// nothing where it returns -1, for a next volume that is missing.
+    fn unp_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error>;
     /// `UnpWrite`: unpacked data.
     fn unp_write(&mut self, data: &[u8]) -> Result<(), Error>;
 }
@@ -314,7 +319,11 @@ pub(crate) struct Unpack {
     filters: Vec<Filter>,
 
     old_dist: [usize; 4],
+    /// For RAR 2 and older, whose `old_dist` goes round.
+    old_dist_ptr: usize,
     last_length: u32,
+    /// For RAR 2 and older: in RAR 3 the last distance is `old_dist[0]`.
+    last_dist: u32,
 
     unp_ptr: usize,
     prev_ptr: usize,
@@ -339,6 +348,9 @@ pub(crate) struct Unpack {
 
     tables_read3: bool,
     tables_read5: bool,
+
+    st15: Box<State15>,
+    st20: Box<State20>,
 
     // RAR 3.
     prev_low_dist: i32,
@@ -379,7 +391,9 @@ impl Unpack {
             filter_dst_memory: Vec::new(),
             filters: Vec::new(),
             old_dist: [0; 4],
+            old_dist_ptr: 0,
             last_length: 0,
+            last_dist: 0,
             unp_ptr: 0,
             prev_ptr: 0,
             first_win_done: false,
@@ -395,6 +409,8 @@ impl Unpack {
             written_file_size: 0,
             tables_read3: false,
             tables_read5: false,
+            st15: Box::new(State15::new()),
+            st20: Box::new(State20::new()),
             prev_low_dist: 0,
             low_dist_rep_count: 0,
             ppm: Some(Box::new(ModelPpm::new())),
@@ -465,6 +481,10 @@ impl Unpack {
         io: &mut dyn UnpIo,
     ) -> Result<(), Error> {
         match method {
+            // RAR 1.5.
+            15 => self.unpack15(solid, io),
+            // RAR 2.x, and files larger than 2 GB.
+            20 | 26 => self.unpack20(solid, io),
             // RAR 2.9 to 4.
             29 => self.unpack29(solid, io),
             // RAR 5.0 and 7.0.
@@ -480,6 +500,8 @@ impl Unpack {
     fn unp_init_data(&mut self, solid: bool) {
         if !solid {
             self.old_dist = [usize::MAX; 4];
+            self.old_dist_ptr = 0;
+            self.last_dist = u32::MAX;
             self.last_length = 0;
             *self.block_tables = BlockTables::zero();
             self.unp_ptr = 0;
@@ -500,6 +522,7 @@ impl Unpack {
             block_size: -1,
             ..BlockHeader::default()
         };
+        self.st20.init_data(solid);
         self.unp_init_data30(solid);
         self.unp_init_data50(solid);
     }
@@ -546,11 +569,22 @@ impl Unpack {
 
     /// Makes the window long enough for a match from `unp_ptr`. Past the
     /// window's end a match wraps, and by then the window has its full size.
+    ///
+    /// Having been through a window means it has its full size for what comes
+    /// next, even if the window was made again. That takes a RAR 1.5 entry
+    /// solid by the archive's flag and not by its own, whose `Init` makes a
+    /// larger window while the stream goes on: then a match reads zeros.
     #[inline(always)]
     fn reserve_window(&mut self) -> Result<(), Error> {
-        let needed = self.unp_ptr + MAX_INC_LZ_MATCH + 1;
-        if needed > self.window.len() && self.window.len() < self.max_win_size {
-            return self.grow_window(needed);
+        if self.window.len() < self.max_win_size {
+            let needed = if self.first_win_done {
+                self.max_win_size
+            } else {
+                self.unp_ptr + MAX_INC_LZ_MATCH + 1
+            };
+            if needed > self.window.len() {
+                return self.grow_window(needed);
+            }
         }
         Ok(())
     }
@@ -565,6 +599,20 @@ impl Unpack {
             .try_reserve_exact(size - self.window.len())
             .map_err(|_| Error::NoMemory)?;
         self.window.resize(size, 0);
+        Ok(())
+    }
+
+    /// A window of at least `end` bytes, zeros past what has been written.
+    /// Entries of RAR 1.5 that are solid only by the archive's flag can change
+    /// the window under what is still to be written: there it is what UnRAR's
+    /// cleared window has.
+    fn window_up_to(&mut self, end: usize) -> Result<(), Error> {
+        if end > self.window.len() {
+            self.window
+                .try_reserve_exact(end - self.window.len())
+                .map_err(|_| Error::NoMemory)?;
+            self.window.resize(end, 0);
+        }
         Ok(())
     }
 
@@ -607,6 +655,9 @@ impl Unpack {
             } else if distance == 1 {
                 let byte = self.window[src_ptr];
                 self.window[unp_ptr..unp_ptr + length].fill(byte);
+            } else if distance == 0 {
+                // RAR 1.5 can leave a distance of 0 for a solid entry of a
+                // later algorithm: each byte is copied onto itself.
             } else {
                 // Overlapping: what was just written is read again, and it
                 // repeats, so that each copy can be as long as all before it.

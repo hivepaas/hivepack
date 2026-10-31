@@ -7,8 +7,7 @@
 //
 //   list <enable_broken> <hex>
 //
-// opens the archive (its bytes in hex), with QuickOpen off, as IsArchive
-// opens it, then reads every header as Archive::ReadHeader reads them,
+// opens the archive (its bytes in hex), as IsArchive opens it, then reads every header as Archive::ReadHeader reads them,
 // printing what UnRAR keeps of each: the header's fields, the archive's
 // state, and the exit code at the end.
 //
@@ -332,6 +331,22 @@ static void close_archive_file(int fd, const char *path) {
 #endif
 }
 
+// The password of the request being answered, in hex: UTF-8.
+static std::wstring request_password;
+
+static void set_password(CommandData &Cmd) {
+  if (!request_password.empty())
+    Cmd.Password.Set(request_password.c_str());
+}
+
+static std::wstring password_from_hex(const char *hex) {
+  std::vector<byte> bytes = unhex(hex);
+  std::string utf((const char *)bytes.data(), bytes.size());
+  std::wstring wide;
+  UtfToWide(utf.c_str(), wide);
+  return wide;
+}
+
 static void do_list(int enable_broken, const char *hex) {
   char path[64];
   int fd = archive_file(hex, path, sizeof(path));
@@ -341,7 +356,7 @@ static void do_list(int enable_broken, const char *hex) {
   out = "list";
   ErrHandler.Clean();
   CommandData Cmd;
-  Cmd.QOpenMode = QOPEN_NONE;
+  set_password(Cmd);
   try {
     Archive Arc(&Cmd);
     std::string narrow(path);
@@ -393,6 +408,9 @@ void operator delete[](void *memory) noexcept { free(memory); }
 void operator delete[](void *memory, size_t) noexcept { free(memory); }
 
 static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
+  // A next volume that is there is fine, and one that is not stays that way.
+  if ((msg == UCM_CHANGEVOLUME || msg == UCM_CHANGEVOLUMEW) && p2 == RAR_VOL_NOTIFY)
+    return 1;
   if (msg != UCM_PROCESSDATA)
     return -1;
   const byte *data = (const byte *)p1;
@@ -404,20 +422,53 @@ static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
   return 1;
 }
 
+// The volumes of a `testvol` request, each a name and its bytes: the archive is
+// the first, among real files so that UnRAR finds the next ones by their names.
+static std::vector<std::pair<std::string, std::string>> request_volumes;
+
+static std::string write_volumes() {
+  char dir[] = "/tmp/rar-oracle-XXXXXX";
+  if (!mkdtemp(dir))
+    return "";
+  for (auto &volume : request_volumes) {
+    std::vector<byte> data = unhex(volume.second.c_str());
+    std::string name = std::string(dir) + "/" + volume.first;
+    FILE *f = fopen(name.c_str(), "wb");
+    if (!f)
+      return "";
+    if (!data.empty())
+      fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+  }
+  return dir;
+}
+
+static void remove_volumes(const std::string &dir) {
+  for (auto &volume : request_volumes)
+    unlink((dir + "/" + volume.first).c_str());
+  rmdir(dir.c_str());
+}
+
 static void do_test(const char *hex, unsigned long long limit) {
-  char path[64];
-  int fd = archive_file(hex, path, sizeof(path));
-  if (fd < 0)
-    return;
+  char path[256];
+  std::string volume_dir;
+  int fd = -1;
+  if (request_volumes.empty()) {
+    fd = archive_file(hex, path, sizeof(path));
+    if (fd < 0)
+      return;
+  } else {
+    volume_dir = write_volumes();
+    snprintf(path, sizeof(path), "%s/%s", volume_dir.c_str(), request_volumes[0].first.c_str());
+  }
 
   out = "test";
   ErrHandler.Clean();
-  // What RAROpenArchiveEx and ProcessFile set for testing, with QuickOpen off.
+  // What RAROpenArchiveEx and ProcessFile set for testing, QuickOpen on, as there.
   // Recursing is the one difference: with "*" as the only mask and no recursing,
   // UnRAR stops after a first file whose name is that very "*", taking it for
   // all that was asked for, which says nothing of reading the archive.
   CommandData Cmd;
-  Cmd.QOpenMode = QOPEN_NONE;
   Cmd.FileArgs.AddString(L"*");
   Cmd.Overwrite = OVERWRITE_ALL;
   Cmd.VersionControl = 1;
@@ -427,6 +478,7 @@ static void do_test(const char *hex, unsigned long long limit) {
   Cmd.Test = true;
   if (limit != 0)
     Cmd.WinSizeLimit = Cmd.WinSize = limit;
+  set_password(Cmd);
   try {
     Archive Arc(&Cmd);
     CmdExtract Extract(&Cmd);
@@ -439,7 +491,7 @@ static void do_test(const char *hex, unsigned long long limit) {
     } else {
       out += " archive";
       // Only now: IsArchive reads on past an encrypted main header if there is
-      // a callback that could give a password. Passwords are for later.
+      // a callback that could give a password, and this one gives none.
       Cmd.Callback = test_callback;
       Extract.ExtractArchiveInit(Arc);
       while (true) {
@@ -449,16 +501,12 @@ static void do_test(const char *hex, unsigned long long limit) {
         put("headertype", (unsigned)Arc.GetHeaderType());
         put("cur", (unsigned long long)Arc.CurBlockPos);
         put("next", (unsigned long long)Arc.NextBlockPos);
-        // What hivepack-rar cannot read yet is passed over on both sides, and
-        // so is what UnRAR's mask refuses: "*" does not match a name that
+        // What UnRAR's mask refuses is passed over on both sides: "*" does not match a name that
         // starts with "*" and goes on, as match() takes that "*" for a plain
         // character. That is choosing files, and hivepack-rar has no masks.
         if (size != 0 && Arc.GetHeaderType() == HEAD_FILE) {
           FileHeader &h = Arc.FileHead;
-          bool old_method = h.UnpVer >= 13 && h.UnpVer <= 15 || h.UnpVer == 20 || h.UnpVer == 26;
-          if ((h.Method != 0 && Arc.Format != RARFMT50 && old_method) || h.Encrypted ||
-              h.SplitBefore || h.SplitAfter ||
-              !Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
+          if (!Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
             out += " later";
             Arc.SeekToNext();
             continue;
@@ -474,12 +522,60 @@ static void do_test(const char *hex, unsigned long long limit) {
         put("data", data_size);
         put("fnv", data_fnv);
         put("baddata", Cmd.DllError == ERAR_BAD_DATA);
+        put("nopassword", Cmd.DllError == ERAR_MISSING_PASSWORD);
+        put("badpassword", Cmd.DllError == ERAR_BAD_PASSWORD);
+        put("novolume", Cmd.DllError == ERAR_EOPEN);
         put("pos", (unsigned long long)Arc.Tell());
         put("broken", Arc.BrokenHeader);
         put("code", ErrHandler.GetErrorCode());
         if (!go)
           break;
       }
+    }
+  } catch (RAR_EXIT code) {
+    put("thrown", code);
+  } catch (std::bad_alloc &) {
+    out += " badalloc";
+  }
+  put("exit", ErrHandler.GetErrorCode());
+  if (volume_dir.empty())
+    close_archive_file(fd, path);
+  else
+    remove_volumes(volume_dir);
+  printf("%s\n", out.c_str());
+}
+
+// Archive::GetComment after opening, as what comes before the first entry.
+static void do_comment(const char *hex) {
+  char path[64];
+  int fd = archive_file(hex, path, sizeof(path));
+  if (fd < 0)
+    return;
+  out = "comment";
+  ErrHandler.Clean();
+  CommandData Cmd;
+  set_password(Cmd);
+  try {
+    Archive Arc(&Cmd);
+    std::string narrow(path);
+    std::wstring wide(narrow.begin(), narrow.end());
+    if (!Arc.Open(wide)) {
+      out += " notopened";
+    } else if (!Arc.IsArchive(true)) {
+      out += " notarchive";
+    } else {
+      std::wstring comment;
+      if (Arc.GetComment(comment)) {
+        out += " comment=";
+        for (wchar c : comment) {
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%x,", (unsigned)c);
+          out += buf;
+        }
+      } else {
+        out += " none";
+      }
+      put("pos", (unsigned long long)Arc.Tell());
     }
   } catch (RAR_EXIT code) {
     put("thrown", code);
@@ -622,6 +718,37 @@ static void do_ppm(unsigned long long count, uint heap, const char *hex) {
   printf("%s\n", out.c_str());
 }
 
+// CryptData by itself: SetCryptKeys with this password, salt ("-" for none)
+// and count, then DecryptBlock of this data in chunks of this size.
+static void do_crypt(int method, const char *password, const char *salt_hex, const char *initv_hex,
+                     uint lg2, size_t chunk, const char *hex) {
+  static CryptData crypt;
+  std::vector<byte> data = unhex(hex);
+  std::vector<byte> salt = unhex(salt_hex);
+  std::vector<byte> initv = unhex(initv_hex);
+  salt.resize(SIZE_SALT50);
+  initv.resize(SIZE_INITV);
+  SecPassword pwd;
+  pwd.Set(password_from_hex(password).c_str());
+  byte hash_key[SHA256_DIGEST_SIZE] = {0};
+  byte psw_check[SIZE_PSWCHECK] = {0};
+  bool set = crypt.SetCryptKeys(false, (CRYPT_METHOD)method, &pwd,
+                                strcmp(salt_hex, "-") == 0 ? NULL : salt.data(), initv.data(), lg2,
+                                hash_key, psw_check);
+  out = "crypt";
+  put("set", set);
+  if (set) {
+    put_bytes("hashkey", hash_key, sizeof(hash_key));
+    put_bytes("pswcheck", psw_check, sizeof(psw_check));
+    data.resize(data.size() + CRYPT_BLOCK_SIZE);
+    size_t size = data.size() - CRYPT_BLOCK_SIZE;
+    for (size_t at = 0; at < size; at += chunk)
+      crypt.DecryptBlock(data.data() + at, Min(chunk, size - at));
+    put_bytes("data", data.data(), size);
+  }
+  printf("%s\n", out.c_str());
+}
+
 int main() {
   setenv("TZ", "UTC", 1);
   tzset();
@@ -635,11 +762,36 @@ int main() {
       line += (char)c;
     if (c == EOF && line.empty())
       break;
-    char *words[7];
+    char *words[512];
     int count = 0;
-    for (char *w = strtok(&line[0], " "); w && count < 7; w = strtok(NULL, " "))
+    for (char *w = strtok(&line[0], " "); w && count < 512; w = strtok(NULL, " "))
       words[count++] = w;
-    if (count == 3 && strcmp(words[0], "list") == 0)
+    if (count >= 5 && count % 2 == 1 && strcmp(words[0], "testvol") == 0) {
+      // testvol <password> <limit> <name> <bytes> ...
+      if (strcmp(words[1], "-") != 0)
+        request_password = password_from_hex(words[1]);
+      for (int i = 3; i + 1 < count; i += 2)
+        request_volumes.emplace_back(words[i], words[i + 1]);
+      do_test("", strtoull(words[2], NULL, 10));
+      request_volumes.clear();
+      request_password.clear();
+    } else if (count == 3 && strcmp(words[0], "comment") == 0) {
+      if (strcmp(words[1], "-") != 0)
+        request_password = password_from_hex(words[1]);
+      do_comment(words[2]);
+      request_password.clear();
+    } else if (count == 8 && strcmp(words[0], "crypt") == 0)
+      do_crypt(atoi(words[1]), words[2], words[3], words[4], (uint)atoi(words[5]),
+               strtoul(words[6], NULL, 10), words[7]);
+    else if ((count == 3 || count == 4) && strcmp(words[0], "testpw") == 0) {
+      request_password = password_from_hex(words[1]);
+      do_test(words[2], count == 4 ? strtoull(words[3], NULL, 10) : 0);
+      request_password.clear();
+    } else if (count == 4 && strcmp(words[0], "listpw") == 0) {
+      request_password = password_from_hex(words[1]);
+      do_list(atoi(words[2]), words[3]);
+      request_password.clear();
+    } else if (count == 3 && strcmp(words[0], "list") == 0)
       do_list(atoi(words[1]), words[2]);
     else if (count == 2 && strcmp(words[0], "list") == 0)
       do_list(atoi(words[1]), "");

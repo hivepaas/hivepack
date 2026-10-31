@@ -257,6 +257,34 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_unpack_old"
+path = "fuzz_targets/rar_unpack_old.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_password"
+path = "fuzz_targets/rar_password.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_quick_open"
+path = "fuzz_targets/rar_quick_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_volumes"
+path = "fuzz_targets/rar_volumes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "extract_xar"
 path = "fuzz_targets/extract_xar.rs"
 test = false
@@ -291,6 +319,13 @@ bench = false
 [[bin]]
 name = "sevenz"
 path = "fuzz_targets/sevenz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_7z"
+path = "fuzz_targets/extract_7z.rs"
 test = false
 doc = false
 bench = false

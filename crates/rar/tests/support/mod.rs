@@ -38,6 +38,60 @@ pub fn testdata() -> PathBuf {
 /// libarchive's RAR test archives (the `libarchive-rar` set), by name, or
 /// none with a note when they are not fetched; CI lists the `core` group
 /// in `HIVEPACK_TESTDATA_REQUIRED`, and then they must be there.
+/// The RAR archives that rarfile, junrar and unrar.rs keep for their tests,
+/// whatever their names, or nothing if they are not fetched.
+pub fn other_projects_archives() -> Vec<(String, Vec<u8>)> {
+    fn walk(folder: &std::path::Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(folder).expect("the folder") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut archives = Vec::new();
+    for set in ["rarfile-tests", "junrar-tests", "unrar-rs-tests"] {
+        let folder = testdata().join(set);
+        if !folder.join(".complete").exists() {
+            let required = std::env::var("HIVEPACK_TESTDATA_REQUIRED").unwrap_or_default();
+            assert!(
+                !required.split(',').any(|g| g == "all" || g == "generated"),
+                "{set} is missing: run `python3 scripts/testdata.py fetch`"
+            );
+            eprintln!("skipping: {set} is not fetched");
+            continue;
+        }
+        let mut found = Vec::new();
+        walk(&folder, &mut found);
+        found.sort();
+        for path in found {
+            let is_archive = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "rar"
+                    || e == "sfx"
+                    || e == "exe"
+                    || e.starts_with('r')
+                        && e.len() == 3
+                        && e[1..].bytes().all(|b| b.is_ascii_digit())
+            });
+            if is_archive {
+                let name = path
+                    .strip_prefix(&folder)
+                    .expect("in it")
+                    .display()
+                    .to_string();
+                archives.push((
+                    format!("{set}/{name}"),
+                    std::fs::read(&path).expect("the archive"),
+                ));
+            }
+        }
+    }
+    archives
+}
+
 pub fn libarchive_archives() -> Vec<(String, Vec<u8>)> {
     let folder = testdata().join("libarchive-rar");
     if !folder.join(".complete").exists() {

@@ -1102,6 +1102,13 @@ impl Xar {
     }
 
     /// `xar_read_data_skip`: what is left of the entry's data.
+    ///
+    /// Differs from libarchive, which adds the bytes of the last block read
+    /// but not yet consumed to its place in the heap a second time
+    /// (`xar_read_data` added them when it read the block): after data read
+    /// only in part, the next entry then seems behind it, and is gone back
+    /// to, which an input that cannot seek fails ("Cannot seek"). Here they
+    /// count once.
     pub(crate) fn read_data_skip<R: Read>(&mut self, input: &mut Input<R>) -> Result<(), Error> {
         if self.end_of_file {
             // ARCHIVE_EOF, which archive_read_data_skip takes for success.
@@ -1110,7 +1117,7 @@ impl Xar {
         let request = self.entry_remaining.wrapping_add(self.entry_unconsumed) as i64;
         input.consume(request).map_err(|e| self.fail(e))?;
         if request > 0 {
-            self.offset = self.offset.wrapping_add(request as u64);
+            self.offset = self.offset.wrapping_add(self.entry_remaining);
         }
         self.entry_unconsumed = 0;
         Ok(())

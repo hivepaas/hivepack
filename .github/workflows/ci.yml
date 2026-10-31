@@ -90,7 +90,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # ubuntu-latest, which builds every oracle and compares with zstd's
+    # corpora, took 53 minutes before XAR extraction's tests were added.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

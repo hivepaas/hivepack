@@ -58,8 +58,10 @@
 //! images, the same way; [`extract_udf`] UDF volumes and [`extract_7z`] 7z
 //! archives, checked first, as ZIP archives are.
 //!
-//! The design, and what comes next (RAR), are in the repository's
-//! `docs/extract.md`.
+//! With the feature `rar`, off by default as it takes UnRAR's license,
+//! `extract_rar` extracts RAR archives the same way, reading them twice.
+//!
+//! The design is in the repository's `docs/extract.md`.
 
 mod cpio;
 mod destination;
@@ -69,6 +71,8 @@ mod name;
 mod origin;
 mod plan;
 mod progress;
+#[cfg(feature = "rar")]
+mod rar;
 mod sevenz;
 mod tar;
 mod udf;
@@ -77,12 +81,16 @@ mod xar;
 mod zip;
 
 pub use cpio::extract_cpio;
+#[cfg(feature = "rar")]
+pub use error::RarProblem;
 pub use error::{Error, ErrorKind};
 pub use iso::extract_iso;
 pub use name::{MAX_COMPONENT, Name, NameError, check_name};
 pub use origin::Origin;
 pub use plan::{Limits, Links, Names, OnRefused, Options, Packages, Permissions};
 pub use progress::{Cancel, Progress, ProgressFn};
+#[cfg(feature = "rar")]
+pub use rar::extract_rar;
 pub use sevenz::extract_7z;
 pub use tar::extract_tar;
 pub use udf::extract_udf;

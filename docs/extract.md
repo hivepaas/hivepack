@@ -1,6 +1,6 @@
 # Extracting safely
 
-`hivepack-extract` writes an archive's entries to disk, and is safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs. It extracts ZIP archives that `hivepack-zip` opened, tar archives that `hivepack-tar` reads, cpio archives that `hivepack-cpio` reads (RPM packages' payloads among them), XAR archives that `hivepack-xar` reads (macOS packages and `.xip` files, their payloads expanded), ISO 9660 images that `hivepack-iso` reads, UDF volumes that `hivepack-udf` mounts and 7z archives that `hivepack-7z` opened, with the same checks and the same writing; RAR will too.
+`hivepack-extract` writes an archive's entries to disk, and is safe by default: nothing is written outside the destination, through a link, over what is there, or past limits set against archive bombs. It extracts ZIP archives that `hivepack-zip` opened, tar archives that `hivepack-tar` reads, cpio archives that `hivepack-cpio` reads (RPM packages' payloads among them), XAR archives that `hivepack-xar` reads (macOS packages and `.xip` files, their payloads expanded), ISO 9660 images that `hivepack-iso` reads, UDF volumes that `hivepack-udf` mounts, 7z archives that `hivepack-7z` opened and, with the feature `rar`, off by default as it takes UnRAR's license, RAR archives that `hivepack-rar` reads, with the same checks and the same writing.
 
 Extractors no longer break on memory, which safe Rust settles, but on logic, and memory-safe code gets that wrong as often as C: writing through a link (the `zip` crate's CVE-2025-29787, adm-zip's CVE-2026-76845), keeping setuid bits or chmod through a link (RUSTSEC-2026-0367 and 0369), links that point outside (RUSTSEC-2026-0368), alternate data streams on Windows (WinRAR's CVE-2025-8088, exploited), and Python's tarfile filter, which took five CVEs in June 2025 for checking strings and `realpath`. The rules below answer those, and come from the research behind this repository's ZIP plan.
 
@@ -228,7 +228,8 @@ The `extract_tar` fuzz target does the same for tar, seeded with Go's test archi
 | CVE-2023-38831, exploited | WinRAR | a file and a folder of one name, `report.pdf ` and `report.pdf /` | the trailing space; without it, the same path | `cve_2023_38831_a_file_and_a_folder_of_one_name` |
 | CVE-2013-4787 (Master Key) | Android | one name twice, one checked and the other used | libzip's consistency check at opening; without it, the same path | `cve_2013_4787_one_name_twice` |
 | CVE-2021-37712 | node-tar | a link and a directory whose names are one once normalized | names compared by their key (`Duplicate`) | `cve_2021_37712_a_link_and_a_directory_one_by_normalization` |
-| CVE-2025-8088, exploited | WinRAR | NTFS streams whose names climb with `..\` to the Startup folder | the backslash, and the colon with backslashes as separators or names cleaned up | `cve_2025_8088_streams_that_climb` |
+| CVE-2025-8088, exploited | WinRAR | NTFS streams whose names climb with `..\` to the Startup folder | the backslash, and the colon with backslashes as separators or names cleaned up | `cve_2025_8088_streams_that_climb`, and the same in `rar.rs` as RAR 4 and RAR 5 archives |
+| CVE-2025-6218 | WinRAR | a name that climbs out with `..\` | RAR 4, the climb; RAR 5 from Unix, the backslash; RAR 5 from Windows reads it as one name with `_`, inside | `rar.rs`: `cve_2025_6218_a_path_that_climbs` |
 | CVE-2026-58052 | 7-Zip | streams `:Zone.Identifier:$DATA` and `::$DATA`, over the file's mark and data | the colon; skipped, the file alone is written | `cve_2026_58052_streams_that_replace_the_mark` |
 | CVE-2025-0411, exploited | 7-Zip | the Mark of the Web lost through an archive inside an archive | every file gets the archive's mark, an inner archive too, and what is extracted from it (Windows) | `cve_2025_0411_the_mark_through_nested_archives` |
 | CVE-2021-1810 | macOS's Archive Utility | no quarantine on paths longer than 886 characters | the mark set on each file's descriptor, whatever its path (macOS) | `cve_2021_1810_the_quarantine_on_long_paths` |
@@ -238,6 +239,5 @@ Two are not made again: macOS's CVE-2026-28849 ("a maliciously crafted ZIP archi
 
 ## What comes next
 
-- **RAR**, through the same checks and writing.
 - **Sparse files written with holes**, rather than zeros.
 - **The tar archives behind Python's tarfile CVEs** of June 2025, made again as these are.

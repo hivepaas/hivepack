@@ -15,6 +15,49 @@ pub struct Error {
     pub kind: ErrorKind,
 }
 
+/// What is wrong with a RAR archive or entry, as [`hivepack_rar::Extract`]
+/// says it.
+#[cfg(feature = "rar")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RarProblem {
+    /// A header is broken, or the archive is cut short.
+    BrokenArchive,
+    /// An entry's data does not match its hash.
+    BrokenData,
+    /// A link's target is too long to be one, or cut short.
+    BrokenLink,
+    /// An entry is encrypted, and there is no password.
+    MissingPassword,
+    /// The password is not the entry's.
+    BadPassword,
+    /// A next volume is not there.
+    MissingVolume,
+    /// The first entry goes on from a volume before this one.
+    NeedsPreviousVolume,
+    /// An entry asks for a dictionary over what UnRAR allows.
+    DictionaryTooLarge,
+    /// An entry is of a version or an encryption not known.
+    UnknownFormat,
+}
+
+#[cfg(feature = "rar")]
+impl std::fmt::Display for RarProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RarProblem::BrokenArchive => "a header is broken, or the archive is cut short",
+            RarProblem::BrokenData => "data does not match its hash",
+            RarProblem::BrokenLink => "a link's target is too long or cut short",
+            RarProblem::MissingPassword => "encrypted, and there is no password",
+            RarProblem::BadPassword => "the password is wrong",
+            RarProblem::MissingVolume => "a next volume is not there",
+            RarProblem::NeedsPreviousVolume => "goes on from a volume before this one",
+            RarProblem::DictionaryTooLarge => "the dictionary is too large",
+            RarProblem::UnknownFormat => "a version or an encryption not known",
+        })
+    }
+}
+
 /// The reasons an extraction stops.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -98,6 +141,13 @@ pub enum ErrorKind {
     /// not match, a method `hivepack-7z` does not decode, or a password
     /// missing or wrong.
     SevenZip(hivepack_7z::Error),
+    /// The RAR archive could not be read: not one, a next volume that is not
+    /// of it, headers encrypted with no password, or no memory for a dictionary.
+    #[cfg(feature = "rar")]
+    Rar(hivepack_rar::Error),
+    /// An entry of the RAR archive, or the archive, is what UnRAR would report.
+    #[cfg(feature = "rar")]
+    RarEntry(RarProblem),
     /// A directory of the UDF volume met again: under two names, or its
     /// own ancestor, which UDF does not allow.
     DirectoryAgain,
@@ -158,6 +208,10 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Payload(e) => write!(f, "payload: {e}"),
             ErrorKind::Udf(e) => write!(f, "volume: {e}"),
             ErrorKind::SevenZip(e) => write!(f, "archive: {e}"),
+            #[cfg(feature = "rar")]
+            ErrorKind::Rar(e) => write!(f, "archive: {e}"),
+            #[cfg(feature = "rar")]
+            ErrorKind::RarEntry(e) => write!(f, "archive: {e}"),
             ErrorKind::DirectoryAgain => f.write_str("a directory met again"),
             ErrorKind::Changed => f.write_str("the archive changed between its two readings"),
             ErrorKind::Io(e) => write!(f, "{e}"),
@@ -190,6 +244,8 @@ impl std::error::Error for Error {
             ErrorKind::Payload(e) => Some(e),
             ErrorKind::Udf(e) => Some(e),
             ErrorKind::SevenZip(e) => Some(e),
+            #[cfg(feature = "rar")]
+            ErrorKind::Rar(e) => Some(e),
             ErrorKind::Io(e) | ErrorKind::Origin(e) => Some(e),
             _ => None,
         }

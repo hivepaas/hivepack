@@ -21,6 +21,7 @@
 | RPM | the lead's magic `ED AB EE DB`, a major version of 3 or 4 and a binary or source package, as libarchive's filter bids on it |
 | ZIP | `PK 03 04`, `PK 05 06` (an empty archive), `PK 07 08` (a split archive's marker) |
 | 7z | its signature, `37 7A BC AF 27 1C`, as the LZMA SDK checks it (`hivepack_7z::SIGNATURE`) |
+| RAR | its signature, `Rar!\x1a\x07` then 0 or 1, or RAR 1.4's `RE~^`, as UnRAR's `IsSignature`. Only told: `hivepack-rar`, under UnRAR's license, is not a dependency of this crate, so it is read through `hivepack_extract::extract_rar` or by itself. One after a self-extracting module is not told |
 | XAR | `xar!`, a header of 28 bytes, version 1, and a checksum libarchive knows (none, SHA-1, MD5, SHA-256, SHA-512), as libarchive's bid tells one: macOS packages (`.pkg`), `.xip` files |
 | cpio | the magic of odc (`070707`), afio's large ASCII header (`070727`), newc (`070701`) or crc (`070702`), with the whole header in the digits of its format; or the binary format's 16-bit `070707`, in either byte order, with a name of 1 to 1,024 bytes that ends where its length says, as two bytes of magic alone could start any data |
 | tar | `ustar` at 257 (USTAR and GNU), or else a checksum that adds up, signed or not, with a name: V7 has no magic |

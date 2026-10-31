@@ -118,6 +118,9 @@ impl<R: ReadAt> UnpIo for DataIo<'_, '_, R> {
     }
 }
 
+/// `MAXPATHSIZE`: the longest target of a RAR 4 link.
+const MAX_PATH_SIZE: i64 = 0x10000;
+
 /// Where an entry's data goes.
 pub type Output<'a> = dyn FnMut(&[u8]) -> io::Result<()> + 'a;
 
@@ -129,6 +132,19 @@ pub struct Extract {
     /// the extraction stops, as `CheckWinLimit` stops it when nobody allows
     /// more. By default what UnRAR allows, 4 GiB.
     pub win_size_limit: u64,
+    /// Goes through the entries without decompressing or giving out any data:
+    /// what is read and what is passed over are as when reading it, as what
+    /// follows a directory's header or a split entry's end depends on that, so
+    /// that a caller sees the entries a reading will see. Data is not checked.
+    pub headers_only: bool,
+    /// Reads the target of a RAR 4 Unix link, which is kept as its data, into
+    /// [`link_target`](Extract::link_target), and checks it: `ExtractUnixLink30`.
+    /// Otherwise links are as when testing, which passes over it.
+    pub link_targets: bool,
+    /// The last entry's target, with [`link_targets`](Extract::link_targets).
+    pub link_target: Vec<u8>,
+    /// Whether that target is too long to be one or is cut short.
+    pub bad_link_target: bool,
     /// How many bytes of the last entry were given out: `CurUnpWrite`.
     pub cur_unp_write: u64,
     /// Whether the last entry's data was skipped over, as the data before a
@@ -167,6 +183,10 @@ impl Default for Extract {
     fn default() -> Extract {
         Extract {
             win_size_limit: 0x1_0000_0000,
+            headers_only: false,
+            link_targets: false,
+            link_target: Vec::new(),
+            bad_link_target: false,
             cur_unp_write: 0,
             skip_solid: false,
             broken_file: false,
@@ -218,6 +238,8 @@ impl Extract {
         self.missing_volume = false;
         self.dictionary_too_large = false;
         self.unknown_format = false;
+        self.link_target.clear();
+        self.bad_link_target = false;
         if header_size == 0 {
             if !self.unp_volume {
                 return Ok(false);
@@ -364,6 +386,39 @@ impl Extract {
             if redir_type == Redirection::Unknown || arc.format == Format::Rar15 {
                 show_checksum = false;
             }
+            if self.link_targets && arc.format == Format::Rar15 {
+                let size = arc.file_head.pack_size;
+                if size > MAX_PATH_SIZE {
+                    self.bad_link_target = true;
+                } else {
+                    let mut target = vec![0; size as usize];
+                    let mut io = DataIo {
+                        arc: &mut *arc,
+                        packed_left: size,
+                        hash: &mut hash,
+                        out,
+                        skip_unp_crc: self.skip_solid,
+                        cur_unp_write: &mut self.cur_unp_write,
+                        decrypt,
+                        unp_volume: false,
+                        next_volume_missing: false,
+                    };
+                    let read = io.unp_read(&mut target)?.unwrap_or(0);
+                    if read == target.len() {
+                        // The hash goes up to a zero, and so does the target.
+                        let end = target.iter().position(|&b| b == 0).unwrap_or(read);
+                        target.truncate(end);
+                        hash.update(&target);
+                        show_checksum = true;
+                        self.link_target = target;
+                    } else {
+                        self.bad_link_target = true;
+                    }
+                }
+            }
+        } else if self.headers_only {
+            arc.seek_to_next();
+            return Ok(true);
         } else if split_before {
             // What this entry goes on from is not here: nothing to read.
         } else if arc.file_head.method == 0 {

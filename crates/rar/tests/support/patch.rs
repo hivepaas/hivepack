@@ -437,6 +437,138 @@ pub fn with_quick_open(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// What an entry of [`with_entries`] is.
+#[derive(Clone, Copy)]
+pub enum Kind<'a> {
+    File,
+    Dir,
+    /// RAR 5's redirection, by its type, to this target. In RAR 4, a Unix link
+    /// whose data is the target, whatever the type.
+    Redirect(u64, &'a [u8]),
+}
+
+/// An entry of [`with_entries`]: stored, as nothing here compresses. Its CRC is
+/// right unless it says otherwise.
+#[derive(Clone, Copy)]
+pub struct Entry<'a> {
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+    pub kind: Kind<'a>,
+    pub unix: bool,
+    pub bad_crc: bool,
+}
+
+impl<'a> Entry<'a> {
+    pub fn file(name: &'a [u8], data: &'a [u8]) -> Entry<'a> {
+        Entry {
+            name,
+            data,
+            kind: Kind::File,
+            unix: true,
+            bad_crc: false,
+        }
+    }
+    pub fn dir(name: &'a [u8]) -> Entry<'a> {
+        Entry {
+            kind: Kind::Dir,
+            ..Entry::file(name, b"")
+        }
+    }
+    pub fn redirect(name: &'a [u8], kind: u64, target: &'a [u8]) -> Entry<'a> {
+        Entry {
+            kind: Kind::Redirect(kind, target),
+            ..Entry::file(name, b"")
+        }
+    }
+}
+
+/// A copy of `rar5_stored.rar` with these entries in place of its one.
+pub fn with_entries(entries: &[Entry<'_>]) -> Vec<u8> {
+    let mut out = MAIN.to_vec();
+    for entry in entries {
+        let mut extra = Vec::new();
+        if let Kind::Redirect(kind, target) = entry.kind {
+            let mut record = vec![5];
+            put_vint(&mut record, kind);
+            record.push(0);
+            put_vint(&mut record, target.len() as u64);
+            record.extend_from_slice(target);
+            put_vint(&mut extra, record.len() as u64);
+            extra.extend_from_slice(&record);
+        }
+        let is_dir = matches!(entry.kind, Kind::Dir);
+        let mut body = vec![2, 2 | u8::from(!extra.is_empty())];
+        if !extra.is_empty() {
+            put_vint(&mut body, extra.len() as u64);
+        }
+        put_vint(&mut body, entry.data.len() as u64);
+        body.push(4 | u8::from(is_dir));
+        put_vint(&mut body, entry.data.len() as u64);
+        let attr = match (entry.unix, entry.kind) {
+            (true, Kind::File) => 0o100_644,
+            (true, Kind::Dir) => 0o040_755,
+            (true, Kind::Redirect(..)) => 0o120_777,
+            (false, Kind::Dir) => 0x10,
+            (false, _) => 0x20,
+        };
+        put_vint(&mut body, attr);
+        let crc = crc32(entry.data) ^ u32::from(entry.bad_crc);
+        body.extend_from_slice(&crc.to_le_bytes());
+        body.push(0);
+        body.push(u8::from(entry.unix));
+        put_vint(&mut body, entry.name.len() as u64);
+        body.extend_from_slice(entry.name);
+        body.extend_from_slice(&extra);
+        let mut header = Vec::new();
+        put_vint(&mut header, body.len() as u64);
+        header.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&header).to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(entry.data);
+    }
+    out.extend_from_slice(END);
+    out
+}
+
+/// A copy of `rar.rar` with these entries in place of its own.
+pub fn with_entries15(entries: &[Entry<'_>]) -> Vec<u8> {
+    let mut out = MAIN15.to_vec();
+    for entry in entries {
+        let data = match entry.kind {
+            Kind::Redirect(_, target) => target,
+            _ => entry.data,
+        };
+        let is_dir = matches!(entry.kind, Kind::Dir);
+        let flags = 0x8000u16 | if is_dir { 0xe0 } else { 0 };
+        let size = 32 + entry.name.len() as u16;
+        let mut body = vec![0x74];
+        body.extend_from_slice(&flags.to_le_bytes());
+        body.extend_from_slice(&size.to_le_bytes());
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.push(if entry.unix { 3 } else { 2 });
+        let crc = crc32(data) ^ u32::from(entry.bad_crc);
+        body.extend_from_slice(&crc.to_le_bytes());
+        body.extend_from_slice(b"\xb7\x76\xda\x3e");
+        body.extend_from_slice(&[29, 0x30]);
+        body.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
+        let attr: u32 = match (entry.unix, entry.kind) {
+            (true, Kind::File) => 0o100_644,
+            (true, Kind::Dir) => 0o040_755,
+            (true, Kind::Redirect(..)) => 0o120_777,
+            (false, Kind::Dir) => 0x10,
+            (false, _) => 0x20,
+        };
+        body.extend_from_slice(&attr.to_le_bytes());
+        body.extend_from_slice(entry.name);
+        out.extend_from_slice(&(crc32(&body) as u16).to_le_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(data);
+    }
+    out.extend_from_slice(END15);
+    out
+}
+
 fn get_vint(data: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in 0..10 {

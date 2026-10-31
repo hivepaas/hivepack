@@ -200,6 +200,7 @@ dependencies = [
  "hivepack-cpio",
  "hivepack-iso",
  "hivepack-open",
+ "hivepack-rar",
  "hivepack-tar",
  "hivepack-udf",
  "hivepack-xar",

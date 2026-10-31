@@ -2,7 +2,7 @@
 
 `hivepack-rar` reads RAR archives: it lists them, checks them and gives their entries' data, from RAR 1.4 to RAR 7. It is a port of UnRAR, RARLAB's own source, to safe Rust, under UnRAR's license, and it is checked against a program built from the same source. It does not write RAR, and never will: UnRAR's license forbids it, and so does this plan.
 
-> **Status:** steps 1 to 3 are done: `hivepack-rar` reads what UnRAR reads, every algorithm, every cipher, volumes, comments and QuickOpen records, compared with UnRAR on the archives of libarchive, rarfile, junrar and unrar.rs and on damaged copies of them (see [Progress](#progress)). Extracting to disk, step 4, comes next.
+> **Status:** done, all four steps: `hivepack-rar` reads what UnRAR reads, every algorithm, every cipher, volumes, comments and QuickOpen records, compared with UnRAR on the archives of libarchive, rarfile, junrar and unrar.rs and on damaged copies of them, and `hivepack_extract::extract_rar` writes it to disk (see [Progress](#progress)). Wiring it into packwing and a benchmark come next.
 
 ## Why UnRAR
 
@@ -23,7 +23,7 @@ UnRAR's source is freeware under its own license, `UnRAR` in SPDX, which OSI doe
 A port is modified UnRAR source, so `hivepack-rar`:
 
 - is licensed `UnRAR`, with UnRAR's `license.txt` as its `LICENSE`, and that paragraph, in full, in a comment at the top of every source file;
-- is a crate of its own, which no other crate depends on: `deny.toml` allows `UnRAR` for `hivepack-rar` only, so the rest of hivepack stays under open licenses, and only those who want RAR take its terms;
+- is a crate of its own, which no other crate depends on by default: `deny.toml` allows `UnRAR` for `hivepack-rar` only, and `hivepack-extract` takes it only with its feature `rar`, so the rest of hivepack stays under open licenses, and only those who want RAR take its terms. `hivepack-open` only tells a RAR archive by its signature, which takes no code of UnRAR's;
 - reads RAR and never writes it: no compression, no archive writer, not even in tests, which use archives others made and damaged copies of them.
 
 Reading RAR inside an archiver, closed or paid, is what the license allows ("in any software to handle RAR archives").
@@ -149,12 +149,18 @@ They agree in a run by hand on this code, with `HIVEPACK_RAR_DAMAGED=300`: 37,50
 
 `testdata/oracle/rar-unpack-old.txt`, `rar-password.txt`, `rar-volumes.txt` and `rar-quick-open.txt` hold what the `rar_unpack_old`, `rar_password`, `rar_volumes` and `rar_quick_open` fuzz targets found, with UnRAR's answers, replayed everywhere.
 
+**Step 4, extracting.** `hivepack_extract::extract_rar`, with that crate's feature `rar`, reads an archive twice, as `extract_tar` does. `Extract::headers_only` makes the first reading go through what the second will, without decompressing, because a list made by another route could differ: what follows a directory's header is read as a header whatever its pack size says, and a split entry goes on through `MergeArchive`. It stops the reading on anything UnRAR's library would report, a broken header, a missing volume or password, and RAR 5's check of the password, before anything is written. `Extract::link_targets` reads a RAR 4 Unix link's target as `ExtractUnixLink30` does: raw from where its data would be, never through a decompressor, up to `MAXPATHSIZE`.
+
+The rules are `hivepack-extract`'s (see [extract.md](extract.md)), not UnRAR's own (`IsRelativeSymlinkSafe`, `ConvertPath`, which drops what climbs and writes the rest): a name or link that leaves the destination is refused, not cleaned. A name's `\` is what UnRAR on Linux makes it, on every system: a separator in RAR 4, and in RAR 5 `_` from Windows, kept from Unix, which the checks refuse. A file in a solid stream is held to its share of the stream's compressed data, as 7z's folders are. A file copy is a copy of what was extracted before it, and a hard link or file copy to anything else is refused.
+
+On 158 archives of those four projects, what `extract_rar` writes is what `hivepack-rar` reads, 306 files by their bytes. The archives behind WinRAR's CVE-2023-38831, CVE-2025-8088 and CVE-2025-6218 and 7-Zip's CVE-2026-58052 are patched copies, in `crates/extract/tests/rar.rs`, stored and with the names that did the harm: nothing here compresses. The `extract_rar` fuzz target found that a file copy, which writes under any option, was not counted in what progress says is to be written, and ran six minutes after the fix with no finding.
+
 ## The order of work
 
 1. **Headers and stored data**, done. The signature, after a self-extracting module or not; the headers of RAR 1.4, 1.5 to 4.x and 5.0, their CRCs and RAR 5's extra records; listing; the data of stored entries, checked against CRC-32 or BLAKE2sp. `hivepack-crypto` gets BLAKE2s and BLAKE2sp.
 2. **Decompression**, done: RAR 2.9/3.x (its LZ, PPMd and standard filters), and RAR 5.0 and 7.0, solid archives included. RAR 7's algorithm is only reached by the copies above, as no archive at hand uses it.
 3. **The rest of reading**, done: QuickOpen records, encryption (RAR 1.3, 1.5, 2.0, 3.x and 5.0, headers too; `hivepack-crypto` gets AES decryption, HMAC-SHA256 and PBKDF2-HMAC-SHA256), volumes, comments, RAR 1.5 and 2.x compression.
-4. **Extracting**: `extract_rar` in `hivepack-extract`, through its rules, with RAR's links and times, and the archives behind RAR's CVEs (WinRAR's CVE-2025-8088 and CVE-2025-6218, 7-Zip's CVE-2026-58052).
+4. **Extracting**, done: `extract_rar` in `hivepack-extract`, through its rules, with RAR's links and times, and the archives behind RAR's CVEs (WinRAR's CVE-2025-8088 and CVE-2025-6218, 7-Zip's CVE-2026-58052).
 
 Each step is a pull request or a few, with its tests against the oracle.
 

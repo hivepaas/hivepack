@@ -40,3 +40,5 @@ hivepack-iso.workspace = true
 hivepack-udf.workspace = true
 # For the payloads of the packages it finds.
 hivepack-xar.workspace = true
+# For the 7z archives it finds.
+hivepack-7z.workspace = true

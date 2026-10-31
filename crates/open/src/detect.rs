@@ -1,6 +1,6 @@
 //! What a stream is, from its first bytes: a layer to take off (age, a
 //! compressor, an RPM package's lead and headers), a container (tar, ZIP,
-//! cpio, XAR, an ISO 9660 image, a UDF volume), or plain data.
+//! 7z, cpio, XAR, an ISO 9660 image, a UDF volume), or plain data.
 
 /// A layer over the data: encryption or compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,6 +39,10 @@ pub enum Container {
     /// A ZIP archive, which is read by random access: in a layer, it must
     /// be taken out to a file first.
     Zip,
+    /// A 7z archive, which `hivepack-7z` reads by random access, its
+    /// headers from its end: in a layer, it must be taken out to a file
+    /// first.
+    SevenZip,
     /// A cpio archive, which `hivepack-cpio` reads in order: Linux's
     /// initramfs, an RPM package's payload, a macOS package's.
     Cpio,
@@ -91,6 +95,9 @@ const AGE_ARMOR: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
 const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
 const LZ4_MAGIC: &[u8] = &[0x04, 0x22, 0x4D, 0x18];
 const LZ4_LEGACY_MAGIC: &[u8] = &[0x02, 0x21, 0x4C, 0x18];
+/// A 7z archive's signature (`hivepack_7z::SIGNATURE`, kept here so that
+/// telling one does not take the decoder).
+const SEVEN_ZIP_MAGIC: &[u8] = &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 
 /// Whether `head` starts with a skippable frame's magic, 0x184D2A50 to
 /// 0x184D2A5F, little-endian: zstd's and LZ4's, which share them.
@@ -308,6 +315,9 @@ pub fn detect(head: &[u8], name: Option<&str>) -> Detected {
     }
     if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") || starts(b"PK\x07\x08") {
         return Detected::Container(Container::Zip);
+    }
+    if starts(SEVEN_ZIP_MAGIC) {
+        return Detected::Container(Container::SevenZip);
     }
     if is_xar(head) {
         return Detected::Container(Container::Xar);
@@ -665,6 +675,28 @@ mod tests {
             layer(&far[..UDF_HEAD_LEN]),
             Detected::Container(Container::Data)
         );
+    }
+
+    #[test]
+    fn seven_zip_by_its_signature() {
+        let seven = Detected::Container(Container::SevenZip);
+        // The signature, its version (0.4) and its start header's CRC.
+        assert_eq!(layer(b"7z\xBC\xAF\x27\x1C\x00\x04\x8d\x9b\xd5\x0f"), seven);
+        assert_eq!(layer(b"7z\xBC\xAF\x27\x1C"), seven);
+        // Cut short, or a byte off: data.
+        for head in [
+            &b"7z\xBC\xAF\x27"[..],
+            b"7z\xBC\xAF\x27\x1D",
+            b"7Z\xBC\xAF\x27\x1C",
+        ] {
+            assert_eq!(
+                layer(head),
+                Detected::Container(Container::Data),
+                "{head:?}"
+            );
+        }
+        // Not under a name: the signature tells.
+        assert_eq!(detect(b"7z\xBC\xAF\x27\x1C", Some("x.lzma")), seven);
     }
 
     #[test]

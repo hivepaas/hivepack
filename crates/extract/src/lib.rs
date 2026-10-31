@@ -55,8 +55,8 @@
 //! twice: once to check, once to write; [`extract_cpio`] cpio archives
 //! (RPM packages' payloads among them), [`extract_xar`] XAR archives
 //! (macOS packages, their payloads expanded) and [`extract_iso`] ISO 9660
-//! images, the same way; [`extract_udf`] UDF volumes, walked and checked
-//! first, as ZIP archives are.
+//! images, the same way; [`extract_udf`] UDF volumes and [`extract_7z`] 7z
+//! archives, checked first, as ZIP archives are.
 //!
 //! The design, and what comes next (RAR), are in the repository's
 //! `docs/extract.md`.
@@ -69,6 +69,7 @@ mod name;
 mod origin;
 mod plan;
 mod progress;
+mod sevenz;
 mod tar;
 mod udf;
 mod unicode;
@@ -82,6 +83,7 @@ pub use name::{MAX_COMPONENT, Name, NameError, check_name};
 pub use origin::Origin;
 pub use plan::{Limits, Links, Names, OnRefused, Options, Packages, Permissions};
 pub use progress::{Cancel, Progress, ProgressFn};
+pub use sevenz::extract_7z;
 pub use tar::extract_tar;
 pub use udf::extract_udf;
 /// The version of Unicode names are compared with: major, minor, update.

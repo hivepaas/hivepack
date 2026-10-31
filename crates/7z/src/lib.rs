@@ -257,6 +257,22 @@ impl<R: Read + Seek> Archive<R> {
         self.db.db.folder_unpack_size(folder)
     }
 
+    /// Not in the SDK: the bytes folder `folder`'s packed streams take in
+    /// the archive, which it decodes to [`folder_size`](Self::folder_size)
+    /// bytes. 0 for a folder that is not there.
+    pub fn folder_packed_size(&self, folder: usize) -> u64 {
+        let ar = &self.db.db;
+        let stream = |fo: usize| ar.fo_start_pack_stream_index.get(fo).copied();
+        let position = |s: u32| ar.pack_positions.get(s as usize).copied();
+        match (stream(folder), stream(folder + 1)) {
+            (Some(first), Some(end)) => match (position(first), position(end)) {
+                (Some(start), Some(stop)) => stop.saturating_sub(start),
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
     /// `SzAr_DecodeFolder`: all of folder `folder`, checked.
     pub fn decode_folder(&mut self, folder: usize) -> Result<Vec<u8>> {
         if folder >= self.folders() {

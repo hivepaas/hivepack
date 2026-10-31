@@ -470,7 +470,8 @@ fn make_sparse(tar: &str, dir: &Path, out: &Path, options: &[&str]) -> Result<()
     }
     let status = Command::new(tar)
         .current_dir(dir)
-        .args(["--sparse", "-cf"])
+        // Looking for zeros, as file systems differ in what they report as holes.
+        .args(["--sparse", "--hole-detection=raw", "-cf"])
         .arg(out)
         .args(options)
         .arg("sparse")
@@ -479,6 +480,10 @@ fn make_sparse(tar: &str, dir: &Path, out: &Path, options: &[&str]) -> Result<()
         .map_err(|e| format!("GNU tar: {e}"))?;
     if !status.success() {
         return Err(format!("tar {options:?}: {status}"));
+    }
+    let len = std::fs::metadata(out).map_err(|e| e.to_string())?.len();
+    if len > SPARSE_FILES as u64 * SPARSE_SIZE / 2 {
+        return Err(format!("tar {options:?} found no holes: {len} bytes"));
     }
     Ok(())
 }

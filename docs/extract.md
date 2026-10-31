@@ -67,7 +67,7 @@ The defaults are a judgment, to be tuned on real archives; each can be raised.
 
 Every entry's data is checked at its end, its CRC-32, or for WinZip AES its authentication code, by `hivepack-zip`; a file whose data fails is removed, as is one cut off at a limit, and the extraction stops. Encrypted entries are read with `Options::password`.
 
-On Unix, a file gets the permission bits its entry has, masked as Python's `data` filter masks them: no setuid, setgid or sticky bit, nothing writable by group or others, and readable and writable by its owner. Owners, ACLs and extended attributes are not restored. Directories get the system's default permissions. Files and directories get the time their entry has, the directories once nothing more is written in them, the deepest first, without following a link.
+On Unix, a file gets the permission bits its entry has, masked as Python's `data` filter masks them: no setuid, setgid or sticky bit, nothing writable by group or others, and readable and writable by its owner. Owners, ACLs and extended attributes are not restored. Directories get the system's default permissions. Files and directories get the time their entry has, the directories once nothing more is written in them, the deepest first, without following a link. A time the system cannot hold (after January 2038 where `time_t` has 32 bits) is left: the file keeps the time it was written at.
 
 ## Marks of origin
 

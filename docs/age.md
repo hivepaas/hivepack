@@ -50,6 +50,34 @@ No Edwards arithmetic is needed: age turns an Ed25519 private key into an X25519
 
 What the port allocates is bounded before it reads a file, as age bounds it: the header to 2 MiB, 1,024 stanzas and 128 arguments each; the payload to one chunk of 64 KiB at a time; a key file to 16 MiB and lines of 64 KiB. A passphrase's work factor is the exception that age sets for the caller to choose: 2^22 by default, which is 4 GiB of memory and about 5 seconds on a Ryzen 9 9950X. A file asking for more fails at once, without the work. An application that opens files from strangers, as an archiver does, should lower it with `ScryptIdentity::set_max_work_factor` (or `LazyScryptIdentity`'s): age's own default when encrypting is 2^18 (256 MiB, 0.3 s), and each step up doubles the time and the memory. scrypt's memory is allocated with `try_reserve_exact`, so a machine without it gets an error rather than an abort.
 
+## The speed
+
+`tools/age-bench` times the port against age v1.3.2, in a program of its own (`tools/age-bench/go`), on files age makes:
+
+```sh
+python3 scripts/testdata.py fetch --group bench
+cargo run --release -p age-bench -- [--only TEXT] [--rounds 5] [--seconds 0.5]
+```
+
+AMD Ryzen 9 9950X (16 cores, x86-64), 45 GiB of memory, Ubuntu 26.04 with Linux 7.0 and the `powersave` governor, rustc 1.99.1 in the workspace's release profile, Go 1.27.2 with age v1.3.2, October 2026, the Silesia corpus cut to 64 MiB, in memory. Each speed is the best of five rounds taken in turn. Both read the same bytes.
+
+| Workload | The port | age | Port / age |
+|---|---|---|---|
+| **Finding the file key, in an empty file** | | | |
+| X25519 | 13,161 files/s | 14,258 files/s | 0.92× |
+| X25519, the last of ten recipients | 1,377 files/s | 1,792 files/s | 0.77× |
+| ssh-ed25519 | 6,800 files/s | 7,647 files/s | 0.89× |
+| Passphrase, scrypt at 2^14 | 71.2 files/s | 55.7 files/s | 1.28× |
+| Passphrase, scrypt at 2^18, age's default | 3.3 files/s | 3.2 files/s | 1.02× |
+| **Reading the payload** | | | |
+| Big file | 905 MB/s | 2,279 MB/s | 0.40× |
+| Big file, in ASCII armor | 132 MB/s | 493 MB/s | 0.27× |
+| Files of 4 KiB | 12,362 files/s | 14,392 files/s | 0.86× |
+| **Parsing keys** | | | |
+| A file of 1,000 age keys | 14 k keys/s | 19 k keys/s | 0.72× |
+
+The big file's gap is ChaCha20-Poly1305, which Go runs in AVX2 assembly and the port in constant-time safe Rust ([crypto.md](crypto.md#speed)). In ASCII armor, 63% of the port's time is decoding base64 (`base64::decode_with`), a byte at a time, which is not looked into yet. Parsing keys is X25519, for each key's public half. Other work started on the machine towards the end of the run, though the best of the rounds should hide most of it.
+
 ## How it is shown
 
 - **`tests/cctv.rs`**: C2SP's CCTV test vectors for age (`c2sp.org/CCTV/age` at commit 4448f2097b2d, the module age v1.3.2 tests with), fetched by `scripts/testdata.py` from Go's module proxy into the `cctv-age` set. Each vector is a file with the outcome it must have, and the SHA-256 of all the plaintext given out, even when the payload fails later. As age's `testkit_test.go` does, an armored vector goes through the armor reader; then the vector goes through `decrypt_file` too, which must agree, except that a file with garbage before its armor is not taken for armored and fails as a header. All 128 vectors with X25519 keys and passphrases pass; the 19 with post-quantum keys are skipped.

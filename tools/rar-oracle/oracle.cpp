@@ -38,12 +38,18 @@
 // included in license, or in documentation if license is not available, and
 // in source code comments of resulting package.
 
-#include "rar.hpp"
-
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 #include <string>
+#include <vector>
+
+// For RarVM's memory and Unpack::ApplyFilter, compared by themselves.
+#define private public
+#include "rar.hpp"
+#undef private
+
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -374,6 +380,18 @@ static unsigned long long data_size, data_fnv;
 
 // All an entry's data comes here, and nobody allows anything: no password, no
 // next volume, no larger dictionary.
+// Zeros in what UnRAR allocates with new[]: damaged data can have RAR 3's
+// filters read their memory (RarVM::Mem) before it is written, and an answer
+// must not depend on what was on the heap. The port's memory starts as zeros.
+void *operator new[](size_t size) {
+  void *memory = calloc(size ? size : 1, 1);
+  if (memory == NULL)
+    throw std::bad_alloc();
+  return memory;
+}
+void operator delete[](void *memory) noexcept { free(memory); }
+void operator delete[](void *memory, size_t) noexcept { free(memory); }
+
 static int CALLBACK test_callback(UINT msg, LPARAM, LPARAM p1, LPARAM p2) {
   if (msg != UCM_PROCESSDATA)
     return -1;
@@ -437,7 +455,9 @@ static void do_test(const char *hex, unsigned long long limit) {
         // character. That is choosing files, and hivepack-rar has no masks.
         if (size != 0 && Arc.GetHeaderType() == HEAD_FILE) {
           FileHeader &h = Arc.FileHead;
-          if (h.Method != 0 || h.Encrypted || h.SplitBefore || h.SplitAfter ||
+          bool old_method = h.UnpVer >= 13 && h.UnpVer <= 15 || h.UnpVer == 20 || h.UnpVer == 26;
+          if ((h.Method != 0 && Arc.Format != RARFMT50 && old_method) || h.Encrypted ||
+              h.SplitBefore || h.SplitAfter ||
               !Cmd.IsProcessFile(h, NULL, MATCH_WILDSUBPATH, false, NULL)) {
             out += " later";
             Arc.SeekToNext();
@@ -487,6 +507,121 @@ static void do_hash(int type, size_t chunk, const char *hex) {
   printf("%s\n", out.c_str());
 }
 
+static unsigned long long fnv(const byte *data, size_t size) {
+  unsigned long long h = 0xcbf29ce484222325ULL;
+  for (size_t i = 0; i < size; i++) {
+    h ^= data[i];
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
+// RarVM::Execute of one standard filter over these bytes.
+static void do_filter3(int kind, uint r0, uint r1, uint r4, uint r6, const char *hex) {
+  static const VM_StandardFilters kinds[] = {VMSF_NONE, VMSF_E8, VMSF_E8E9, VMSF_ITANIUM,
+                                             VMSF_RGB, VMSF_AUDIO, VMSF_DELTA};
+  std::vector<byte> data = unhex(hex);
+  RarVM vm;
+  vm.Init();
+  vm.SetMemory(0, data.data(), data.size());
+  VM_PreparedProgram prg;
+  prg.Type = kinds[kind];
+  memset(prg.InitR, 0, sizeof(prg.InitR));
+  prg.InitR[0] = r0;
+  prg.InitR[1] = r1;
+  prg.InitR[4] = r4;
+  prg.InitR[6] = r6;
+  vm.Execute(&prg);
+  out = "filter3";
+  put("size", prg.FilteredDataSize);
+  put("at", prg.FilteredData - vm.Mem);
+  put("fnv", fnv(prg.FilteredData, prg.FilteredDataSize));
+  put("mem", fnv(vm.Mem, VM_MEMSIZE + 4));
+  printf("%s\n", out.c_str());
+}
+
+// Unpack::ApplyFilter over these bytes, with so much already written.
+static void do_filter5(int kind, int channels, uint written, const char *hex) {
+  std::vector<byte> data = unhex(hex);
+  static ComprDataIO io;
+  static Unpack unpack(&io);
+  unpack.WrittenFileSize = written;
+  UnpackFilter filter;
+  filter.Type = (byte)kind;
+  filter.Channels = (byte)channels;
+  filter.NextWindow = false;
+  filter.BlockStart = 0;
+  filter.BlockLength = (uint)data.size();
+  byte *output = unpack.ApplyFilter(data.data(), (uint)data.size(), &filter);
+  out = "filter5";
+  if (output == NULL)
+    out += " none";
+  else
+    put("fnv", fnv(output, data.size()));
+  printf("%s\n", out.c_str());
+}
+
+// ModelPPM by itself. A stream that is not one stops the model within a few
+// hundred symbols, and the archives at hand are too short to fill its least
+// memory, 1 MiB, so this gives it `heap` bytes as if that had been asked for and
+// starts it again where it stops: what no stream at hand reaches is its memory
+// filling, the gluing of free blocks and its restarts.
+static void do_ppm(unsigned long long count, uint heap, const char *hex) {
+  std::vector<byte> data = unhex(hex);
+  size_t at = 0;
+  static ComprDataIO io;
+  static Unpack *unpack = NULL;
+  delete unpack;
+  unpack = new Unpack(&io);
+  const size_t chunk = 0x4000;
+  auto feed = [&]() {
+    if (io.UnpackFromMemorySize == 0 && at < data.size()) {
+      size_t size = Min(chunk, data.size() - at);
+      io.UnpackFromMemory = true;
+      io.UnpackFromMemoryAddr = data.data() + at;
+      io.UnpackFromMemorySize = size;
+      at += size;
+    }
+  };
+  feed();
+  unpack->UnpReadBuf30();
+  feed();
+  int esc = 2;
+  out = "ppm";
+  if (!unpack->PPM.DecodeInit(unpack, esc)) {
+    out += " noinit";
+  } else {
+    int order = unpack->PPM.MaxOrder;
+    unpack->PPM.SubAlloc.SubAllocatorSize = heap;
+    unpack->PPM.StartModelRare(order);
+    unsigned long long done = 0, h = 0xcbf29ce484222325ULL, restarts = 0;
+    while (done < count) {
+      feed();
+      int ch = unpack->PPM.DecodeChar();
+      if (ch == -1) {
+        if (at >= data.size())
+          break;
+        // The coder too, as a block's start does: UnRAR never goes on with one
+        // that has failed, and would divide by zero.
+        feed();
+        unpack->PPM.Coder.InitDecoder(unpack);
+        unpack->PPM.StartModelRare(order);
+        restarts++;
+        continue;
+      }
+      h ^= (byte)ch;
+      h *= 0x100000001b3ULL;
+      done++;
+    }
+    put("symbols", done);
+    put("restarts", restarts);
+    put("fnv", h);
+  }
+  // The bytes are about to go: nothing is left to read from them.
+  io.UnpackFromMemorySize = 0;
+  printf("%s\n", out.c_str());
+}
+
 int main() {
   setenv("TZ", "UTC", 1);
   tzset();
@@ -500,9 +635,9 @@ int main() {
       line += (char)c;
     if (c == EOF && line.empty())
       break;
-    char *words[4];
+    char *words[7];
     int count = 0;
-    for (char *w = strtok(&line[0], " "); w && count < 4; w = strtok(NULL, " "))
+    for (char *w = strtok(&line[0], " "); w && count < 7; w = strtok(NULL, " "))
       words[count++] = w;
     if (count == 3 && strcmp(words[0], "list") == 0)
       do_list(atoi(words[1]), words[2]);
@@ -516,6 +651,13 @@ int main() {
       do_test("", 0);
     else if (count == 4 && strcmp(words[0], "hash") == 0)
       do_hash(atoi(words[1]), strtoul(words[2], NULL, 10), words[3]);
+    else if (count == 4 && strcmp(words[0], "ppm") == 0)
+      do_ppm(strtoull(words[1], NULL, 10), (uint)strtoul(words[2], NULL, 10), words[3]);
+    else if (count == 7 && strcmp(words[0], "filter3") == 0)
+      do_filter3(atoi(words[1]), (uint)strtoul(words[2], NULL, 10), (uint)strtoul(words[3], NULL, 10),
+                 (uint)strtoul(words[4], NULL, 10), (uint)strtoul(words[5], NULL, 10), words[6]);
+    else if (count == 5 && strcmp(words[0], "filter5") == 0)
+      do_filter5(atoi(words[1]), atoi(words[2]), (uint)strtoul(words[3], NULL, 10), words[4]);
     else
       printf("unknown request\n");
     fflush(stdout);

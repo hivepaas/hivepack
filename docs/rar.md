@@ -95,14 +95,39 @@ The oracle's `test` request drives UnRAR's own `CmdExtract` the same way, with t
 - Links have no data when testing. RAR 5's are checked against the hash of no data, and RAR 4's not at all, as their target is their data.
 - A next volume that cannot be opened is `RARX_OPEN`, which the warning that follows does not replace.
 
-No archive at hand stores data under BLAKE2sp or RAR 1.4's checksum, and hivepack does not make archives, so the `hash` request compares those with UnRAR's `DataHash` directly, in chunks of several sizes, and unit tests check the comparison. Going through a whole archive with BLAKE2sp comes with `rar5_blake2.rar` in step 2; none of the archives at hand is RAR 1.4. Two things are left out on purpose, as they concern choosing files and not reading archives, and the port has no masks. With `*` as the only mask and no recursing, UnRAR stops after a first file named `*`, taking it for all that was asked for, so the oracle recurses. And the mask `*` does not match a name whose last part starts with `*` and goes on, like `*root.txt`, as `match` (rewritten on 2026-09-23) compares that `*` as a plain character before it treats it as a wildcard: UnRAR 7.3.2 silently leaves such a file out. The oracle passes over those entries, and so does the comparison.
+No archive at hand stores data under BLAKE2sp or RAR 1.4's checksum, and hivepack does not make archives, so the `hash` request compares those with UnRAR's `DataHash` directly, in chunks of several sizes, and unit tests check the comparison. `rar5_blake2.rar` goes through a whole archive with BLAKE2sp since step 2; none of the archives at hand is RAR 1.4. Two things are left out on purpose, as they concern choosing files and not reading archives, and the port has no masks. With `*` as the only mask and no recursing, UnRAR stops after a first file named `*`, taking it for all that was asked for, so the oracle recurses. And the mask `*` does not match a name whose last part starts with `*` and goes on, like `*root.txt`, as `match` (rewritten on 2026-09-23) compares that `*` as a plain character before it treats it as a wildcard: UnRAR 7.3.2 silently leaves such a file out. The oracle passes over those entries, and so does the comparison.
 
 `testdata/oracle/rar-test.txt` holds the oracle's answers for libarchive's stored archives and those of 2 KB or less with damaged copies, and for hashes, replayed everywhere. The `rar_test` fuzz target goes through its input twice: 7.1 million inputs over four minutes found nothing before the first commit.
+
+**Step 2, decompression.** `Unpack` is UnRAR's `Unpack`: `v50` the algorithm of RAR 5.0 and 7.0 (unpack50.cpp), `v30` that of RAR 2.9 to 4 (unpack30.cpp), `ppm` its PPMd variant H (model.cpp, suballoc.cpp, coder.cpp) and `filters` its standard filters (rarvm.cpp). Solid entries go on from each other as they do in UnRAR. An entry compressed by RAR 1.5 or 2.x is still `Error::NotYet`, as is one that is encrypted or split across volumes. Three things differ from UnRAR, none in what comes out:
+
+- **The window grows as data reaches it.** UnRAR allocates the whole dictionary an entry asks for. It only reads the window where it has been written, so a few damaged bytes asking for 4 GiB cost nothing here. The one exception is a RAR 3 filter of no length, which reads to the end of the dictionary: what is not there yet is zeros.
+- **PPMd's heap is a byte array with 32-bit offsets**, in the layout of 6-byte states and 12-byte units that the algorithm was made for. UnRAR's larger structures are its adjustment to 64-bit pointers, which keeps to these sizes for every decision.
+- **The fragmented window and the threads are left out**: they are for 32-bit systems that cannot allocate a whole window, and for speed.
+
+What they had to agree on, which is not written anywhere:
+
+- Reading past what was read gives what the buffer held from before, as UnRAR's input buffer is not cleared.
+- A filter with a type UnRAR does not know writes nothing, and what it covered still counts as written.
+- A filter's output is not limited by the entry's unpacked size, while the data around filters is.
+- A RAR 3 filter can be told to work on more than it was given, and reads what earlier filters left in its memory. That memory is uninitialized in UnRAR, so the oracle's `new[]` gives zeros, as the port's memory starts: an answer must not depend on the heap.
+- A range coder that has failed stays failed: UnRAR never goes on with it, and it would divide by zero if it did.
+
+Damage to libarchive's archives, which are small, does not get far into a decoder: mutants showed that most of the code could be wrong without a test noticing. So there is more than damage:
+
+- **Damage with the headers' CRCs made right again**, which reaches solid flags, dictionaries, algorithms and sizes.
+- **Bytes as packed data**: `tests/support/patch.rs` puts them in place of the data of a copy of `rar5_stored.rar` or `rar.rar`, one entry or two, which is how RAR 7's algorithm is reached at all, as no archive at hand uses it. Nothing here compresses, and nothing could make a valid stream. The `rar_unpack` fuzz target feeds this, and what it finds is compared with UnRAR.
+- **The filters by themselves**: no archive at hand has RAR 3's Itanium, RGB or audio filters, whose code cannot be made up, so the `filter3` and `filter5` requests give the same bytes to `RarVM::Execute` and `Unpack::ApplyFilter`, reached by the oracle with `#define private public`.
+- **PPMd's model by itself**: a stream that is not one stops a range decoder within a few hundred symbols, and the archives at hand are too short to fill the model's least memory. The `ppm` request gives `ModelPPM`, on both sides, a heap of a few kilobytes that no block could ask for, and starts it again where it stops.
+
+They agree on libarchive's 131 archives, and in runs by hand on the last code: 2 million damaged copies with their data reached, 2 million with damaged headers, 4 million random packed streams, 320,000 filter requests, 16,000 PPMd streams and the 1,183 inputs left of the fuzzer's corpus. Of 118 mutants put by hand into the decoders, what CI runs catches 104. Of the 14 left, 8 change nothing that can be seen or next to nothing: a distance in 64 bits, the CRC and XOR that RAR 3's filters check themselves with, the size given to the E8 filter, where the VM puts its output, the choice in the RGB filter, how far the window wraps, and how PPMd starts again after an escape. The other 6 are not reached: the limit on the number of filters, chains of RAR 3 filters, the window size of solid entries, one table of PPMd (`ns2indx`), and its shrinking of units and its minimum for text.
+
+`testdata/oracle/rar-unpack.txt` holds 790 of what the fuzzer found with UnRAR's answers, chosen so that they catch what the rest does not, and `rar-filters.txt` the answers for the filters, both replayed everywhere. A stream of 241 MB out of 176 KB takes about 1.6 times UnRAR's time, and a smaller one of binary data about 1.3 times. There is no large archive at hand to say more.
 
 ## The order of work
 
 1. **Headers and stored data.** The signature, after a self-extracting module or not; the headers of RAR 1.4, 1.5 to 4.x and 5.0, their CRCs and RAR 5's extra records; listing; the data of stored entries, checked against CRC-32 or BLAKE2sp. `hivepack-crypto` gets BLAKE2s and BLAKE2sp.
-2. **Decompression**: RAR 2.9/3.x (its LZ, PPMd and standard filters), and RAR 5.0 and 7.0, solid archives included.
+2. **Decompression**: RAR 2.9/3.x (its LZ, PPMd and standard filters), and RAR 5.0 and 7.0, solid archives included. RAR 7's algorithm is only reached by the copies above, as no archive at hand uses it.
 3. **The rest of reading**: encryption (RAR 1.3, 1.5, 2.0, 3.x and 5.0, headers too; `hivepack-crypto` gets AES decryption, HMAC-SHA256 and PBKDF2-HMAC-SHA256), volumes, comments, RAR 1.5 and 2.x compression.
 4. **Extracting**: `extract_rar` in `hivepack-extract`, through its rules, with RAR's links and times, and the archives behind RAR's CVEs (WinRAR's CVE-2025-8088 and CVE-2025-6218, 7-Zip's CVE-2026-58052).
 

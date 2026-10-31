@@ -127,6 +127,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "zip_split"
+path = "fuzz_targets/zip_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "zip_edit"
 path = "fuzz_targets/zip_edit.rs"
 test = false
@@ -238,6 +245,13 @@ bench = false
 [[bin]]
 name = "extract_cpio"
 path = "fuzz_targets/extract_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_unpack"
+path = "fuzz_targets/rar_unpack.rs"
 test = false
 doc = false
 bench = false
